@@ -95,6 +95,26 @@ let extensionThemesCache: CachedExtensionTheme[] = [];
 /** True once the extension load pass has completed at least once in the renderer. */
 let extensionsHydrated = false;
 
+/**
+ * Debounce handle for `reconcileActiveTheme`. An extension reload
+ * (dev-install/dev-reload) briefly unregisters and re-registers its theme
+ * contributions in the renderer, producing an `extension-themes-changed`
+ * event where the active theme is momentarily absent even though the
+ * extension isn't actually gone. Firing the fallback on that raw event
+ * treated every reload as an uninstall. Debouncing lets a reload's
+ * re-registration land before we decide the theme is really missing.
+ */
+let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
+const RECONCILE_DEBOUNCE_MS = 1500;
+
+function scheduleReconcile(): void {
+  if (reconcileTimer) clearTimeout(reconcileTimer);
+  reconcileTimer = setTimeout(() => {
+    reconcileTimer = null;
+    reconcileActiveTheme();
+  }, RECONCILE_DEBOUNCE_MS);
+}
+
 // Track the user themes dir once it's resolved -- used to decide origin.
 let cachedUserThemesDir: string | null = null;
 
@@ -303,7 +323,7 @@ export async function registerThemeHandlers() {
       }));
     extensionsHydrated = true;
     broadcastThemeListChanged();
-    reconcileActiveTheme();
+    scheduleReconcile();
   });
 
   // Pending fallback notice — read by the Themes panel banner.
