@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
+- Tracker board cards now have a run/resume/focus button to start, reopen, or jump to that item's AI session without leaving the board.
 
 ### Changed
 <!-- Changes to existing functionality go here -->

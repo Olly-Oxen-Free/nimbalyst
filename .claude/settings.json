@@ -3,15 +3,26 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__nimbalyst-mcp__developer_git_commit_proposal",
         "hooks": [
           {
-            "type": "command",
             "command": "node scripts/agent-test-gate.mjs",
+            "statusMessage": "Running typecheck + unit tests before commit...",
             "timeout": 600,
-            "statusMessage": "Running typecheck + unit tests before commit..."
+            "type": "command"
           }
-        ]
+        ],
+        "matcher": "mcp__nimbalyst-mcp__developer_git_commit_proposal"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "bd prime --hook-json",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
       }
     ]
   }

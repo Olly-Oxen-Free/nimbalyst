@@ -257,3 +257,12 @@ packages/collab-client/src/**/*.d.ts.map
 !packages/runtime/src/**/*-env.d.ts
 !packages/runtime/src/types/*.d.ts
 !packages/runtime/src/editor/types/*.d.ts
+
+# KARIMO worktree directories (isolated task execution)
+.karimo/.worktrees/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

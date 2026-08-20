@@ -1,0 +1,8 @@
+{
+  "slug": "tracker-task-dispatch",
+  "feature_description": "One-click dispatch of a tracker item as an AI agent session prompt, ported from vibeyard's kanban-card dispatch feature",
+  "internal_research": true,
+  "external_research": true,
+  "external_source": "https://github.com/elirantutia/vibeyard",
+  "created_at": "2026-08-20T01:40:10Z"
+}

@@ -11,7 +11,8 @@
  * spec address.
  */
 
-import React from 'react';
+import React, { useCallback, useMemo } from 'react';
+import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol, TrackerUnreadDot } from '@nimbalyst/runtime';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import { TrackerFavoriteStar } from '@nimbalyst/runtime/plugins/TrackerPlugin';
@@ -25,6 +26,25 @@ import { UserAvatar } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/
 import { NEUTRAL_SWATCH, PRIORITY_COLORS, TYPE_COLORS } from './trackerBoardTokens';
 import { TrackerCardMilestoneChip } from './TrackerCardMilestoneChip';
 import { TrackerCardStalenessChip } from './TrackerCardStalenessChip';
+import { store } from '../../store';
+import {
+  refreshSessionListAtom,
+  sessionProcessingAtom,
+  sessionRegistryAtom,
+  setSelectedWorkstreamAtom,
+} from '../../store/atoms/sessions';
+import { setWindowModeAtom } from '../../store/atoms/windowMode';
+import { activeWorkspacePathAtom } from '../../store/atoms/openProjects';
+import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
+import { workstreamStateAtom } from '../../store/atoms/workstreamState';
+import { resolveLinkedSessions } from '../../utils/resolveLinkedSessions';
+import { isClaudeCliTerminalSession } from '../UnifiedAI/claudeCliInputRouting';
+import { launchTrackerSession, resumeTrackerSession } from './trackerSessionDispatch';
+import {
+  deriveTrackerCardSessionAction,
+  SESSION_ACTION_ICON,
+  SESSION_ACTION_LABEL,
+} from './trackerCardSessionAction';
 import './TrackerBoardCard.css';
 
 export interface TrackerBoardCardProps {
@@ -82,6 +102,91 @@ export const TrackerBoardCard: React.FC<TrackerBoardCardProps> = ({
   // imported/external items stay recognizable on the board.
   const keyLine = [item.issueKey, getRecordExternalKey(item)].filter(Boolean).join(' · ');
 
+  const workspacePath = useAtomValue(activeWorkspacePathAtom);
+  const defaultModel = useAtomValue(defaultAgentModelAtom);
+  const sessionRegistry = useAtomValue(sessionRegistryAtom);
+  const setSelectedWorkstream = useSetAtom(setSelectedWorkstreamAtom);
+  const setWindowMode = useSetAtom(setWindowModeAtom);
+  const refreshSessionList = useSetAtom(refreshSessionListAtom);
+
+  const linkedSession = useMemo(
+    () => resolveLinkedSessions(item, sessionRegistry)[0],
+    [item, sessionRegistry],
+  );
+  const isLinkedSessionProcessing = useAtomValue(sessionProcessingAtom(linkedSession?.id ?? ''));
+  const sessionAction = deriveTrackerCardSessionAction(!!linkedSession, isLinkedSessionProcessing);
+
+  // Mirrors TrackerMainView's handleSwitchToAgentMode: an existing linked
+  // session may itself be a workstream/worktree root or a workstream child,
+  // so reopening it (resume/focus) needs the same type resolution a fresh
+  // launch (always a plain 'session') doesn't.
+  const navigateToSession = useCallback((sessionId: string) => {
+    if (!workspacePath) return;
+    const registry = store.get(sessionRegistryAtom);
+    const sessionMeta = registry.get(sessionId);
+    let targetId = sessionId;
+    let type: 'session' | 'workstream' | 'worktree' = 'session';
+    if (sessionMeta?.parentSessionId && registry.get(sessionMeta.parentSessionId)) {
+      targetId = sessionMeta.parentSessionId;
+      type = 'workstream';
+    } else {
+      const state = store.get(workstreamStateAtom(sessionId));
+      type = state.type === 'worktree' ? 'worktree' : state.type === 'workstream' ? 'workstream' : 'session';
+    }
+    setSelectedWorkstream({ workspacePath, selection: { type, id: targetId } });
+    setWindowMode('agent');
+  }, [workspacePath, setSelectedWorkstream, setWindowMode]);
+
+  const handleSessionAction = useCallback(async (event: React.MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!workspacePath) return;
+
+    if (sessionAction === 'focus') {
+      if (linkedSession) navigateToSession(linkedSession.id);
+      return;
+    }
+
+    if (sessionAction === 'resume' && linkedSession) {
+      if (!isClaudeCliTerminalSession(linkedSession.provider)) {
+        // Non-claude-cli providers can't resume; reopen the existing session
+        // record instead of dispatching, which would otherwise fall back to
+        // creating a duplicate session (see trackerSessionDispatch.ts).
+        navigateToSession(linkedSession.id);
+        return;
+      }
+      try {
+        const sessionId = await resumeTrackerSession({
+          trackerItemId: item.id,
+          trackerItem: item,
+          workspacePath,
+          defaultModel,
+          linkedSession,
+        });
+        if (!sessionId) return;
+        await refreshSessionList();
+        navigateToSession(sessionId);
+      } catch (err) {
+        console.error('[TrackerBoardCard] Failed to resume session:', err);
+      }
+      return;
+    }
+
+    try {
+      const sessionId = await launchTrackerSession({
+        trackerItemId: item.id,
+        trackerItem: item,
+        workspacePath,
+        defaultModel,
+      });
+      if (!sessionId) return;
+      await refreshSessionList();
+      navigateToSession(sessionId);
+    } catch (err) {
+      console.error('[TrackerBoardCard] Failed to launch session:', err);
+    }
+  }, [sessionAction, linkedSession, workspacePath, defaultModel, item, refreshSessionList, navigateToSession]);
+
   return (
     <div
       data-testid="tracker-kanban-card"
@@ -131,6 +236,27 @@ export const TrackerBoardCard: React.FC<TrackerBoardCardProps> = ({
         />
         <TrackerUnreadDot itemId={item.id} className="mt-1" />
         <TrackerFavoriteStar itemId={item.id} isFavorite={isFavorite} onToggle={onToggleFavorite} />
+        <button
+          type="button"
+          draggable={false}
+          data-testid="tracker-card-session-button"
+          aria-label={SESSION_ACTION_LABEL[sessionAction]}
+          title={SESSION_ACTION_LABEL[sessionAction]}
+          className={`tracker-card-session-button shrink-0 inline-flex items-center justify-center w-6 h-6 rounded hover:bg-nim-tertiary transition-colors ${
+            sessionAction === 'focus' ? 'text-[var(--nim-primary)]' : 'text-nim-faint opacity-60 hover:opacity-100'
+          }`}
+          onPointerDown={(event) => event.stopPropagation()}
+          onMouseDown={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+          onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }}
+          onClick={handleSessionAction}
+        >
+          <MaterialSymbol
+            icon={SESSION_ACTION_ICON[sessionAction]}
+            size={14}
+            className={sessionAction === 'focus' ? 'animate-spin' : undefined}
+          />
+        </button>
         <div className="flex-1 min-w-0">
           {keyLine ? (
             <div className="text-[10px] font-mono font-medium uppercase tracking-[0.08em] text-nim-faint mb-0.5">
