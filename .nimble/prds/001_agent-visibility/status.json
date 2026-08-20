@@ -1,0 +1,44 @@
+{
+  "prd_slug": "agent-visibility",
+  "version": "5.0",
+  "status": "ready",
+  "tracker": {
+    "issue_key": null,
+    "item_id": "plan_1787269888437_qky6ex",
+    "type": "plan",
+    "created_at": "2026-08-20T22:20:00Z",
+    "publish_error": "No document service available to change Draft/Published state — retry tracker_update(published: true) once the workspace document service is up.",
+    "escalations": []
+  },
+  "execution_mode": "feature-branch",
+  "feature_branch": "feature/agent-visibility",
+  "created_at": "2026-08-20T22:03:20Z",
+  "started_at": null,
+  "completed_at": null,
+  "finalized_at": null,
+  "ready_for_merge_at": null,
+  "merged_to_main_at": null,
+
+  "waves": {
+    "1": { "status": "pending" },
+    "2": { "status": "pending" },
+    "3": { "status": "pending" },
+    "4": { "status": "pending" },
+    "5": { "status": "pending" },
+    "6": { "status": "pending" }
+  },
+
+  "active_worktrees": [],
+
+  "tasks": {
+    "1a": { "status": "queued", "wave": 1, "model": "opus" },
+    "1b": { "status": "queued", "wave": 1, "model": "opus" },
+    "2a": { "status": "queued", "wave": 2, "model": "sonnet" },
+    "3a": { "status": "queued", "wave": 2, "model": "opus" },
+    "2b": { "status": "queued", "wave": 3, "model": "opus" },
+    "3b": { "status": "queued", "wave": 3, "model": "opus" },
+    "2c": { "status": "queued", "wave": 4, "model": "opus" },
+    "2d": { "status": "queued", "wave": 5, "model": "sonnet" },
+    "5a": { "status": "queued", "wave": 6, "model": "sonnet" }
+  }
+}

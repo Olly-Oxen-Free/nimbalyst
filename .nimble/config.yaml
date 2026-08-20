@@ -1,0 +1,41 @@
+project:
+  name: nimbalyst-monorepo
+  runtime: node
+  framework: electron
+  package_manager: npm
+
+commands:
+  build: npm run build
+  lint: npm run lint --workspace=@nimbalyst/electron
+  test: npm run test:unit
+  typecheck: npm run typecheck
+
+boundaries:
+  never_touch:
+    - package-lock.json
+    - packages/browser-extension/package-lock.json
+    - ".env*"
+    - .github/workflows/*
+    - packages/electron/src/database/migrations/*
+    - packages/electron/src/main/database/sqlite/schemas/*
+    - node_modules/
+    - "**/dist/"
+    - packages/electron/out/
+    - nimbalyst-local/
+    - .beads/
+  require_review:
+    - packages/runtime/src/auth/*
+    - packages/electron/src/main/database/*
+    - packages/electron/src/main/index.ts
+    - packages/electron/src/main/bootstrap.ts
+    - packages/electron/src/main/utils/protocolRegistration.ts
+    - CHANGELOG.md
+    - packages/collab-protocol/*
+    - packages/collab-client/*
+    - packages/collab-bundle/*
+    - packages/collab-adapters/*
+
+github:
+  owner: Olly-Oxen-Free
+  repo: nimbalyst
+  default_branch: main

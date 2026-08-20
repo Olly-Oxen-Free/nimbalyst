@@ -1,0 +1,368 @@
+# ============================================================
+# NIMBLE TASK DEFINITIONS
+# Parsed by the orchestrator for execution planning.
+# Generated from a non-interactive PRD interview for agent-visibility.
+# ============================================================
+
+metadata:
+  prd_slug: "agent-visibility"
+  created_at: "2026-08-20T22:03:20Z"
+  total_complexity: 42
+  task_count: 9
+
+tasks:
+  - id: "1a"
+    title: "Add blocked status to TeammateInfo.status"
+    description: |
+      Add a `blocked` value to `TeammateInfo.status`
+      (packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx:30, values today
+      'running'|'completed'|'errored'|'idle' — note: agentMode.ts:30 only imports this type, it
+      does not declare it). Set the status to `blocked` when the teammate's
+      permission/prompt request is pending, via the existing createCanUseToolHandler routing at
+      TeammateManager.ts:1465 (the lead's sessionId is already passed in, so the request is
+      already attributed correctly — this task only needs the status transition, not new routing).
+      Clear it back to the prior/next status once the prompt resolves.
+
+      Fulfills requirement R1.
+    depends_on: []
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "`blocked` is a valid value of `TeammateInfo.status` alongside the existing four values"
+      - "Status transitions to `blocked` when a teammate's permission/prompt request becomes pending"
+      - "Status transitions away from `blocked` correctly once the prompt resolves (approved, denied, or cancelled)"
+      - "Existing running/completed/errored/idle transitions are unaffected (regression-safe)"
+      - "Unit test covers both the blocked-entry and blocked-exit transitions"
+    files_affected:
+      - "packages/electron/src/renderer/store/atoms/agentMode.ts"
+      - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+    agent_context: |
+      Read TeammateManager.ts:1465 (createCanUseToolHandler call) and the surrounding emit path
+      (emitTeammateUpdate) before editing — the permission-pending signal already exists for
+      routing the prompt to the lead session; this task adds a status-emission hook alongside it,
+      it does not build new permission routing.
+
+      Do not touch ToolPermissionService's core routing logic — only add the status-transition
+      hook. Do not modify Meta-Agent Mode's separate status enum (MetaAgentMode.tsx:67-104) —
+      out of scope.
+
+      Gotcha: TeammateManager.ts:1264-1289 (the "all completed"/error emit paths) is also touched
+      by task 3a — this task should not change that logic, only the mid-run status field.
+
+      File overlap: `TeammateInfo.status` is declared in TeammatePanel.tsx, not agentMode.ts (which
+      only imports the type). The real cross-task overlap on this file is 1a/2b/2c — sequential per
+      the dependency chain (2b depends on 2a which depends on 1a; 2c depends on 2b), no real
+      conflict. There is no meaningful overlap between 1a and 1b on agentMode.ts for this reason.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — the status field addition and its unit test are the only artifacts."
+
+  - id: "1b"
+    title: "Add blocked status to TaskInfo.status"
+    description: |
+      Add a `blocked` value to `TaskInfo.status`
+      (packages/electron/src/renderer/store/atoms/agentMode.ts:233, values today
+      'running'|'completed'|'failed'|'stopped'). SDK-native Task sub-agents inherit the same
+      canUseTool callback as the lead's query() (no per-Task override) —
+      ClaudeCodeProvider.ts:3648 (createCanUseToolHandler), routing at :3705-3760. Set `blocked`
+      when a specific Task sub-agent's permission request is pending, and clear it on resolution.
+
+      Investigation step (do this FIRST, before writing attribution logic): `createCanUseToolHandler`
+      does not receive a task_id, and `options.toolUseID` in the callback is the inner tool call's
+      id, not the Task's own `tool_use_id` that populates `TaskInfo`. Confirm whether
+      `parent_tool_use_id` (seen on stream chunks — ClaudeCodeRawParser.ts:200 and a test fixture)
+      or an equivalent value is threadable from the stream-chunk handler into the `canUseTool`
+      closure, so the pending-permission signal can be attributed to the correct individual Task id
+      rather than flipping a global flag. Document what you find before implementing the transition.
+
+      Fulfills requirement R2.
+    depends_on: []
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "`blocked` is a valid value of `TaskInfo.status` alongside the existing four values"
+      - "Status transitions to `blocked` when the specific Task sub-agent's permission request becomes pending"
+      - "Status transitions away from `blocked` correctly once the prompt resolves"
+      - "Existing running/completed/failed/stopped transitions are unaffected (regression-safe)"
+      - "Unit test covers both the blocked-entry and blocked-exit transitions"
+      - "When two Task sub-agents are running concurrently and one hits a permission prompt, only that sub-agent's chip/status shows `blocked` — the other stays `running`"
+    files_affected:
+      - "packages/electron/src/renderer/store/atoms/agentMode.ts"
+      - "packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts"
+    agent_context: |
+      Read ClaudeCodeProvider.ts:3648-3760 before editing — the canUseTool handler is shared
+      across all Task sub-agents in-process; this task needs to attribute the pending-permission
+      signal to the correct individual Task id in `currentTasks` metadata, not just flip a global
+      flag. Start with the investigation step in the description: confirm `parent_tool_use_id` (or
+      an equivalent) is actually threadable into the `canUseTool` closure before writing the
+      attribution logic — this is not yet proven in the codebase.
+
+      Note: `TeammateInfo.status` (edited by task 1a) is declared in TeammatePanel.tsx, not
+      agentMode.ts (which only imports that type) — there is no meaningful file overlap between 1a
+      and 1b on agentMode.ts. The real cross-task overlap for this feature is 1a/2b/2c on
+      TeammatePanel.tsx, sequential per the dependency chain, no real conflict.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — the status field addition and its unit test are the only artifacts."
+
+  - id: "2a"
+    title: "Build normalized SubAgentStatus mapping"
+    description: |
+      Create a new derived mapping — not a new field persisted on TeammateInfo/TaskInfo — that
+      normalizes every TeammateInfo.status and TaskInfo.status value (including the new `blocked`
+      from 1a/1b) into one shared display status: working / waiting / blocked / complete / error.
+      Follow the reusable derived-atom pattern already used for groupSessionStatusAtom
+      (packages/electron/src/renderer/store/atoms/sessions.ts:1052), scoped to sub-agents rather
+      than whole sessions.
+
+      Fulfills requirement R3.
+    depends_on: ["1a", "1b"]
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Mapping function/atom covers every current TeammateInfo.status value including blocked"
+      - "Mapping function/atom covers every current TaskInfo.status value including blocked"
+      - "Mapping is exhaustive — no silent fallthrough on an unmapped status (TypeScript exhaustiveness check or equivalent test)"
+      - "Unit test asserts each source status maps to the expected normalized SubAgentStatus value"
+    files_affected:
+      - "packages/electron/src/renderer/store/atoms/agentMode.ts"
+      - "packages/electron/src/renderer/store/atoms/subAgentStatus.ts"
+    agent_context: |
+      Read sessions.ts:1052 (groupSessionStatusAtom) as the pattern reference before writing this
+      module — reuse the derived-atom approach, do not reuse the atom itself (it's session-level,
+      this is sub-agent-level).
+
+      Do not fold Meta-Agent Mode's getStatusTone/getBarTone enum (MetaAgentMode.tsx:67-104) into
+      this mapping — explicitly out of scope per the PRD's non-goals.
+
+      Exact new-file path is a naming choice for the implementing agent/brief-writer; keep it near
+      agentMode.ts for discoverability.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — new module plus its unit test are the only artifacts."
+
+  - id: "2b"
+    title: "Build horizontal chip row above chat input"
+    description: |
+      Build a new horizontal chip row rendered directly above the chat message input (not inside
+      FilesEditedSidebar, not in AgentSessionsPopover, not in MetaAgentMode's dashboard), sourced
+      from sessionTeammatesAtom/sessionTasksAtom (agentMode.ts:223-253) via the SubAgentStatus
+      mapping from task 2a. One chip per active Teammate/Task sub-agent, colored per its
+      normalized status.
+
+      Fulfills requirement R4.
+    depends_on: ["2a"]
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "Chip row renders above the chat message input when at least one teammate/task is active for the session"
+      - "No chip row rendered (not an empty placeholder) when no teammates/tasks are active"
+      - "Chips appear/disappear as teammates/tasks spawn and complete, reading from sessionTeammatesAtom/sessionTasksAtom"
+      - "Chip color follows the normalized SubAgentStatus mapping from task 2a"
+      - "Uses only canonical --nim-* CSS variables; component root has a stable kebab-case class per REACT_DOM_MARKERS.md"
+      - "Responsive chip sizing/wrapping uses @container queries, not @media"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+    agent_context: |
+      Reference TeammatePanel.tsx's existing spinner/hollow-circle/filled-dot status-coloring
+      convention (:342-355 teammates, :267-277 tasks) for visual consistency, but this is a new,
+      separate component — do not merge into or replace TeammatePanel/FilesEditedSidebar.
+
+      Open question (PRD §9 Q3, Q6): exact placement relative to the existing chat-input toolbar/
+      attachment UI, and terminal-state (complete/error) chip dismissal timing, are not resolved
+      in the PRD. Run an investigator scan of the chat-input parent component before finalizing
+      placement; match whatever dismissal convention TeammatePanel.tsx already uses for
+      completed/errored teammates rather than inventing a new one.
+
+      File overlap: tasks 2c and 2d both extend this same new component file — 2d now structurally
+      depends_on 2c (see task 2d), so they run in separate waves rather than being sequenced by PM
+      prose alone.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — new component and its test(s) are the only artifacts."
+
+  - id: "2c"
+    title: "Wire Teammate chip click-to-open-thread"
+    description: |
+      Make clicking a Teammate chip open/load that teammate's own thread and allow sending it a
+      message directly — extending scrollToTeammateAtom (TeammatePanel.tsx:61-63,307-309), which
+      today only scrolls the existing single transcript to the spawn point, into a real
+      open-and-communicate flow using TeammateManager.appendToInbox/flushPendingMessages
+      (TeammateManager.ts:957-1011).
+
+      Fulfills requirement R5.
+    depends_on: ["2b"]
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "Clicking a Teammate chip opens/loads that teammate's own thread (not just a scroll to the spawn point)"
+      - "A message typed after clicking a Teammate chip reaches the teammate via appendToInbox/flushPendingMessages or equivalent"
+      - "Verified via an IPC-level or integration test, not only a UI/manual check"
+      - "Existing scroll-to-spawn-point behavior in TeammatePanel is preserved or intentionally superseded (documented either way)"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+    agent_context: |
+      Open question (PRD §9 Q4): research found appendToInbox/flushPendingMessages "could support"
+      a direct-message flow but did not confirm a wired UI control exists end-to-end. Run an
+      investigator scan to confirm whether new main<->renderer IPC plumbing is required, or
+      whether existing electronAPI surface is sufficient, before finalizing this task's
+      implementation approach — do not assume the IPC layer is already complete.
+
+      If a new IPC handler is added, follow the safeHandle/safeOn pattern (main-process-init.md)
+      and the centralized-listener pattern (ipc-listeners.md) — components must not subscribe to
+      IPC events directly.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code and its test(s), unless the investigator scan surfaces a new IPC surface requiring an IPC_GUIDE.md/IPC_LISTENERS.md doc update — in that case, treat the doc update as a deliverable of this task."
+
+  - id: "2d"
+    title: "Read-only status popover for Task sub-agent chips"
+    description: |
+      Make clicking a Task sub-agent chip open a read-only popover (via @floating-ui/react,
+      FloatingPortal, per floating-ui.md) showing current status and active tool name — not a
+      thread. Task sub-agent turns are intentionally hidden from the visible transcript by design
+      (claudeCliSubAgentTracker.ts:20-22) and this task does not change that.
+
+      Fulfills requirement R6.
+    depends_on: ["2b", "2c"]
+    complexity: 3
+    priority: "should"
+    success_criteria:
+      - "Clicking a Task sub-agent chip opens a read-only popover with current status and active tool name"
+      - "Popover uses @floating-ui/react with FloatingPortal — no manually calculated position: fixed coordinates"
+      - "No navigation occurs; no attempt is made to surface the hidden Task sub-agent transcript"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx"
+    agent_context: |
+      This task is a deliberate visibility ceiling, not a partial implementation of a full thread
+      view — do not extend it toward un-hiding claudeCliSubAgentTracker.ts's hidden turns; that is
+      an explicit non-goal of the PRD.
+
+      File overlap: this task and 2c both extend SubAgentChipRow.tsx. This is now enforced via
+      `depends_on: 2c` rather than left as PM sequencing guidance — 2c runs first (wave 4), this
+      task runs after it (wave 5).
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — new popover UI and its test are the only artifacts."
+
+  - id: "3a"
+    title: "Guarantee distinct notification on Teammate error/crash"
+    description: |
+      Wire notificationService.showBlockedNotification (or an equivalent distinct signal) into
+      every `teammates:allCompleted` emit site in TeammateManager.ts — there are five:
+      line 205 (the idle-abandon silent-death path — a teammate that goes idle and is abandoned
+      without an explicit error), and lines 1265, 1288, 1740, 1757 (the handleStreamError and
+      "all completed" emit paths). All five currently funnel into the same teammates:allCompleted
+      event indistinguishably. Also wire MessageStreamingHandler.onTeammatesAllCompleted
+      (MessageStreamingHandler.ts:1109-1136, which today ends the session and plays the same
+      completion sound used for success regardless of whether a teammate errored or was silently
+      abandoned). A teammate that crashes, or is silently abandoned while idle, and happens to be
+      the last active one must no longer produce identical UX to a clean finish.
+
+      Fulfills requirement R7.
+    depends_on: ["1a"]
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "A teammate that errors triggers showBlockedNotification (or equivalent distinct signal), not the success completion sound"
+      - "A teammate that crashes without an explicit thrown error (silent death) also triggers the distinct notification"
+      - "Regression test proves a clean multi-teammate run still plays the existing unchanged success sound"
+      - "Every `teammates:allCompleted` emit site (TeammateManager.ts:205, 1265, 1288, 1740, 1757) distinguishes clean finish from error/abandon, not just the two originally cited"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/electron/src/main/services/ai/MessageStreamingHandler.ts"
+      - "packages/electron/src/main/services/NotificationService.ts"
+    agent_context: |
+      Write the regression test FIRST per end-to-end-verification.md: reproduce the current bug
+      (crash produces identical UX to success) as a failing test, then make the fix flip it green.
+      This is exactly the restart/main-process-init class of bug end-to-end-verification.md calls
+      out — do not declare this task done on "the code path looks right."
+
+      Existing showBlockedNotification call sites to follow as pattern:
+      interactiveToolHandlers.ts:671,1070,1548 and MessageStreamingHandler.ts:899,951,995 (used for
+      top-level session permission/AskUserQuestion blocks) — this task wires the same primitive
+      into the sub-agent lifecycle, it does not build a new notification primitive.
+
+      None of the touched files are in .nimble/config.yaml's require_review list, so this task
+      does not require the human-review gate on its own (only task 5a, via CHANGELOG.md, does).
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — the regression test proving the fix is itself part of the code deliverable, not a separate artifact."
+
+  - id: "3b"
+    title: "Extend guaranteed notification to Meta-Agent Mode"
+    description: |
+      Extend the notification pattern established in task 3a to Meta-Agent Mode's existing
+      pendingPrompt detection so a blocked Meta-Agent child session also fires a proactive
+      main-thread notification, not just a dashboard label visible only while the Meta-Agent
+      dashboard is focused. The implementation anchor is
+      packages/electron/src/main/services/MetaAgentService.ts, where `pendingPrompt` is actually
+      produced — `MetaAgentMode.tsx:31-34` is a renderer view-model type declaration, not detection
+      logic, and criterion 1 below is unachievable from an unmounted renderer component. Wire the
+      notification into MetaAgentService.ts's main-process logic. `MetaAgentMode.tsx:538-542`
+      ("Waiting for {promptType}") stays as-is and is only useful as the existing renderer
+      *display* pattern to be consistent with when the dashboard IS focused — it is not where the
+      fix goes.
+
+      Fulfills requirement R8.
+    depends_on: ["3a"]
+    complexity: 5
+    priority: "should"
+    success_criteria:
+      - "A Meta-Agent child session entering pendingPrompt fires showBlockedNotification (or the same signal established in 3a) even when the Meta-Agent dashboard isn't the focused view"
+      - "The existing 'Waiting for {promptType}' dashboard label is preserved, not replaced"
+      - "Regression test confirms normal Meta-Agent session completion (no pending prompt) is unaffected"
+    files_affected:
+      - "packages/electron/src/renderer/components/MetaAgentMode/MetaAgentMode.tsx"
+      - "packages/electron/src/main/services/MetaAgentService.ts"
+      - "packages/electron/src/main/services/NotificationService.ts"
+    agent_context: |
+      Reuse the exact pattern/signal established in task 3a — do not build a second, divergent
+      notification mechanism for Meta-Agent Mode.
+
+      Implementation anchor is MetaAgentService.ts's main-process logic (where `pendingPrompt` is
+      produced), not MetaAgentMode.tsx — that renderer component only declares the view-model type
+      (:31-34) and can't fire a notification while unmounted/unfocused. MetaAgentMode.tsx:538-542's
+      display label may be touched only to the extent needed to keep it consistent, not as the
+      wiring location.
+
+      This task does NOT bring Meta-Agent Mode's chip row or click-to-thread into this PRD's scope
+      (both already exist per research: MetaAgentMode.tsx:550-559 open-in-agent, :538-542
+      pending-prompt label) — it closes only the proactive-notification gap.
+
+      Do not modify MetaAgentMode.tsx's getStatusTone/getBarTone status-color mapping — out of
+      scope per the PRD's non-goals.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — the regression test proving normal completion is unaffected is part of the code deliverable."
+
+  - id: "5a"
+    title: "CHANGELOG entry and final review gate"
+    description: |
+      Add one user-facing bullet to the [Unreleased] section of CHANGELOG.md summarizing the
+      shipped behavior: chip row above the chat input, blocked status coloring, click-to-thread
+      for Teammates, and guaranteed notification on sub-agent error/crash/block. Match the
+      existing one-sentence-bullet voice in [Unreleased] and recent git log — no internal
+      scaffolding (atom names, IPC channel names, file paths) in the bullet.
+
+      This task touches CHANGELOG.md, which is in .nimble/config.yaml's require_review list —
+      it is the designated gate task for this PRD (see PRD §12 Assumption 5: gate after wave 5,
+      before this wave 6 task, model=pause).
+    depends_on: ["2c", "2d", "3b"]
+    complexity: 1
+    priority: "must"
+    success_criteria:
+      - "Exactly one new bullet added to CHANGELOG.md's [Unreleased] section"
+      - "Bullet describes user-visible behavior only — no atom/IPC/service/class names"
+      - "Bullet length and voice match the surrounding [Unreleased] entries"
+    files_affected:
+      - "CHANGELOG.md"
+    agent_context: |
+      This file requires human review per .nimble/config.yaml's require_review list. Do not
+      merge past this task without the pause-gate review described in PRD §12 Assumption 5. The
+      full feature diff (tasks 1a through 3b) being available for human review is the gate's
+      precondition (see execution_plan.yaml's gate definition), not something this task itself
+      produces or asserts.
+
+      One feature, one bullet — do not add a separate bullet per task (1a-3b) that built this
+      feature; per CLAUDE.md's CHANGELOG rules, edit a single bullet if multiple commits touch it.
+    deliverables:
+      - artifact: "CHANGELOG.md [Unreleased] bullet"
+        path: "CHANGELOG.md"
+        done_when: "A single new bullet exists in the [Unreleased] section describing the chip row, blocked status, click-to-thread, and guaranteed-notification behavior, matching the voice of surrounding entries, with no internal symbol/file names."
