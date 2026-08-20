@@ -74,6 +74,18 @@ describe('buildTrackerLaunchContext', () => {
     expect(context.draftInput).toContain('Source: @nimbalyst-local/plans/branching.md');
     expect(context.worktreeName).toBe('plan-branching-branching-plan');
   });
+
+  it('substitutes a custom effective template instead of the default', () => {
+    const context = buildTrackerLaunchContext(
+      'feature_1624',
+      makeTrackerRecord(),
+      'This project uses the KARIMO/beads workflow. File work as a bead, not an ad-hoc commit.\n\nItem: {itemId} ({status})',
+    );
+
+    expect(context.draftInput).toBe(
+      'This project uses the KARIMO/beads workflow. File work as a bead, not an ad-hoc commit.\n\nItem: NIM-1624 (in-progress)',
+    );
+  });
 });
 
 describe('deriveTrackerWorktreeName', () => {

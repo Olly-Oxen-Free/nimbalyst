@@ -12,7 +12,10 @@ import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import type { SessionMeta } from '../../store/atoms/sessions';
 import { isClaudeCliTerminalSession } from '../UnifiedAI/claudeCliInputRouting';
-import { buildTrackerLaunchContext } from './trackerSessionLaunch';
+import {
+  buildTrackerLaunchContext,
+  getEffectiveTrackerLaunchPromptTemplateForWorkspace,
+} from './trackerSessionLaunch';
 
 export interface TrackerDispatchOptions {
   trackerItemId: string;
@@ -38,7 +41,8 @@ export async function launchTrackerSession({
   workspacePath,
   defaultModel,
 }: TrackerDispatchOptions): Promise<string | null> {
-  const trackerContext = buildTrackerLaunchContext(trackerItemId, trackerItem);
+  const effectiveTemplate = await getEffectiveTrackerLaunchPromptTemplateForWorkspace(workspacePath);
+  const trackerContext = buildTrackerLaunchContext(trackerItemId, trackerItem, effectiveTemplate);
 
   // Derive provider from the user's default model rather than hardcoding
   // 'claude-code'. Mirrors AgentMode.createNewSession so a Codex-only

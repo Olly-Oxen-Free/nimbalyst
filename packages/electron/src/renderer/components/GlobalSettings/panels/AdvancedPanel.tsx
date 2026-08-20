@@ -26,6 +26,8 @@ import {
   trackerAutomationAtom,
   setTrackerAutomationAtom,
 } from '../../../store/atoms/trackerAutomationAtoms';
+import { useSettingState } from '../../../hooks/useSetting';
+import { DEFAULT_TRACKER_LAUNCH_PROMPT_TEMPLATE } from '../../../../shared/trackerLaunchPromptTemplate';
 import {
   multiProjectModeAtom,
   openProjectsAtom,
@@ -102,6 +104,13 @@ export function AdvancedPanel() {
   // Tracker automation settings
   const trackerAutomation = useAtomValue(trackerAutomationAtom);
   const setTrackerAutomation = useSetAtom(setTrackerAutomationAtom);
+
+  // Tracker dispatch prompt template
+  const [trackerLaunchPromptTemplate, setTrackerLaunchPromptTemplate] = useSettingState('ai.trackerLaunchPromptTemplate');
+  const [trackerLaunchPromptTemplateDraft, setTrackerLaunchPromptTemplateDraft] = useState(trackerLaunchPromptTemplate);
+  useEffect(() => {
+    setTrackerLaunchPromptTemplateDraft(trackerLaunchPromptTemplate);
+  }, [trackerLaunchPromptTemplate]);
 
   // External editor settings from Jotai atoms
   const [externalEditorSettings] = useAtom(externalEditorSettingsAtom);
@@ -459,6 +468,45 @@ export function AdvancedPanel() {
             description="Change tracker item status to done when a commit message uses a closing keyword."
           />
         )}
+
+        <div className="pt-3 mt-3 border-t border-[var(--nim-border)]">
+          <span className="provider-enable-label text-sm font-medium text-[var(--nim-text)]">Dispatch Prompt Template</span>
+          <p className="text-xs text-[var(--nim-text-muted)] mt-1 mb-2">
+            Text sent as the starting prompt when a tracker item is dispatched into an AI session
+            (kanban card button, detail panel "Launch Session"/"Launch Worktree").
+          </p>
+          <textarea
+            data-testid="tracker-launch-prompt-template-global"
+            value={trackerLaunchPromptTemplateDraft}
+            onChange={(e) => setTrackerLaunchPromptTemplateDraft(e.target.value)}
+            onBlur={() => setTrackerLaunchPromptTemplate(trackerLaunchPromptTemplateDraft)}
+            rows={8}
+            className="w-full py-1.5 px-2 rounded text-xs bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] text-[var(--nim-text)] font-mono focus:border-[var(--nim-primary)] outline-none resize-y"
+          />
+          <p className="text-[11px] text-[var(--nim-text-faint)] leading-relaxed mt-1.5">
+            Placeholders: <code>{'{itemId}'}</code> <code>{'{title}'}</code> <code>{'{type}'}</code>{' '}
+            <code>{'{status}'}</code> <code>{'{priority}'}</code> <code>{'{description}'}</code>{' '}
+            <code>{'{sourcePath}'}</code> — and pre-formatted blocks <code>{'{meta}'}</code>{' '}
+            <code>{'{descriptionBlock}'}</code> <code>{'{sourceLine}'}</code>, each blank when the
+            underlying field is unset. Unrecognized placeholders are left as literal text.
+          </p>
+          <p className="text-[11px] text-[var(--nim-primary)] leading-relaxed mt-1">
+            ⚠ Removing the "tracker_update" line means dispatched sessions won't self-report their
+            status — the item won't move past whatever status it's already at until you close it
+            some other way (e.g. a closing commit reference).
+          </p>
+          <div className="mt-1.5">
+            <button
+              onClick={() => {
+                setTrackerLaunchPromptTemplateDraft(DEFAULT_TRACKER_LAUNCH_PROMPT_TEMPLATE);
+                setTrackerLaunchPromptTemplate(DEFAULT_TRACKER_LAUNCH_PROMPT_TEMPLATE);
+              }}
+              className="py-1 px-2.5 rounded text-xs font-medium bg-[var(--nim-bg-tertiary)] border border-[var(--nim-border)] text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)] transition-colors"
+            >
+              Reset to default
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* ── Tools & Environment ── */}

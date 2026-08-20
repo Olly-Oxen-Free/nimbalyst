@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 
 import type { SessionMeta } from '../../../store/atoms/sessions';
-import { resumeTrackerSession } from '../trackerSessionDispatch';
+import { launchTrackerSession, resumeTrackerSession } from '../trackerSessionDispatch';
 
 const trackerItem: TrackerRecord = {
   id: 'feature_1624',
@@ -112,5 +112,45 @@ describe('resumeTrackerSession', () => {
       trackerId: 'feature_1624',
       sessionId: 'new-session',
     });
+  });
+});
+
+describe('launchTrackerSession', () => {
+  it('uses the project override template when one is configured for the workspace', async () => {
+    invoke = vi.fn(async (channel: string) => {
+      if (channel === 'sessions:create') return { success: true, id: 'new-session' };
+      if (channel === 'ai:getProjectTrackerLaunchPromptTemplate') {
+        return { success: true, override: 'This project uses the KARIMO/beads workflow. Item: {itemId}' };
+      }
+      return { success: true };
+    });
+    (globalThis as any).window = { electronAPI: { invoke, terminal: { ensureClaudeCliSession } } };
+
+    await launchTrackerSession(options);
+
+    expect(invoke).toHaveBeenCalledWith(
+      'ai:saveDraftInput',
+      'new-session',
+      'This project uses the KARIMO/beads workflow. Item: NIM-1624',
+      '/repo',
+    );
+  });
+
+  it('falls back to the global template when no project override is configured', async () => {
+    invoke = vi.fn(async (channel: string) => {
+      if (channel === 'sessions:create') return { success: true, id: 'new-session' };
+      if (channel === 'ai:getProjectTrackerLaunchPromptTemplate') return { success: true, override: null };
+      return { success: true };
+    });
+    (globalThis as any).window = { electronAPI: { invoke, terminal: { ensureClaudeCliSession } } };
+
+    await launchTrackerSession(options);
+
+    expect(invoke).toHaveBeenCalledWith(
+      'ai:saveDraftInput',
+      'new-session',
+      expect.stringContaining('tracker_update with id "NIM-1624"'),
+      '/repo',
+    );
   });
 });

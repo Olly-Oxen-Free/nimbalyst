@@ -84,7 +84,9 @@ import {
   shouldShowCommunityPopup,
   wasCommunityPopupShownThisLaunch,
   getDefaultEffortLevel,
-  getDefaultThinkingMode
+  getDefaultThinkingMode,
+  getTrackerLaunchPromptTemplateOverride,
+  saveTrackerLaunchPromptTemplateOverride
 } from '../../utils/store';
 import { mergeAISettings, getAIProviderOverridesWithWorktreeFallback } from '../../utils/aiSettingsMerge';
 import { DocumentContextService, type RawDocumentContext, type PreparedDocumentContext } from '@nimbalyst/runtime';
@@ -3946,6 +3948,19 @@ export class AIService {
       if (!workspacePath) return { success: false, error: 'workspacePath is required' };
       const { saveTrackerAutomationOverride } = await import('../../utils/store');
       saveTrackerAutomationOverride(workspacePath, override || undefined);
+      return { success: true };
+    });
+
+    // Get project-level tracker launch prompt template override
+    safeHandle('ai:getProjectTrackerLaunchPromptTemplate', async (_event, workspacePath: string) => {
+      if (!workspacePath) return { success: false, error: 'workspacePath is required' };
+      return { success: true, override: getTrackerLaunchPromptTemplateOverride(workspacePath) ?? null };
+    });
+
+    // Save project-level tracker launch prompt template override
+    safeHandle('ai:saveProjectTrackerLaunchPromptTemplate', async (_event, workspacePath: string, template: string | null) => {
+      if (!workspacePath) return { success: false, error: 'workspacePath is required' };
+      saveTrackerLaunchPromptTemplateOverride(workspacePath, template || undefined);
       return { success: true };
     });
 
