@@ -20,6 +20,7 @@
  */
 
 import { z } from 'zod';
+import { DEFAULT_TRACKER_LAUNCH_PROMPT_TEMPLATE } from '../trackerLaunchPromptTemplate';
 
 // ---------- Reusable schemas ----------
 
@@ -83,7 +84,8 @@ function setting<S extends z.ZodTypeAny>(
  *   - ai.apiKey.<name>  -- per-provider API key (string, may be empty)
  *   - ai.defaultProvider, ai.showToolCalls, ai.chatShowToolCalls, ai.aiDebugLogging,
  *     ai.showPromptAdditions, ai.customClaudeCodePath, ai.autoCommitEnabled,
- *     ai.showMcpSessionStatus, ai.trackerAutomation, ai.diffPeekSize
+ *     ai.showMcpSessionStatus, ai.trackerAutomation, ai.diffPeekSize,
+ *     ai.trackerLaunchPromptTemplate
  */
 export const SETTINGS_REGISTRY = {
   // ---- AI providers (per-key) ----
@@ -216,6 +218,11 @@ export const SETTINGS_REGISTRY = {
     }).passthrough(),
     { store: 'ai-settings', path: 'trackerAutomation' },
     { enabled: false, autoCloseOnCommit: true },
+  ),
+  'ai.trackerLaunchPromptTemplate': setting(
+    z.string(),
+    { store: 'ai-settings', path: 'trackerLaunchPromptTemplate' },
+    DEFAULT_TRACKER_LAUNCH_PROMPT_TEMPLATE,
   ),
   'ai.diffPeekSize': setting(
     z.object({ width: z.number(), height: z.number() }).nullable(),

@@ -4,6 +4,7 @@ import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { getProviderIcon } from '@nimbalyst/runtime/ui/icons/ProviderIcons';
 import { advancedSettingsAtom } from '../../../store/atoms/appSettings';
 import { isProviderVisible } from '../../../utils/chatProviderVisibility';
+import { useSetting } from '../../../hooks/useSetting';
 
 interface ProviderOverride {
   enabled?: boolean;
@@ -62,6 +63,8 @@ export function ProjectAIProvidersPanel({ workspacePath, workspaceName }: Projec
   const [availableModels, setAvailableModels] = useState<Record<string, Model[]>>({});
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [trackerAutomationOverride, setTrackerAutomationOverride] = useState<TrackerAutomationOverride | null>(null);
+  const [trackerLaunchPromptTemplateOverride, setTrackerLaunchPromptTemplateOverride] = useState<string | null>(null);
+  const globalTrackerLaunchPromptTemplate = useSetting('ai.trackerLaunchPromptTemplate');
   const [hasChanges, setHasChanges] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -100,6 +103,16 @@ export function ProjectAIProvidersPanel({ workspacePath, workspaceName }: Projec
         console.error('Failed to load tracker automation override:', err);
       }
 
+      // Load tracker dispatch prompt template override
+      try {
+        const templateResult = await window.electronAPI.invoke('ai:getProjectTrackerLaunchPromptTemplate', workspacePath);
+        if (templateResult.success) {
+          setTrackerLaunchPromptTemplateOverride(templateResult.override);
+        }
+      } catch (err) {
+        console.error('Failed to load tracker launch prompt template override:', err);
+      }
+
       // Load available models
       try {
         const modelsResult = await window.electronAPI.aiGetAllModels();
@@ -121,6 +134,7 @@ export function ProjectAIProvidersPanel({ workspacePath, workspaceName }: Projec
     try {
       await window.electronAPI.invoke('ai:saveProjectSettings', workspacePath, projectOverrides);
       await window.electronAPI.invoke('ai:saveProjectTrackerAutomation', workspacePath, trackerAutomationOverride);
+      await window.electronAPI.invoke('ai:saveProjectTrackerLaunchPromptTemplate', workspacePath, trackerLaunchPromptTemplateOverride);
       setHasChanges(false);
     } catch (error) {
       console.error('Failed to save project AI settings:', error);
@@ -462,6 +476,39 @@ export function ProjectAIProvidersPanel({ workspacePath, workspaceName }: Projec
         </div>
         <p className="text-xs text-[var(--nim-text-faint)] m-0">
           Override the global tracker automation setting for this workspace.
+        </p>
+      </div>
+
+      {/* Tracker Dispatch Prompt Template Override */}
+      <div className="tracker-launch-prompt-template-override mt-6 pt-4 border-t border-[var(--nim-border)]">
+        <h3 className="text-sm font-semibold text-[var(--nim-text)] mb-3">Dispatch Prompt Template</h3>
+        <label className="flex items-center gap-2 mb-2 text-sm text-[var(--nim-text)]">
+          <input
+            type="checkbox"
+            checked={trackerLaunchPromptTemplateOverride !== null}
+            onChange={(e) => {
+              setTrackerLaunchPromptTemplateOverride(e.target.checked ? globalTrackerLaunchPromptTemplate : null);
+              setHasChanges(true);
+            }}
+          />
+          Override for this project
+        </label>
+        {trackerLaunchPromptTemplateOverride !== null && (
+          <textarea
+            data-testid="tracker-launch-prompt-template-project-override"
+            value={trackerLaunchPromptTemplateOverride}
+            onChange={(e) => {
+              setTrackerLaunchPromptTemplateOverride(e.target.value);
+              setHasChanges(true);
+            }}
+            rows={8}
+            className="w-full py-1.5 px-2 rounded text-xs bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] text-[var(--nim-text)] font-mono focus:border-[var(--nim-primary)] outline-none resize-y mb-2"
+          />
+        )}
+        <p className="text-xs text-[var(--nim-text-faint)] m-0">
+          {trackerLaunchPromptTemplateOverride !== null
+            ? 'This project uses its own dispatch prompt template instead of the global default.'
+            : `Inheriting the global template. Check the box to customize it for this project (e.g. "This project uses the KARIMO/beads workflow.").`}
         </p>
       </div>
 

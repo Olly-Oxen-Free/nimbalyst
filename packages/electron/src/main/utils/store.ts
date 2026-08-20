@@ -611,6 +611,9 @@ export interface WorkspaceState {
   // PR review: gh CLI account login override for this project. When set, it
   // wins over the global AppStoreSchema.prReviewDefaultGhAccount.
   prReviewGhAccountOverride?: string;
+  // Tracker dispatch prompt template override for this project. When set, it
+  // wins over the global ai.trackerLaunchPromptTemplate setting.
+  trackerLaunchPromptTemplateOverride?: string;
   // Privileged extension capability grants scoped to this workspace.
   // Global-scope grants live on AppStoreSchema.extensionPermissionGrantsGlobal.
   // See packages/electron/src/main/extensions/permissionGrantStore.ts for the
@@ -1368,6 +1371,25 @@ export function getEffectiveTrackerAutomation(
     enabled: override.enabled ?? globalSettings.enabled,
     autoCloseOnCommit: override.autoCloseOnCommit ?? globalSettings.autoCloseOnCommit,
   };
+}
+
+// Tracker dispatch prompt template override. Global default lives in
+// ai-settings via the SETTINGS_REGISTRY key ai.trackerLaunchPromptTemplate;
+// per-project override in workspace state; resolver returns override ?? global.
+export function getTrackerLaunchPromptTemplateOverride(workspacePath: string): string | undefined {
+  return getWorkspaceState(workspacePath).trackerLaunchPromptTemplateOverride;
+}
+
+export function saveTrackerLaunchPromptTemplateOverride(workspacePath: string, template: string | undefined): void {
+  updateWorkspaceState(workspacePath, workspace => {
+    workspace.trackerLaunchPromptTemplateOverride = template;
+  });
+}
+
+/** Resolve the effective tracker launch prompt template: override ?? global default. */
+export function getEffectiveTrackerLaunchPromptTemplate(globalTemplate: string, workspacePath?: string): string {
+  if (!workspacePath) return globalTemplate;
+  return getTrackerLaunchPromptTemplateOverride(workspacePath) ?? globalTemplate;
 }
 
 // PR review gh-account selection. Global default in app-settings,

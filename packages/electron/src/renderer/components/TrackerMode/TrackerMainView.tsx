@@ -86,6 +86,7 @@ import { setTrackerFavoriteAtom } from '../../store/atoms/trackerPersonalState';
 import { WorktreeBaseBranchPicker } from '../AgenticCoding/WorktreeBaseBranchPicker';
 import {
   buildTrackerLaunchContext,
+  getEffectiveTrackerLaunchPromptTemplateForWorkspace,
   type TrackerLaunchContext,
 } from './trackerSessionLaunch';
 import { launchTrackerSession } from './trackerSessionDispatch';
@@ -541,13 +542,15 @@ export const TrackerMainView: React.FC<TrackerMainViewProps> = ({
   }, [workspacePath, refreshSessionList, setSelectedWorkstream, setWindowMode, defaultModel]);
 
   /** Launch a new isolated worktree session linked to a tracker item. */
-  const handleLaunchWorktree = useCallback((trackerItemId: string) => {
+  const handleLaunchWorktree = useCallback(async (trackerItemId: string) => {
     const itemsMap = store.get(trackerItemsMapAtom);
+    const effectiveTemplate = await getEffectiveTrackerLaunchPromptTemplateForWorkspace(workspacePath);
     setPendingWorktreeLaunch(buildTrackerLaunchContext(
       trackerItemId,
       itemsMap.get(trackerItemId),
+      effectiveTemplate,
     ));
-  }, []);
+  }, [workspacePath]);
 
   const handleCreateTrackerWorktree = useCallback(async (
     options: { baseBranch: string; name?: string },
