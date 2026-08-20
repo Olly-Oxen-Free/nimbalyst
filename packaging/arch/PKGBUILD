@@ -1,0 +1,52 @@
+# Maintainer: jeppcohen
+# Personal fork of nimbalyst/nimbalyst (https://github.com/Olly-Oxen-Free/nimbalyst)
+# with a fix so a dev-reloaded theme-contributing extension doesn't fall back
+# to the dark theme mid-reload (see fix/theme-reload-fallback-debounce).
+#
+# Not for AUR submission -- this packages a build produced locally from
+# ../../packages/electron/release/linux-unpacked (run `npm run build:linux`
+# in packages/electron first). No source= array: nothing is downloaded,
+# makepkg just repackages what's already built.
+
+pkgname=nimbalyst
+pkgver=0.73.2
+pkgrel=3
+pkgdesc="AI coding workspace (personal fork: live theme-reload fix, Wayland glass transparency)"
+arch=('x86_64')
+url="https://github.com/Olly-Oxen-Free/nimbalyst"
+license=('MIT')
+depends=('gtk3' 'nss' 'libxss' 'libxtst' 'at-spi2-core' 'alsa-lib' 'libdrm' 'mesa')
+provides=('nimbalyst')
+conflicts=('nimbalyst')
+options=('!strip' '!emptydirs')
+
+_unpacked_dir="$startdir/../../packages/electron/release/linux-unpacked"
+
+build() {
+    if [ ! -d "$_unpacked_dir" ]; then
+        echo "error: $_unpacked_dir not found -- run 'npm run build:linux' in packages/electron first" >&2
+        return 1
+    fi
+}
+
+package() {
+    install -dm755 "$pkgdir/opt/nimbalyst"
+    cp -a "$_unpacked_dir/." "$pkgdir/opt/nimbalyst/"
+
+    # electron-builder ships a setuid sandbox helper; pacman packages can't
+    # carry setuid bits, and --no-sandbox is already how this app is launched.
+    rm -f "$pkgdir/opt/nimbalyst/chrome-sandbox"
+
+    install -dm755 "$pkgdir/usr/bin"
+    ln -sf "/opt/nimbalyst/@nimbalystelectron" "$pkgdir/usr/bin/nimbalyst"
+
+    install -Dm644 "$startdir/nimbalyst.desktop" \
+        "$pkgdir/usr/share/applications/nimbalyst.desktop"
+
+    # Icons extracted from upstream's own AppImage build (packages/electron
+    # doesn't ship a Linux icon set in the unpacked dir itself).
+    for size in 16x16 32x32 48x48 64x64 256x256 512x512; do
+        install -Dm644 "$startdir/icons/nimbalyst-${size}.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}/apps/nimbalyst.png"
+    done
+}

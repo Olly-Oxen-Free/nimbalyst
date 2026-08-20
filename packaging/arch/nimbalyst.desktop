@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Nimbalyst
+GenericName=AI Coding Workspace
+Comment=Run multiple AI coding agents in parallel and visually edit their work in markdown, mockups, and diagrams
+Exec=/usr/bin/nimbalyst --no-sandbox %U
+Icon=nimbalyst
+Terminal=false
+StartupWMClass=Nimbalyst
+StartupNotify=true
+Categories=Development;IDE;
+Keywords=AI;Agent;Claude;Codex;Coding;Workspace;Markdown;Diagram;Mockup;
+MimeType=text/markdown;x-scheme-handler/nimbalyst;
