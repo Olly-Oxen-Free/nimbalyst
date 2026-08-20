@@ -1,0 +1,15 @@
+{
+  "slug": "tracker-task-dispatch",
+  "status": "ready-for-merge",
+  "execution_mode": "feature-branch",
+  "beads_epic": "nby-73f",
+  "aven_ref": "NMB-4RFA",
+  "created_at": "2026-08-20T01:40:10Z",
+  "feature_branch": "feature/tracker-task-dispatch",
+  "tasks": {
+    "total": 3,
+    "sonnet": 2,
+    "opus": 1,
+    "closed": 3
+  }
+}

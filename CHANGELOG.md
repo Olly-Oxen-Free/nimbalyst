@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Desktop notifications now carry their own icon, so you can tell a finished agent, a question, an approval request, and a teammate's message apart at a glance.
 - Trackers now show the work that is still outstanding by default, with an Open / All / Closed switch on every view, counts and boards that follow it, and Won't Do and Duplicate for closing something you are not going to do.
 - Spreadsheet columns can now hold dates with times, times, checkboxes, links, and tracker items, alongside accounting and scientific number styles, custom date patterns, red or parenthesized negatives, and your own alignment. A tracker cell shows the item's live title and status and opens it when clicked, columns can detect their own type, and sorting and filtering now follow the column's type instead of its text. You can also style any range of cells — bold, italic, underline, strikethrough, text and fill color, alignment — and date formulas now do arithmetic, so `=A1+7` and `=B1-A1` work.
+- Tracker board cards now have a run/resume/focus button to start, reopen, or jump to that item's AI session without leaving the board.
 
 ### Changed
 <!-- Changes to existing functionality go here -->

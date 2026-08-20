@@ -67,7 +67,6 @@ import { resolveRoleFieldName } from '@nimbalyst/runtime/plugins/TrackerPlugin/t
 import { workstreamStateAtom } from '../../store/atoms/workstreamState';
 import { setWindowModeAtom } from '../../store/atoms/windowMode';
 import { defaultAgentModelAtom, worktreesFeatureAvailableAtom } from '../../store/atoms/appSettings';
-import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import { store } from '../../store';
 import { buildTrackerTagOptions } from './trackerTagFilterUtils';
 import {
@@ -89,6 +88,7 @@ import {
   buildTrackerLaunchContext,
   type TrackerLaunchContext,
 } from './trackerSessionLaunch';
+import { launchTrackerSession } from './trackerSessionDispatch';
 import { trackTeamAnalyticsEvent } from '../../utils/teamAnalytics';
 import { TrackerQuickAddOverlay } from './TrackerQuickAddOverlay';
 
@@ -520,47 +520,21 @@ export const TrackerMainView: React.FC<TrackerMainViewProps> = ({
   const handleLaunchSession = useCallback(async (trackerItemId: string) => {
     try {
       const itemsMap = store.get(trackerItemsMapAtom);
-      const trackerContext = buildTrackerLaunchContext(
+      const sessionId = await launchTrackerSession({
         trackerItemId,
-        itemsMap.get(trackerItemId),
-      );
-
-      // Derive provider from the user's default model rather than hardcoding
-      // 'claude-code'. Mirrors AgentMode.createNewSession so a Codex-only
-      // workspace launches a Codex session, not a failed claude-code one.
-      // See nimbalyst#176.
-      const sessionId = crypto.randomUUID();
-      const parsedModel = defaultModel ? ModelIdentifier.tryParse(defaultModel) : null;
-      const provider = parsedModel?.provider || 'claude-code';
-      const result = await window.electronAPI.invoke('sessions:create', {
-        session: {
-          id: sessionId,
-          provider,
-          model: defaultModel,
-          title: 'New Session',
-        },
-        workspaceId: workspacePath,
+        trackerItem: itemsMap.get(trackerItemId),
+        workspacePath,
+        defaultModel,
       });
-      if (result?.success && result?.id) {
-        await window.electronAPI.invoke('tracker:link-session', {
-          trackerId: trackerContext.trackerLinkId,
-          sessionId: result.id,
-        });
-        await window.electronAPI.invoke(
-          'ai:saveDraftInput',
-          result.id,
-          trackerContext.draftInput,
-          workspacePath,
-        );
+      if (!sessionId) return;
 
-        // Refresh session list to pick up the new session, then navigate
-        await refreshSessionList();
-        setSelectedWorkstream({
-          workspacePath: workspacePath || '',
-          selection: { type: 'session', id: result.id },
-        });
-        setWindowMode('agent');
-      }
+      // Refresh session list to pick up the new session, then navigate
+      await refreshSessionList();
+      setSelectedWorkstream({
+        workspacePath: workspacePath || '',
+        selection: { type: 'session', id: sessionId },
+      });
+      setWindowMode('agent');
     } catch (err) {
       console.error('[TrackerMainView] Failed to launch session:', err);
     }

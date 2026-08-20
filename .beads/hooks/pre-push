@@ -1,0 +1,104 @@
+#!/bin/sh
+set -eu
+
+# Validate package-lock.json is in sync with every workspace package.json
+# when the outgoing commits touch any manifest. This is exactly the check
+# CI's `npm ci` performs; without it, lockfile drift is only discovered
+# after pushing (2026-07-07 incident: npm 10/11 override-shape mismatch).
+base=$(node scripts/resolve-prepush-base.mjs)
+
+# Fail fast, and accurately, when the hook is running under the wrong Node.
+# Every check below shells out to node/npm, and with engine-strict=true the
+# lockfile check reports an engine mismatch as lockfile drift.
+echo "[pre-push] Checking the Node/npm toolchain..."
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  echo "[pre-push] ERROR: node and npm are not both on PATH."
+  echo "[pre-push] PATH=$PATH"
+  echo "[pre-push] GUI git clients skip your shell config; push from a terminal, or point"
+  echo "[pre-push] your version manager's default alias at the version in .nvmrc."
+  exit 1
+fi
+node scripts/check-toolchain.mjs "$(npm -v)"
+
+# Refuse to push escaped unit-test fixture commits (2026-07-22 incident: the
+# pre-push vitest run leaked "Test User" commits onto public main).
+echo "[pre-push] Checking outgoing commits for test-fixture authors..."
+node scripts/check-push-authors.mjs "$base..HEAD"
+
+# Hooks export repository-local GIT_* variables. In a linked worktree GIT_DIR
+# is absolute, so a real-Git test running in a temp directory can otherwise
+# mutate this branch and the shared repository config. Git documents this list
+# specifically for commands that leave the hook's repository.
+git_local_env=$(git rev-parse --local-env-vars)
+# Intentional word splitting: rev-parse returns one variable name per line.
+unset $git_local_env
+unset GIT_NAMESPACE
+
+if ! git diff --quiet "$base" HEAD -- package-lock.json 'package.json' '*/package.json' 2>/dev/null; then
+  echo "[pre-push] Manifest/lockfile changed; validating lockfile sync (npm ci --dry-run)..."
+  if ! npm ci --dry-run >/dev/null 2>&1; then
+    echo ""
+    echo "[pre-push] ERROR: package-lock.json is out of sync with package.json."
+    echo "[pre-push] Run 'npm install' (Node 24 / npm 11 -- see .nvmrc) and commit the lockfile."
+    npm ci --dry-run 2>&1 | grep -E 'Invalid|Missing|EBADENGINE' | head -10
+    exit 1
+  fi
+  echo "[pre-push] Lockfile in sync."
+fi
+
+echo "[pre-push] Checking override/dep sync..."
+npm run check:override-sync
+
+echo "[pre-push] Checking tracked text files for raw NUL bytes..."
+npm run check:text-nuls -- --ref HEAD
+
+echo "[pre-push] Building typecheck prerequisites and running the full typecheck..."
+npm run typecheck:prepush
+
+echo "[pre-push] Verifying platform test-gate behavior..."
+npm run test:prepush-gate
+
+# Every line printed here lands in the Git extension's Output panel, so the
+# prepush scripts use dot reporters, --silent=passed-only, and a quiet Vite
+# build. A passing push is ~84 lines instead of ~25500 (most of which was
+# console.log from the tests themselves). Failures still print in full.
+if [ "$(node scripts/prepush-test-gate.mjs)" = "run" ]; then
+  echo "[pre-push] Running non-provider unit tests..."
+  npm run test:prepush
+else
+  echo "[pre-push] Skipping the full Vitest suite on local Windows; CI and non-Windows pushes still require it."
+  echo "[pre-push] See docs/WINDOWS_PREPUSH_GATE.md for the tracked nonportable failures."
+fi
+
+# --- BEGIN BEADS INTEGRATION v1.2.2 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  _bd_used_perl=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run pre-push "$@"
+    _bd_exit=$?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$_bd_timeout" bd hooks run pre-push "$@"
+    _bd_exit=$?
+  elif command -v perl >/dev/null 2>&1; then
+    _bd_used_perl=1
+    perl -e 'alarm shift; exec @ARGV' "$_bd_timeout" bd hooks run pre-push "$@"
+    _bd_exit=$?
+  else
+    echo >&2 "beads: hook 'pre-push' running without timeout; install coreutils or perl to enable BEADS_HOOK_TIMEOUT"
+    bd hooks run pre-push "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 124 ] || { [ $_bd_used_perl -eq 1 ] && [ $_bd_exit -eq 142 ]; }; then
+    echo >&2 "beads: hook 'pre-push' timed out after ${_bd_timeout}s — continuing without beads"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'pre-push'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.2.2 ---
