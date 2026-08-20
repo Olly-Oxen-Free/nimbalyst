@@ -1,6 +1,6 @@
 {
   "slug": "tracker-task-dispatch",
-  "status": "ready-for-merge",
+  "status": "complete",
   "execution_mode": "feature-branch",
   "beads_epic": "nby-73f",
   "aven_ref": "NMB-4RFA",
@@ -11,5 +11,7 @@
     "sonnet": 2,
     "opus": 1,
     "closed": 3
-  }
+  },
+  "merged_at": "2026-08-20T03:16:25Z",
+  "merge_commit": "c2fe2c599"
 }
