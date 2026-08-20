@@ -236,27 +236,6 @@ export const TrackerBoardCard: React.FC<TrackerBoardCardProps> = ({
         />
         <TrackerUnreadDot itemId={item.id} className="mt-1" />
         <TrackerFavoriteStar itemId={item.id} isFavorite={isFavorite} onToggle={onToggleFavorite} />
-        <button
-          type="button"
-          draggable={false}
-          data-testid="tracker-card-session-button"
-          aria-label={SESSION_ACTION_LABEL[sessionAction]}
-          title={SESSION_ACTION_LABEL[sessionAction]}
-          className={`tracker-card-session-button shrink-0 inline-flex items-center justify-center w-6 h-6 rounded hover:bg-nim-tertiary transition-colors ${
-            sessionAction === 'focus' ? 'text-[var(--nim-primary)]' : 'text-nim-faint opacity-60 hover:opacity-100'
-          }`}
-          onPointerDown={(event) => event.stopPropagation()}
-          onMouseDown={(event) => event.stopPropagation()}
-          onDoubleClick={(event) => event.stopPropagation()}
-          onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }}
-          onClick={handleSessionAction}
-        >
-          <MaterialSymbol
-            icon={SESSION_ACTION_ICON[sessionAction]}
-            size={14}
-            className={sessionAction === 'focus' ? 'animate-spin' : undefined}
-          />
-        </button>
         <div className="flex-1 min-w-0">
           {keyLine ? (
             <div className="text-[10px] font-mono font-medium uppercase tracking-[0.08em] text-nim-faint mb-0.5">
@@ -308,6 +287,27 @@ export const TrackerBoardCard: React.FC<TrackerBoardCardProps> = ({
             ) : null}
           </div>
         </div>
+        <button
+          type="button"
+          draggable={false}
+          data-testid="tracker-card-session-button"
+          aria-label={SESSION_ACTION_LABEL[sessionAction]}
+          title={SESSION_ACTION_LABEL[sessionAction]}
+          className={`tracker-card-session-button shrink-0 inline-flex items-center justify-center w-6 h-6 rounded hover:bg-nim-tertiary transition-colors ${
+            sessionAction === 'focus' ? 'text-[var(--nim-primary)]' : 'text-nim-faint opacity-60 hover:opacity-100'
+          }`}
+          onPointerDown={(event) => event.stopPropagation()}
+          onMouseDown={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+          onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }}
+          onClick={handleSessionAction}
+        >
+          <MaterialSymbol
+            icon={SESSION_ACTION_ICON[sessionAction]}
+            size={14}
+            className={sessionAction === 'focus' ? 'animate-spin' : undefined}
+          />
+        </button>
       </div>
     </div>
   );
