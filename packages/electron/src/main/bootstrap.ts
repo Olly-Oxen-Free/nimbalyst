@@ -92,6 +92,15 @@ try {
   // console.log('[Bootstrap] V8 heap limit set to 4096MB (default)');
 }
 
+// Real per-pixel window transparency on Linux/Wayland (for compositor
+// blur-behind, e.g. niri's app-id-matched background-effect rules) requires
+// this Chromium switch in addition to `transparent: true` on the
+// BrowserWindow itself (WindowManager.ts) -- without it, Chromium's GL/Vulkan
+// surface is created opaque regardless of the BrowserWindow option.
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('enable-transparent-visuals');
+}
+
 // Enable CDP remote debugging in dev mode for Playwright extension testing.
 // This allows `playwright connectOverCDP("http://localhost:9222")` to drive
 // the running Nimbalyst instance without launching a separate Electron process.

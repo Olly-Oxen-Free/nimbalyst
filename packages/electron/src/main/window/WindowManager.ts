@@ -110,6 +110,7 @@ export const documentServices = new Map<string, ElectronDocumentService>();
 // File-system services live in a separate module so the multi-project rail
 // handlers can register/free them without importing this whole module.
 import { fileSystemServices } from './serviceRegistry';
+import { watchAndInjectGlassCss } from './glassCss';
 
 function resolveDocumentServiceForEvent(event: IpcMainEvent | IpcMainInvokeEvent): ElectronDocumentService | null {
     const browserWindow = BrowserWindow.fromWebContents(event.sender);
@@ -254,6 +255,20 @@ export function createWindow(
         }
         // console.log('[WINDOW-MANAGER] Background color:', backgroundColor);
 
+        // Real per-pixel transparency on Linux/Wayland, so a compositor
+        // window-rule (e.g. niri's app-id-matched background-effect) can
+        // blur behind chrome surfaces -- see nimbalyst-nirvana-theme's
+        // palette.ts, which gives --nim-bg-secondary/-tertiary real alpha
+        // for exactly this. Requires the `enable-transparent-visuals`
+        // Chromium switch set in bootstrap.ts. Scoped to this window only
+        // (the main workspace window); other windows are unaffected.
+        // `backgroundColor` becomes fully transparent too, since an opaque
+        // pre-paint flash color would defeat the point.
+        const isLinuxGlass = process.platform === 'linux';
+        if (isLinuxGlass) {
+            backgroundColor = '#00000000';
+        }
+
         const preloadPath = getPreloadPath();
 
         const windowOptions: Electron.BrowserWindowConstructorOptions = {
@@ -263,6 +278,7 @@ export function createWindow(
             y,
             title: isWorkspaceMode && workspacePath ? basename(workspacePath) : 'Nimbalyst',
             backgroundColor,
+            transparent: isLinuxGlass,
             webPreferences: {
                 nodeIntegration: false,
                 contextIsolation: true,
@@ -567,12 +583,13 @@ export function createWindow(
             if (process.env.ELECTRON_RENDERER_URL) {
                 const url = new URL(process.env.ELECTRON_RENDERER_URL);
                 url.searchParams.set('theme', currentTheme);
+                if (isLinuxGlass) url.searchParams.set('glass', '1');
                 // console.log('[MAIN] Loading from ELECTRON_RENDERER_URL:', url.toString());
                 return window.loadURL(url.toString());
             } else if (process.env.NODE_ENV === 'development') {
                 // Use VITE_PORT if set (for isolated dev mode), otherwise default to 5273
                 const devPort = process.env.VITE_PORT || '5273';
-                const url = `http://localhost:${devPort}?${themeParam}`;
+                const url = `http://localhost:${devPort}?${themeParam}${isLinuxGlass ? '&glass=1' : ''}`;
                 // console.log('[MAIN] Loading from dev server:', url);
                 return window.loadURL(url);
             } else {
@@ -592,7 +609,9 @@ export function createWindow(
                     // Fallback for other built scenarios
                     htmlPath = join(appPath, 'out/renderer/index.html');
                 }
-                return window.loadFile(htmlPath, { query: { theme: currentTheme } });
+                return window.loadFile(htmlPath, {
+                    query: isLinuxGlass ? { theme: currentTheme, glass: '1' } : { theme: currentTheme },
+                });
             }
         };
 
@@ -724,6 +743,10 @@ export function createWindow(
             // backfill, etc.) is released only after the first window has
             // painted, never competing with the queries that load it. NIM-899.
             signalFirstWindowLoaded();
+
+            if (isLinuxGlass) {
+                watchAndInjectGlassCss(window);
+            }
 
             // DO NOT send theme-change here - the window already got the theme via getThemeSync()
             // Sending it again causes a flash as React re-applies the same theme

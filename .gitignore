@@ -262,3 +262,11 @@ packages/collab-client/src/**/*.d.ts.map
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# makepkg build artifacts (packaging/arch/) -- pkg/ is the fakeroot install
+# tree (contains the entire built Electron binary), src/ is makepkg's build
+# scratch dir, *.pkg.tar.zst is the packaged output. None of these are source.
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.pkg.tar.zst
+packaging/arch/*.pkg.tar.zst.sig
