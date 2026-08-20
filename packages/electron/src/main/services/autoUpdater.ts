@@ -58,11 +58,15 @@ export class AutoUpdaterService {
     log.transports.file.level = 'info';
     autoUpdater.logger = log;
 
-    // Configure auto-updater. autoDownload=true: both background polls and the
-    // manual "Check for Updates" trigger download immediately, then surface a
-    // single "Ready to install" toast. Per maintainer direction on #327.
+    // Configure auto-updater. autoDownload=true keeps the manual
+    // "Check for Updates" flow working (check -> download -> "Ready to
+    // install" toast, per #327). Background polls are disabled in this fork
+    // (see startAutoUpdateCheck), so a download can only ever start from a
+    // user-initiated check. autoInstallOnAppQuit=false: never install
+    // silently on quit -- install only via the explicit "Restart now"
+    // toast action. This build is managed by pacman, not electron-updater.
     autoUpdater.autoDownload = true;
-    autoUpdater.autoInstallOnAppQuit = true;
+    autoUpdater.autoInstallOnAppQuit = false;
 
     // Configure feed URL based on release channel
     this.configureFeedURL();
@@ -554,16 +558,13 @@ export class AutoUpdaterService {
     });
   }
 
-  public startAutoUpdateCheck(intervalMinutes = 60) {
-    // Initial check after 30 seconds
-    setTimeout(() => {
-      this.checkForUpdates();
-    }, 30000);
-
-    // Set up periodic checks
-    this.updateCheckInterval = setInterval(() => {
-      this.checkForUpdates();
-    }, intervalMinutes * 60 * 1000);
+  public startAutoUpdateCheck(_intervalMinutes = 60) {
+    // Fork change: background update checks are disabled. This build is
+    // installed and updated via pacman; silent hourly polls (and the 30s
+    // startup check) would auto-download updates the package manager should
+    // own. The manual "Check for Updates" menu item (checkForUpdatesWithUI)
+    // remains fully functional.
+    log.info('Background auto-update checks are disabled in this build');
   }
 
   public stopAutoUpdateCheck() {
