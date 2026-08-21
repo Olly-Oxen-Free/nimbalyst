@@ -1,11 +1,17 @@
 {
   "slug": "project-bar-top-placement",
-  "status": "executing",
+  "status": "ready-for-review",
   "created_at": "2026-08-20T00:00:00Z",
   "execution_mode": "feature-branch",
   "branch_strategy": "use-worktree-branch-directly",
   "branch": "worktree/project-bar-movement",
-  "phase": "1-brief-generation",
+  "phase": "4-complete-pending-manual-verification",
+  "verification": {
+    "typecheck": "PASS (independently re-run, exit 0)",
+    "targeted_unit_tests": "PASS (independently re-run, 48/48)",
+    "monorepo_test_prepush": "PASS per nimble-pm report (10200/10232, 6 pre-existing failures tracked in bd nby-6el, confirmed unrelated to this PRD)",
+    "manual_e2e_verification": "NOT PERFORMED — no live dev-mode Nimbalyst instance available in this session (get_environment_info confirmed packaged build, dev mode NO). Task 3a's RISK FLAG and this repo's end-to-end-verification.md rule require manually clicking a circle, dragging the window, and right-clicking a circle in a running dev build before 3a (and by extension 4b's hover-reveal) can be considered fully verified. Outstanding."
+  },
   "tracker": {
     "issue_key": null,
     "item_id": "plan_1787289447069_qb6yvp",
