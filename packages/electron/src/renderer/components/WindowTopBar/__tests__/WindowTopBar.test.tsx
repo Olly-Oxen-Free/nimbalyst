@@ -509,12 +509,14 @@ describe('WindowTopBar', () => {
       const switchOther = screen.getByLabelText(`Switch to project ${other.name}`);
       const addButton = screen.getByTestId('window-top-bar-add-project');
 
-      expect(closeActive.classList.contains(NO_DRAG_REGION)).toBe(true);
       expect(addButton.classList.contains(NO_DRAG_REGION)).toBe(true);
-      // The circle itself opts out via its non-interactive wrapper group
-      // rather than per-button, mirroring ProjectRail.tsx's own icon; the
-      // wrapping `window-top-bar__identity-others` group carries no-drag.
-      expect(switchOther.closest('.window-top-bar__identity-others')?.classList.contains(NO_DRAG_REGION)).toBe(true);
+      // Every project icon (active project's pill included — it renders
+      // through the same shared ProjectRailIcon as every other project,
+      // in its natural position, not a separately-classed element) opts
+      // out via the wrapping `window-top-bar__identity-icons` group
+      // rather than per-button, mirroring ProjectRail.tsx's own icon.
+      expect(closeActive.closest('.window-top-bar__identity-icons')?.classList.contains(NO_DRAG_REGION)).toBe(true);
+      expect(switchOther.closest('.window-top-bar__identity-icons')?.classList.contains(NO_DRAG_REGION)).toBe(true);
     });
   });
 });

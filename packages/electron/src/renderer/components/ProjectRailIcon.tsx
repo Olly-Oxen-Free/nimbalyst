@@ -151,8 +151,15 @@ export function ProjectRailIcon({
         onClick={handleClick}
         aria-label={`Switch to project ${project.name}`}
         aria-current={isActive ? 'true' : undefined}
+        // The active project, in the top-docked (horizontal) bar, expands
+        // in place into a full-name pill instead of staying an abbreviated
+        // circle — it keeps its position in the open-project order rather
+        // than being pulled out to a separate title element. Left-docked
+        // (vertical) rail is unaffected: still always shows initials.
+        title={isActive && orientation === 'horizontal' ? undefined : project.name}
+        data-testid={isActive && orientation === 'horizontal' ? 'window-top-bar-workspace-name' : undefined}
       >
-        {projectInitials(project.name)}
+        {isActive && orientation === 'horizontal' ? project.name : projectInitials(project.name)}
         {showBadge && (
           <span
             className="project-rail-item-badge"

@@ -287,15 +287,44 @@
  *   - `.project-rail-top` on the row-layout container.
  *   - `.project-rail-item.is-horizontal` on each icon's root — 1b/`ProjectRailIcon`
  *     already applies this modifier automatically when `orientation="horizontal"`.
- *   - `.project-rail-top-name` on the active project's expanded full-name text.
+ *     The active project is one of these icons (`.is-active.is-horizontal`),
+ *     not a separately-classed element — it expands in place into a
+ *     full-name pill rather than being pulled out of the icon list.
  *
  * None of `.project-rail`'s fixed width/column layout or the vertical
  * `left:-10px` active-indicator bar (`.project-rail-item.is-active::before`
  * above) are reused here — this block is a parallel, row-oriented rule set.
  */
 .project-rail-top {
-  container-name: project-rail-top;
-  container-type: inline-size;
+  /* NOT container-type: inline-size. This element is a grid item in
+     WindowTopBar's center `auto` track (grid-template-columns:
+     minmax(0,1fr) auto minmax(0,1fr)) and is meant to shrink-wrap its
+     own content (variable number of open projects, variable name
+     length). container-type: inline-size applies CSS size containment,
+     which makes an element's OWN width unable to be derived from its
+     content for ANY axis-relevant purpose -- including width/min-width/
+     max-content keywords ON THAT SAME ELEMENT, which then also resolve
+     as if there were no content. Combined with the `auto` grid track
+     (which needs to measure this item's content to size itself), that's
+     an unsatisfiable cycle: browsers resolve it by collapsing this
+     element (and the grid track) to 0px. Confirmed live via CDP
+     (Runtime.evaluate against the running app): computed width was
+     0px with container-type present, and jumped to ~422px the instant
+     container-type was removed, with every other rule here unchanged.
+     This is why the top-docked bar rendered as a fully blank title bar,
+     and why an earlier attempt at fixing this via width/min-width alone
+     (while container-type was still present) had no effect at all --
+     those values were being nullified by the same containment.
+     Consequence: the @container-based narrow-window shrink behavior
+     that was planned for this element (see the removed
+     `@container project-rail-top (max-width: 420px)` block) is not
+     achievable on an element that also needs ordinary content-based
+     auto-sizing in a grid `auto` track -- it would need to live on a
+     stably-sized ancestor instead (e.g. `.window-top-bar__available-area`,
+     whose width comes from `env(titlebar-area-width)`, not from this
+     item's content). Descoped for now; overflow-x: auto below still
+     provides a working (if not auto-shrinking) fallback for narrow
+     windows with many open projects. */
   display: flex;
   flex-direction: row;
   align-items: center;
@@ -310,51 +339,73 @@
   display: none;
 }
 
-/* Horizontal icons keep the same 40x40 circle by default; the vertical
-   left-edge active-indicator bar doesn't apply in a row layout, so it's
-   suppressed below and the existing is-active fill/border-radius treatment
-   (not geometry-locked, reused as-is) carries the active state instead. */
+/* Horizontal icons are smaller than the left rail's 40x40 (top bar is a
+   tighter, 38px-tall space shared with the menu/git-status/panel controls,
+   not a dedicated column) — per explicit user feedback during
+   verification. The vertical left-edge active-indicator bar doesn't apply
+   in a row layout, so it's suppressed below. */
 .project-rail-item.is-horizontal {
+  width: 24px;
+  height: 24px;
   flex-shrink: 0;
+}
+
+.project-rail-item.is-horizontal .project-rail-item-main {
+  font-size: 10px;
 }
 
 .project-rail-item.is-active.is-horizontal::before {
   content: none;
 }
 
-.project-rail-top-name {
-  min-width: 0;
+/*
+ * Active project, top-docked: expands in place from the abbreviated
+ * circle into a full-name pill — it does NOT get pulled out to a separate
+ * title element (an earlier version did this; changed per explicit user
+ * feedback: the active project should stay in its position in the open-
+ * project order). "Pill" here means a rounded-rectangle shape, not a full
+ * circle — auto width so it can fit the name, capped so a long name still
+ * truncates instead of pushing other icons out of the bar.
+ */
+.project-rail-item.is-active.is-horizontal {
+  width: auto;
+  max-width: 160px;
+}
+
+.project-rail-item.is-active.is-horizontal .project-rail-item-main {
+  width: auto;
+  min-width: 24px;
+  max-width: 100%;
+  border-radius: 12px;
+  padding-inline: 10px;
+  font-size: 12px;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--nim-text, #111827);
 }
 
-/* Narrow top bar with several open projects: shrink circles and clamp the
-   expanded name before the row overflows horizontally. */
-@container project-rail-top (max-width: 420px) {
-  .project-rail-item.is-horizontal {
-    width: 28px;
-    height: 28px;
-  }
-
-  .project-rail-top-name {
-    max-width: 120px;
-  }
-}
+/* Narrow-window auto-shrink for the top-docked bar (circles/name clamp
+   before overflow) was removed here: it required container-type: inline-size
+   on `.project-rail-top`, which caused the zero-width collapse documented
+   on that rule above. `.project-rail-top`'s overflow-x: auto still lets
+   the row scroll horizontally instead of breaking layout. Follow-up: a
+   working version of this would need container-type on a stably-sized
+   ancestor (e.g. `.window-top-bar__available-area`) instead. */
 
 /*
- * R9 (task 4a): circle-to-text expand animation + left<->top crossfade.
+ * R9 (task 4a): circle-to-pill expand animation + left<->top crossfade.
  *
- * Scope note: the active project never renders as a circle in the
- * top-docked bar (task 3a renders it directly as expanded-name text, per
- * R5) — there is no literal circle DOM node to morph from. The "expand in
- * place" effect below is a mount-triggered shape/size keyframe on the
- * name element itself; WindowTopBar.tsx remounts that element (via a
- * `key` on the active project's path) on load and on every active-project
- * switch so the animation restarts cleanly instead of stacking.
+ * The active project stays the same DOM node (ProjectRailIcon, keyed by
+ * project path) whether it's active or not — isActive only toggles which
+ * CSS rules apply, it doesn't remount anything. That's what makes the
+ * expand animation replay correctly on every active-project switch: the
+ * `.project-rail-item.is-active.is-horizontal .project-rail-item-main`
+ * selector only matches once isActive flips true, so the browser treats
+ * `animation-name` as newly applied (not already running) and restarts
+ * the keyframe — no explicit remount/key trick needed. The previously-
+ * active icon's own class flips off in the same render, instantly
+ * reverting to its circle form (no reverse/shrink animation defined; see
+ * PRD scope note — this is expand-in-place, not a two-way morph).
  *
  * The left<->top transition (requirement 2) is a plain crossfade/slide on
  * mount of whichever container the position setting causes to render
@@ -380,22 +431,18 @@
 
 @keyframes nim-project-rail-expand-name {
   from {
-    max-width: 28px;
+    max-width: 24px;
     border-radius: 999px;
-    background-color: var(--nim-bg-tertiary, #2a2a2a);
-    padding-inline: 4px;
+    padding-inline: 0;
   }
   to {
-    max-width: 240px;
-    border-radius: 4px;
-    background-color: transparent;
-    padding-inline: 0;
+    max-width: 160px;
+    border-radius: 12px;
+    padding-inline: 10px;
   }
 }
 
-.project-rail-top-name {
-  display: inline-block;
-  border-radius: 4px;
+.project-rail-item.is-active.is-horizontal .project-rail-item-main {
   animation: nim-project-rail-expand-name 220ms ease;
 }
 
@@ -408,7 +455,7 @@
 @media (prefers-reduced-motion: reduce) {
   .project-rail,
   .project-rail-top,
-  .project-rail-top-name {
+  .project-rail-item.is-active.is-horizontal .project-rail-item-main {
     animation: none !important;
   }
 }
@@ -418,26 +465,28 @@
  *
  * `.project-rail-top--hover-reveal` is applied by WindowTopBar.tsx only
  * when `projectRailExpandedDisplayAtom === 'hover-reveal'`; in the default
- * 'always-visible' mode this modifier is absent and
- * `.window-top-bar__identity-others` keeps normal, unconditional
- * visibility (no coupling to hover state). Pure CSS `:hover` — no mouse
- * listener attached to the drag-region element, so this cannot interfere
- * with window-dragging. Closest existing precedent in this file:
- * `.project-rail-item:hover .project-rail-item-close` above.
+ * 'always-visible' mode this modifier is absent and every icon keeps
+ * normal, unconditional visibility (no coupling to hover state). Targets
+ * individual icons (`:not(.is-active)`) rather than a group wrapper div,
+ * since the active project now renders inline in the same icon list
+ * instead of a separately-wrapped "others" group. Pure CSS `:hover` — no
+ * mouse listener attached to the drag-region element, so this cannot
+ * interfere with window-dragging. Closest existing precedent in this
+ * file: `.project-rail-item:hover .project-rail-item-close` above.
  */
-.project-rail-top--hover-reveal .window-top-bar__identity-others {
+.project-rail-top--hover-reveal .project-rail-item:not(.is-active) {
   opacity: 0;
   pointer-events: none;
   transition: opacity 150ms ease;
 }
 
-.project-rail-top--hover-reveal:hover .window-top-bar__identity-others {
+.project-rail-top--hover-reveal:hover .project-rail-item:not(.is-active) {
   opacity: 1;
   pointer-events: auto;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .project-rail-top--hover-reveal .window-top-bar__identity-others {
+  .project-rail-top--hover-reveal .project-rail-item:not(.is-active) {
     transition: none !important;
   }
 }

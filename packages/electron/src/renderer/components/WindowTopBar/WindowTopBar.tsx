@@ -10,7 +10,6 @@ import {
 } from '../../store/atoms/trackers';
 import { windowFullScreenAtom } from '../../store/atoms/windowFullScreen';
 import {
-  activeOpenProjectAtom,
   multiProjectModeAtom,
   projectRailPositionAtom,
   projectRailExpandedDisplayAtom,
@@ -419,9 +418,14 @@ function ExitFullScreenButton() {
 /**
  * Top-docked project bar (R4-R6): renders when `projectRailPositionAtom`
  * is 'top' and multi-project mode is on, replacing the static
- * `window-top-bar__identity` block. The active project shows as expanded
- * full-name text (not a circle, per R5); other open projects render via
- * the shared `ProjectRailIcon` (1b) in `orientation="horizontal"`.
+ * `window-top-bar__identity` block. All open projects render, in their
+ * natural open-order, via the shared `ProjectRailIcon` (1b) in
+ * `orientation="horizontal"` — the active project is NOT pulled out to a
+ * separate title element (an earlier version did this; changed per
+ * explicit user feedback during verification). Instead ProjectRailIcon
+ * itself expands the active project in place from its abbreviated-
+ * initials circle into a full-name pill (R5), still wrapped in a rounded
+ * pill shape, while every other project stays a small circle.
  *
  * This is a structurally separate container from the default identity
  * block, without `pointer-events-none` — see the RISK FLAG in this task's
@@ -429,8 +433,7 @@ function ExitFullScreenButton() {
  * independent mechanisms and both must be handled for circles to be
  * clickable while empty bar space stays draggable.
  */
-function TopDockedProjectBar({ workspaceName }: { workspaceName: string }) {
-  const activeOpenProject = useAtomValue(activeOpenProjectAtom);
+function TopDockedProjectBar() {
   const expandedDisplay = useAtomValue(projectRailExpandedDisplayAtom);
   const controller = useProjectRailController();
 
@@ -466,8 +469,6 @@ function TopDockedProjectBar({ workspaceName }: { workspaceName: string }) {
     }
   }, [addMenu.refs]);
 
-  const activeName = activeOpenProject?.name || workspaceName;
-  const otherProjects = controller.openProjects.filter((p) => p.path !== controller.activePath);
   const contextMenuProject = controller.contextMenuProject;
 
   // R8: when 'hover-reveal', non-selected circles stay hidden until the
@@ -480,62 +481,37 @@ function TopDockedProjectBar({ workspaceName }: { workspaceName: string }) {
     <div
       className={`window-top-bar__identity-rail project-rail-top flex items-center justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)]${revealClass}`}
     >
-      <div
-        // Keyed on the active project's path so this whole block remounts
-        // (and its CSS mount animation, `nimProjectRailExpandName` in
-        // ProjectRail.css, restarts cleanly) both on initial load in the
-        // top-docked state and on every subsequent active-project switch
-        // (R9) — rather than stacking/queuing animations on prop changes.
-        key={activeOpenProject?.path ?? 'none'}
-        className={`window-top-bar__identity-active flex items-center gap-1 min-w-0 ${NO_DRAG_REGION}`}
-        onContextMenu={
-          activeOpenProject
-            ? (event) => {
-                event.preventDefault();
-                handleContextMenu(activeOpenProject, event.clientX, event.clientY);
-              }
-            : undefined
-        }
-      >
-        <span
-          className="window-top-bar__workspace-name project-rail-top-name text-nim text-xs font-semibold"
-          data-testid="window-top-bar-workspace-name"
-          title={activeName}
-        >
-          {activeName}
-        </span>
-        {activeOpenProject && (
-          <button
-            type="button"
-            className={`window-top-bar__identity-active-close inline-flex items-center justify-center w-4 h-4 rounded-full text-[11px] leading-none text-nim-muted hover:text-nim-error hover:bg-nim-hover ${NO_DRAG_REGION}`}
-            onClick={() => controller.close(activeOpenProject)}
-            aria-label={`Close ${activeOpenProject.name}`}
-          >
-            ×
-          </button>
-        )}
+      {/*
+       * Projects render in their natural open-order, active project
+       * included in place — it does not get pulled out to a separate
+       * "title" element. Instead ProjectRailIcon itself expands the
+       * active project from its abbreviated-initials circle into a
+       * full-name pill (still wrapped in a rounded pill shape) when
+       * `isActive && orientation === 'horizontal'`, per explicit user
+       * feedback during verification of this feature — see
+       * ProjectRailIcon.tsx and the is-active.is-horizontal rules in
+       * ProjectRail.css. data-testid stays on the currently-active
+       * icon's name element (see ProjectRailIcon) for any selector
+       * previously keyed to "window-top-bar-workspace-name".
+       */}
+      <div className={`window-top-bar__identity-icons flex items-center gap-1.5 ${NO_DRAG_REGION}`}>
+        {controller.openProjects.map((project) => {
+          const activity = controller.getActivity(project.path);
+          return (
+            <ProjectRailIcon
+              key={project.path}
+              project={project}
+              isActive={project.path === controller.activePath}
+              processingCount={activity.processingCount}
+              unreadCount={activity.unreadCount}
+              orientation="horizontal"
+              onActivate={controller.activate}
+              onClose={controller.close}
+              onContextMenu={handleContextMenu}
+            />
+          );
+        })}
       </div>
-
-      {otherProjects.length > 0 && (
-        <div className={`window-top-bar__identity-others flex items-center gap-1.5 ${NO_DRAG_REGION}`}>
-          {otherProjects.map((project) => {
-            const activity = controller.getActivity(project.path);
-            return (
-              <ProjectRailIcon
-                key={project.path}
-                project={project}
-                isActive={false}
-                processingCount={activity.processingCount}
-                unreadCount={activity.unreadCount}
-                orientation="horizontal"
-                onActivate={controller.activate}
-                onClose={controller.close}
-                onContextMenu={handleContextMenu}
-              />
-            );
-          })}
-        </div>
-      )}
 
       <button
         ref={addButtonRef}
@@ -704,7 +680,7 @@ export function WindowTopBar({
         </div>
 
         {showTopDockedRail ? (
-          <TopDockedProjectBar workspaceName={workspaceName} />
+          <TopDockedProjectBar />
         ) : (
           <div className="window-top-bar__identity flex items-baseline justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)] whitespace-nowrap pointer-events-none">
             <span
