@@ -33,6 +33,8 @@ import {
   openProjectsAtom,
   activeWorkspacePathAtom,
   restorePreviousProjectsAtom,
+  projectRailPositionAtom,
+  projectRailExpandedDisplayAtom,
 } from '../../../store/atoms/openProjects';
 
 /** Reusable compact dropdown row */
@@ -410,6 +412,10 @@ export function AdvancedPanel() {
 
         <RestorePreviousProjectsToggle />
 
+        <ProjectRailPositionControl />
+
+        <ProjectRailExpandedDisplayControl />
+
         <SettingsToggle
           checked={analyticsEnabled}
           onChange={(checked) => updateSettings({ analyticsEnabled: checked })}
@@ -748,6 +754,56 @@ function RestorePreviousProjectsToggle() {
           ? 'When on, the project rail rehydrates with every project that was open at last close. When off, only the project you pick from the launch screen opens.'
           : 'Only takes effect when Multi-project Mode is enabled.'
       }
+    />
+  );
+}
+
+/**
+ * Lets the user dock the project bar on the left edge or merge it into the
+ * top title bar. Only meaningful (and only shown) when Multi-project Mode
+ * is on — matches ProjectRail()'s own `!isMultiProjectMode` return-null gate.
+ */
+function ProjectRailPositionControl() {
+  const isMultiProject = useAtomValue(multiProjectModeAtom);
+  const [position, setPosition] = useAtom(projectRailPositionAtom);
+
+  if (!isMultiProject) return null;
+
+  return (
+    <DropdownRow
+      value={position}
+      onChange={(val) => setPosition(val as 'left' | 'top')}
+      name="Project Bar Position"
+      description="Dock the project bar on the left edge, or merge it into the title bar at the top."
+      options={[
+        { value: 'left', label: 'Left' },
+        { value: 'top', label: 'Top' },
+      ]}
+    />
+  );
+}
+
+/**
+ * Controls whether non-selected projects stay always visible or only
+ * reveal on hover when the project bar is docked at the top. Only shown
+ * when the position is actually 'top'.
+ */
+function ProjectRailExpandedDisplayControl() {
+  const position = useAtomValue(projectRailPositionAtom);
+  const [displayMode, setDisplayMode] = useAtom(projectRailExpandedDisplayAtom);
+
+  if (position !== 'top') return null;
+
+  return (
+    <DropdownRow
+      value={displayMode}
+      onChange={(val) => setDisplayMode(val as 'always-visible' | 'hover-reveal')}
+      name="Non-Selected Project Display"
+      description="How other open projects are shown when the project bar is docked at the top."
+      options={[
+        { value: 'always-visible', label: 'Always Visible' },
+        { value: 'hover-reveal', label: 'Hover to Reveal' },
+      ]}
     />
   );
 }
