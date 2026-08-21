@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createStore } from 'jotai';
+import { store } from '@nimbalyst/runtime/store';
 import {
   openProjectsAtom,
   activeWorkspacePathAtom,
@@ -10,6 +11,9 @@ import {
   attachWorkspaceSwitchCleanup,
   resolveInitialOpenProjectsState,
   selectProjectsToRegister,
+  initOpenProjects,
+  projectRailPositionAtom,
+  projectRailExpandedDisplayAtom,
   type OpenProject,
 } from '../openProjects';
 import { activeSessionIdAtom, selectedWorkstreamAtom } from '../sessions';
@@ -315,6 +319,45 @@ describe('openProjects atoms', () => {
         '/ws/a',
         '/ws/b',
       ]);
+    });
+  });
+
+  // 1a: projectRailPositionAtom/projectRailExpandedDisplayAtom default-merge
+  // behavior. Exercises the real initOpenProjects() load path (module-level
+  // `store`, not a locally-created one) with the IPC round-trip stubbed to
+  // resolve undefined for both channels, simulating a saved-state object
+  // from before this setting existed. initOpenProjects() guards itself with
+  // a module-level `initialized` flag and openProjects.ts has no
+  // resetOpenProjects()-equivalent, so this can only run once per module
+  // instance — kept as a single it() rather than split across cases.
+  describe('projectRailPosition / projectRailExpandedDisplay default-merge', () => {
+    it('resolves to left/always-visible when the IPC round-trip returns undefined', async () => {
+      const invoke = vi.fn((channel: string) => {
+        switch (channel) {
+          case 'app:get-multi-project-mode':
+            return Promise.resolve(false);
+          case 'app:get-restore-previous-projects':
+            return Promise.resolve(false);
+          case 'app:get-open-projects':
+            return Promise.resolve([]);
+          case 'app:get-active-project-path':
+            return Promise.resolve(null);
+          case 'app:get-project-rail-position':
+            return Promise.resolve(undefined);
+          case 'app:get-project-rail-expanded-display':
+            return Promise.resolve(undefined);
+          default:
+            return Promise.resolve(undefined);
+        }
+      });
+      vi.stubGlobal('window', { electronAPI: { invoke } });
+
+      await initOpenProjects();
+
+      expect(store.get(projectRailPositionAtom)).toBe('left');
+      expect(store.get(projectRailExpandedDisplayAtom)).toBe('always-visible');
+
+      vi.unstubAllGlobals();
     });
   });
 });

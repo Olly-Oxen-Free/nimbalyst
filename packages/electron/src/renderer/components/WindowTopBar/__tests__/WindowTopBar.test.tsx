@@ -6,6 +6,13 @@ import { getDefaultStore } from 'jotai';
 import { WindowTopBar, clampGitFeedbackMessage } from '../WindowTopBar';
 import { windowFullScreenAtom } from '../../../store/atoms/windowFullScreen';
 import { NO_DRAG_REGION } from '../dragRegion';
+import {
+  openProjectsAtom,
+  activeWorkspacePathAtom,
+  multiProjectModeAtom,
+  projectRailPositionAtom,
+  type OpenProject,
+} from '../../../store/atoms/openProjects';
 
 // Only the icon needs stubbing (jsdom has no font ligatures). The rest of the
 // barrel is kept real: the bar's imports reach other runtime exports
@@ -19,6 +26,10 @@ vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({
 afterEach(() => {
   cleanup();
   getDefaultStore().set(windowFullScreenAtom, false);
+  getDefaultStore().set(multiProjectModeAtom, false);
+  getDefaultStore().set(projectRailPositionAtom, 'left');
+  getDefaultStore().set(openProjectsAtom, []);
+  getDefaultStore().set(activeWorkspacePathAtom, null);
 });
 
 describe('WindowTopBar', () => {
@@ -388,5 +399,122 @@ describe('WindowTopBar', () => {
     expect(clampGitFeedbackMessage('Push completed')).toBe('Push completed');
     expect(clampGitFeedbackMessage('line 1\nline 2')).toBe('line 1\nline 2');
     expect(clampGitFeedbackMessage('a\nb\nc\nd\ne\nf\ng')).toBe('a\nb\nc\nd\ne\nf…');
+  });
+
+  // Task 3a/4a: top-docked project bar merge (R4/R5).
+  describe('project-bar top placement', () => {
+    function seedTopDocked() {
+      const active: OpenProject = { path: '/ws/nebula', name: 'Nebula', openedAt: 0 };
+      const other: OpenProject = { path: '/ws/aurora', name: 'Aurora', openedAt: 1 };
+      getDefaultStore().set(openProjectsAtom, [active, other]);
+      getDefaultStore().set(activeWorkspacePathAtom, active.path);
+      getDefaultStore().set(multiProjectModeAtom, true);
+      getDefaultStore().set(projectRailPositionAtom, 'top');
+      return { active, other };
+    }
+
+    it('renders the active project full name from activeOpenProjectAtom when position is top', () => {
+      const { active, other } = seedTopDocked();
+
+      render(
+        <WindowTopBar
+          workspaceName="Fallback Workspace Name"
+          activeModeLabel="Files"
+          gitStatus={null}
+          gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
+        />,
+      );
+
+      expect(screen.getByTestId('window-top-bar-workspace-name').textContent).toBe(active.name);
+      // The static mode-label span only exists in the fallback (left-docked)
+      // branch — its absence here confirms the top-docked branch is a
+      // structurally separate render path, not a conditional patch of the
+      // same JSX.
+      expect(screen.queryByTestId('window-top-bar-mode-label')).toBeNull();
+      // The non-active project renders as a circle via the shared
+      // ProjectRailIcon (1b), clickable to switch (R6).
+      expect(screen.getByLabelText(`Switch to project ${other.name}`)).toBeTruthy();
+    });
+
+    it('switches the active project when a non-selected circle is clicked', () => {
+      const { other } = seedTopDocked();
+
+      render(
+        <WindowTopBar
+          workspaceName="Fallback Workspace Name"
+          activeModeLabel="Files"
+          gitStatus={null}
+          gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
+        />,
+      );
+
+      fireEvent.click(screen.getByLabelText(`Switch to project ${other.name}`));
+
+      expect(getDefaultStore().get(activeWorkspacePathAtom)).toBe(other.path);
+    });
+
+    it("renders today's static workspace-name behavior unchanged when position is left", () => {
+      // Explicit position='left' (also the atom default) confirms R4's
+      // zero-regression requirement: the existing suite's other cases
+      // already exercise this branch implicitly, this one pins it down
+      // alongside the new top-docked coverage.
+      getDefaultStore().set(projectRailPositionAtom, 'left');
+      getDefaultStore().set(multiProjectModeAtom, false);
+
+      render(
+        <WindowTopBar
+          workspaceName="Static Name"
+          activeModeLabel="Files"
+          gitStatus={null}
+          gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
+        />,
+      );
+
+      expect(screen.getByTestId('window-top-bar-workspace-name').textContent).toBe('Static Name');
+      expect(screen.getByTestId('window-top-bar-mode-label').textContent).toBe('Files');
+    });
+
+    it('falls back to the static identity when multi-project mode is off even if position is top', () => {
+      // R4/3a success criterion: position='top' with multi-project mode off
+      // must show no rail remnant.
+      getDefaultStore().set(projectRailPositionAtom, 'top');
+      getDefaultStore().set(multiProjectModeAtom, false);
+
+      render(
+        <WindowTopBar
+          workspaceName="Static Name"
+          activeModeLabel="Files"
+          gitStatus={null}
+          gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
+        />,
+      );
+
+      expect(screen.getByTestId('window-top-bar-workspace-name').textContent).toBe('Static Name');
+      expect(screen.getByTestId('window-top-bar-mode-label').textContent).toBe('Files');
+    });
+
+    it('gives every interactive top-docked element explicit no-drag', () => {
+      const { active, other } = seedTopDocked();
+
+      render(
+        <WindowTopBar
+          workspaceName="Fallback Workspace Name"
+          activeModeLabel="Files"
+          gitStatus={null}
+          gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
+        />,
+      );
+
+      const closeActive = screen.getByLabelText(`Close ${active.name}`);
+      const switchOther = screen.getByLabelText(`Switch to project ${other.name}`);
+      const addButton = screen.getByTestId('window-top-bar-add-project');
+
+      expect(closeActive.classList.contains(NO_DRAG_REGION)).toBe(true);
+      expect(addButton.classList.contains(NO_DRAG_REGION)).toBe(true);
+      // The circle itself opts out via its non-interactive wrapper group
+      // rather than per-button, mirroring ProjectRail.tsx's own icon; the
+      // wrapping `window-top-bar__identity-others` group carries no-drag.
+      expect(switchOther.closest('.window-top-bar__identity-others')?.classList.contains(NO_DRAG_REGION)).toBe(true);
+    });
   });
 });
