@@ -1,17 +1,29 @@
-import React from 'react';
+import React, { useCallback, useLayoutEffect, useRef } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { MAIN_WINDOW_TITLE_BAR_HEIGHT } from '../../../shared/windowChrome';
-import { FloatingPortal, useFloatingMenu } from '../../hooks/useFloatingMenu';
+import { FloatingPortal, useFloatingMenu, virtualElement } from '../../hooks/useFloatingMenu';
 import {
   setTrackerModeLayoutAtom,
   trackerModeDocumentItemIdAtom,
   trackerModeLayoutAtom,
 } from '../../store/atoms/trackers';
 import { windowFullScreenAtom } from '../../store/atoms/windowFullScreen';
+import {
+  activeOpenProjectAtom,
+  multiProjectModeAtom,
+  projectRailPositionAtom,
+  type OpenProject,
+} from '../../store/atoms/openProjects';
+import { ProjectRailIcon, useProjectRailController, REVEAL_LABEL } from '../ProjectRailIcon';
 import { TRACKER_DOCUMENT_PANEL_MODES } from '../TrackerMode/trackerDocumentPanelModes';
 import { DRAG_REGION, NO_DRAG_REGION } from './dragRegion';
 import { WindowMenuBar } from './WindowMenuBar';
+// Top-docked project bar reuses ProjectRail's classes (project-rail-item,
+// project-rail-top, project-rail-context-menu, etc.) — import here too since
+// <ProjectRail /> isn't mounted when position='top' (App.tsx gates it out),
+// so its own `import './ProjectRail.css'` side effect wouldn't otherwise fire.
+import '../ProjectRail.css';
 
 export interface WindowTopBarGitStatus {
   branch: string;
@@ -403,6 +415,209 @@ function ExitFullScreenButton() {
   );
 }
 
+/**
+ * Top-docked project bar (R4-R6): renders when `projectRailPositionAtom`
+ * is 'top' and multi-project mode is on, replacing the static
+ * `window-top-bar__identity` block. The active project shows as expanded
+ * full-name text (not a circle, per R5); other open projects render via
+ * the shared `ProjectRailIcon` (1b) in `orientation="horizontal"`.
+ *
+ * This is a structurally separate container from the default identity
+ * block, without `pointer-events-none` — see the RISK FLAG in this task's
+ * brief: `pointer-events-none` and `-webkit-app-region: drag` are two
+ * independent mechanisms and both must be handled for circles to be
+ * clickable while empty bar space stays draggable.
+ */
+function TopDockedProjectBar({ workspaceName }: { workspaceName: string }) {
+  const activeOpenProject = useAtomValue(activeOpenProjectAtom);
+  const controller = useProjectRailController();
+
+  // Right-click context menu ("Open in new window" / reveal / "Close
+  // project"), mirroring ProjectRail.tsx's own instance but opening
+  // downward (bottom-start) per R7, since this is the top-docked layout.
+  const contextMenu = useFloatingMenu({
+    placement: 'bottom-start',
+    open: controller.contextMenuProject !== null,
+    onOpenChange: (open) => {
+      if (!open) controller.closeContextMenu();
+    },
+  });
+  const handleContextMenu = useCallback(
+    (project: OpenProject, x: number, y: number) => {
+      contextMenu.refs.setPositionReference(virtualElement(x, y));
+      controller.openContextMenu(project);
+    },
+    [contextMenu.refs, controller]
+  );
+
+  // Add-project ("+") dropdown, anchored to its own button, also opening
+  // downward.
+  const addButtonRef = useRef<HTMLButtonElement | null>(null);
+  const addMenu = useFloatingMenu({
+    placement: 'bottom-start',
+    open: controller.addMenuOpen,
+    onOpenChange: (open) => (open ? controller.openAddMenu() : controller.closeAddMenu()),
+  });
+  useLayoutEffect(() => {
+    if (addButtonRef.current) {
+      addMenu.refs.setReference(addButtonRef.current);
+    }
+  }, [addMenu.refs]);
+
+  const activeName = activeOpenProject?.name || workspaceName;
+  const otherProjects = controller.openProjects.filter((p) => p.path !== controller.activePath);
+  const contextMenuProject = controller.contextMenuProject;
+
+  return (
+    <div className="window-top-bar__identity-rail project-rail-top flex items-center justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)]">
+      <div
+        className={`window-top-bar__identity-active flex items-center gap-1 min-w-0 ${NO_DRAG_REGION}`}
+        onContextMenu={
+          activeOpenProject
+            ? (event) => {
+                event.preventDefault();
+                handleContextMenu(activeOpenProject, event.clientX, event.clientY);
+              }
+            : undefined
+        }
+      >
+        <span
+          className="window-top-bar__workspace-name project-rail-top-name text-nim text-xs font-semibold"
+          data-testid="window-top-bar-workspace-name"
+          title={activeName}
+        >
+          {activeName}
+        </span>
+        {activeOpenProject && (
+          <button
+            type="button"
+            className={`window-top-bar__identity-active-close inline-flex items-center justify-center w-4 h-4 rounded-full text-[11px] leading-none text-nim-muted hover:text-nim-error hover:bg-nim-hover ${NO_DRAG_REGION}`}
+            onClick={() => controller.close(activeOpenProject)}
+            aria-label={`Close ${activeOpenProject.name}`}
+          >
+            ×
+          </button>
+        )}
+      </div>
+
+      {otherProjects.length > 0 && (
+        <div className={`window-top-bar__identity-others flex items-center gap-1.5 ${NO_DRAG_REGION}`}>
+          {otherProjects.map((project) => {
+            const activity = controller.getActivity(project.path);
+            return (
+              <ProjectRailIcon
+                key={project.path}
+                project={project}
+                isActive={false}
+                processingCount={activity.processingCount}
+                unreadCount={activity.unreadCount}
+                orientation="horizontal"
+                onActivate={controller.activate}
+                onClose={controller.close}
+                onContextMenu={handleContextMenu}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      <button
+        ref={addButtonRef}
+        type="button"
+        className={`window-top-bar__identity-add w-5 h-5 ${CONTROL_BASE} ${CONTROL_GHOST} ${NO_DRAG_REGION}`}
+        onClick={controller.openAddMenu}
+        disabled={controller.atCap}
+        data-testid="window-top-bar-add-project"
+        aria-label="Add project to rail"
+      >
+        <MaterialSymbol icon="add" size={14} />
+      </button>
+
+      {controller.addMenuOpen && (
+        <FloatingPortal>
+          <div
+            ref={addMenu.refs.setFloating}
+            style={addMenu.floatingStyles}
+            {...addMenu.getFloatingProps()}
+            className={`project-rail-context-menu project-rail-add-menu ${NO_DRAG_REGION}`}
+            data-testid="window-top-bar-add-project-menu"
+          >
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => {
+                controller.closeAddMenu();
+                controller.pickFolder();
+              }}
+            >
+              Open folder…
+            </button>
+            {controller.filteredRecents.length > 0 && (
+              <>
+                <div className="project-rail-context-menu-divider" />
+                <div className="project-rail-context-menu-heading">Recent projects</div>
+                {controller.filteredRecents.map((recent) => (
+                  <button
+                    key={recent.path}
+                    type="button"
+                    className="project-rail-context-menu-item project-rail-context-menu-item-recent"
+                    onClick={() => {
+                      controller.closeAddMenu();
+                      controller.addProjectByPath(recent.path);
+                    }}
+                    title={recent.path}
+                  >
+                    <span className="project-rail-context-menu-item-name">{recent.name || recent.path}</span>
+                    <span className="project-rail-context-menu-item-path">{recent.path}</span>
+                  </button>
+                ))}
+              </>
+            )}
+          </div>
+        </FloatingPortal>
+      )}
+
+      {contextMenuProject && (
+        <FloatingPortal>
+          <div
+            ref={contextMenu.refs.setFloating}
+            style={contextMenu.floatingStyles}
+            {...contextMenu.getFloatingProps()}
+            className={`project-rail-context-menu ${NO_DRAG_REGION}`}
+            data-testid="window-top-bar-project-context-menu"
+          >
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => controller.openInNewWindow(contextMenuProject)}
+            >
+              Open in new window
+            </button>
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => controller.revealInFinder(contextMenuProject)}
+            >
+              {REVEAL_LABEL}
+            </button>
+            <div className="project-rail-context-menu-divider" />
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => {
+                controller.closeContextMenu();
+                controller.close(contextMenuProject);
+              }}
+            >
+              Close project
+            </button>
+          </div>
+        </FloatingPortal>
+      )}
+    </div>
+  );
+}
+
 export function WindowTopBar({
   workspaceName,
   activeModeLabel,
@@ -415,6 +630,9 @@ export function WindowTopBar({
   const trackerLayout = useAtomValue(trackerModeLayoutAtom);
   const setTrackerLayout = useSetAtom(setTrackerModeLayoutAtom);
   const trackerDocumentActive = activeModeLabel === 'Tracker' && trackerDocumentItemId !== null;
+  const projectRailPosition = useAtomValue(projectRailPositionAtom);
+  const isMultiProjectMode = useAtomValue(multiProjectModeAtom);
+  const showTopDockedRail = projectRailPosition === 'top' && isMultiProjectMode;
   const visiblePanelControls: WindowTopBarPanelControls | undefined = trackerDocumentActive
     ? {
         left: {
@@ -469,22 +687,26 @@ export function WindowTopBar({
           <WindowMenuBar />
         </div>
 
-        <div className="window-top-bar__identity flex items-baseline justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)] whitespace-nowrap pointer-events-none">
-          <span
-            className="window-top-bar__workspace-name min-w-0 overflow-hidden text-ellipsis text-nim text-xs font-semibold"
-            data-testid="window-top-bar-workspace-name"
-            title={workspaceName}
-          >
-            {workspaceName}
-          </span>
-          <span className="window-top-bar__identity-separator text-nim-muted text-[11px]" aria-hidden="true">—</span>
-          <span
-            className="window-top-bar__mode-label min-w-0 overflow-hidden text-ellipsis text-nim-muted text-[11px]"
-            data-testid="window-top-bar-mode-label"
-          >
-            {activeModeLabel}
-          </span>
-        </div>
+        {showTopDockedRail ? (
+          <TopDockedProjectBar workspaceName={workspaceName} />
+        ) : (
+          <div className="window-top-bar__identity flex items-baseline justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)] whitespace-nowrap pointer-events-none">
+            <span
+              className="window-top-bar__workspace-name min-w-0 overflow-hidden text-ellipsis text-nim text-xs font-semibold"
+              data-testid="window-top-bar-workspace-name"
+              title={workspaceName}
+            >
+              {workspaceName}
+            </span>
+            <span className="window-top-bar__identity-separator text-nim-muted text-[11px]" aria-hidden="true">—</span>
+            <span
+              className="window-top-bar__mode-label min-w-0 overflow-hidden text-ellipsis text-nim-muted text-[11px]"
+              data-testid="window-top-bar-mode-label"
+            >
+              {activeModeLabel}
+            </span>
+          </div>
+        )}
 
         <div className="window-top-bar__right grid grid-cols-[minmax(0,1fr)_auto] items-center self-stretch min-w-0">
           {gitStatus && (

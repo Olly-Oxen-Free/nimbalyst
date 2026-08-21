@@ -180,6 +180,7 @@ import { organizationDirectoryAtom, personalAccountsAtom } from './store/atoms/s
 import {
   activeWorkspacePathAtom,
   multiProjectModeAtom,
+  projectRailPositionAtom,
   addOpenProjectAtom as addOpenProjectAction,
 } from './store/atoms/openProjects';
 import { registerDocumentLinkPlugin } from './plugins/registerDocumentLinkPlugin';
@@ -583,6 +584,7 @@ export default function App() {
   // (which is wired to that state) re-renders for the new project.
   const isMultiProjectMode = useAtomValue(multiProjectModeAtom);
   const railActivePath = useAtomValue(activeWorkspacePathAtom);
+  const projectRailPosition = useAtomValue(projectRailPositionAtom);
   const addOpenProject = useSetAtom(addOpenProjectAction);
   const setRailActivePath = useSetAtom(activeWorkspacePathAtom);
   // NOTE: fileTree, sidebarWidth, isNewFileDialogOpen, newFileDirectory, isHistoryDialogOpen moved to EditorMode
@@ -2699,8 +2701,9 @@ export default function App() {
       )}
       <div data-layout="workspace-row" className="flex flex-row flex-1 min-h-0">
       {/* Far-left: project rail (Discord-style) — visible only when
-          multi-project mode is enabled in settings. */}
-      <ProjectRail />
+          multi-project mode is enabled in settings and docked left. When
+          docked top, WindowTopBar renders the rail's content instead. */}
+      {projectRailPosition !== 'top' && <ProjectRail />}
       {/* Left: Navigation Gutter - full height */}
       <NavigationGutter
         contentMode={activeMode}
