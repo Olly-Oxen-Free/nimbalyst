@@ -413,3 +413,32 @@
   }
 }
 
+/*
+ * R8 (task 4b): hover-reveal for non-selected top-docked circles.
+ *
+ * `.project-rail-top--hover-reveal` is applied by WindowTopBar.tsx only
+ * when `projectRailExpandedDisplayAtom === 'hover-reveal'`; in the default
+ * 'always-visible' mode this modifier is absent and
+ * `.window-top-bar__identity-others` keeps normal, unconditional
+ * visibility (no coupling to hover state). Pure CSS `:hover` — no mouse
+ * listener attached to the drag-region element, so this cannot interfere
+ * with window-dragging. Closest existing precedent in this file:
+ * `.project-rail-item:hover .project-rail-item-close` above.
+ */
+.project-rail-top--hover-reveal .window-top-bar__identity-others {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+
+.project-rail-top--hover-reveal:hover .window-top-bar__identity-others {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .project-rail-top--hover-reveal .window-top-bar__identity-others {
+    transition: none !important;
+  }
+}
+

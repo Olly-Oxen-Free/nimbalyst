@@ -13,6 +13,7 @@ import {
   activeOpenProjectAtom,
   multiProjectModeAtom,
   projectRailPositionAtom,
+  projectRailExpandedDisplayAtom,
   type OpenProject,
 } from '../../store/atoms/openProjects';
 import { ProjectRailIcon, useProjectRailController, REVEAL_LABEL } from '../ProjectRailIcon';
@@ -430,6 +431,7 @@ function ExitFullScreenButton() {
  */
 function TopDockedProjectBar({ workspaceName }: { workspaceName: string }) {
   const activeOpenProject = useAtomValue(activeOpenProjectAtom);
+  const expandedDisplay = useAtomValue(projectRailExpandedDisplayAtom);
   const controller = useProjectRailController();
 
   // Right-click context menu ("Open in new window" / reveal / "Close
@@ -468,8 +470,16 @@ function TopDockedProjectBar({ workspaceName }: { workspaceName: string }) {
   const otherProjects = controller.openProjects.filter((p) => p.path !== controller.activePath);
   const contextMenuProject = controller.contextMenuProject;
 
+  // R8: when 'hover-reveal', non-selected circles stay hidden until the
+  // user hovers the bar area — pure CSS `:hover` (see ProjectRail.css),
+  // so no mouse listener is attached to the drag-region element and
+  // window-dragging from empty bar space is unaffected either way.
+  const revealClass = expandedDisplay === 'hover-reveal' ? ' project-rail-top--hover-reveal' : '';
+
   return (
-    <div className="window-top-bar__identity-rail project-rail-top flex items-center justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)]">
+    <div
+      className={`window-top-bar__identity-rail project-rail-top flex items-center justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)]${revealClass}`}
+    >
       <div
         // Keyed on the active project's path so this whole block remounts
         // (and its CSS mount animation, `nimProjectRailExpandName` in
