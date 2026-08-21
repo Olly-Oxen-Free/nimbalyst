@@ -24,6 +24,8 @@ export type { SessionState, SessionWindow } from '../types';
 
 export type CompletionSoundType = 'chime' | 'bell' | 'pop' | 'alert' | 'custom' | 'none';
 export type ReleaseChannel = 'stable' | 'alpha';
+export type ProjectRailPosition = 'left' | 'top';
+export type ProjectRailExpandedDisplay = 'always-visible' | 'hover-reveal';
 export type PreferredTerminalShell = 'auto' | 'pwsh' | 'powershell' | 'git-bash' | 'wsl' | 'cmd';
 export type WorkspaceFileTreeFilter = 'all' | 'markdown' | 'known' | 'git-uncommitted' | 'git-worktree' | 'ai-read' | 'ai-written';
 export type AttachmentStagingMode = 'temp' | 'workspace' | 'custom';
@@ -298,6 +300,12 @@ interface AppStoreSchema {
   // Multi-project rail: opt-in flag to host multiple projects in a single
   // window. When false (default), each project still gets its own window.
   multiProjectMode?: boolean;
+  // Project-bar layout: dock the multi-project rail on the left edge or
+  // merge it into the top title bar. Defaults to 'left' (today's behavior).
+  projectRailPosition?: ProjectRailPosition;
+  // When the project bar is top-docked, whether non-selected projects stay
+  // always visible or only reveal on hover. Defaults to 'always-visible'.
+  projectRailExpandedDisplay?: ProjectRailExpandedDisplay;
   // Workspace paths currently warm in the multi-project rail, in display
   // order. Empty when multiProjectMode is off or before the user adds any.
   openProjects?: string[];
@@ -2778,6 +2786,22 @@ export function getMultiProjectMode(): boolean {
 
 export function setMultiProjectMode(enabled: boolean): void {
   getAppStore().set('multiProjectMode', enabled);
+}
+
+export function getProjectRailPosition(): ProjectRailPosition {
+  return getAppStore().get('projectRailPosition', 'left');
+}
+
+export function setProjectRailPosition(position: ProjectRailPosition): void {
+  getAppStore().set('projectRailPosition', position);
+}
+
+export function getProjectRailExpandedDisplay(): ProjectRailExpandedDisplay {
+  return getAppStore().get('projectRailExpandedDisplay', 'always-visible');
+}
+
+export function setProjectRailExpandedDisplay(mode: ProjectRailExpandedDisplay): void {
+  getAppStore().set('projectRailExpandedDisplay', mode);
 }
 
 export function getOpenProjectPaths(): string[] {

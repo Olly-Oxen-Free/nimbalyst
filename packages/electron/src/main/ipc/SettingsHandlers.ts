@@ -28,6 +28,8 @@ import {
     isShowTrayIcon,
     setPreferredAgentLanguage,
     getMultiProjectMode, setMultiProjectMode,
+    getProjectRailPosition, setProjectRailPosition, ProjectRailPosition,
+    getProjectRailExpandedDisplay, setProjectRailExpandedDisplay, ProjectRailExpandedDisplay,
     getOpenProjectPaths, setOpenProjectPaths,
     getActiveProjectPath, setActiveProjectPath,
     getRestorePreviousProjectsOnLaunch, setRestorePreviousProjectsOnLaunch,
@@ -637,6 +639,22 @@ export function registerSettingsHandlers() {
 
     safeHandle('app:set-multi-project-mode', async (_event, enabled: boolean) => {
         setMultiProjectMode(enabled);
+    });
+
+    safeHandle('app:get-project-rail-position', async () => {
+        return getProjectRailPosition();
+    });
+
+    safeHandle('app:set-project-rail-position', async (_event, position: ProjectRailPosition) => {
+        setProjectRailPosition(position);
+    });
+
+    safeHandle('app:get-project-rail-expanded-display', async () => {
+        return getProjectRailExpandedDisplay();
+    });
+
+    safeHandle('app:set-project-rail-expanded-display', async (_event, mode: ProjectRailExpandedDisplay) => {
+        setProjectRailExpandedDisplay(mode);
     });
 
     safeHandle('app:get-open-projects', async () => {
