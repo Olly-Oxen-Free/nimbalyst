@@ -278,3 +278,70 @@
   text-overflow: ellipsis;
 }
 
+/*
+ * Horizontal / top-docked layout — see task 2b (project-bar-top-placement).
+ *
+ * Naming contract for task 3a (the WindowTopBar structural merge) and 4a/4b
+ * (animation, hover-reveal), which apply these classes to the markup they
+ * render inside WindowTopBar:
+ *   - `.project-rail-top` on the row-layout container.
+ *   - `.project-rail-item.is-horizontal` on each icon's root — 1b/`ProjectRailIcon`
+ *     already applies this modifier automatically when `orientation="horizontal"`.
+ *   - `.project-rail-top-name` on the active project's expanded full-name text.
+ *
+ * None of `.project-rail`'s fixed width/column layout or the vertical
+ * `left:-10px` active-indicator bar (`.project-rail-item.is-active::before`
+ * above) are reused here — this block is a parallel, row-oriented rule set.
+ */
+.project-rail-top {
+  container-name: project-rail-top;
+  container-type: inline-size;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.project-rail-top::-webkit-scrollbar {
+  display: none;
+}
+
+/* Horizontal icons keep the same 40x40 circle by default; the vertical
+   left-edge active-indicator bar doesn't apply in a row layout, so it's
+   suppressed below and the existing is-active fill/border-radius treatment
+   (not geometry-locked, reused as-is) carries the active state instead. */
+.project-rail-item.is-horizontal {
+  flex-shrink: 0;
+}
+
+.project-rail-item.is-active.is-horizontal::before {
+  content: none;
+}
+
+.project-rail-top-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--nim-text, #111827);
+}
+
+/* Narrow top bar with several open projects: shrink circles and clamp the
+   expanded name before the row overflows horizontally. */
+@container project-rail-top (max-width: 420px) {
+  .project-rail-item.is-horizontal {
+    width: 28px;
+    height: 28px;
+  }
+
+  .project-rail-top-name {
+    max-width: 120px;
+  }
+}
+
