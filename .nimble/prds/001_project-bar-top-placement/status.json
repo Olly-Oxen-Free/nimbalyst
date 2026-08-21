@@ -1,0 +1,14 @@
+{
+  "slug": "project-bar-top-placement",
+  "status": "ready",
+  "created_at": "2026-08-20T00:00:00Z",
+  "tracker": {
+    "issue_key": null,
+    "item_id": "plan_1787289447069_qb6yvp",
+    "type": "plan",
+    "created_at": "2026-08-21T00:00:00Z",
+    "escalations": [],
+    "publish_status": "unassigned",
+    "publish_note": "tracker_update published:true failed — 'No document service is available to change Draft/Published state. Open the workspace and retry.' Retry when workspace is open."
+  }
+}
