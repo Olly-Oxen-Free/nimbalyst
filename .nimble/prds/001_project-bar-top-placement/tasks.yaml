@@ -274,17 +274,20 @@ tasks:
       - "Unit or component test confirms the position control in AdvancedPanel is hidden when multi-project mode is off, and the display-mode control is hidden when position != 'top'"
       - "Test confirms WindowTopBar renders the active project's full name (from activeOpenProjectAtom) when position = 'top', and renders today's static workspace-name behavior unchanged when position = 'left'"
       - "No presentation-only tests (icon names, exact pixel positions) per this repo's testing conventions — assert behavior/className, not visual detail"
-      - "None of the three target test files exist yet (verified during PRD review) — this task creates all three as new files following the closest existing sibling test file's setup/mocking conventions in the same directory, not from a blank template"
+      - "openProjects.test.ts and WindowTopBar.test.tsx already exist (verified during brief generation, correcting an earlier PRD assumption) — extend them with new cases rather than creating parallel files; only AdvancedPanel.test.tsx is genuinely new"
     files_affected:
-      - "packages/electron/src/renderer/store/atoms/openProjects.test.ts"
-      - "packages/electron/src/renderer/components/GlobalSettings/panels/AdvancedPanel.test.tsx"
-      - "packages/electron/src/renderer/components/WindowTopBar/WindowTopBar.test.tsx"
+      - "packages/electron/src/renderer/store/atoms/__tests__/openProjects.test.ts"
+      - "packages/electron/src/renderer/components/GlobalSettings/panels/__tests__/AdvancedPanel.test.tsx"
+      - "packages/electron/src/renderer/components/WindowTopBar/__tests__/WindowTopBar.test.tsx"
     agent_context: |
       Follow this repo's testing rules: mock the narrowest module (never
       the @nimbalyst/runtime barrel), add // @vitest-environment node to
       any test that never touches the DOM, never assert on component
       source text via readFileSync, and never use getBy*(...).toBeTruthy().
-      All three files are new — look at an adjacent existing test file
-      in the same directory (e.g. a sibling *.test.tsx under
-      GlobalSettings/panels/ or WindowTopBar/) for the mocking pattern
-      to follow rather than inventing one from scratch.
+      openProjects.test.ts and WindowTopBar.test.tsx already exist under
+      __tests__/ — extend them, don't duplicate. Only AdvancedPanel.test.tsx
+      under GlobalSettings/panels/__tests__/ is new; follow a sibling test
+      file's mocking pattern there (e.g. DatabasePanel.test.tsx's narrow
+      deep-path mock, not SyncPanel.test.tsx's @nimbalyst/runtime
+      barrel-spread mock, which this repo's CLAUDE.md names as the
+      anti-pattern to avoid).

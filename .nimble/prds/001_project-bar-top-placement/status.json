@@ -1,7 +1,11 @@
 {
   "slug": "project-bar-top-placement",
-  "status": "ready",
+  "status": "executing",
   "created_at": "2026-08-20T00:00:00Z",
+  "execution_mode": "feature-branch",
+  "branch_strategy": "use-worktree-branch-directly",
+  "branch": "worktree/project-bar-movement",
+  "phase": "1-brief-generation",
   "tracker": {
     "issue_key": null,
     "item_id": "plan_1787289447069_qb6yvp",

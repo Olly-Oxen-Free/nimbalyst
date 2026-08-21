@@ -25,7 +25,7 @@ file_conflicts_checked:
   wave_2_note: "2b edits ProjectRailIcon.tsx created by 1b in wave 1 - ordering, not conflict"
   wave_3: "4a alone - WindowTopBar.tsx, ProjectRailIcon.tsx, ProjectRail.css"
   wave_4: "4b alone - WindowTopBar.tsx, ProjectRail.css (overlaps 4a's files, hence serialized after it via depends_on)"
-  wave_5: "5a touches only new test files - disjoint from all prior waves"
+  wave_5: "5a touches test files - disjoint from all prior waves. Correction from brief generation: openProjects.test.ts and WindowTopBar.test.tsx already exist (extend, not create); only AdvancedPanel.test.tsx is new"
 
 model_assignments:
   "1a": { complexity: 4, model: "sonnet" }
