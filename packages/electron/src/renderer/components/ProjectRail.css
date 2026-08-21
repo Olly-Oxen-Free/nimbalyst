@@ -345,3 +345,71 @@
   }
 }
 
+/*
+ * R9 (task 4a): circle-to-text expand animation + left<->top crossfade.
+ *
+ * Scope note: the active project never renders as a circle in the
+ * top-docked bar (task 3a renders it directly as expanded-name text, per
+ * R5) — there is no literal circle DOM node to morph from. The "expand in
+ * place" effect below is a mount-triggered shape/size keyframe on the
+ * name element itself; WindowTopBar.tsx remounts that element (via a
+ * `key` on the active project's path) on load and on every active-project
+ * switch so the animation restarts cleanly instead of stacking.
+ *
+ * The left<->top transition (requirement 2) is a plain crossfade/slide on
+ * mount of whichever container the position setting causes to render
+ * (`.project-rail` or `.project-rail-top`) — not a cross-tree shared-
+ * element morph, since no shared-layout-animation library is a dependency
+ * of this codebase.
+ */
+@keyframes nim-project-rail-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.project-rail,
+.project-rail-top {
+  animation: nim-project-rail-fade-in 180ms ease;
+}
+
+@keyframes nim-project-rail-expand-name {
+  from {
+    max-width: 28px;
+    border-radius: 999px;
+    background-color: var(--nim-bg-tertiary, #2a2a2a);
+    padding-inline: 4px;
+  }
+  to {
+    max-width: 240px;
+    border-radius: 4px;
+    background-color: transparent;
+    padding-inline: 0;
+  }
+}
+
+.project-rail-top-name {
+  display: inline-block;
+  border-radius: 4px;
+  animation: nim-project-rail-expand-name 220ms ease;
+}
+
+/*
+ * No `prefers-reduced-motion` convention exists elsewhere in
+ * packages/electron (the only monorepo precedent is
+ * packages/collab-bundle/src/editor/browserChrome.css) — this establishes
+ * the first instance of the pattern within this package.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .project-rail,
+  .project-rail-top,
+  .project-rail-top-name {
+    animation: none !important;
+  }
+}
+

@@ -471,6 +471,12 @@ function TopDockedProjectBar({ workspaceName }: { workspaceName: string }) {
   return (
     <div className="window-top-bar__identity-rail project-rail-top flex items-center justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)]">
       <div
+        // Keyed on the active project's path so this whole block remounts
+        // (and its CSS mount animation, `nimProjectRailExpandName` in
+        // ProjectRail.css, restarts cleanly) both on initial load in the
+        // top-docked state and on every subsequent active-project switch
+        // (R9) — rather than stacking/queuing animations on prop changes.
+        key={activeOpenProject?.path ?? 'none'}
         className={`window-top-bar__identity-active flex items-center gap-1 min-w-0 ${NO_DRAG_REGION}`}
         onContextMenu={
           activeOpenProject
