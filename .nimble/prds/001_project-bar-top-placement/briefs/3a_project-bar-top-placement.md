@@ -65,11 +65,21 @@ brief did not exist at the time this brief was generated** — see the dedicated
 "1b Dependency — Verify Before Starting," before touching `WindowTopBar.tsx`.
 
 This task fulfills PRD requirements **R4** (structural DOM merge), **R5** (active project's full
-name replaces static workspace name), and **R6** (full interaction parity: switch/close/add, every
-interactive element `NO_DRAG_REGION`'d, empty space stays draggable). It does **not** cover R9 (the
-animated circle↔text transition — task 4a, which depends on this task) or R8 (hover-reveal — task
-4b). Your job is the correct static end-state DOM structure and full interactivity; 4a layers an
-animation on top of what you build, it does not change what state exists.
+name replaces static workspace name), **R6** (full interaction parity: switch/close/add, every
+interactive element `NO_DRAG_REGION`'d, empty space stays draggable), and — added during reviewer
+validation, see "Context Menu — Added Scope" below — the context-menu portion of **R7** ("context
+menus reposition below instead of beside"). It does **not** cover R9 (the animated circle↔text
+transition — task 4a, which depends on this task) or R8 (hover-reveal — task 4b). Your job is the
+correct static end-state DOM structure and full interactivity; 4a layers an animation on top of
+what you build, it does not change what state exists.
+
+**Scope correction from pre-execution review:** the original task brief and `tasks.yaml` omitted
+building a context menu for the top-docked position entirely. 1b's `ProjectRailIconProps` makes
+`onContextMenu` a required prop, and R7 requires context menus to exist and reopen downward in the
+top-docked layout — but neither 1b (deliberately, per-consumer) nor 2b (files out of scope) build
+the menu UI itself, and it was originally missing from this task's Composition Plan too. It is
+folded into this task now (see the new section below) rather than becoming a ninth task, since this
+is the only task with `WindowTopBar.tsx` in scope.
 
 ---
 
@@ -326,6 +336,35 @@ bar space stays a functioning drag region."
 Do not attempt the circle→text animation here (4a's job) — a plain conditional swap between "render
 circle" and "render expanded name text" for the active project is the correct scope for this task.
 
+### Context Menu — Added Scope (from pre-execution review)
+
+`ProjectRail.tsx`'s current right-click context menu (`ProjectRail.tsx:298-417`) — "Open in new
+window" / reveal-in-Finder / "Close project" — has its own `useFloating()` instance in the parent
+`ProjectRail()` container (`ProjectRail.tsx:372-392`, virtual cursor reference, `placement:
+'right-start'`, `windowControlsClearance()` middleware, local `{x, y}` state set from the click
+event). 1b keeps this in `ProjectRail.tsx`, not `ProjectRailIcon.tsx`, "per-consumer" — meaning
+**this task must build its own instance in `WindowTopBar.tsx`**, mirroring that pattern:
+
+- A new `useFloating()` call in `WindowTopBar.tsx`, virtual reference from the right-click event's
+  `{x, y}`, `placement: 'bottom-start'` (not `'right-start'` — R7 requires menus to open downward
+  in the top-docked layout, not sideways), `windowControlsClearance()` middleware, rendered through
+  `FloatingPortal`.
+- Local `contextMenuProject`/`{x, y}` state in `WindowTopBar.tsx` (or lifted into whatever 1b's hook
+  exposes, if it exposes menu-open state — check 1b's actual landed shape first).
+- Wire the menu's actions (open in new window, reveal in Finder, close project) to 1b's shared
+  handlers rather than reimplementing the underlying IPC calls — same principle as the add-project
+  flow: 1b's widened scope exists precisely so this task doesn't reimplement business logic.
+- Attach `onContextMenu` to both the active-project element (piece 1) and each non-active circle
+  (piece 2) — every icon needs the same right-click behavior it has today in the left rail.
+- This is new UI code in `WindowTopBar.tsx`, not a reuse of `ProjectRail.tsx`'s menu component (that
+  component isn't exported for reuse per 1b's per-consumer design) — expect to write a comparable
+  amount of floating-ui wiring here as `ProjectRail.tsx:298-417` has today, adapted for
+  `'bottom-start'` placement.
+
+If 1b's actual landed hook exposes a ready-made `openContextMenu`/`closeContextMenu`/
+`contextMenuProject` state triple (as its own brief describes), use that instead of inventing new
+local state — check `briefs/1b_project-bar-top-placement.md` and 1b's landed code before wiring.
+
 ---
 
 ## Success Criteria
@@ -339,6 +378,8 @@ Complete ALL criteria before marking task done:
 - [ ] Close-project and add-project controls both function in the top-docked position
 - [ ] Every interactive element has explicit NO_DRAG_REGION; dragging the window from empty bar space still works
 - [ ] When multiProjectModeAtom is false and position = 'top', WindowTopBar shows no rail remnant — falls back to today's static workspace-name display, matching ProjectRail's existing return-null gating
+- [ ] Right-click on a project circle (or the expanded active-project name) opens a context menu in the top-docked position, positioned via its own useFloating() instance in WindowTopBar.tsx, opening downward (placement: 'bottom-start') per R7, wired to 1b's shared context-menu actions — see "Context Menu — Added Scope" above
+- [ ] The add-project (+) control's dropdown menu is a visibly positioned floating-ui element in WindowTopBar.tsx, not just a button that fires the IPC call with no visible menu
 
 **All criteria must pass before task is complete.** Per this repo's `end-to-end-verification.md`
 rule: this task's verification (dragging the window, clicking a circle) requires manually
@@ -535,7 +576,7 @@ names, internal structure) for this task alone.
 ## Validation Checklist
 
 Before creating PR / handing off for the integration review:
-- [ ] All success criteria met, including the two that require manually exercising the running app (click a circle, drag the window)
+- [ ] All success criteria met, including the ones that require manually exercising the running app (click a circle, drag the window, right-click a circle to confirm the context menu opens downward, click the + button to confirm a visible dropdown appears)
 - [ ] Build passes: `npm run build`
 - [ ] Type check passes: `npm run typecheck`
 - [ ] No `never_touch` files modified

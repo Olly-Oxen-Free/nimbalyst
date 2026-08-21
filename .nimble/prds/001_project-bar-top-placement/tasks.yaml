@@ -138,9 +138,10 @@ tasks:
       - "packages/electron/src/renderer/components/ProjectRail.css"
       - "packages/electron/src/renderer/components/ProjectRailIcon.tsx"
     agent_context: |
-      ProjectRail.css:1-14 and 73-81 are the vertical-only styles that
-      must NOT be reused for this variant. Per UI_PATTERNS.md, use
-      @container queries, not @media. Per REACT_DOM_MARKERS.md, keep a
+      ProjectRail.css:1-14 and 66-75 (verified during brief generation;
+      tasks.yaml previously cited 73-81, drifted) are the vertical-only
+      styles that must NOT be reused for this variant. Per UI_PATTERNS.md,
+      use @container queries, not @media. Per REACT_DOM_MARKERS.md, keep a
       stable kebab-case class on the component root for this layout too.
 
   - id: "3a"
@@ -168,6 +169,8 @@ tasks:
       - "Close-project and add-project controls both function in the top-docked position"
       - "Every interactive element has explicit NO_DRAG_REGION; dragging the window from empty bar space still works"
       - "When multiProjectModeAtom is false and position = 'top', WindowTopBar shows no rail remnant — falls back to today's static workspace-name display, matching ProjectRail's existing return-null gating"
+      - "Right-click on a project circle (or the expanded active-project name) opens a context menu in the top-docked position, positioned via its own useFloating() instance in WindowTopBar.tsx (mirroring ProjectRail.tsx's existing context-menu pattern, opening downward per R7), wired to 1b's shared context-menu actions — this was missing from the original task scope (caught in reviewer validation: 1b's ProjectRailIconProps makes onContextMenu a required prop, and R7 requires context menus to exist in the top-docked position, but no task originally built the menu itself since 1b/2b deliberately keep floating-ui positioning per-consumer)"
+      - "The add-project (+) control's dropdown menu is a visibly positioned floating-ui element in WindowTopBar.tsx (its own useFloating() instance, not just the IPC handler being wired) — a bare button with no visible menu does not satisfy this criterion"
     files_affected:
       - "packages/electron/src/renderer/App.tsx"
       - "packages/electron/src/renderer/components/WindowTopBar/WindowTopBar.tsx"
