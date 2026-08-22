@@ -1,0 +1,47 @@
+{
+  "configured_at": "2026-08-21T23:19:00-04:00",
+  "orchestration_version": 2,
+  "orchestration": {
+    "integration": {
+      "cadence": "worktree",
+      "auto_merge_on_green": false
+    },
+    "review": {
+      "trigger": "per-task",
+      "scope": "pr-diff",
+      "skip_if_diff_under": 0,
+      "on_findings": "halt",
+      "providers": {
+        "greptile": { "fire_at": [], "on_findings": "halt" },
+        "code-review": { "fire_at": [], "on_findings": "halt" }
+      },
+      "mode": "manual",
+      "note": "No automated review provider configured in .nimble/config.yaml (review.enabled: false, provider: null, none_behavior: manual). Task PRs target feature/ollama-provider and wait for human review/merge; nothing auto-merges unreviewed."
+    },
+    "gates": {
+      "model": "pause",
+      "auto_place": false,
+      "placements": [],
+      "conditions": {
+        "require_tests_pass": true,
+        "require_build_pass": true,
+        "max_critical_findings": 0
+      }
+    }
+  },
+  "models": {
+    "default": "sonnet",
+    "complexity_threshold": 5,
+    "force_opus_tasks": [],
+    "force_sonnet_tasks": [],
+    "escalation": {
+      "after_failures": 1,
+      "triggers": ["architectural_issues", "type_system_issues"]
+    }
+  },
+  "max_revision_loops": 3,
+  "allow_bypass": {
+    "future_work_overlap": true,
+    "false_positive_factual": true
+  }
+}
