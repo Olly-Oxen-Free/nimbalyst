@@ -191,16 +191,12 @@ None — no task in this PRD depends on T3. T2a and T2b build the separate `olla
 
 ## Commit Guidelines
 
-Use Conventional Commits:
+Use Conventional Commits, no `Co-Authored-By` trailer — this repo's `CLAUDE.md` forbids it outright:
 ```
 feat(opencode): add Ollama coding-agent bridge
-
-Co-Authored-By: Claude <noreply@anthropic.com>
 ```
 
 Types: feat, fix, refactor, test, docs, chore
-
-Note: this repo's own `CLAUDE.md` says "Don't add `Co-Authored-By` lines to commit messages" for work done directly in an interactive Claude Code session. If this brief is executed by an autonomous NIMBLE worker agent under a different attribution convention, follow whatever convention the orchestrating `/nimble:run` invocation specifies; otherwise omit the `Co-Authored-By` trailer to match repo convention.
 
 ---
 

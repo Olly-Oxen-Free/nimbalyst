@@ -36,8 +36,13 @@ Full detail: `.nimble/prds/001_ollama-provider/research/findings.md`. Task-relev
 
 - **Panel structure:** `packages/electron/src/renderer/components/GlobalSettings/panels/LMStudioPanel.tsx` (142 lines) is the exact template — props shape (`config`, `apiKeys`, `availableModels`, `loading`, `onToggle`, `onApiKeyChange`, `onModelToggle`, `onSelectAllModels`, `onTestConnection`, `onConfigChange`), the `SettingsToggle` enable switch, base-URL input + "Test"/"Testing.../✓ Connected/✗ Failed" button, and the model checkbox grid with Select All / Deselect All / Refresh Models.
 - **Settings routing:** `SettingsView.tsx:874-875` — `case 'lmstudio': return wrapWithOverride('lmstudio', 'LM Studio', <LMStudioPanel {...commonProps} />);` is the exact shape to add for `'ollama'`.
-- **Sidebar entry:** `SettingsSidebar.tsx:148` — `{ id: 'lmstudio', scope: 'application', group: 'Chat Providers', label: 'LM Studio', icon: 'memory', isAvailable: directChatProvidersVisible }`.
-- **Route type + icon lookup:** `settingsRoutes.ts:17` (the `SettingsRouteId` union includes `'lmstudio'`) and `settingsRoutes.ts:42` (`routeIcon()`'s provider-icon allow-list array includes `'lmstudio'`).
+- **Sidebar entry:** `settingsRoutes.ts:148` (in `builtinSettingsRouteDefinitions`) — `{ id: 'lmstudio', scope: 'application', group: 'Chat Providers', label: 'LM Studio', icon: 'memory', isAvailable: directChatProvidersVisible }`.
+- **Route type + icon lookup:** `settingsRoutes.ts:15` (the `ApplicationSettingsCategory` union includes `'lmstudio'`) and `SettingsSidebar.tsx:41-42` (`routeIcon()`'s provider-icon allow-list array includes `'lmstudio'`).
+
+[Corrected during brief review: the routes array and the ApplicationSettingsCategory union both
+live in `settingsRoutes.ts`, not `SettingsSidebar.tsx`; `routeIcon()` lives in `SettingsSidebar.tsx`,
+not `settingsRoutes.ts`. There is no `SettingsRouteId` type in this codebase — the original brief
+draft named one that doesn't exist. Corrected below and in the Files-to-Modify table.]
 - **Model formatting:** `modelUtils.ts:182,197,220,248` — four `case 'lmstudio':` branches for display name, badge text, and two model-name-cleanup functions (strip `-GGUF` suffix, truncate long names).
 - **Model picker grouping:** `ModelSelector.tsx:264` (membership switch that routes `'lmstudio'` through the generic per-provider path) and `:318` (`case 'lmstudio': return 'LMStudio';` group-header label).
 - **aiApi provider union:** `aiApi.ts:340` — `provider?: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'lmstudio'` needs `'ollama'` added.
@@ -103,8 +108,8 @@ Source of truth: `tasks.yaml`'s `T2b` entry (refined through a PRD-review pass) 
 
 1. **`GlobalSettings/panels/OllamaPanel.tsx`** (new file) — modeled directly on `LMStudioPanel.tsx`: a base-URL field defaulting to `http://localhost:11434` and a connection-test button, same enable-toggle / models-grid / Select-All-Deselect-All / Refresh-Models structure.
 2. **`SettingsView.tsx`** — add a `case 'ollama':` in the provider switch (~line 874-875) returning `wrapWithOverride('ollama', 'Ollama', <OllamaPanel {...commonProps} />)`.
-3. **`SettingsSidebar.tsx`** — add an `'ollama'` entry to the routes array (mirrors `lmstudio`'s at line 148: `group: 'Chat Providers'`, `isAvailable: directChatProvidersVisible`; pick a distinct icon from LM Studio's `memory`, e.g. `hub` or similar — confirm it renders via `MaterialSymbol`).
-4. **`settingsRoutes.ts`** — add `'ollama'` to the `SettingsRouteId` union (~line 17) and to `routeIcon()`'s provider-icon allow-list array (~line 42).
+3. **`settingsRoutes.ts`** — add an `'ollama'` entry to the `builtinSettingsRouteDefinitions` routes array (mirrors `lmstudio`'s at line 148: `group: 'Chat Providers'`, `isAvailable: directChatProvidersVisible`; pick a distinct icon from LM Studio's `memory`, e.g. `hub` or similar — confirm it renders via `MaterialSymbol`), and add `'ollama'` to the `ApplicationSettingsCategory` union (~line 15).
+4. **`SettingsSidebar.tsx`** — add `'ollama'` to `routeIcon()`'s provider-icon allow-list array (~lines 41-42).
 5. **`Settings/panels/ProjectAIProvidersPanel.tsx`** (per-project override, a *separate* surface from `OllamaPanel.tsx`) — add `{ id: 'ollama', name: 'Ollama', subtitle: 'Local Models' }` to the `PROVIDERS` array (~line 55).
 6. **`store/atoms/appSettings.ts`** — add `ollama: { enabled: false, baseUrl: 'http://localhost:11434', testStatus: 'idle' }` (~line 1203) and `ollama_url: 'http://localhost:11434'` (~line 1215) to the default-settings atoms, mirroring the `lmstudio` entries exactly.
 7. **`UnifiedAI/ModelSelector.tsx`** — add `'ollama'` to the provider-membership switch (~line 264) and a `case 'ollama': return 'Ollama';` group-header label (~line 318).
@@ -142,8 +147,8 @@ Complete ALL criteria before marking task done (verbatim from `tasks.yaml`):
 | `packages/electron/src/renderer/components/GlobalSettings/panels/OllamaPanel.tsx` | create | New settings panel, modeled on `LMStudioPanel.tsx` |
 | `packages/electron/src/renderer/store/atoms/appSettings.ts` | modify | Add `ollama` provider default + `ollama_url` default (mirrors lines 1203, 1215) |
 | `packages/electron/src/renderer/components/Settings/SettingsView.tsx` | modify | Add `case 'ollama':` to the provider-panel switch (~line 874-875) |
-| `packages/electron/src/renderer/components/Settings/SettingsSidebar.tsx` | modify | Add `'ollama'` sidebar route entry (~line 148) |
-| `packages/electron/src/renderer/components/Settings/settingsRoutes.ts` | modify | Add `'ollama'` to `SettingsRouteId` union and icon allow-list (~lines 17, 42) |
+| `packages/electron/src/renderer/components/Settings/settingsRoutes.ts` | modify | Add `'ollama'` route entry to `builtinSettingsRouteDefinitions` (~line 148) and to the `ApplicationSettingsCategory` union (~line 15) |
+| `packages/electron/src/renderer/components/Settings/SettingsSidebar.tsx` | modify | Add `'ollama'` to `routeIcon()`'s provider-icon allow-list (~lines 41-42) |
 | `packages/electron/src/renderer/components/Settings/panels/ProjectAIProvidersPanel.tsx` | modify | Add `ollama` to the per-project `PROVIDERS` array (~line 55) |
 | `packages/electron/src/renderer/components/UnifiedAI/ModelSelector.tsx` | modify | Add `ollama` to provider switch + group-header label (~lines 264, 318) |
 | `packages/electron/src/renderer/utils/modelUtils.ts` | modify | Add `ollama` display/badge/cleanup branches (~lines 182, 197, 220, 248) |
