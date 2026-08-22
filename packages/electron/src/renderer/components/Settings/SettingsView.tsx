@@ -28,6 +28,7 @@ import { OpenAICodexPanel } from '../GlobalSettings/panels/OpenAICodexPanel';
 import { OpenCodePanel } from '../GlobalSettings/panels/OpenCodePanel';
 import { CopilotCLIPanel } from '../GlobalSettings/panels/CopilotCLIPanel';
 import { LMStudioPanel } from '../GlobalSettings/panels/LMStudioPanel';
+import { OllamaPanel } from '../GlobalSettings/panels/OllamaPanel';
 import { AdvancedPanel } from '../GlobalSettings/panels/AdvancedPanel';
 import { DatabasePanel } from '../GlobalSettings/panels/DatabasePanel';
 import { AgentFeaturesPanel } from './AgentFeaturesPanel';
@@ -898,6 +899,8 @@ export function SettingsView({
         return wrapWithOverride('copilot-cli', 'GitHub Copilot', <CopilotCLIPanel {...commonProps} />);
       case 'lmstudio':
         return wrapWithOverride('lmstudio', 'LM Studio', <LMStudioPanel {...commonProps} />);
+      case 'ollama':
+        return wrapWithOverride('ollama', 'Ollama', <OllamaPanel {...commonProps} />);
       case 'advanced':
         // AdvancedPanel is self-contained - uses Jotai atoms and IPC directly
         return <AdvancedPanel />;

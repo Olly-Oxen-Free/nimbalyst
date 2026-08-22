@@ -1706,6 +1706,8 @@ export const RichTranscriptView = React.forwardRef<
         return 'OpenAI';
       case 'lmstudio':
         return 'LM Studio';
+      case 'ollama':
+        return 'Ollama';
       default:
         return 'Agent';
     }

@@ -337,7 +337,7 @@ class AIApi {
   async createSession(
     documentContext?: DocumentContext,
     workspacePath?: string,
-    provider?: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'lmstudio',
+    provider?: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'lmstudio' | 'ollama',
     modelId?: string,
     sessionType?: string
   ): Promise<SessionData> {

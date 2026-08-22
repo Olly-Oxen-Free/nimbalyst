@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_LM_STUDIO_BASE_URL,
+  DEFAULT_OLLAMA_BASE_URL,
   hasConfiguredDirectChatProvider,
   isDirectChatProviderMeaningfullyConfigured,
   isProviderVisible,
@@ -23,10 +24,12 @@ describe('chat provider visibility policy', () => {
       claude: { enabled: false },
       openai: { enabled: false, models: [] },
       lmstudio: { enabled: false, baseUrl: DEFAULT_LM_STUDIO_BASE_URL },
+      ollama: { enabled: false, baseUrl: DEFAULT_OLLAMA_BASE_URL },
     }, {
       anthropic: '   ',
       openai: '',
       lmstudio_url: `${DEFAULT_LM_STUDIO_BASE_URL}/`,
+      ollama_url: `${DEFAULT_OLLAMA_BASE_URL}/`,
     });
 
     expect(hasConfiguredDirectChatProvider(snapshot)).toBe(false);
@@ -40,6 +43,8 @@ describe('chat provider visibility policy', () => {
     ['provider API key', settings({ openai: { apiKey: 'sk-project' } }), 'openai'],
     ['non-default LM Studio URL', settings({ lmstudio: { baseUrl: 'http://localhost:1234' } }), 'lmstudio'],
     ['legacy LM Studio URL', settings({}, { lmstudio_url: 'http://localhost:1234' }), 'lmstudio'],
+    ['non-default Ollama URL', settings({ ollama: { baseUrl: 'http://localhost:9999' } }), 'ollama'],
+    ['legacy Ollama URL', settings({}, { ollama_url: 'http://localhost:9999' }), 'ollama'],
   ] as const)('recognizes %s as meaningful configuration', (_label, snapshot, providerId) => {
     expect(isDirectChatProviderMeaningfullyConfigured(providerId, snapshot)).toBe(true);
     expect(shouldShowDirectChatProviderSettings(false, snapshot)).toBe(true);

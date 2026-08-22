@@ -1,14 +1,29 @@
-export const DIRECT_CHAT_PROVIDER_IDS = ['claude', 'openai', 'lmstudio'] as const;
+export const DIRECT_CHAT_PROVIDER_IDS = ['claude', 'openai', 'lmstudio', 'ollama'] as const;
 
 export type DirectChatProviderId = typeof DIRECT_CHAT_PROVIDER_IDS[number];
 
 export const DEFAULT_LM_STUDIO_BASE_URL = 'http://127.0.0.1:8234';
+export const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
 
 const directChatProviderIds = new Set<string>(DIRECT_CHAT_PROVIDER_IDS);
 
 const apiKeyNames: Partial<Record<DirectChatProviderId, string>> = {
   claude: 'anthropic',
   openai: 'openai',
+};
+
+// Local providers are "meaningfully configured" via a non-default base URL
+// rather than an API key -- each has its own default, so this must stay a
+// per-provider lookup rather than a shared constant (LM Studio's default port
+// and Ollama's are different, and conflating them would misreport visibility).
+const localProviderDefaultBaseUrls: Partial<Record<DirectChatProviderId, string>> = {
+  lmstudio: DEFAULT_LM_STUDIO_BASE_URL,
+  ollama: DEFAULT_OLLAMA_BASE_URL,
+};
+
+const localProviderUrlApiKeyNames: Partial<Record<DirectChatProviderId, string>> = {
+  lmstudio: 'lmstudio_url',
+  ollama: 'ollama_url',
 };
 
 export interface ChatProviderConfigSnapshot {
@@ -56,12 +71,15 @@ export function isDirectChatProviderMeaningfullyConfigured(
     return true;
   }
 
-  if (providerId !== 'lmstudio') {
+  const localDefaultBaseUrl = localProviderDefaultBaseUrls[providerId];
+  if (!localDefaultBaseUrl) {
     return false;
   }
 
-  const defaultBaseUrl = normalizeBaseUrl(DEFAULT_LM_STUDIO_BASE_URL);
-  return [config?.baseUrl, settings.apiKeys.lmstudio_url].some((baseUrl) =>
+  const defaultBaseUrl = normalizeBaseUrl(localDefaultBaseUrl);
+  const urlApiKeyName = localProviderUrlApiKeyNames[providerId];
+  const urlApiKeyValue = urlApiKeyName ? settings.apiKeys[urlApiKeyName] : undefined;
+  return [config?.baseUrl, urlApiKeyValue].some((baseUrl) =>
     hasText(baseUrl) && normalizeBaseUrl(baseUrl!) !== defaultBaseUrl,
   );
 }

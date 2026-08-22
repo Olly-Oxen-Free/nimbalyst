@@ -180,6 +180,7 @@ export function getProviderDisplayName(provider: string): string {
     case 'claude-code-cli': return 'Claude Code CLI';
     case 'openai': return 'OpenAI';
     case 'lmstudio': return 'LMStudio';
+    case 'ollama': return 'Ollama';
     case 'copilot-cli': return 'GitHub Copilot';
     default: return provider;
   }
@@ -195,6 +196,7 @@ export function getProviderLabel(provider: string): string {
     case 'claude-code-cli': return 'CLI';
     case 'openai': return 'GPT';
     case 'lmstudio': return 'LOCAL';
+    case 'ollama': return 'LOCAL';
     default: return provider.toUpperCase();
   }
 }
@@ -226,6 +228,15 @@ export function getModelDisplayName(provider: string, modelId: string): string {
       .replace(/\b\w/g, l => l.toUpperCase());
   }
 
+  if (provider === 'ollama') {
+    // Ollama tags (e.g. "qwen2.5-coder:14b") don't carry LM Studio's GGUF
+    // quantization suffixes -- split family/tag and title-case the family,
+    // keeping the tag intact so distinct sizes stay distinguishable.
+    const [family, tag] = modelId.split(':');
+    const prettyFamily = family.replace(/[-_]/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+    return tag ? `${prettyFamily} (${tag})` : prettyFamily;
+  }
+
   return modelId;
 }
 
@@ -250,6 +261,12 @@ export function getModelShortName(provider: string, modelId: string): string {
     const clean = modelId.replace(/-GGUF$/i, '').replace(/-Q[0-9]_K_[A-Z]/i, '');
     if (clean.length > 15) return clean.substring(0, 12) + '...';
     return clean;
+  }
+
+  if (provider === 'ollama') {
+    // Ollama tags don't carry GGUF suffixes to strip -- just truncate as-is.
+    if (modelId.length > 15) return modelId.substring(0, 12) + '...';
+    return modelId;
   }
 
   // Default truncation for unknown providers

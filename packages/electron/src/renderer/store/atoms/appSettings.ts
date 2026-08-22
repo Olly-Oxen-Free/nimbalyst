@@ -1201,6 +1201,7 @@ const defaultProviders: Record<string, ProviderConfig> = {
   opencode: { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
   'copilot-cli': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
   lmstudio: { enabled: false, baseUrl: 'http://127.0.0.1:8234', testStatus: 'idle' },
+  ollama: { enabled: false, baseUrl: 'http://localhost:11434', testStatus: 'idle' },
 };
 
 /**
@@ -1213,6 +1214,7 @@ const defaultApiKeys: Record<string, string> = {
   'openai-codex': '',
   opencode: '',
   lmstudio_url: 'http://127.0.0.1:8234',
+  ollama_url: 'http://localhost:11434',
 };
 
 /**
