@@ -24,6 +24,7 @@ interface OpenCodePanelProps {
 
 type CLIStatus = 'checking' | 'installed' | 'not-installed' | 'installing' | 'install-error';
 type LMStudioStatus = 'idle' | 'configuring' | 'success' | 'error';
+type OllamaStatus = 'idle' | 'configuring' | 'success' | 'error';
 
 interface OpenCodeConfigReadResponse {
   success: boolean;
@@ -39,6 +40,13 @@ interface OpenCodeConfigMergeResponse {
 }
 
 interface OpenCodeLMStudioResponse {
+  success: boolean;
+  config?: OpenCodeFileConfig;
+  modelIds?: string[];
+  error?: string;
+}
+
+interface OpenCodeOllamaResponse {
   success: boolean;
   config?: OpenCodeFileConfig;
   modelIds?: string[];
@@ -63,8 +71,11 @@ export function OpenCodePanel({
   const [configError, setConfigError] = useState<string | null>(null);
   const [lmStudioStatus, setLmStudioStatus] = useState<LMStudioStatus>('idle');
   const [lmStudioMessage, setLmStudioMessage] = useState<string | null>(null);
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus>('idle');
+  const [ollamaMessage, setOllamaMessage] = useState<string | null>(null);
 
   const existingBridgeBaseUrl = openCodeConfig?.provider?.lmstudio?.options?.baseURL as string | undefined;
+  const existingOllamaBridgeBaseUrl = openCodeConfig?.provider?.ollama?.options?.baseURL as string | undefined;
 
   // The LM Studio bridge URL field. Default to LM Studio's standard local port;
   // if opencode.json already contains a bridge entry we seed from that exactly
@@ -78,6 +89,19 @@ export function OpenCodePanel({
       seededFromConfig.current = true;
     }
   }, [existingBridgeBaseUrl]);
+
+  // The Ollama bridge URL field. Default to Ollama's standard local port;
+  // if opencode.json already contains a bridge entry we seed from that exactly
+  // once via the ref guard so an async config load doesn't cause a render loop.
+  const [ollamaBaseUrl, setOllamaBaseUrl] = useState<string>('http://localhost:11434');
+  const seededOllamaFromConfig = useRef(false);
+  useEffect(() => {
+    if (seededOllamaFromConfig.current) return;
+    if (existingOllamaBridgeBaseUrl) {
+      setOllamaBaseUrl(existingOllamaBridgeBaseUrl.replace(/\/v\d+\/?$/, ''));
+      seededOllamaFromConfig.current = true;
+    }
+  }, [existingOllamaBridgeBaseUrl]);
 
   const checkCLI = useCallback(async () => {
     setCLIStatus('checking');
@@ -200,10 +224,56 @@ export function OpenCodePanel({
     }
   };
 
+  const handleConnectOllama = async () => {
+    setOllamaStatus('configuring');
+    setOllamaMessage(null);
+    try {
+      const response = await window.electronAPI.invoke('opencode-config:upsert-ollama', {
+        baseUrl: ollamaBaseUrl,
+        modelIds: [],
+        autoDiscoverModels: true,
+        displayName: 'Ollama (local)',
+      }) as OpenCodeOllamaResponse;
+      if (response.success && response.config) {
+        setOpenCodeConfig(response.config);
+        setOllamaStatus('success');
+        const count = response.modelIds?.length ?? 0;
+        setOllamaMessage(`Configured ${count} ${count === 1 ? 'model' : 'models'} from Ollama.`);
+      } else {
+        setOllamaStatus('error');
+        setOllamaMessage(response.error ?? 'Failed to configure Ollama bridge');
+      }
+    } catch (err) {
+      setOllamaStatus('error');
+      setOllamaMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDisconnectOllama = async () => {
+    setOllamaStatus('configuring');
+    try {
+      const response = await window.electronAPI.invoke('opencode-config:remove-ollama') as OpenCodeConfigMergeResponse;
+      if (response.success) {
+        setOpenCodeConfig(response.config ?? null);
+        setOllamaStatus('idle');
+        setOllamaMessage(null);
+      } else {
+        setOllamaStatus('error');
+        setOllamaMessage(response.error ?? 'Failed to remove Ollama bridge');
+      }
+    } catch (err) {
+      setOllamaStatus('error');
+      setOllamaMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
   const selectedModel = openCodeConfig?.model ?? '';
   const lmStudioBridgeConfigured = !!openCodeConfig?.provider?.lmstudio;
   const lmStudioBridgeModelCount = openCodeConfig?.provider?.lmstudio?.models
     ? Object.keys(openCodeConfig.provider.lmstudio.models).length
+    : 0;
+  const ollamaBridgeConfigured = !!openCodeConfig?.provider?.ollama;
+  const ollamaBridgeModelCount = openCodeConfig?.provider?.ollama?.models
+    ? Object.keys(openCodeConfig.provider.ollama.models).length
     : 0;
   const autoUpdateOptedOut = openCodeConfig?.autoupdate === false;
 
@@ -340,6 +410,54 @@ export function OpenCodePanel({
             {lmStudioMessage && (
               <div className={`text-xs mt-2 ${lmStudioStatus === 'error' ? 'text-[var(--nim-error)]' : 'text-[var(--nim-text-muted)]'}`}>
                 {lmStudioMessage}
+              </div>
+            )}
+          </div>
+
+          <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
+            <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Ollama integration</h4>
+            <p className="text-[13px] text-[var(--nim-text-muted)] mb-3 leading-relaxed">
+              Point at a running Ollama server and Nimbalyst will query <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">/api/tags</code>,
+              then write a <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">provider.ollama</code> block into your <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">opencode.json</code>.
+              You don't need to enable Ollama as a separate Nimbalyst chat provider.
+            </p>
+            <div className="flex items-center gap-2 flex-wrap mb-2">
+              <input
+                data-testid="opencode-ollama-base-url"
+                type="text"
+                value={ollamaBaseUrl}
+                onChange={(e) => { setOllamaBaseUrl(e.target.value); seededOllamaFromConfig.current = true; }}
+                onFocus={(e) => e.target.select()}
+                placeholder="http://localhost:11434"
+                className="flex-1 min-w-[220px] py-2 px-3 rounded-md bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] text-[var(--nim-text)] outline-none font-mono focus:border-[var(--nim-primary)]"
+              />
+              <button
+                data-testid="opencode-ollama-connect"
+                className="inline-flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium cursor-pointer transition-all bg-[var(--nim-primary)] text-white border border-[var(--nim-primary)] hover:opacity-90 disabled:opacity-60 disabled:cursor-wait"
+                onClick={handleConnectOllama}
+                disabled={ollamaStatus === 'configuring' || !ollamaBaseUrl.trim()}
+              >
+                {ollamaStatus === 'configuring' ? 'Configuring...' : (ollamaBridgeConfigured ? 'Refresh' : 'Connect')}
+              </button>
+              {ollamaBridgeConfigured && (
+                <button
+                  data-testid="opencode-ollama-disconnect"
+                  className="inline-flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium cursor-pointer transition-all bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)] border border-[var(--nim-border)] hover:bg-[var(--nim-bg-hover)]"
+                  onClick={handleDisconnectOllama}
+                  disabled={ollamaStatus === 'configuring'}
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            {ollamaBridgeConfigured && (
+              <p className="text-xs text-[var(--nim-text-muted)]">
+                Bridge active with {ollamaBridgeModelCount} {ollamaBridgeModelCount === 1 ? 'model' : 'models'}. Select one above to use it as the default.
+              </p>
+            )}
+            {ollamaMessage && (
+              <div className={`text-xs mt-2 ${ollamaStatus === 'error' ? 'text-[var(--nim-error)]' : 'text-[var(--nim-text-muted)]'}`}>
+                {ollamaMessage}
               </div>
             )}
           </div>
