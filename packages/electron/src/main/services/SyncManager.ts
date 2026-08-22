@@ -1244,10 +1244,12 @@ async function getAvailableModelsForMobile(): Promise<{ models: Array<{ id: stri
     if (providerSettings['openai-codex']?.enabled === true) enabledSet.add('openai-codex');
     if (providerSettings['openai-codex-acp']?.enabled === true) enabledSet.add('openai-codex-acp');
     if (providerSettings['lmstudio']?.enabled === true) enabledSet.add('lmstudio');
+    if (providerSettings['ollama']?.enabled === true) enabledSet.add('ollama');
 
     const modelsConfig = {
       ...apiKeys,
-      lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234'
+      lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234',
+      ollama_url: providerSettings['ollama']?.baseUrl || 'http://localhost:11434'
     };
     const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledSet as Set<any>);
     // Filter to enabled models (model-level filtering for specific model selection)

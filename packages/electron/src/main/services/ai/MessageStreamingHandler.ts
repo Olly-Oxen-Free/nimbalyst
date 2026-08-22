@@ -556,6 +556,10 @@ export class MessageStreamingHandler {
             // LMStudio doesn't need an API key, just the base URL
             apiKey = 'not-required'; // Dummy value since LMStudio doesn't need a key
             break;
+          case 'ollama':
+            // Ollama doesn't need an API key, just the base URL
+            apiKey = 'not-required'; // Dummy value since Ollama doesn't need a key
+            break;
           default:
             throw new Error(`Unknown provider: ${session.provider}`);
         }
@@ -613,6 +617,12 @@ export class MessageStreamingHandler {
       if (session.provider === 'lmstudio') {
         const providerSettings = this.svc.getSettingsStore().get('providerSettings', {}) as any;
         reinitConfig.baseUrl = providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234';
+      }
+
+      // Add baseUrl for Ollama
+      if (session.provider === 'ollama') {
+        const providerSettings = this.svc.getSettingsStore().get('providerSettings', {}) as any;
+        reinitConfig.baseUrl = providerSettings['ollama']?.baseUrl || 'http://localhost:11434';
       }
 
       // Pass model to provider config for all providers including claude-code
@@ -741,7 +751,7 @@ export class MessageStreamingHandler {
     // their runtime config from the persisted session before each send so a
     // cached provider cannot keep an empty or stale model after the picker
     // updates session.model and invalidates the prior instance.
-    if (['claude', 'openai', 'lmstudio'].includes(session.provider)) {
+    if (['claude', 'openai', 'lmstudio', 'ollama'].includes(session.provider)) {
       let expectedModel: string | undefined;
       const fullModel = session.model || session.providerConfig?.model;
       if (fullModel) {
@@ -762,10 +772,10 @@ export class MessageStreamingHandler {
       const currentModel = ((provider as any).config as ProviderConfig | undefined)?.model;
       if (expectedModel && currentModel !== expectedModel) {
         const effectiveWorkspacePath = session.workspacePath || workspacePath;
-        const apiKey = session.provider === 'lmstudio'
+        const apiKey = session.provider === 'lmstudio' || session.provider === 'ollama'
           ? 'not-required'
           : this.svc.getApiKeyForProvider(session.provider, effectiveWorkspacePath);
-        if (!apiKey && session.provider !== 'lmstudio') {
+        if (!apiKey && session.provider !== 'lmstudio' && session.provider !== 'ollama') {
           throw new Error(session.provider === 'openai' ? 'OpenAI API key not configured' : 'Anthropic API key not configured');
         }
 
@@ -779,6 +789,11 @@ export class MessageStreamingHandler {
         if (session.provider === 'lmstudio') {
           const providerSettings = this.svc.getSettingsStore().get('providerSettings', {}) as any;
           refreshedConfig.baseUrl = providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234';
+        }
+
+        if (session.provider === 'ollama') {
+          const providerSettings = this.svc.getSettingsStore().get('providerSettings', {}) as any;
+          refreshedConfig.baseUrl = providerSettings['ollama']?.baseUrl || 'http://localhost:11434';
         }
 
         await provider.initialize(refreshedConfig);

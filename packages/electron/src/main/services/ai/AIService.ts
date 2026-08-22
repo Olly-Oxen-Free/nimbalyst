@@ -720,6 +720,11 @@ export class AIService {
                 enabled: false,
                 testStatus: "idle",
                 baseUrl: "http://127.0.0.1:8234"
+              },
+              ollama: {
+                enabled: false,
+                testStatus: "idle",
+                baseUrl: "http://localhost:11434"
               }
             }
           },
@@ -791,6 +796,8 @@ export class AIService {
       case 'openai-codex':
         return globalApiKeys['openai-codex'];
       case 'lmstudio':
+        return 'not-required';
+      case 'ollama':
         return 'not-required';
       default:
         return globalApiKeys[provider];
@@ -1853,6 +1860,11 @@ export class AIService {
                          providerSettings['lmstudio']?.models?.length > 0;
       if (hasLMStudio) return true;
 
+      // Check Ollama (doesn't need API key but needs enabled models)
+      const hasOllama = providerSettings['ollama']?.enabled === true &&
+                         providerSettings['ollama']?.models?.length > 0;
+      if (hasOllama) return true;
+
       return false;
     });
 
@@ -1957,6 +1969,9 @@ export class AIService {
             break;
           case 'lmstudio':
             // LMStudio doesn't need an API key, just the base URL
+            break;
+          case 'ollama':
+            // Ollama doesn't need an API key, just the base URL
             break;
           default:
             throw new Error(`Unknown provider: ${provider}`);
@@ -2107,6 +2122,13 @@ export class AIService {
         const lmstudioSettings = this.getSettingsStore().get('providerSettings.lmstudio', {}) as any;
         const storedApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
         initConfig.baseUrl = lmstudioSettings.baseUrl || storedApiKeys['lmstudio_url'] || 'http://127.0.0.1:8234';
+      }
+
+      // Add Ollama-specific config
+      if (provider === 'ollama') {
+        const ollamaSettings = this.getSettingsStore().get('providerSettings.ollama', {}) as any;
+        const storedApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
+        initConfig.baseUrl = ollamaSettings.baseUrl || storedApiKeys['ollama_url'] || 'http://localhost:11434';
       }
 
       // Pass through allowedTools and effort level settings for Claude Code
@@ -3272,6 +3294,10 @@ export class AIService {
           // lmstudio_url is a regular setting -- no masking, just write it.
           safeSet('ai.apiKey.lmstudio_url', settings.apiKeys.lmstudio_url);
         }
+        if (settings.apiKeys.ollama_url !== undefined) {
+          // ollama_url is a regular setting -- no masking, just write it.
+          safeSet('ai.apiKey.ollama_url', settings.apiKeys.ollama_url);
+        }
       }
 
       if (settings.providerSettings && typeof settings.providerSettings === 'object') {
@@ -3383,6 +3409,10 @@ export class AIService {
             break;
           case 'lmstudio':
             // LMStudio doesn't need an API key, just test the connection
+            apiKey = 'not-required';
+            break;
+          case 'ollama':
+            // Ollama doesn't need an API key, just test the connection
             apiKey = 'not-required';
             break;
           default:
@@ -3558,6 +3588,16 @@ export class AIService {
           }
         }
 
+        // For Ollama, test the endpoint
+        if (provider === 'ollama') {
+          const providerSettings = this.getSettingsStore().get('providerSettings', {}) as any;
+          const baseUrl = providerSettings['ollama']?.baseUrl || 'http://localhost:11434';
+          const response = await fetch(`${baseUrl}/v1/models`);
+          if (!response.ok) {
+            throw new Error(`Ollama server not responding at ${baseUrl}`);
+          }
+        }
+
         return { success: true, provider };
       } catch (error: any) {
         return { success: false, error: error.message };
@@ -3583,10 +3623,12 @@ export class AIService {
       if (providerSettings['openai-codex']?.enabled === true) enabledSet.add('openai-codex');
       if (providerSettings['opencode']?.enabled === true) enabledSet.add('opencode');
       if (providerSettings['lmstudio']?.enabled === true) enabledSet.add('lmstudio');
+      if (providerSettings['ollama']?.enabled === true) enabledSet.add('ollama');
 
       const modelsConfig = {
         ...apiKeys,
-        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234'
+        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234',
+        ollama_url: providerSettings['ollama']?.baseUrl || 'http://localhost:11434'
       };
       const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledSet);
 
@@ -3831,8 +3873,6 @@ export class AIService {
           hiddenModels: providerSettings['lmstudio']?.hiddenModels
         },
         'ollama': {
-          // Full wiring (settings schema, connection test, etc.) lands in a
-          // follow-up task; this stub only keeps AIProviderType exhaustiveness green.
           enabled: providerSettings['ollama']?.enabled === true,
           models: providerSettings['ollama']?.models,
           hiddenModels: providerSettings['ollama']?.hiddenModels
@@ -3847,7 +3887,8 @@ export class AIService {
       );
       const modelsConfig = {
         ...apiKeys,
-        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234'
+        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234',
+        ollama_url: providerSettings['ollama']?.baseUrl || 'http://localhost:11434'
       };
       const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledProviderSet);
 
@@ -4177,7 +4218,7 @@ export class AIService {
 
     // Extension SDK: List available chat models
     safeHandle('extensions:ai-list-models', async () => {
-      const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio'];
+      const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio', 'ollama'];
       const providerSettings = this.getNormalizedProviderSettings() as any;
       const globalApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
 
@@ -4191,7 +4232,9 @@ export class AIService {
         const apiKey = provider === 'claude' ? globalApiKeys['anthropic']
           : provider === 'openai' ? globalApiKeys['openai']
           : undefined;
-        const baseUrl = provider === 'lmstudio' ? (globalApiKeys['lmstudio_url'] || undefined) : undefined;
+        const baseUrl = provider === 'lmstudio' ? (globalApiKeys['lmstudio_url'] || undefined)
+          : provider === 'ollama' ? (globalApiKeys['ollama_url'] || undefined)
+          : undefined;
 
         try {
           const models = await ModelRegistry.getModelsForProvider(provider, apiKey, baseUrl);
@@ -4465,13 +4508,13 @@ export class AIService {
 
   /**
    * Resolve which chat provider and config to use for an extension completion request.
-   * Only chat providers (claude, openai, lmstudio) are supported.
+   * Only chat providers (claude, openai, lmstudio, ollama) are supported.
    */
   private async resolveExtensionChatProvider(
     event: Electron.IpcMainInvokeEvent,
     options: { model?: string; maxTokens?: number; temperature?: number; responseFormat?: any }
   ): Promise<{ provider: AIProvider; providerConfig: ProviderConfig; providerType: AIProviderType; syntheticSessionId: string }> {
-    const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio'];
+    const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio', 'ollama'];
 
     // Determine provider from model ID or find first available
     let providerType: AIProviderType | undefined;
@@ -4506,12 +4549,12 @@ export class AIService {
     }
 
     if (!providerType) {
-      throw new Error('No chat provider available. Enable Claude, OpenAI, or LM Studio in Settings > AI.');
+      throw new Error('No chat provider available. Enable Claude, OpenAI, LM Studio, or Ollama in Settings > AI.');
     }
 
     // Get API key
     const apiKey = this.getApiKeyForProvider(providerType);
-    if (providerType !== 'lmstudio' && !apiKey) {
+    if (providerType !== 'lmstudio' && providerType !== 'ollama' && !apiKey) {
       throw new Error(`API key not configured for provider ${providerType}. Configure it in Settings > AI.`);
     }
 
@@ -4535,6 +4578,12 @@ export class AIService {
     if (providerType === 'lmstudio') {
       const globalApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
       providerConfig.baseUrl = globalApiKeys['lmstudio_url'] || 'http://127.0.0.1:1234';
+    }
+
+    // Ollama needs baseUrl
+    if (providerType === 'ollama') {
+      const globalApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
+      providerConfig.baseUrl = globalApiKeys['ollama_url'] || 'http://localhost:11434';
     }
 
     const syntheticSessionId = `ext-completion-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

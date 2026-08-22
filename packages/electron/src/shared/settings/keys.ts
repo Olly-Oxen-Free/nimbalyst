@@ -134,6 +134,11 @@ export const SETTINGS_REGISTRY = {
     { store: 'ai-settings', path: 'providerSettings.lmstudio' },
     { enabled: false, baseUrl: 'http://127.0.0.1:8234', testStatus: 'idle' },
   ),
+  'ai.provider.ollama': setting(
+    ProviderConfigSchema,
+    { store: 'ai-settings', path: 'providerSettings.ollama' },
+    { enabled: false, baseUrl: 'http://localhost:11434', testStatus: 'idle' },
+  ),
 
   // ---- API keys (per-key) ----
   'ai.apiKey.anthropic': setting(
@@ -168,6 +173,11 @@ export const SETTINGS_REGISTRY = {
     z.string(),
     { store: 'ai-settings', path: 'apiKeys.lmstudio_url' },
     'http://127.0.0.1:8234',
+  ),
+  'ai.apiKey.ollama_url': setting(
+    z.string(),
+    { store: 'ai-settings', path: 'apiKeys.ollama_url' },
+    'http://localhost:11434',
   ),
 
   // ---- Other AI-domain settings ----
