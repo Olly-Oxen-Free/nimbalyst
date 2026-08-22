@@ -10,6 +10,7 @@ export * from './providers/OpenAICodexProvider';
 export * from './providers/OpenAICodexACPProvider';
 export * from './providers/ProviderPermissionMixin';
 export * from './providers/LMStudioProvider';
+export * from './providers/OllamaProvider';
 export * from './providers/OpenCodeProvider';
 export * from './providers/openCode/OpenCodeConfigTypes';
 export * from './providers/openCode/OpenCodeModelCatalog';

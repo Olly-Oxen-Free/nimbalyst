@@ -102,6 +102,7 @@ export const BUILTIN_AGENT_CAPABILITIES: Readonly<Record<AIProviderType, AgentCa
   claude: TOKEN_COUNT_ONLY_CAPABILITIES,
   openai: TOKEN_COUNT_ONLY_CAPABILITIES,
   lmstudio: TOKEN_COUNT_ONLY_CAPABILITIES,
+  ollama: TOKEN_COUNT_ONLY_CAPABILITIES,
 
   // The Claude Agent SDK reports its own commands and skills in the init
   // payload and interprets `/compact` as a real command.

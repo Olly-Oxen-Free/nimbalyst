@@ -3829,6 +3829,13 @@ export class AIService {
           enabled: providerSettings['lmstudio']?.enabled === true,
           models: providerSettings['lmstudio']?.models,
           hiddenModels: providerSettings['lmstudio']?.hiddenModels
+        },
+        'ollama': {
+          // Full wiring (settings schema, connection test, etc.) lands in a
+          // follow-up task; this stub only keeps AIProviderType exhaustiveness green.
+          enabled: providerSettings['ollama']?.enabled === true,
+          models: providerSettings['ollama']?.models,
+          hiddenModels: providerSettings['ollama']?.hiddenModels
         }
       };
 

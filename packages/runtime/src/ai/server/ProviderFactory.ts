@@ -10,6 +10,7 @@ import { OpenAIProvider } from './providers/OpenAIProvider';
 import { OpenAICodexProvider } from './providers/OpenAICodexProvider';
 import { OpenAICodexACPProvider } from './providers/OpenAICodexACPProvider';
 import { LMStudioProvider } from './providers/LMStudioProvider';
+import { OllamaProvider } from './providers/OllamaProvider';
 import { OpenCodeProvider } from './providers/OpenCodeProvider';
 import { CopilotCLIProvider } from './providers/CopilotCLIProvider';
 import { ExtensionAgentProvider } from './providers/ExtensionAgentProvider';
@@ -78,6 +79,9 @@ export class ProviderFactory {
         break;
       case 'lmstudio':
         provider = new LMStudioProvider();
+        break;
+      case 'ollama':
+        provider = new OllamaProvider();
         break;
       case 'copilot-cli':
         provider = new CopilotCLIProvider();
