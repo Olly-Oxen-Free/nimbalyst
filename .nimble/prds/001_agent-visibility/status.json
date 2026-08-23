@@ -35,8 +35,11 @@
     "1b": { "status": "queued", "wave": 1, "model": "opus" },
     "2a": { "status": "queued", "wave": 2, "model": "sonnet" },
     "3a": { "status": "queued", "wave": 2, "model": "opus" },
+    "4a": { "status": "queued", "wave": 2, "model": "opus" },
     "2b": { "status": "queued", "wave": 3, "model": "opus" },
     "3b": { "status": "queued", "wave": 3, "model": "opus" },
+    "4b": { "status": "queued", "wave": 3, "model": "opus" },
+    "4c": { "status": "queued", "wave": 3, "model": "sonnet" },
     "2c": { "status": "queued", "wave": 4, "model": "opus" },
     "2d": { "status": "queued", "wave": 5, "model": "sonnet" },
     "5a": { "status": "queued", "wave": 6, "model": "sonnet" }

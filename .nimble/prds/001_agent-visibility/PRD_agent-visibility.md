@@ -78,6 +78,10 @@ its thread and lets you message it directly. A different teammate crashes mid-ru
 thread gets a distinct notification instead of the same "all completed" chime a clean finish
 produces.
 
+**Amendment note:** This PRD was later extended (2026-08-22) to also cover stall/hang detection
+and wake-delivery reliability for Teammates and Task sub-agents (R10-R12), alongside the original
+status/chip-row/notification scope.
+
 **Primary risk:** `TeammateManager`'s error/idle paths and `MessageStreamingHandler.onTeammatesAllCompleted`
 are tightly coupled to the existing "clean finish" completion-sound behavior
 (`TeammateManager.ts:1264-1289`, `MessageStreamingHandler.ts:1109-1136`). Wiring in a
@@ -111,6 +115,17 @@ noticing a stalled task — the exact failure mode the tracker item was filed to
 chat experience to parity with native Claude Code sub-agent visibility, which the tracker item
 calls "native functionality... lacking in nimbalyst."
 
+### Amendment Context (2026-08-22): Stall/Hang Detection and Wake-Delivery Gaps
+
+This amendment (R10-R12, tasks 4a-4c) was triggered by a user-reported recurring failure: "a
+spawned agent designed to report back either never reports, or the main session never wakes." The
+motivating example was observed concretely in this project's own NIMBLE agent-orchestration
+workflow — `/nimble:run`'s `nimble-pm` agent spawning worker agents via the `Agent` tool with no
+timeout on the spawn call (see `research/findings.md`, "Additional Research" section). However,
+NIMBLE's own worker-liveness gap lives in a separate sibling repo (the `nimble` plugin itself,
+`.claude/plugins/nimble/agents/pm.md`) and is explicitly **out of scope** for this PRD/codebase —
+it needs to be raised separately in that other project.
+
 ---
 
 ## 3. Goals, Non-Goals & Success Metrics
@@ -142,6 +157,10 @@ calls "native functionality... lacking in nimbalyst."
 - Bringing Meta-Agent Mode's chip row / click-to-thread into scope — it already has both
   (`MetaAgentMode.tsx:550-559` open-in-agent, `:538-542` pending-prompt label); only its
   notification gap is closed here (Goal 4).
+- NIMBLE's own `nimble-pm` worker-liveness gap (the `Agent`-tool spawn call in
+  `.claude/plugins/nimble/agents/pm.md` has no timeout/watchdog). This lives in a separate sibling
+  repo (the `nimble` plugin), not this codebase, and must be raised as its own item in that
+  project — see §2 Amendment Context.
 
 ### Success Metrics
 
@@ -167,6 +186,9 @@ calls "native functionality... lacking in nimbalyst."
 | R5 | Click a Teammate chip → opens/loads that teammate's own thread and allows sending it a message directly, extending `scrollToTeammateAtom` (`TeammatePanel.tsx:61-63`) into a real open-and-communicate flow using `TeammateManager.appendToInbox`/`flushPendingMessages` (`TeammateManager.ts:957-1011`). | Clicking a teammate chip navigates to/opens its thread (not just scrolls); a message typed and sent reaches the teammate; verified via IPC-level or integration test, not just a UI screenshot. |
 | R6 | Click a Task sub-agent chip → shows a read-only status/tool-use popover (`@floating-ui/react`, per `floating-ui.md`), not a thread — Task sub-agent transcripts stay hidden by design. | Clicking a Task chip opens a popover with current status/tool name only; no navigation; no attempt to surface the hidden transcript. |
 | R7 | Wire `notificationService.showBlockedNotification` into `TeammateManager`'s error/crash paths (`TeammateManager.ts:1264-1289`) and `MessageStreamingHandler.onTeammatesAllCompleted` (`:1109-1136`) so an errored or crashed teammate produces a distinct main-thread notification, never the same completion sound as a clean finish. | A teammate that errors triggers `showBlockedNotification` (or equivalent distinct signal), not the success chime; a teammate that crashes without an explicit error also notifies; regression test confirms a clean multi-teammate run still plays the unchanged success sound. |
+| R10 | **Teammate stream-stall watchdog.** `TeammateManager.spawnTeammate`'s core loop (`packages/runtime/src/ai/server/providers/TeammateManager.ts:1493`, a plain `for await`) has no timeout — a teammate whose process hangs with no error and no chunk produces no signal at all. `lastActiveAt` is tracked per-chunk (`TeammateManager.ts:1524`) but its only read site is a cosmetic "last active Xm ago" label (`TeammatePanel.tsx:324-325`); nothing polls it. Add a watchdog reusing the pattern/helper already used for the lead session's own stall detection (`streamStallWatchdog.ts`, e.g. `raceNextChunkWithStallWatchdog`) so a stalled teammate transitions to `errored` and fires the distinct notification established by R7/task 3a — not left waiting forever. | A teammate whose stream produces no chunk within the timeout window transitions to `errored` and fires `showBlockedNotification` (or equivalent); a healthy teammate producing chunks normally is unaffected; regression test proves both. |
+| R11 | **Concurrent Task sub-agent stall masking.** After the lead's own result arrives, `armPromptEndTimer`'s grace timer (`ClaudeCodeProvider.ts:1038-1052`, `SUBAGENT_DRAIN_GRACE_MS` = 5 min) resets on ANY subsequent chunk regardless of which concurrent Task sub-agent produced it (`ClaudeCodeProvider.ts:1197-1200`, `grace-period-reset-on-activity`). The pre-result `shouldArmStreamStallWatchdog` (`streamStallWatchdog.ts:56-66`) is a different, correctly-scoped mechanism and is NOT the bug — the solo-sub-agent case is already covered correctly by the existing 5-minute post-result grace timer, since nothing else resets it when only one sub-agent is running. The real gap: when multiple Task sub-agents drain concurrently post-result, one genuinely stalled sub-agent is masked indefinitely by a healthy sibling's activity resetting the single shared timer. Add per-task-id last-activity tracking (mirroring the `lastActiveAt` pattern already used for Teammates, `TeammateManager.ts:1524`) so a stalled task can be individually detected even while siblings remain healthy. | With two concurrent Task sub-agents, one stalled and one healthy, the stalled one is still detected within a bounded window, not masked by the healthy sibling; a solo sub-agent's existing 5-minute reap behavior is unaffected; the pre-result watchdog's arming condition is not modified; regression test proves both. |
+| R12 | **`onTeammateMessageWhileIdle` silent-drop fallback.** `onTeammateMessageWhileIdle` (`packages/electron/src/main/services/ai/MessageStreamingHandler.ts:1054-1106`) is the real mechanism that resumes the main session when a completed teammate's message arrives — but delivery is silently dropped in three cases: `findWindowByWorkspace` (`packages/electron/src/main/window/WindowManager.ts:810`) returns null (workspace's window closed), the found window is destroyed, or `sendMessageHandler` is absent. None of these fire a notification today. Add a fallback: when delivery isn't possible for any of these reasons, fire `showBlockedNotification` (or equivalent) instead of silently dropping the message. | Each of the three drop cases (no window, destroyed window, no handler) fires a notification instead of silent drop; the working case (window exists, not destroyed, handler present) is unchanged; regression test proves all four cases. |
 
 ### Should Have (important, not blocking)
 
@@ -255,8 +277,10 @@ dependency identified.
 | Files | Tasks | Note |
 | ----- | ----- | ---- |
 | `packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx` | 1a, 2b, 2c | `TeammateInfo.status` is actually declared here (not in `agentMode.ts`, which only imports the type); 1a adds the `blocked` value here, and 2b/2c both extend this file later. Sequential per the dependency chain (2b depends on 2a which depends on 1a; 2c depends on 2b) — no real conflict. |
-| `packages/runtime/src/ai/server/providers/TeammateManager.ts` | 1a, 3a | 3a depends on 1a; sequential by construction. |
+| `packages/runtime/src/ai/server/providers/TeammateManager.ts` | 1a, 3a, 4b | 3a depends on 1a; 4b depends on 3a — 4b adds a stall watchdog to the same spawn loop 3a's error-path notification wiring touches; sequential by construction. |
+| `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts` | 1b, 4a | 4a depends on 1b — 1b touches the canUseTool routing (:3648/:3705-3760), 4a touches the post-result drain-grace timer (:1038-1052/:1197-1200), different sections of the same file; sequential by construction. |
 | `packages/electron/src/main/services/NotificationService.ts` | 3a, 3b | 3b depends on 3a; sequential by construction. |
+| `packages/electron/src/main/services/ai/MessageStreamingHandler.ts` | 3a, 4c | 4c depends on 3a — 3a wires notification into `onTeammatesAllCompleted`, 4c adds the missing `else` branch/fallback notification to `onTeammateMessageWhileIdle`; sequential by construction. |
 | New chip-row component file (path TBD by investigator/brief-writer, e.g. `packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx`) | 2b, 2c, 2d | 2c and 2d both extend the same new component; sequencing is now enforced structurally via `2d depends_on 2c` (2c in wave 4, 2d in wave 5) rather than left as prose-only PM guidance. |
 
 ### Risks & Mitigations
@@ -414,7 +438,10 @@ this is an internal verification/gap-closure PRD; no new dependency is introduce
 | 2d | Read-only status popover for Task sub-agent chips | 3 | sonnet | should | 2b |
 | 3a | Guarantee distinct notification on Teammate error/crash | 6 | opus | must | 1a |
 | 3b | Extend guaranteed notification to Meta-Agent Mode | 5 | opus | should | 3a |
-| 5a | CHANGELOG entry and final review gate | 1 | sonnet | must | 2c, 2d, 3b |
+| 4a | Fix concurrent Task sub-agent stall masking | 6 | opus | must | 1b |
+| 4b | Add Teammate stream-stall watchdog | 6 | opus | must | 3a |
+| 4c | Fix onTeammateMessageWhileIdle silent-drop fallback | 3 | sonnet | must | 3a |
+| 5a | CHANGELOG entry and final review gate | 1 | sonnet | must | 2c, 2d, 3b, 4a, 4b, 4c |
 
 ---
 
@@ -452,7 +479,7 @@ was made by default rather than asked. **Review this section before approving ex
    before task 2b's brief is finalized.
 
 5. **Orchestration and complexity assessment (Round 2.5/2.6), computed rather than asked:**
-   9 tasks, 6 waves, 42 total complexity points, 0 high-risk (7+) tasks — below all three
+   12 tasks, 6 waves, 57 total complexity points, 0 high-risk (7+) tasks — below all three
    points/task/wave slicing thresholds. (Complexity was 41/5 waves at initial planning; task 1b
    was bumped from 5 to 6 to account for the added investigation step required to confirm a
    correlation key for attributing blocked permission prompts to individual Task sub-agents, and
@@ -486,4 +513,19 @@ was made by default rather than asked. **Review this section before approving ex
 
 8. **No PostHog analytics event added.** Chip-row interactions are not instrumented in this PRD
    (Q5 in §9); deferred to the architect's judgment at PR review rather than assumed either way.
+
+9. **Amendment recorded (2026-08-22), human-directed.** R10-R12 and tasks 4a-4c were added by
+   explicit human direction, not as a default resolved during a non-interactive interview round —
+   unlike items 1-8 above. `total_complexity` changed from 42 to 57 as a result; `task_count`
+   changed from 9 to 12. See §2 Amendment Context for the triggering report and the NIMBLE
+   worker-liveness non-goal it surfaced.
+
+10. **R11 re-scoped after re-review (2026-08-22).** The first draft of R11/task 4a targeted the
+    wrong mechanism — it claimed a lone Task sub-agent running solo had no stall protection and
+    proposed changing `shouldArmStreamStallWatchdog`'s arming condition. Re-review against the
+    actual code showed the solo case is already handled correctly by the existing 5-minute
+    post-result `SUBAGENT_DRAIN_GRACE_MS` grace timer; the real, evidenced gap is that the same
+    shared timer resets on ANY concurrent sub-agent's activity, masking one stalled sibling while
+    another stays healthy. R11 and task 4a were corrected to target that instead — see R11's text
+    above for the corrected mechanism.
 ```

@@ -7,8 +7,8 @@
 metadata:
   prd_slug: "agent-visibility"
   created_at: "2026-08-20T22:03:20Z"
-  total_complexity: 42
-  task_count: 9
+  total_complexity: 57
+  task_count: 12
 
 tasks:
   - id: "1a"
@@ -332,6 +332,125 @@ tasks:
     deliverables: []
     deliverables_note: "Nothing beyond the code — the regression test proving normal completion is unaffected is part of the code deliverable."
 
+  - id: "4a"
+    title: "Fix concurrent Task sub-agent stall masking"
+    description: |
+      After the lead's own result arrives, `armPromptEndTimer`'s grace timer
+      (ClaudeCodeProvider.ts:1038-1052, SUBAGENT_DRAIN_GRACE_MS = 5 min) resets on ANY
+      subsequent chunk regardless of which concurrent Task sub-agent produced it
+      (ClaudeCodeProvider.ts:1197-1200, "grace-period-reset-on-activity"). The pre-result
+      `shouldArmStreamStallWatchdog` (streamStallWatchdog.ts:56-66) is a different,
+      correctly-scoped mechanism for before the lead's result arrives and is NOT the bug here —
+      do not touch its arming condition; the solo-sub-agent case is already covered correctly by
+      the existing 5-minute post-result grace timer, since nothing else resets it when only one
+      sub-agent is running.
+
+      The real gap: when multiple Task sub-agents are draining concurrently post-result, one
+      genuinely stalled sub-agent is masked indefinitely by a healthy sibling's activity resetting
+      the single shared timer — the grace period never expires as long as *some* sub-agent is
+      active. Add per-task-id last-activity tracking (mirroring the `lastActiveAt` pattern already
+      used for Teammates, TeammateManager.ts:1524) so a stalled task can be individually detected
+      and reaped/flagged even while siblings remain healthy.
+
+      Fulfills requirement R11.
+    depends_on: ["1b"]
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "With two concurrent Task sub-agents, one stalled and one healthy and actively producing chunks, the stalled one is still detected/flagged within a bounded window — not masked indefinitely by the healthy sibling"
+      - "A solo sub-agent's existing 5-minute grace-timer reap behavior (already correct today) is unaffected"
+      - "The pre-result `shouldArmStreamStallWatchdog` arming condition is NOT modified by this task"
+      - "Regression test proves both: concurrent-stall detection now fires, and solo/healthy cases are unregressed"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts"
+    agent_context: |
+      Write the regression test FIRST per end-to-end-verification.md: reproduce "one stalled Task
+      sub-agent is masked by a healthy concurrent sibling's activity resetting the shared grace
+      timer" as a failing test, then make the fix flip it green. Do not declare this task done on
+      "the code path looks right."
+
+      File overlap: this task and 1b both touch ClaudeCodeProvider.ts (1b at the canUseTool
+      routing, :3648/:3705-3760; a different section). 4a depends_on 1b to avoid conflicting edits
+      in the same file.
+
+      This file is not in .nimble/config.yaml's require_review list, so this task does not require
+      the human-review gate on its own.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — the regression test proving the fix is itself part of the code deliverable, not a separate artifact."
+
+  - id: "4b"
+    title: "Add Teammate stream-stall watchdog"
+    description: |
+      `TeammateManager.spawnTeammate`'s core loop (packages/runtime/src/ai/server/providers/
+      TeammateManager.ts:1493, a plain `for await`) has no timeout — a teammate whose process
+      hangs with no error and no chunk produces no signal at all. `lastActiveAt` is tracked
+      per-chunk (TeammateManager.ts:1524) but its only read site is a cosmetic "last active Xm ago"
+      label (TeammatePanel.tsx:324-325); nothing polls it. Add a watchdog reusing the
+      pattern/helper already used for the lead session's own stall detection
+      (streamStallWatchdog.ts, e.g. raceNextChunkWithStallWatchdog) so a stalled teammate
+      transitions to `errored` and fires the distinct notification established by R7/task 3a — not
+      left waiting forever.
+
+      Fulfills requirement R10.
+    depends_on: ["3a"]
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "A teammate whose stream produces no chunk within the timeout window transitions to `errored`"
+      - "The stalled-teammate transition fires `showBlockedNotification` (or equivalent) established by task 3a"
+      - "A healthy teammate producing chunks normally is unaffected"
+      - "Regression test proves both: stalled detection now fires, and healthy teammates are unregressed"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+    agent_context: |
+      Reuse the streamStallWatchdog.ts pattern (raceNextChunkWithStallWatchdog) rather than
+      building a new timeout mechanism from scratch — this is the same NIM-1481 bug class already
+      fixed for the lead session, reproduced unfixed on TeammateManager.ts:1493.
+
+      Write the regression test FIRST per end-to-end-verification.md.
+
+      File overlap: this task and 3a both touch TeammateManager.ts. 4b depends_on 3a to avoid file
+      conflict — 3a's error/crash notification wiring must land first so this task's stall-timeout
+      path can call into it.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — the regression test proving the fix is itself part of the code deliverable, not a separate artifact."
+
+  - id: "4c"
+    title: "Fix onTeammateMessageWhileIdle silent-drop fallback"
+    description: |
+      `onTeammateMessageWhileIdle` (packages/electron/src/main/services/ai/
+      MessageStreamingHandler.ts:1054-1106) is the real mechanism that resumes the main session
+      when a completed teammate's message arrives — but the delivery is silently dropped in three
+      cases: `findWindowByWorkspace` (packages/electron/src/main/window/WindowManager.ts:810)
+      returns null (workspace's window closed), the found window is destroyed
+      (`targetWindow.isDestroyed()`), or `this.svc.sendMessageHandler` is absent. None of these
+      currently fire a notification. Add a fallback: when delivery isn't possible for any of these
+      three reasons, fire `showBlockedNotification` (or equivalent) instead of silently dropping
+      the message.
+
+      Fulfills requirement R12.
+    depends_on: ["3a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "When the target window doesn't exist, a notification fires instead of silent drop"
+      - "When the target window exists but is destroyed, a notification fires instead of silent drop"
+      - "When sendMessageHandler is absent, a notification fires instead of silent drop"
+      - "When the window exists, is not destroyed, and the handler is present, existing resume behavior is unchanged"
+      - "Regression test proves all four cases"
+    files_affected:
+      - "packages/electron/src/main/services/ai/MessageStreamingHandler.ts"
+    agent_context: |
+      Write the regression test FIRST per end-to-end-verification.md: simulate window-not-found
+      and prove the message is currently dropped silently, then prove the fallback notification
+      fires.
+
+      File overlap: this task and 3a both touch MessageStreamingHandler.ts. 4c depends_on 3a to
+      avoid file conflict — 3a wires notification into `onTeammatesAllCompleted`, this task adds
+      the missing `else` branch to `onTeammateMessageWhileIdle`.
+    deliverables: []
+    deliverables_note: "Nothing beyond the code — the regression test proving the fix is itself part of the code deliverable, not a separate artifact."
+
   - id: "5a"
     title: "CHANGELOG entry and final review gate"
     description: |
@@ -344,7 +463,7 @@ tasks:
       This task touches CHANGELOG.md, which is in .nimble/config.yaml's require_review list —
       it is the designated gate task for this PRD (see PRD §12 Assumption 5: gate after wave 5,
       before this wave 6 task, model=pause).
-    depends_on: ["2c", "2d", "3b"]
+    depends_on: ["2c", "2d", "3b", "4a", "4b", "4c"]
     complexity: 1
     priority: "must"
     success_criteria:
@@ -356,11 +475,11 @@ tasks:
     agent_context: |
       This file requires human review per .nimble/config.yaml's require_review list. Do not
       merge past this task without the pause-gate review described in PRD §12 Assumption 5. The
-      full feature diff (tasks 1a through 3b) being available for human review is the gate's
+      full feature diff (tasks 1a through 4c) being available for human review is the gate's
       precondition (see execution_plan.yaml's gate definition), not something this task itself
       produces or asserts.
 
-      One feature, one bullet — do not add a separate bullet per task (1a-3b) that built this
+      One feature, one bullet — do not add a separate bullet per task (1a-4c) that built this
       feature; per CLAUDE.md's CHANGELOG rules, edit a single bullet if multiple commits touch it.
     deliverables:
       - artifact: "CHANGELOG.md [Unreleased] bullet"
