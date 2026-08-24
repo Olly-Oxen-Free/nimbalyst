@@ -22,7 +22,7 @@
   "waves": {
     "1": { "status": "done" },
     "2": { "status": "done" },
-    "3": { "status": "pending" },
+    "3": { "status": "done" },
     "4": { "status": "pending" },
     "5": { "status": "pending" },
     "6": { "status": "pending" },
@@ -36,7 +36,7 @@
     "1a": { "status": "done", "wave": 2, "model": "opus", "commit": "39191908b" },
     "4a": { "status": "done", "wave": 2, "model": "opus", "commit": "245d9faeb" },
     "2a": { "status": "done", "wave": 3, "model": "sonnet", "commit": "a5102380e" },
-    "3a": { "status": "queued", "wave": 3, "model": "opus" },
+    "3a": { "status": "done", "wave": 3, "model": "opus", "commit": "1e2923b73" },
     "2b": { "status": "queued", "wave": 4, "model": "opus" },
     "3b": { "status": "queued", "wave": 4, "model": "opus" },
     "4b": { "status": "queued", "wave": 4, "model": "opus" },
