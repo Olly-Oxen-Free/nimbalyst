@@ -427,6 +427,18 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       });
     }
 
+    // ToolPermissionService emits through this provider's own emitter, and only
+    // once a prompt genuinely needs the user (trust/cache/pattern hits never get
+    // here). `teammateName` rides along on pending but not on resolved, so the
+    // manager correlates the pair by requestId.
+    this.on('toolPermission:pending', (data: { requestId: string; sessionId?: string; teammateName?: string }) => {
+      if (!data.teammateName) return;
+      this.teammateManager.markTeammatePermissionPending(data.sessionId, data.teammateName, data.requestId);
+    });
+    this.on('toolPermission:resolved', (data: { requestId: string; sessionId?: string }) => {
+      this.teammateManager.markTeammatePermissionResolved(data.sessionId, data.requestId);
+    });
+
     // Initialize MCP configuration service from the shared registry + the
     // provider-owned config/env loaders.
     this.mcpConfigService = getMcpConfigService({
