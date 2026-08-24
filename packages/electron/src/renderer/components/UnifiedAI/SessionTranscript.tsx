@@ -41,6 +41,7 @@ import { PendingReviewBanner } from '../AIChat/PendingReviewBanner';
 import { WakeupBanner } from '../AIChat/WakeupBanner';
 import { McpLockdownBanner } from '../AIChat/McpLockdownBanner';
 import { SubAgentChipRow } from '../AgentMode/SubAgentChipRow';
+import { TeammateThreadPopover } from '../AgentMode/TeammateThreadPopover';
 import type { AIMode } from './ModeTag';
 // Note: ExitPlanMode, AskUserQuestion, and ToolPermission use inline widgets via InteractiveWidgetHost (in runtime package)
 import { SlashCommandSuggestions } from './SlashCommandSuggestions';
@@ -112,7 +113,7 @@ import {
   MIN_CLI_TERMINAL_HEIGHT,
   MAX_CLI_TERMINAL_HEIGHT,
 } from '../../store/atoms/terminals';
-import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom } from '../../store/atoms/agentMode';
+import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, sessionTeammatesAtom } from '../../store/atoms/agentMode';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, defaultThinkingModeAtom, chatShowToolCallsAtom, developerModeAtom } from '../../store/atoms/appSettings';
 import { supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
@@ -2251,6 +2252,23 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     setScrollToTeammate(null);
   }, [scrollToTeammate, setScrollToTeammate, sessionId, messages]);
 
+  // Teammate chip click-to-thread (R5): a separate flow from the scroll-to-
+  // spawn-point behavior above, which stays exactly as-is — clicking a
+  // teammate's row in the vertical TeammatePanel still just scrolls; clicking
+  // its chip in the new horizontal SubAgentChipRow opens a compose popover.
+  const allTeammatesForThread = useAtomValue(sessionTeammatesAtom(sessionId));
+  const [openTeammateThread, setOpenTeammateThread] = useState<{
+    agentId: string;
+    name: string;
+    isActive: boolean;
+    anchorEl: HTMLElement;
+  } | null>(null);
+  const handleTeammateChipClick = useCallback((agentId: string, anchorEl: HTMLElement) => {
+    const teammate = allTeammatesForThread.find(t => t.agentId === agentId);
+    const isActive = teammate ? teammate.status !== 'completed' && teammate.status !== 'errored' : false;
+    setOpenTeammateThread({ agentId, name: teammate?.name ?? agentId, isActive, anchorEl });
+  }, [allTeammatesForThread]);
+
   // Scroll-to-message: when PromptQuickOpen selects a prompt, scroll to the
   // matching user message by timestamp.
   const scrollToMessage = useAtomValue(scrollToMessageAtom);
@@ -2669,7 +2687,17 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       />
 
       {/* Sub-agent status chips - renders nothing when the session has none */}
-      <SubAgentChipRow sessionId={sessionId} />
+      <SubAgentChipRow sessionId={sessionId} onTeammateClick={handleTeammateChipClick} />
+      {openTeammateThread && (
+        <TeammateThreadPopover
+          sessionId={sessionId}
+          agentId={openTeammateThread.agentId}
+          teammateName={openTeammateThread.name}
+          isActive={openTeammateThread.isActive}
+          anchorEl={openTeammateThread.anchorEl}
+          onClose={() => setOpenTeammateThread(null)}
+        />
+      )}
 
       {/* Note: All interactive prompts (ToolPermission, ExitPlanMode, AskUserQuestion) use inline widgets in transcript */}
 

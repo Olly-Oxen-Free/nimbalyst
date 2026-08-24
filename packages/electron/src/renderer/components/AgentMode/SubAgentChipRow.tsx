@@ -91,15 +91,18 @@ interface SubAgentChipProps {
   label: string;
   status: SubAgentStatus;
   kind: 'teammate' | 'task';
-  /** Optional - a chip is inert (and not focusable) until a handler is given. */
-  onClick?: () => void;
+  /** Optional - a chip is inert (and not focusable) until a handler is given.
+   *  Receives the triggering event so a caller can anchor a popover to
+   *  `e.currentTarget` regardless of whether the click came from a pointer or
+   *  a keyboard activation. */
+  onClick?: (e: React.SyntheticEvent<HTMLDivElement>) => void;
 }
 
 const SubAgentChip: React.FC<SubAgentChipProps> = React.memo(({ label, status, kind, onClick }) => {
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     if (onClick && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
-      onClick();
+      onClick(e);
     }
   }, [onClick]);
 
@@ -139,8 +142,8 @@ interface SubAgentChipEntry {
 export interface SubAgentChipRowProps {
   /** Session whose teammates/tasks are shown. */
   sessionId: string;
-  /** Wired by a later task - opens the teammate's own thread. */
-  onTeammateClick?: (agentId: string) => void;
+  /** Opens the teammate's own thread, anchored to the clicked chip element. */
+  onTeammateClick?: (agentId: string, anchorEl: HTMLElement) => void;
   /** Wired by a later task - opens the task's read-only status popover. */
   onTaskClick?: (taskId: string) => void;
 }
@@ -178,8 +181,8 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
     })),
   ], [allTeammates, tasks]);
 
-  const handleChipClick = useCallback((entry: SubAgentChipEntry) => {
-    if (entry.kind === 'teammate') onTeammateClick?.(entry.id);
+  const handleChipClick = useCallback((entry: SubAgentChipEntry, e: React.SyntheticEvent<HTMLDivElement>) => {
+    if (entry.kind === 'teammate') onTeammateClick?.(entry.id, e.currentTarget);
     else onTaskClick?.(entry.id);
   }, [onTeammateClick, onTaskClick]);
 
@@ -205,7 +208,7 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
             label={entry.label}
             status={entry.status}
             kind={entry.kind}
-            onClick={hasClickHandler ? () => handleChipClick(entry) : undefined}
+            onClick={hasClickHandler ? (e) => handleChipClick(entry, e) : undefined}
           />
         ))}
       </div>

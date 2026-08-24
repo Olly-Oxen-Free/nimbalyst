@@ -2558,6 +2558,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   }
 
   /**
+   * Deliver a UI-initiated message to a specific managed teammate, by agentId
+   * (not the fuzzy name matching the lead model's own SendMessage tool uses --
+   * the UI already has the exact agentId from TeammateInfo).
+   */
+  public async sendMessageToManagedTeammate(agentId: string, content: string): Promise<{ delivered: boolean; wasIdle: boolean }> {
+    return this.teammateManager.sendMessageFromHost(this.currentSessionId, agentId, content);
+  }
+
+  /**
    * Check if any teammates are still active (running or idle).
    * Used by AIService to decide whether to defer endSession().
    */

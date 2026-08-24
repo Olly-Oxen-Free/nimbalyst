@@ -681,6 +681,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Additional AI operations that weren't in the first block
   aiCancelRequest: (sessionId: string) => ipcRenderer.invoke('ai:cancelRequest', sessionId),
+  aiSendMessageToTeammate: (sessionId: string, agentId: string, content: string) =>
+    ipcRenderer.invoke('ai:sendMessageToTeammate', sessionId, agentId, content),
   aiApplyEdit: (edit: any) => ipcRenderer.invoke('ai:applyEdit', edit),
   onAIEditRequest: (callback: (edit: any) => void) => {
     const handler = (_event: any, edit: any) => callback(edit);
