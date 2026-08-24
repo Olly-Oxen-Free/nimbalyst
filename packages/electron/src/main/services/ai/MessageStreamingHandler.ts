@@ -117,6 +117,7 @@ import { disableParentNotificationsAfterDirectTakeover } from './childSessionTak
 import { installScopedProviderListener } from './providerListenerRegistry';
 import { shouldSettleUnterminatedTurn } from './sessionSettlePolicy';
 import { announceTeammatesCompletion, type TeammatesCompletionOutcome } from './teammateCompletionSignal';
+import { announceTeammateWakeDelivery, classifyTeammateWakeDelivery } from './teammateWakeDelivery';
 import { captureTutorialMilestone } from '../tutorial/tutorialAnalytics';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
@@ -1082,14 +1083,16 @@ export class MessageStreamingHandler {
         });
 
         const targetWindow = findWindowByWorkspace(effectiveWorkspacePath);
-        if (targetWindow && !targetWindow.isDestroyed()) {
-          // Create a mock event and call sendMessage directly
-          const mockEvent = {
-            sender: targetWindow.webContents,
-            senderFrame: targetWindow.webContents.mainFrame,
-          } as Electron.IpcMainInvokeEvent;
+        const outcome = classifyTeammateWakeDelivery(targetWindow, !!this.svc.sendMessageHandler);
 
-          if (this.svc.sendMessageHandler) {
+        await announceTeammateWakeDelivery(outcome, {
+          deliver: () => {
+            // Create a mock event and call sendMessage directly
+            const mockEvent = {
+              sender: targetWindow!.webContents,
+              senderFrame: targetWindow!.webContents.mainFrame,
+            } as Electron.IpcMainInvokeEvent;
+
             // Fire-and-forget: sendMessage will stream results to the renderer
             setImmediate(async () => {
               try {
@@ -1098,8 +1101,20 @@ export class MessageStreamingHandler {
                 logger.main.error('[AIService] Failed to process teammate message while idle:', err);
               }
             });
-          }
-        }
+          },
+          logDropped: (logSuffix) => {
+            logger.main.warn(`[AIService] Teammate message dropped for session ${data.sessionId}: ${logSuffix}`);
+          },
+          notifyUndelivered: async (reason) => {
+            const sessionTitle = await getCurrentSessionTitle(data.sessionId);
+            await notificationService.showAgentFailureNotification(
+              data.sessionId,
+              sessionTitle,
+              reason,
+              effectiveWorkspacePath
+            );
+          },
+        });
       } catch (error) {
         logger.main.error('[AIService] Failed to handle teammate message while idle:', error);
       }
