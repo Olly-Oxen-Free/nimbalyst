@@ -625,6 +625,39 @@ class NotificationService {
       sourceLabel: sessionName,
     });
   }
+
+  /**
+   * Show an OS notification when an agent stopped for a bad reason -- it
+   * crashed, errored, or was abandoned -- rather than finishing its work.
+   *
+   * The completion chime reads as success, so it cannot carry this: an agent
+   * that died silently would be indistinguishable from one that delivered. The
+   * title is what makes it distinct; the artwork is only a secondary cue.
+   *
+   * @param reason Short phrase naming what went wrong, e.g. "a teammate ended
+   *   with an error". Rendered after the session name.
+   */
+  async showAgentFailureNotification(
+    sessionId: string,
+    sessionName: string,
+    reason: string,
+    workspacePath: string
+  ): Promise<void> {
+    // Shares the "session blocked" toggle with showBlockedNotification: both
+    // are "this session stopped and wants you".
+    if (!isSessionBlockedNotificationsEnabled()) {
+      return;
+    }
+
+    await this.showNotification({
+      title: composeNotificationTitle(sessionName, 'Agent Stopped Unexpectedly'),
+      body: `"${sessionName}": ${reason}`,
+      kind: 'needs-input',
+      sessionId,
+      workspacePath,
+      sourceLabel: sessionName,
+    });
+  }
 }
 
 // Export singleton instance

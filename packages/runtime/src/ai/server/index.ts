@@ -9,6 +9,7 @@ export * from './providers/OpenAIProvider';
 export * from './providers/OpenAICodexProvider';
 export * from './providers/OpenAICodexACPProvider';
 export * from './providers/ProviderPermissionMixin';
+export type { TeammatesCompletionOutcome } from './providers/TeammateManager';
 export * from './providers/LMStudioProvider';
 export * from './providers/OpenCodeProvider';
 export * from './providers/CopilotCLIProvider';

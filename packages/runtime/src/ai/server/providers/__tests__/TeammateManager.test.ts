@@ -27,8 +27,18 @@ vi.mock('../../../../storage/repositories/AISessionsRepository', () => ({
 import { TeammateManager, type TeammateManagerDeps } from '../TeammateManager';
 
 type ManagerInternals = {
+  deps: { emit: ReturnType<typeof vi.fn> };
   managedTeammates: Map<string, unknown>;
+  idleTeammates: Map<string, unknown>;
   emitDebounceTimer: unknown;
+  handleStreamCompletion(
+    sessionId: string,
+    agentId: string,
+    teamName: string,
+    idleTemplate: unknown,
+    result: { capturedSessionId?: string; approvedShutdown: boolean; capturedResultText?: string; sentMessageToLead: boolean },
+  ): void;
+  handleStreamError(sessionId: string, agentId: string, teamName: string, err: Error): void;
 };
 
 const internals = (manager: TeammateManager) => manager as unknown as ManagerInternals;
@@ -56,6 +66,26 @@ const settled = (expected: Record<string, string | undefined>) =>
 beforeEach(() => {
   storedTeammates = [];
 });
+
+/** Outcome carried by each teammates:allCompleted the manager has emitted. */
+const allCompletedOutcomes = (manager: TeammateManager) =>
+  internals(manager).deps.emit.mock.calls
+    .filter(([event]) => event === 'teammates:allCompleted')
+    .map(([, payload]) => (payload as { outcome?: string }).outcome);
+
+/** Add a running teammate without going through the SDK spawn path. */
+const addRunning = (manager: TeammateManager, agentId: string) => {
+  const [name, teamName] = agentId.split('@');
+  internals(manager).managedTeammates.set(agentId, { name, agentId, teamName, agentType: 'general' });
+};
+
+/** What streamTeammateOutput resolves with when a teammate is done for good. */
+const FINISHED = { capturedSessionId: undefined, approvedShutdown: false, capturedResultText: undefined, sentMessageToLead: false };
+
+const idleTemplateFor = (agentId: string) => {
+  const [name, teamName] = agentId.split('@');
+  return { teamName, name, sessionId: '', agentType: 'general', model: undefined, color: 'blue', cwd: '/tmp', prompt: 'work' };
+};
 
 describe('TeammateManager permission blocking', () => {
   it('blocks the named teammate until its own prompt resolves, independently of other teammates', async () => {
@@ -112,5 +142,42 @@ describe('TeammateManager permission blocking', () => {
 
     expect(internals(manager).emitDebounceTimer).toBeNull();
     expect(statuses(['alice@red', 'alice@blue'])).toEqual({ 'alice@red': 'running', 'alice@blue': 'running' });
+  });
+});
+
+/**
+ * teammates:allCompleted fires once nothing is left, however the teammates got
+ * there — so a crashed team used to reach the host as the same payload a
+ * finished one did, and got the same completion chime. The payload now says
+ * which happened.
+ */
+describe('TeammateManager batch outcome', () => {
+  it('reports the batch as errored even when a healthy sibling is the one that closes it', async () => {
+    const manager = await managerWith('alice@team', 'bob@team');
+
+    // alice's stream throws. bob is still working, so nothing is announced yet.
+    internals(manager).handleStreamError('session-1', 'alice@team', 'team', new Error('transport closed'));
+    expect(allCompletedOutcomes(manager)).toEqual([]);
+
+    // bob then finishes cleanly and triggers the emit. alice's crash is still
+    // what the user needs to hear about.
+    internals(manager).handleStreamCompletion('session-1', 'bob@team', 'team', idleTemplateFor('bob@team'), FINISHED);
+    expect(allCompletedOutcomes(manager)).toEqual(['errored']);
+
+    // The next batch must not inherit the last one's failure.
+    addRunning(manager, 'carol@team');
+    internals(manager).handleStreamCompletion('session-1', 'carol@team', 'team', idleTemplateFor('carol@team'), FINISHED);
+    expect(allCompletedOutcomes(manager)).toEqual(['errored', 'clean']);
+  });
+
+  it('reports idle teammates orphaned by a dead lead as abandoned, not finished', async () => {
+    // No error is ever thrown here: the lead's transport died and the idle
+    // teammates can no longer be resumed, so they are quietly marked completed.
+    const manager = await managerWith();
+    internals(manager).idleTeammates.set('alice@team', idleTemplateFor('alice@team'));
+
+    manager.abandonIdleTeammates('session-1');
+
+    expect(allCompletedOutcomes(manager)).toEqual(['abandoned']);
   });
 });
