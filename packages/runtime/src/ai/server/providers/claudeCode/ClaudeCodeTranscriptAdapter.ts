@@ -26,7 +26,10 @@ const SUBAGENT_TOOLS = new Set(['Task', 'Agent']);
 export type ParsedItem =
   // Transcript-relevant items (written to canonical events)
   | { kind: 'text'; text: string }
-  | { kind: 'tool_use'; toolId: string; toolName: string; args: Record<string, unknown>; isMcp: boolean; isSubagent: boolean }
+  // `subagentId` is the tool_use id of the Task sub-agent that issued this
+  // tool call (undefined for the lead's own calls). Lets the provider attribute
+  // a permission prompt to one specific entry in its `activeTasks` map.
+  | { kind: 'tool_use'; toolId: string; toolName: string; args: Record<string, unknown>; isMcp: boolean; isSubagent: boolean; subagentId?: string }
   | { kind: 'tool_result'; toolUseId: string; content: unknown; isError: boolean }
   | { kind: 'usage'; usage: any; modelUsage?: any; isPerStep: boolean }
   | { kind: 'error'; message: string; chunk: any }
@@ -311,7 +314,7 @@ export class ClaudeCodeTranscriptAdapter {
       subagentId: subagentId ?? null,
     });
 
-    return { kind: 'tool_use', toolId: toolId ?? `tool-anon`, toolName, args, isMcp, isSubagent: false };
+    return { kind: 'tool_use', toolId: toolId ?? `tool-anon`, toolName, args, isMcp, isSubagent: false, subagentId };
   }
 
   private parseToolResultBlock(block: any): ParsedItem | null {

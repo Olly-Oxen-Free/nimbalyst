@@ -230,7 +230,8 @@ export interface TaskInfo {
   taskId: string;
   description: string;
   taskType?: string;
-  status: 'running' | 'completed' | 'failed' | 'stopped';
+  /** 'blocked' = waiting on a permission prompt for one of its own tool calls. */
+  status: 'running' | 'blocked' | 'completed' | 'failed' | 'stopped';
   startedAt: number;
   toolUseId?: string;
   toolCount: number;

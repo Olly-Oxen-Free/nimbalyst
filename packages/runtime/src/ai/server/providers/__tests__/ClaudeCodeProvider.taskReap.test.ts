@@ -50,11 +50,21 @@ describe('ClaudeCodeProvider background task reaping', () => {
       description: 'Already finished',
       status: 'completed',
     });
+    // Parked on a permission prompt is still alive: it must be reaped like a
+    // running task, not mistaken for settled and left 'blocked' forever.
+    state.activeTasks.set('waiting', {
+      taskId: 'waiting',
+      description: 'Awaiting permission',
+      status: 'blocked',
+    });
+
+    expect(state.hasRunningTasks()).toBe(true);
 
     provider.abort();
 
     expect(state.hasRunningTasks()).toBe(false);
     expect(state.activeTasks.get('bkxaizroy')?.status).toBe('stopped');
+    expect(state.activeTasks.get('waiting')?.status).toBe('stopped');
     // A task that already settled keeps its own terminal status.
     expect(state.activeTasks.get('done')?.status).toBe('completed');
   });

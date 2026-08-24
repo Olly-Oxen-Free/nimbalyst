@@ -31,6 +31,16 @@ export interface MutableSubagentTask extends SubagentTaskLike {
 const BACKGROUND_LAUNCH_ACK = /running in (the )?background|working in the background|async agent launched/i;
 
 /**
+ * A task that has not reached a terminal status yet. 'blocked' (parked on a
+ * permission prompt) is as alive as 'running': counting it as settled would
+ * let turn-end teardown kill a sub-agent that is merely waiting for the user
+ * to answer, and would leave it showing 'blocked' forever after an abort.
+ */
+export function isTaskAlive<T extends string>(status: T): status is T & ('running' | 'blocked') {
+  return status === 'running' || status === 'blocked';
+}
+
+/**
  * Flatten tool_result content to searchable text. The SDK delivers it either
  * as a plain string or as an array of content blocks ({type:'text', text}) —
  * the sub-agent launch acknowledgement arrives as the latter. NIM-1556.
@@ -60,7 +70,7 @@ export function shouldSettleTaskFromToolResult(
   task: { taskType?: string; isBackgrounded?: boolean; status: string },
   resultContent: unknown,
 ): boolean {
-  if (task.status !== 'running') return false;
+  if (!isTaskAlive(task.status)) return false;
   // local_bash tasks only exist when a Bash command was backgrounded; their
   // matching tool_result is always the launch acknowledgement.
   if (task.taskType === 'local_bash') return false;
@@ -201,7 +211,7 @@ export function buildTaskResultContinuationMessage(
 /** True if any tracked sub-agent task is still running. */
 export function hasRunningTasks(tasks: Iterable<SubagentTaskLike>): boolean {
   for (const t of tasks) {
-    if (t.status === 'running') return true;
+    if (isTaskAlive(t.status)) return true;
   }
   return false;
 }
@@ -216,7 +226,7 @@ export function hasRunningTasks(tasks: Iterable<SubagentTaskLike>): boolean {
 export function reapRunningTasks(tasks: Iterable<MutableSubagentTask>): string[] {
   const stranded: string[] = [];
   for (const task of tasks) {
-    if (task.status === 'running') {
+    if (isTaskAlive(task.status)) {
       task.status = 'stopped';
       stranded.push(task.description || task.taskId || 'unknown task');
     }
@@ -228,7 +238,7 @@ export function reapRunningTasks(tasks: Iterable<MutableSubagentTask>): string[]
 export function countRunningTasks(tasks: Iterable<SubagentTaskLike>): number {
   let count = 0;
   for (const t of tasks) {
-    if (t.status === 'running') count++;
+    if (isTaskAlive(t.status)) count++;
   }
   return count;
 }

@@ -111,6 +111,7 @@ import { resolveEffectiveSessionMode } from './claudeCode/resolveEffectiveSessio
 import { resolveClaudeConfigDir } from './claudeCode/claudeConfigDir';
 import {
   hasRunningTasks as computeHasRunningTasks,
+  isTaskAlive,
   countRunningTasks,
   reapRunningTasks,
   shouldDeferTeardownForSubagents,
@@ -299,7 +300,11 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     taskId: string;
     description: string;
     taskType?: string;
-    status: 'running' | 'completed' | 'failed' | 'stopped';
+    // 'blocked' = this sub-agent is parked on a permission prompt for one of
+    // its own tool calls. Kept distinct from 'running' so the UI can show which
+    // sub-agent is actually waiting on the user. Still a live status — see
+    // isTaskAlive() in subagentDrain.ts.
+    status: 'running' | 'blocked' | 'completed' | 'failed' | 'stopped';
     startedAt: number;
     toolUseId?: string;
     toolCount: number;
@@ -311,6 +316,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // returned a launch acknowledgement, not a completion. See NIM-1470.
     isBackgrounded?: boolean;
   }>();
+
+  // Inner tool_use id -> tool_use id of the Task sub-agent that issued it (the
+  // chunk's parent_tool_use_id). Written as the streaming loop reaches each
+  // tool_use item, read by canUseTool to blame a permission prompt on exactly
+  // one entry in activeTasks. Entries are dropped when the tool's result lands.
+  private subagentToolCallOwners = new Map<string, string>();
 
   // Terminal task_notification chunks received while draining background tasks
   // after the lead turn ended. Consumed by finalizeBackgroundDrain to wake the
@@ -1394,6 +1405,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
                 }
 
                 const toolCall = { id: toolId, name: toolName, arguments: args };
+                // Remember which Task sub-agent owns this call before yielding —
+                // canUseTool may fire for it at any point after this chunk was
+                // read. See markTaskBlockedForToolUse().
+                if (item.subagentId) this.subagentToolCallOwners.set(toolId, item.subagentId);
                 toolCallsById.set(toolId, toolCall);
                 // Yield so AIService can track tool calls (notification text reset,
                 // worktree inference, file tracking side effects). Parity with
@@ -1404,6 +1419,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
               }
 
               case 'tool_result': {
+                // The call is done, so no permission prompt can still name it.
+                this.subagentToolCallOwners.delete(item.toolUseId);
                 const toolCall = toolCallsById.get(item.toolUseId);
                 if (toolCall) {
                   const { isDuplicate } = applyToolResultToToolCall(toolCall, item.content, item.isError);
@@ -2793,7 +2810,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           this.drainTerminalNotifications.push({
             taskId: chunk.task_id,
             description: existing.description,
-            status: existing.status === 'running' ? 'completed' : existing.status,
+            status: isTaskAlive(existing.status) ? 'completed' : existing.status,
             summary: chunk.summary,
             outputFile: chunk.output_file,
           });
@@ -3672,18 +3689,29 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         );
         if (immediateDecision) {
           result = immediateDecision;
-        } else if (this.permissionService && sessionId && workspacePath) {
-          result = await this.handleToolPermissionWithService(
-            toolName,
-            input,
-            options,
-            sessionId,
-            workspacePath,
-            permissionsPath,
-            teammateName
-          );
         } else {
-          result = await this.handleToolPermissionFallback(toolName, input, options, sessionId, workspacePath);
+          // Only the branches below actually park on the user. Marking blocked
+          // any earlier would flip the status (and write session metadata) for
+          // every auto-allowed tool call a sub-agent makes.
+          const blockedTaskId = this.markTaskBlockedForToolUse(options.toolUseID, sessionId);
+          try {
+            if (this.permissionService && sessionId && workspacePath) {
+              result = await this.handleToolPermissionWithService(
+                toolName,
+                input,
+                options,
+                sessionId,
+                workspacePath,
+                permissionsPath,
+                teammateName
+              );
+            } else {
+              result = await this.handleToolPermissionFallback(toolName, input, options, sessionId, workspacePath);
+            }
+          } finally {
+            // Approved, denied, cancelled or thrown — the prompt is gone.
+            if (blockedTaskId) this.clearTaskBlocked(blockedTaskId, sessionId);
+          }
         }
       } catch (error) {
         console.error(`[canUseTool] #${callNum} EXCEPTION tool="${toolName}" after ${Date.now() - callStart}ms:`, error);
@@ -3703,6 +3731,51 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
       return result;
     };
+  }
+
+  /**
+   * Mark the Task sub-agent that issued `toolUseId` as blocked on a permission
+   * prompt, so the UI can show which sub-agent is waiting on the user instead
+   * of spinning all of them identically. Returns the task id that was marked,
+   * or undefined when nothing was marked.
+   *
+   * ORDERING, verified against the shipped @anthropic-ai/claude-agent-sdk
+   * 0.3.221 bundle (`Query.readMessages` in sdk.mjs): the SDK's reader walks
+   * the transport in wire order, but it dispatches `control_request` via a
+   * NON-awaited `handleControlRequest(e)` and hands ordinary messages to
+   * `inputStream.enqueue(e)` with no backpressure. So the assistant chunk
+   * carrying the inner tool_use block is enqueued before the `can_use_tool`
+   * request is dispatched, yet nothing gates that dispatch on this provider's
+   * own `for await` loop having drained the queue that far. The lookup below
+   * therefore is NOT guaranteed to hit: if the streaming loop is still behind
+   * (parked on a slow consumer `yield`), the correlation entry does not exist
+   * yet. A miss must fail safe — leave every task alone rather than guess at
+   * an owner and blame the wrong sub-agent. A miss is also the normal case for
+   * the lead session's own tool calls, which have no owning sub-agent at all.
+   */
+  private markTaskBlockedForToolUse(toolUseId: string | undefined, sessionId: string | undefined): string | undefined {
+    const taskToolUseId = toolUseId ? this.subagentToolCallOwners.get(toolUseId) : undefined;
+    if (!taskToolUseId) return undefined;
+
+    for (const task of this.activeTasks.values()) {
+      if (task.toolUseId !== taskToolUseId || task.status !== 'running') continue;
+      task.status = 'blocked';
+      console.log(`[CLAUDE-CODE] SUBAGENT_TASK blocked: id=${task.taskId} awaiting permission for tool_use=${toolUseId}`);
+      this.emitTaskUpdate(sessionId).catch(() => {});
+      return task.taskId;
+    }
+    return undefined;
+  }
+
+  /** Release the `blocked` marker set by markTaskBlockedForToolUse. */
+  private clearTaskBlocked(taskId: string, sessionId: string | undefined): void {
+    const task = this.activeTasks.get(taskId);
+    // Only clear our own marker: task_notification or reapRunningTasks may have
+    // moved the task to a terminal status while the prompt was open, and that
+    // outcome must win.
+    if (task?.status !== 'blocked') return;
+    task.status = 'running';
+    this.emitTaskUpdate(sessionId).catch(() => {});
   }
 
   private async resolveImmediateToolDecision(
