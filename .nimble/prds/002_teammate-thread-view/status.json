@@ -1,0 +1,27 @@
+{
+  "slug": "teammate-thread-view",
+  "status": "queued",
+  "created_at": "2026-08-24T00:00:00Z",
+  "execution_mode": "feature-branch",
+  "branch_strategy": "use-worktree-branch-directly",
+  "branch": "worktree-agent-a5755e12821ebe3c1",
+  "phase": "planned",
+  "beads": {
+    "tier": "cli",
+    "resolved_at": "2026-08-24T00:00:00Z",
+    "note": "config caches tier mcp; nimbalyst-beads MCP tools absent this session, bd 1.2.2 on PATH"
+  },
+  "tracker": {
+    "issue_key": null,
+    "item_id": null,
+    "note": "mcp__nimbalyst-trackers tools not available in the planning session; file on next opportunity"
+  },
+  "tasks": {
+    "1a": { "status": "pending", "wave": 1, "complexity": 8 },
+    "1b": { "status": "pending", "wave": 2, "complexity": 7 },
+    "2a": { "status": "pending", "wave": 3, "complexity": 4 },
+    "2b": { "status": "pending", "wave": 4, "complexity": 6 },
+    "3a": { "status": "pending", "wave": 5, "complexity": 3 },
+    "4a": { "status": "pending", "wave": 6, "complexity": 2 }
+  }
+}

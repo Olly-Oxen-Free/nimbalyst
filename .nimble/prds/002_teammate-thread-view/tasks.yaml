@@ -1,0 +1,365 @@
+# ============================================================
+# NIMBLE TASK DEFINITIONS
+# Parsed by the orchestrator for execution planning.
+# ============================================================
+
+metadata:
+  prd_slug: "teammate-thread-view"
+  created_at: "2026-08-24T00:00:00Z"
+  total_complexity: 30
+  task_count: 6
+
+tasks:
+  - id: "1a"
+    title: "Durable teammate session id + post-restart idle resume"
+    description: |
+      Persist the teammate's SDK session id and make idle-resume survive a
+      Nimbalyst restart.
+
+      (1) Persist sessionId on EVERY emit path in
+      TeammateManager.emitTeammateUpdate, not just the rarely-taken push
+      literals. The common path for an already-known teammate is the map
+      branch at :1281-1300: add sessionId to activityFields (:1284-1288, from
+      managed.sessionId ?? tm.sessionId) and to the idle-transition return at
+      :1296-1297 (from idleTeammates.get(agentId)?.sessionId ?? tm.sessionId).
+      ALSO add it to both push literals (:1302-1315 running, :1318-1329 idle)
+      and to the inline existingTeammates row-type annotation at :1268-1278
+      (it enumerates fields explicitly -- without sessionId there it will not
+      typecheck). Extend the TeammateInfo interface
+      (packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx:25-38)
+      with an optional sessionId field. Key correctness property: a teammate
+      that was already emitted while running (sessionId undefined at spawn,
+      captured later at :1704-1720) must still end up with sessionId in
+      persisted metadata once captured, and when it goes idle.
+
+      (2) Make the resume path restart-safe. In sendMessageFromHost
+      (TeammateManager.ts:1162-1187), when both managedTeammates and
+      idleTeammates miss, fall back to persisted currentTeammates metadata --
+      reuse the AISessionsRepository.get read the same class already performs
+      in emitTeammateUpdate (:1264-1265); do NOT add a new deps accessor
+      (settles PRD Q2: lazy lookup). If an entry with a sessionId and an
+      idle-resumable status exists, reconstruct IdleTeammate (default the
+      required color field deterministically -- it is not persisted) and take
+      the existing resumeIdleTeammate path (:1828-1872).
+
+      (3) Fix the three instance-state dependencies that are unset after a
+      restart, or the resumed teammate logs nothing and runs in the wrong
+      cwd:
+      - lead session id: ClaudeCodeProvider.sendMessageToManagedTeammate
+        (:2587-2589) passes this.currentSessionId, which is only assigned
+        during live system-init (:2704, and only when mcpServerCount > 0).
+        Change the chain to thread the EXPLICIT sessionId from the IPC
+        handler (AIService.ts:3204 already has it) through
+        sendMessageToManagedTeammate into sendMessageFromHost, instead of
+        relying on this.currentSessionId.
+      - cwd/permissions: streamTeammateOutput uses this.lastUsedCwd ||
+        process.cwd() (:1560) and this.lastUsedPermissionsPath (:1563), both
+        assigned only in sdkOptionsBuilder.ts:327-329 during a live lead
+        query. Before resuming with them unset, seed them from the loaded
+        session record's workspace path (the AIService handler has the
+        session in hand -- pass what is needed down rather than reaching up).
+      Without (3), the chunk-logging guards `if (sessionId)` at :1743/:1799
+      never fire for the resumed run and scheduleEmitTeammateUpdate returns
+      early at :1208 -- exactly the restart scenario R2 exists to fix.
+
+      No new DB table, no migration -- currentTeammates metadata is already
+      persisted via AISessionsRepository.updateMetadata.
+
+      Fulfills R1 and R2.
+    depends_on: []
+    complexity: 8
+    priority: "must"
+    success_criteria:
+      - "A teammate first emitted while running (sessionId not yet captured) has sessionId in persisted currentTeammates metadata after capture and after going idle -- covered by a unit test exercising the map branch, not just the push literals"
+      - "TeammateInfo carries sessionId through sessionTeammatesAtom to the renderer, and the inline row type at TeammateManager.ts:1268-1278 typechecks with the new field"
+      - "sendMessageFromHost delivers to an idle teammate whose in-memory maps are empty, by resolving sessionId from persisted session metadata and resuming (unit-testable by stubbing streamTeammateOutput/deps), with the lead sessionId passed explicitly end to end (no reliance on ClaudeCodeProvider.currentSessionId) and cwd/permissions seeded from the session record"
+      - "A teammate entry without a persisted sessionId (pre-feature data) returns { delivered: false } exactly as today -- no throw, no crash (?? -style tolerant read per state-persistence rules)"
+      - "No change to what the lead transcript displays (SessionManager suppression untouched)"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts"
+      - "packages/electron/src/main/services/ai/AIService.ts"
+      - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+    agent_context: |
+      capturedSessionId is captured at TeammateManager.ts:1704-1720 and stored
+      on managed.sessionId (spawn inserts with sessionId: undefined at :1462);
+      idleTeammates is populated at :1371-1377. The ONLY persistence writer is
+      emitTeammateUpdate -> AISessionsRepository.updateMetadata (:1331-1337),
+      and it already reads the session via AISessionsRepository.get at
+      :1264-1265 -- reuse that pattern for the lazy rehydration read.
+      resumeIdleTeammate (:1828-1872) already does the SDK resume with
+      idleInfo.sessionId -- reuse it, do not write a second resume path.
+      IdleTeammate requires a color field (used at :1842/:1856) that is not
+      persisted -- default it deterministically. TeammateManager.ts is runtime
+      but provider-adjacent; the require_review boundary (main-process files)
+      is expected at the single end-of-work review.
+
+  - id: "1b"
+    title: "Teammate transcript read path: IPC handler + raw-message projection"
+    description: |
+      New invoke-style IPC that returns a teammate's transcript as
+      TranscriptViewMessage[], built from data Nimbalyst already persists.
+
+      Handler `ai:getTeammateTranscript(sessionId, agentId, workspacePath)`
+      (safeHandle, in AIService.ts near the existing ai:sendMessageToTeammate
+      handler at :3204): load the lead session's raw ai_agent_messages, filter
+      to chunks whose stored JSON carries _teammateAgentId === agentId
+      (messageTypes teammate_output / teammate_completed /
+      teammate_message_to_lead), and project them through the existing
+      projectRawMessagesToViewMessages path
+      (packages/runtime/src/ai/server/transcript/projectRawMessages.ts:101).
+
+      Projection fidelity is the meat of this task (PRD R4, Q1):
+      - assistant text, thinking blocks, and tool_use/tool_result pairs must
+        come through as proper TranscriptViewMessage entries that
+        RichTranscriptView can render;
+      - user-direction chunks (the "[Message from team-lead]" injections
+        flushed via streamInput) must appear as user turns;
+      - synthetic teammate_message_to_lead chunks (shape at
+        TeammateManager.ts:1062-1103) must be represented legibly, not crash
+        the parser or vanish;
+      - run ClaudeCodeRawParser over real logged teammate chunk shapes FIRST
+        (parseMessage at parsers/ClaudeCodeRawParser.ts:59; note the early
+        return on msg.hidden) and extend the parser/projection where the
+        tagged shapes need handling -- do not fork a bespoke projector.
+
+      Also: preload method (packages/electron/src/preload/index.ts, near
+      aiSendMessageToTeammate at :710) and electron.d.ts declaration (near
+      :488). Renderer touches nothing yet -- UI is task 2b.
+
+      Fulfills R3 and R4.
+    depends_on: ["1a"]
+    complexity: 7
+    priority: "must"
+    success_criteria:
+      - "ai:getTeammateTranscript returns TranscriptViewMessage[] for a lead session with logged teammate chunks, filtered to the requested agentId only"
+      - "Projected output includes assistant text, thinking, and paired tool_use/tool_result entries (verified in a unit test against realistic tagged chunk fixtures, not just 'array is non-empty')"
+      - "Lead-injected messages appear as user-typed turns; teammate_message_to_lead synthetic chunks are represented without crashing the parser"
+      - "The lead session's own visible transcript is unchanged (suppression at SessionManager.ts:397-421 untouched; existing SessionManager tests still green)"
+      - "Renderer-process code performs no DB or filesystem access for this feature -- everything crosses via the new invoke handler"
+    files_affected:
+      - "packages/electron/src/main/services/ai/AIService.ts"
+      - "packages/electron/src/preload/index.ts"
+      - "packages/electron/src/renderer/electron.d.ts"
+      - "packages/runtime/src/ai/server/transcript/projectRawMessages.ts"
+      - "packages/runtime/src/ai/server/transcript/parsers/ClaudeCodeRawParser.ts"
+    agent_context: |
+      The stored chunk is the WHOLE raw SDK message JSON.stringify'd with
+      _isTeammateOutput/_teammateAgentId spread in (TeammateManager.ts:
+      1737-1749) -- so filtering can parse-and-check or string-match, but the
+      projection input should be the parsed chunk. The raw reader to use is
+      createRawMessageStoreAdapter() in packages/electron/src/main/services/
+      TranscriptMigrationAdapters.ts:17-60 -- an IRawMessageStore over
+      ai_agent_messages that already normalizes SQLite's string metadata
+      (:44-51); a near drop-in for this handler. transcript:get-tail-messages
+      (SessionHandlers.ts:1534-1551) is the closest handler SHAPE but reads
+      ai_transcript_events, which has NO rows for teammate chunks -- that is
+      why this handler projects from raw instead. Teammate rows are written
+      with hidden=false (BaseAgentProvider.ts:358), so the parser's
+      msg.hidden early return does not eat them. Chunk types other than
+      assistant/user/result were never logged, so the projector only needs
+      those (plus the synthetic teammate_message_to_lead shape). Follow
+      ERROR_HANDLING.md: workspacePath is an explicit required parameter.
+      projectRawMessagesToViewMessages is at projectRawMessages.ts:99-105.
+
+  - id: "2a"
+    title: "Live update signal channel (main -> renderer)"
+    description: |
+      Fire a lightweight event when a teammate chunk lands, so an open popover
+      can refetch.
+
+      In TeammateManager, after each teammate-chunk logNonBlocking call --
+      assistant/user chunks (:1737-1749), the result chunk (:1794-1812), AND
+      the synthetic teammate_message_to_lead log in deliverMessageToLead
+      (:1079-1083) -- emit a provider event (via the existing deps.emit used
+      for 'message:logged' / 'teammate:messageWhileIdle') such as
+      'teammate:transcriptUpdated' with { sessionId, agentId }. In
+      MessageStreamingHandler.ts, install a listener next to the existing
+      onTeammateMessageWhileIdle installation (:1154) that forwards it to the
+      session's window via safeSend as 'teammate:transcript-updated'
+      (camelCase payload per NAMING_CONVENTIONS.md). In the renderer, add a
+      centralized listener (packages/electron/src/renderer/store/listeners/,
+      pattern of sessionTranscriptListeners.ts:152-160) that bumps a Jotai
+      atomFamily signal keyed by (sessionId, agentId) -- components never
+      subscribe to IPC directly per IPC_LISTENERS.md. Debouncing lives at the
+      consumer (2b), matching SessionTranscriptPeek's 1.5s refresh pattern.
+
+      Fulfills R5.
+    depends_on: ["1a", "1b"]
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Each logged teammate chunk (assistant/user/result, and teammate_message_to_lead) produces exactly one provider event carrying { sessionId, agentId }"
+      - "The renderer signal atom bumps only for the matching (sessionId, agentId) family key, via a centralized listener registered once at startup"
+      - "No change to streamTeammateOutput's existing responsibilities (idle detection, lead delivery, tool-call counting) -- additive emit only"
+      - "Preload exposes the event subscription following the existing on/off pattern used by other main->renderer events"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/electron/src/main/services/ai/MessageStreamingHandler.ts"
+      - "packages/electron/src/preload/index.ts"
+      - "packages/electron/src/renderer/electron.d.ts"
+      - "packages/electron/src/renderer/store/listeners/"
+      - "packages/electron/src/renderer/store/atoms/agentMode.ts"
+    agent_context: |
+      Depends on 1a/1b only to serialize same-file edits (TeammateManager.ts
+      with 1a; preload + electron.d.ts with 1b), not a feature dependency.
+      MessageStreamingHandler resolves
+      the target window via findWindowByWorkspace (see onTeammateMessageWhileIdle
+      :1092-1153) -- reuse that resolution. In deliverMessageToLead, place the
+      new emit INSIDE the `if (sessionId)` guard at :1069 (next to the
+      logNonBlocking at :1079-1083), NOT next to the unconditional
+      message:logged emit at :1099 -- otherwise the "exactly one event per
+      logged chunk" criterion fails when sessionId is undefined. Do NOT reuse 'ai:message-logged'
+      as the trigger: it fires for all session activity and would make every
+      open popover refetch on unrelated traffic.
+
+  - id: "2b"
+    title: "Popover becomes a transcript panel (history + live + compose)"
+    description: |
+      Rebuild TeammateThreadPopover.tsx as a transcript panel modeled on
+      SessionTranscriptPeek.tsx (packages/electron/src/renderer/components/
+      AgenticCoding/SessionTranscriptPeek.tsx): RichTranscriptView with
+      peek-style TranscriptSettings EXCEPT showThinking: true (PEEK_SETTINGS
+      at :24-30 has showThinking: false; R4 requires thinking visible), and
+      keeping the popover's existing click-open/dismiss semantics -- do NOT
+      copy the peek's onMouseLeave={onClose} (:173). Also delete the stale
+      doc comment at TeammateThreadPopover.tsx:1-11 ("no persisted
+      ai_sessions row... no existing transcript to render") -- it is refuted
+      by this feature. Sized for reading (peek precedent:
+      min(600px,...) x min(350px,...); go larger if it reads badly), fetching
+      via window.electronAPI's new getTeammateTranscript on open and
+      refetching (debounced ~1.5s) when 2a's signal atom bumps for this
+      (sessionId, agentId).
+
+      Layout: status header (teammate name, mapped status, model, startedAt,
+      toolCallCount -- all already on TeammateInfo via sessionTeammatesAtom,
+      including sessionId after 1a), transcript body, compose footer.
+      Transcript renders for ALL statuses -- running, blocked, idle,
+      completed, errored. Compose/Send stays exactly as wired today
+      (aiSendMessageToTeammate) and remains available whenever delivery is
+      plausible (running/blocked/idle); completed/errored keep the inactive
+      notice in the footer only. Empty state: teammate exists but no chunks
+      logged yet -> "no activity yet" line, not an error and not a blank
+      panel.
+
+      Keep useFloatingMenu/FloatingPortal positioning (floating-ui rule) and
+      the stable kebab-case root class (REACT_DOM_MARKERS.md).
+
+      Fulfills R6 and R8.
+    depends_on: ["1b", "2a"]
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "Opening a chip fetches and renders the teammate's transcript through RichTranscriptView -- no bespoke message renderer"
+      - "While the teammate runs, new turns appear without reopening the popover (signal-atom-driven refetch, debounced; no polling loop)"
+      - "Transcript renders for completed and errored teammates; compose is replaced by the inactive notice for those, and Send still works for running/blocked/idle"
+      - "A teammate with zero logged chunks shows the explicit empty state"
+      - "Send path regression-free: message a running teammate from the rebuilt popover and the existing sent/failed status line still behaves"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/TeammateThreadPopover.tsx"
+      - "packages/electron/src/renderer/components/UnifiedAI/SessionTranscript.tsx"
+    agent_context: |
+      Mount site + props: SessionTranscript.tsx:2698-2708 (chip row +
+      popover), handleTeammateChipClick :2274-2278; current popover props at
+      TeammateThreadPopover.tsx:16-24 (sessionId here is the LEAD session id
+      -- keep it; agentId identifies the teammate). SessionTranscriptPeek's
+      PEEK_SETTINGS (:24-30), module-level cache (:22) and
+      transcriptEventSignalAtom debounce (:150-157) are the pattern to
+      mirror -- but the refetch trigger is 2a's teammate signal atom, NOT
+      transcriptEventSignalAtom (teammate chunks never enter
+      ai_transcript_events). persistScrollState={false} like the peek.
+
+  - id: "3a"
+    title: "Stop a running teammate from the popover"
+    description: |
+      User-facing stop for a running/blocked teammate. The core machinery
+      ALREADY EXISTS: TeammateManager.stop(name) (:1915-1942) aborts, removes
+      from the map, clears pending messages, and emits status (running branch
+      emits 'errored' at :1923; idle branch emits 'completed' at :1936 -- the
+      Stop button targets running/blocked only, so the running branch is the
+      one that matters; thread sessionId into both);
+      ClaudeCodeProvider.stopManagedTeammate(name) (:2578-2580) exposes it.
+      This task is plumbing + hardening, not new abort machinery:
+
+      - Extend stop() with an agentId-exact overload (current lookup uses
+        fuzzy agentIdMatchesRecipient matching by name) that also takes the
+        lead sessionId EXPLICITLY -- today stop()'s status emit depends on
+        this.lastUsedSessionId (:1922-1923, :1935-1936), which is unset after
+        a restart, so a user stop would silently skip the status update.
+        Distinguish the user-stop reason from the stall-watchdog abort in the
+        logged outcome.
+      - safeHandle 'ai:stopTeammate(sessionId, agentId, workspacePath)' in
+        AIService.ts next to ai:sendMessageToTeammate (:3204), plumbed via a
+        ClaudeCodeProvider method following sendMessageToManagedTeammate's
+        pattern. Preload + electron.d.ts.
+      - Renderer: Stop button in the rebuilt popover's header, visible only
+        for running/blocked statuses, with an in-flight disabled state.
+
+      PRD Q3 is resolved before this task starts: REUSE 'errored' with a
+      user-stop-distinguishing message; no new status value, so
+      subAgentStatus.ts and SubAgentChipRow maps stay untouched.
+
+      Fulfills R7.
+    depends_on: ["2a", "2b"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "ai:stopTeammate stops the exact teammate identified by agentId (not a fuzzy name match) and its status update is emitted using the explicitly-passed lead sessionId, not lastUsedSessionId (unit test with lastUsedSessionId unset)"
+      - "A user stop is distinguishable from a stall-watchdog abort in the logged outcome (message or marker)"
+      - "Stop button renders only for running/blocked teammates and disables while the stop is in flight"
+      - "Stopping a teammate that already completed/errored returns a graceful no-op result, not a throw"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts"
+      - "packages/electron/src/main/services/ai/AIService.ts"
+      - "packages/electron/src/preload/index.ts"
+      - "packages/electron/src/renderer/electron.d.ts"
+      - "packages/electron/src/renderer/components/AgentMode/TeammateThreadPopover.tsx"
+    agent_context: |
+      Sequenced after 2a (TeammateManager.ts same-file) and 2b (popover
+      same-file). Do not build a second abort mechanism -- stop() at
+      :1915-1942 is the one true path; this task widens its addressing and
+      threads sessionId explicitly (same principle as 1a's fix to
+      sendMessageToManagedTeammate).
+
+  - id: "4a"
+    title: "Test hardening + CHANGELOG"
+    description: |
+      End-of-work verification task. Most behavioral tests belong WITH their
+      tasks (each task's success criteria already demand them); this task
+      closes the gaps that only exist once everything is integrated, then
+      runs the full gate.
+
+      - Cross-restart integration test: simulate write -> new TeammateManager
+        instance -> sendMessageFromHost resolves the persisted sessionId and
+        takes the resume path (1a end-to-end at unit level).
+      - Seam test: transcript fetched via the 1b projection, then one more
+        chunk logged, signal fired, refetch -- resulting list has no
+        duplicate and no dropped turn.
+      - Regression sweep: existing TeammateManager / MessageStreamingHandler /
+        SessionTranscript-adjacent suites still green (grep test tree for
+        stale vi.mock specifiers if any import moved).
+      - CHANGELOG.md: extend the existing [Unreleased] agent-visibility
+        bullet (the "Teammates and sub-agents you spawn now show up as a
+        colored chip row..." line) to cover the thread view + stop -- ONE
+        bullet total for the feature area, no scaffolding names.
+      - Full gate green: npm run typecheck && npm run test:prepush.
+    depends_on: ["1a", "1b", "2a", "2b", "3a"]
+    complexity: 2
+    priority: "must"
+    success_criteria:
+      - "Cross-restart resume covered by a test that survives 'two boots' (fresh manager instance, persisted metadata only)"
+      - "History/live seam covered: refetch after an appended chunk yields no dupes, no drops"
+      - "npm run typecheck exits 0; npm run test:prepush shows no new failures versus the pre-change baseline captured before task 1a began"
+      - "CHANGELOG [Unreleased] has exactly one user-facing bullet covering agent-visibility + thread view combined; no IPC/store/class names in it"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/__tests__/"
+      - "packages/electron/src/renderer/components/AgentMode/__tests__/"
+      - "CHANGELOG.md"
+    agent_context: |
+      Testing rules that bite here: mock the narrowest module, never the
+      @nimbalyst/runtime barrel (NIM-2374 pattern); // @vitest-environment
+      node first line for non-DOM tests; extend existing test files
+      (TeammateManager has existing suites) over new ones; no
+      readFileSync-on-source assertions; read failures via npm run test:last,
+      never rerun blind.
