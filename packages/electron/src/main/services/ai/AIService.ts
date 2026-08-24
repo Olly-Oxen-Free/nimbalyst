@@ -3153,6 +3153,34 @@ export class AIService {
       return { success: true, method: result.method, forcedIdle };
     });
 
+    // Deliver a message to a specific Teammate directly from the UI (a
+    // sub-agent chip click-to-thread flow), rather than through the lead
+    // model's own SendMessage tool call. Request/response only -- no event
+    // stream, so no centralized listener is needed (docs/IPC_LISTENERS.md
+    // governs event subscriptions, not invoke-style calls).
+    safeHandle('ai:sendMessageToTeammate', async (_event, sessionId: string, agentId: string, content: string) => {
+      if (!sessionId || !agentId || !content) {
+        throw new Error('sessionId, agentId, and content are required');
+      }
+
+      const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+      const session = await AISessionsRepository.get(sessionId);
+      if (!session) {
+        return { success: false, error: 'Session not found' };
+      }
+      if (session.provider !== 'claude-code') {
+        return { success: false, error: 'Teammates only exist under the claude-code provider' };
+      }
+
+      const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
+      if (!provider || typeof (provider as any).sendMessageToManagedTeammate !== 'function') {
+        return { success: false, error: 'No active provider for session' };
+      }
+
+      const { delivered, wasIdle } = await (provider as ClaudeCodeProvider).sendMessageToManagedTeammate(agentId, content);
+      return { success: delivered, wasIdle };
+    });
+
     // Settings handlers
     safeHandle('ai:getSettings', async () => {
       const apiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;

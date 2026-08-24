@@ -110,6 +110,6 @@ describe('SubAgentChipRow', () => {
     const { chips } = renderRow({ onTeammateClick });
     chips()[0].click();
     expect(chips()[0].getAttribute('role')).toBe('button');
-    expect(onTeammateClick).toHaveBeenCalledWith('agent-code-reviewer');
+    expect(onTeammateClick).toHaveBeenCalledWith('agent-code-reviewer', chips()[0]);
   });
 });

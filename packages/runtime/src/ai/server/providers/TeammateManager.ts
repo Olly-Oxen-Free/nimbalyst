@@ -1143,6 +1143,50 @@ export class TeammateManager {
   }
 
   /**
+   * Deliver a message to a teammate on the host's behalf (a UI-initiated send,
+   * not the lead model's own SendMessage tool call). Reuses the exact
+   * running/idle delivery paths the SendMessage tool-routing branch uses
+   * (queueLeadMessage+flushPendingMessages / resumeIdleTeammate) rather than
+   * duplicating the inbox-file locking or resume-prompt logic.
+   *
+   * Unlike the tool-routing branch, the caller already has the exact agentId
+   * (sourced from TeammateInfo in the UI), so no fuzzy recipient-name matching
+   * is needed here.
+   *
+   * `delivered: true` on the idle path means resume was successfully
+   * initiated, not that the teammate has necessarily read the message yet --
+   * resumeIdleTeammate is fire-and-forget by design; a resume failure surfaces
+   * later through the existing stream-error/notification path (see 3a), not
+   * through this method's return value.
+   */
+  async sendMessageFromHost(
+    leadSessionId: string | undefined,
+    agentId: string,
+    content: string,
+  ): Promise<{ delivered: boolean; wasIdle: boolean }> {
+    const running = this.managedTeammates.get(agentId);
+    if (running) {
+      this.queueLeadMessage(agentId, running.name, content, 'Message from architect');
+      try {
+        await this.flushPendingMessages(agentId, running.query);
+        return { delivered: true, wasIdle: false };
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn(`[MANAGED-TEAMMATE] Failed to deliver host message to "${agentId}":`, reason);
+        return { delivered: false, wasIdle: false };
+      }
+    }
+
+    const idle = this.idleTeammates.get(agentId);
+    if (idle) {
+      this.resumeIdleTeammate(leadSessionId, agentId, idle, content);
+      return { delivered: true, wasIdle: true };
+    }
+
+    return { delivered: false, wasIdle: false };
+  }
+
+  /**
    * Status of a still-managed teammate: blocked for as long as it owns any open
    * permission prompt (it can have more than one in flight), else running.
    */
