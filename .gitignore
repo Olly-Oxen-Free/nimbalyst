@@ -257,6 +257,9 @@ packages/collab-client/src/**/*.d.ts.map
 # KARIMO worktree directories (isolated task execution)
 .karimo/.worktrees/
 
+# NIMBLE worktree directories (isolated task execution)
+.nimble/.worktrees/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
