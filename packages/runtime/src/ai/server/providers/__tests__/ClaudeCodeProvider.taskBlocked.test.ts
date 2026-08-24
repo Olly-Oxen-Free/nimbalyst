@@ -8,6 +8,10 @@
  * architect had to scroll to find the one actually waiting on them.
  * `subagentToolCallOwners` attributes the prompt to a single `activeTasks`
  * entry; these cover that attribution, its release, and its failure mode.
+ *
+ * Teammates reach the same `blocked` status by a different route — the provider
+ * forwards `toolPermission:pending`/`:resolved` to TeammateManager — so the
+ * forwarding is covered here too, and the transitions in TeammateManager.test.ts.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -144,5 +148,26 @@ describe('ClaudeCodeProvider sub-agent permission blocking', () => {
     release.toolu_bashB();
     await promptB;
     expect(statusOf(state, 'task-b')).toBe('running');
+  });
+});
+
+describe('ClaudeCodeProvider teammate permission forwarding', () => {
+  it('forwards a prompt to the teammate manager only when it names a teammate', () => {
+    const provider = new ClaudeCodeProvider();
+    const teammateManager = {
+      markTeammatePermissionPending: vi.fn(),
+      markTeammatePermissionResolved: vi.fn(),
+    };
+    (provider as unknown as { teammateManager: unknown }).teammateManager = teammateManager;
+
+    provider.emit('toolPermission:pending', { requestId: 'req-1', sessionId: 'session-1', teammateName: 'alice' });
+    // The lead's own prompt carries no teammate name and must stay out of the
+    // teammate roster entirely.
+    provider.emit('toolPermission:pending', { requestId: 'req-2', sessionId: 'session-1' });
+    provider.emit('toolPermission:resolved', { requestId: 'req-1', sessionId: 'session-1' });
+
+    expect(teammateManager.markTeammatePermissionPending).toHaveBeenCalledTimes(1);
+    expect(teammateManager.markTeammatePermissionPending).toHaveBeenCalledWith('session-1', 'alice', 'req-1');
+    expect(teammateManager.markTeammatePermissionResolved).toHaveBeenCalledWith('session-1', 'req-1');
   });
 });

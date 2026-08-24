@@ -27,7 +27,10 @@ export interface TeammateInfo {
   agentId: string;
   teamName: string;
   agentType: string;
-  status: 'running' | 'completed' | 'errored' | 'idle';
+  // 'blocked' = this teammate is parked on a permission prompt for one of its
+  // own tool calls. Kept distinct from 'running' so the UI can show which
+  // teammate is actually waiting on the user.
+  status: 'running' | 'blocked' | 'completed' | 'errored' | 'idle';
   model?: string;
   startedAt?: number;
   lastActiveAt?: number;

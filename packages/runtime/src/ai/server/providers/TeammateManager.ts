@@ -107,6 +107,12 @@ export class TeammateManager {
   private completedTeammates: Set<string> = new Set();  // agentIds
   private currentTeamContext?: string;
 
+  // Permission requestId -> agentId of the teammate parked on it. Written when
+  // ToolPermissionService announces a prompt that names a teammate, read to
+  // release the right one on resolution and to keep `blocked` sticky across
+  // unrelated emits (see emitTeammateUpdate).
+  private blockedTeammatesByRequest: Map<string, string> = new Map();
+
   private pendingLeadMessages: Map<string, PendingMessage[]> = new Map();
   private pendingLeadMessageFlushes: Set<string> = new Set();
 
@@ -124,7 +130,7 @@ export class TeammateManager {
   private subAgentCounter: number = 0;
 
   // Debounce state for emitTeammateUpdate
-  private pendingStatusOverrides: Map<string, 'running' | 'completed' | 'errored' | 'idle'> = new Map();
+  private pendingStatusOverrides: Map<string, 'running' | 'blocked' | 'completed' | 'errored' | 'idle'> = new Map();
   private pendingEmitSessionId?: string;
   private emitDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1062,12 +1068,61 @@ export class TeammateManager {
   // ─── UI sync ────────────────────────────────────────────────────────────
 
   /**
+   * Mark the teammate named by an open permission prompt as blocked, so the
+   * architect can see which teammate is actually waiting on them instead of
+   * every teammate showing the same running spinner. `requestId` is the only
+   * handle `toolPermission:resolved` carries, so the attribution is remembered
+   * under it.
+   */
+  markTeammatePermissionPending(sessionId: string | undefined, teammateName: string, requestId: string): void {
+    const matches = [...this.managedTeammates.values()].filter(tm => tm.name === teammateName);
+    if (matches.length !== 1) {
+      // canUseTool is only handed the plain teammate name, so two same-named
+      // teammates in different teams are indistinguishable here. Showing no one
+      // as blocked beats blaming the wrong teammate.
+      console.warn(`[MANAGED-TEAMMATE] Cannot attribute permission request ${requestId} to a teammate: ${matches.length} match "${teammateName}"`);
+      return;
+    }
+
+    const agentId = matches[0].agentId;
+    this.blockedTeammatesByRequest.set(requestId, agentId);
+    console.log(`[MANAGED-TEAMMATE] "${agentId}" blocked awaiting permission (request=${requestId})`);
+    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'blocked']]));
+  }
+
+  /**
+   * Release the marker set by markTeammatePermissionPending — the prompt was
+   * approved, denied, cancelled or aborted.
+   */
+  markTeammatePermissionResolved(sessionId: string | undefined, requestId: string): void {
+    const agentId = this.blockedTeammatesByRequest.get(requestId);
+    if (!agentId) return;
+
+    this.blockedTeammatesByRequest.delete(requestId);
+    // The teammate may have gone idle, completed or errored while the prompt
+    // was open; that terminal status was already emitted and must win.
+    if (!this.managedTeammates.has(agentId)) return;
+    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, this.statusForManaged(agentId)]]));
+  }
+
+  /**
+   * Status of a still-managed teammate: blocked for as long as it owns any open
+   * permission prompt (it can have more than one in flight), else running.
+   */
+  private statusForManaged(agentId: string): 'running' | 'blocked' {
+    for (const blockedAgentId of this.blockedTeammatesByRequest.values()) {
+      if (blockedAgentId === agentId) return 'blocked';
+    }
+    return 'running';
+  }
+
+  /**
    * Debounced version of emitTeammateUpdate. Accumulates status overrides
    * and flushes after EMIT_DEBOUNCE_MS to batch rapid lifecycle transitions.
    */
   private scheduleEmitTeammateUpdate(
     sessionId: string | undefined,
-    statusOverrides?: Map<string, 'running' | 'completed' | 'errored' | 'idle'>
+    statusOverrides?: Map<string, 'running' | 'blocked' | 'completed' | 'errored' | 'idle'>
   ): void {
     if (!sessionId) return;
 
@@ -1118,7 +1173,7 @@ export class TeammateManager {
 
   async emitTeammateUpdate(
     sessionId: string | undefined,
-    statusOverrides?: Map<string, 'running' | 'completed' | 'errored' | 'idle'>
+    statusOverrides?: Map<string, 'running' | 'blocked' | 'completed' | 'errored' | 'idle'>
   ): Promise<void> {
     if (!sessionId) {
       return;
@@ -1134,7 +1189,7 @@ export class TeammateManager {
         agentId: string;
         teamName: string;
         agentType: string;
-        status: 'running' | 'completed' | 'errored' | 'idle';
+        status: 'running' | 'blocked' | 'completed' | 'errored' | 'idle';
         model?: string;
         startedAt?: number;
         lastActiveAt?: number;
@@ -1153,7 +1208,10 @@ export class TeammateManager {
         if (statusOverrides?.has(tm.agentId)) {
           return { ...tm, ...activityFields, status: statusOverrides.get(tm.agentId)! };
         } else if (managed) {
-          return { ...tm, ...activityFields, status: 'running' as const };
+          // Not 'running': any unrelated emit (another teammate's tool call)
+          // would otherwise clear a blocked teammate's status while its prompt
+          // is still open.
+          return { ...tm, ...activityFields, status: this.statusForManaged(tm.agentId) };
         } else if (this.idleTeammates.has(tm.agentId)) {
           return { ...tm, status: 'idle' as const };
         }
@@ -1167,7 +1225,7 @@ export class TeammateManager {
             agentId: tm.agentId,
             teamName: tm.teamName,
             agentType: tm.agentType,
-            status: statusOverrides?.has(agentId) ? statusOverrides.get(agentId)! : 'running',
+            status: statusOverrides?.has(agentId) ? statusOverrides.get(agentId)! : this.statusForManaged(agentId),
             model: tm.model,
             startedAt: tm.startedAt,
             lastActiveAt: tm.lastActiveAt,
