@@ -1,7 +1,7 @@
 {
   "prd_slug": "agent-visibility",
   "version": "5.0",
-  "status": "ready",
+  "status": "ready-for-merge",
   "tracker": {
     "issue_key": null,
     "item_id": "plan_1787269888437_qky6ex",
@@ -14,9 +14,9 @@
   "feature_branch": "feature/agent-visibility",
   "created_at": "2026-08-20T22:03:20Z",
   "started_at": "2026-08-24T00:00:00Z",
-  "completed_at": null,
+  "completed_at": "2026-08-24T12:10:00Z",
   "finalized_at": null,
-  "ready_for_merge_at": null,
+  "ready_for_merge_at": "2026-08-24T12:10:00Z",
   "merged_to_main_at": null,
 
   "waves": {
@@ -26,7 +26,7 @@
     "4": { "status": "done" },
     "5": { "status": "done" },
     "6": { "status": "done" },
-    "7": { "status": "pending" }
+    "7": { "status": "done" }
   },
 
   "active_worktrees": [],
@@ -43,6 +43,6 @@
     "4c": { "status": "done", "wave": 4, "model": "sonnet", "commit": "4ac480083" },
     "2c": { "status": "done", "wave": 5, "model": "opus", "commit": "6fa69b913" },
     "2d": { "status": "done", "wave": 6, "model": "sonnet", "commit": "73d86c9cb" },
-    "5a": { "status": "queued", "wave": 7, "model": "sonnet" }
+    "5a": { "status": "done", "wave": 7, "model": "sonnet", "commit": "0efad9d12" }
   }
 }
