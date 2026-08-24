@@ -21,7 +21,7 @@
 
   "waves": {
     "1": { "status": "done" },
-    "2": { "status": "running" },
+    "2": { "status": "done" },
     "3": { "status": "pending" },
     "4": { "status": "pending" },
     "5": { "status": "pending" },
@@ -33,8 +33,8 @@
 
   "tasks": {
     "1b": { "status": "done", "wave": 1, "model": "opus", "commit": "646ce7cb6" },
-    "1a": { "status": "running", "wave": 2, "model": "opus" },
-    "4a": { "status": "running", "wave": 2, "model": "opus" },
+    "1a": { "status": "done", "wave": 2, "model": "opus", "commit": "39191908b" },
+    "4a": { "status": "done", "wave": 2, "model": "opus", "commit": "245d9faeb" },
     "2a": { "status": "queued", "wave": 3, "model": "sonnet" },
     "3a": { "status": "queued", "wave": 3, "model": "opus" },
     "2b": { "status": "queued", "wave": 4, "model": "opus" },
