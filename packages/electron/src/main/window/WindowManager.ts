@@ -258,20 +258,6 @@ export function createWindow(
         // pre-paint flash color would defeat the point.
         const backgroundColor = isLinuxGlass ? '#00000000' : getBackgroundColor();
 
-        // Real per-pixel transparency on Linux/Wayland, so a compositor
-        // window-rule (e.g. niri's app-id-matched background-effect) can
-        // blur behind chrome surfaces -- see nimbalyst-nirvana-theme's
-        // palette.ts, which gives --nim-bg-secondary/-tertiary real alpha
-        // for exactly this. Requires the `enable-transparent-visuals`
-        // Chromium switch set in bootstrap.ts. Scoped to this window only
-        // (the main workspace window); other windows are unaffected.
-        // `backgroundColor` becomes fully transparent too, since an opaque
-        // pre-paint flash color would defeat the point.
-        const isLinuxGlass = process.platform === 'linux';
-        if (isLinuxGlass) {
-            backgroundColor = '#00000000';
-        }
-
         const preloadPath = getPreloadPath();
 
         const windowOptions: Electron.BrowserWindowConstructorOptions = {
