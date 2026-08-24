@@ -234,6 +234,38 @@ export function reapRunningTasks(tasks: Iterable<MutableSubagentTask>): string[]
   return stranded;
 }
 
+/** A tracked task carrying the timestamp of its own last chunk. */
+export interface TimestampedSubagentTask extends SubagentTaskLike {
+  taskId?: string;
+  description?: string;
+  lastActivityAt: number;
+}
+
+/**
+ * Tasks whose OWN last activity is older than `staleMs`.
+ *
+ * The post-result drain grace timer is shared by every sub-agent and resets on
+ * every chunk of any kind, so with two draining concurrently a healthy
+ * sibling's chunks mask a silent one forever. Per-task stamps make each one
+ * individually detectable against the same window.
+ *
+ * 'blocked' is exempt: that task is parked on a permission prompt waiting for
+ * the user, not silently hung — the same reason the pre-result watchdog stays
+ * disarmed on hasPendingUserInteraction.
+ */
+export function findStalledTasks<T extends TimestampedSubagentTask>(
+  tasks: Iterable<T>,
+  nowMs: number,
+  staleMs: number,
+): T[] {
+  const stalled: T[] = [];
+  for (const task of tasks) {
+    if (task.status !== 'running') continue;
+    if (nowMs - task.lastActivityAt >= staleMs) stalled.push(task);
+  }
+  return stalled;
+}
+
 /** Count of tasks still running — what the drain gate actually keys off. */
 export function countRunningTasks(tasks: Iterable<SubagentTaskLike>): number {
   let count = 0;

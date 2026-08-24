@@ -11,6 +11,7 @@ import {
   shouldArmGraceTimerForResult,
   shouldContinueWithTaskResults,
   buildTaskResultContinuationMessage,
+  findStalledTasks,
 } from '../subagentDrain';
 
 describe('shouldSettleTaskFromToolResult', () => {
@@ -251,6 +252,41 @@ describe('hasRunningTasks', () => {
 
   it('is true when at least one task is running', () => {
     expect(hasRunningTasks([{ status: 'completed' }, { status: 'running' }])).toBe(true);
+  });
+});
+
+describe('findStalledTasks', () => {
+  const GRACE = 5 * 60_000;
+  const NOW = 1_000_000;
+
+  it('flags a task whose own activity is stale while a healthy sibling keeps streaming', () => {
+    const stalled = { taskId: 'a', status: 'running', lastActivityAt: NOW - GRACE - 1 };
+    const healthy = { taskId: 'b', status: 'running', lastActivityAt: NOW - 1_000 };
+    expect(findStalledTasks([stalled, healthy], NOW, GRACE)).toEqual([stalled]);
+  });
+
+  it('flags every stalled sibling, not just the first', () => {
+    const a = { taskId: 'a', status: 'running', lastActivityAt: NOW - GRACE };
+    const b = { taskId: 'b', status: 'running', lastActivityAt: NOW - GRACE * 3 };
+    expect(findStalledTasks([a, b], NOW, GRACE)).toEqual([a, b]);
+  });
+
+  it('exempts a task blocked on a permission prompt — it waits on the user, not the model', () => {
+    const blocked = { taskId: 'a', status: 'blocked', lastActivityAt: NOW - GRACE * 10 };
+    expect(findStalledTasks([blocked], NOW, GRACE)).toEqual([]);
+  });
+
+  it('ignores tasks that already settled', () => {
+    const settled = [
+      { taskId: 'a', status: 'completed', lastActivityAt: NOW - GRACE * 10 },
+      { taskId: 'b', status: 'stopped', lastActivityAt: NOW - GRACE * 10 },
+    ];
+    expect(findStalledTasks(settled, NOW, GRACE)).toEqual([]);
+  });
+
+  it('gives a task that has not produced a chunk yet the full window from its start', () => {
+    const justStarted = { taskId: 'a', status: 'running', lastActivityAt: NOW - 1 };
+    expect(findStalledTasks([justStarted], NOW, GRACE)).toEqual([]);
   });
 });
 
