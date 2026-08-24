@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- New features go here -->
 - Tracker board cards now have a run/resume/focus button to start, reopen, or jump to that item's AI session without leaving the board.
 - The prompt sent when dispatching a tracker item into a session is now customizable, globally and per project, in Settings.
+- Chat with a local Ollama server as its own provider, and optionally bridge its models into OpenCode for coding sessions.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
