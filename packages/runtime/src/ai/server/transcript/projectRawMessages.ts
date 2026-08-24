@@ -26,7 +26,16 @@ import type { RawMessage } from './TranscriptTransformer';
 import type { TranscriptEvent } from './types';
 import { processDescriptor, selectRawParser } from './processDescriptor';
 
-function createParser(provider: string): IRawMessageParser {
+export interface RawProjectionOptions {
+  /**
+   * Parse `_isTeammateOutput`-tagged chunks for a teammate's own thread view
+   * (see ClaudeCodeRawParser.setTeammateProjectionMode). Never set this when
+   * projecting a lead session's transcript.
+   */
+  teammateProjection?: boolean;
+}
+
+function createParser(provider: string, options?: RawProjectionOptions): IRawMessageParser {
   const kind = selectRawParser(provider);
   // Codex has two transports (SDK / app-server) with different output shapes;
   // route per-message via the same dispatcher the server-side transformer uses,
@@ -38,7 +47,9 @@ function createParser(provider: string): IRawMessageParser {
   if (kind === 'copilot') return new CopilotRawParser();
   if (kind === 'opencode') return new OpenCodeRawParser();
   if (kind === 'voice') return new VoiceRawParser();
-  return new ClaudeCodeRawParser();
+  const claudeParser = new ClaudeCodeRawParser();
+  if (options?.teammateProjection) claudeParser.setTeammateProjectionMode(true);
+  return claudeParser;
 }
 
 /**
@@ -48,13 +59,14 @@ function createParser(provider: string): IRawMessageParser {
 export async function rawMessagesToCanonicalEvents(
   rawMessages: RawMessage[],
   provider: string,
+  options?: RawProjectionOptions,
 ): Promise<TranscriptEvent[]> {
   if (rawMessages.length === 0) return [];
 
   const sessionId = rawMessages[0].sessionId;
   const store = new InMemoryTranscriptEventStore();
   const writer = new TranscriptWriter(store, provider);
-  const parser = createParser(provider);
+  const parser = createParser(provider, options);
 
   writer.seedSequence(1);
   const toolEventIds = new Map<string, number>();
@@ -99,7 +111,42 @@ export async function rawMessagesToCanonicalEvents(
 export async function projectRawMessagesToViewMessages(
   rawMessages: RawMessage[],
   provider: string,
+  options?: RawProjectionOptions,
 ): Promise<TranscriptViewMessage[]> {
-  const events = await rawMessagesToCanonicalEvents(rawMessages, provider);
+  const events = await rawMessagesToCanonicalEvents(rawMessages, provider, options);
   return TranscriptProjector.project(events).messages;
+}
+
+/**
+ * Project one managed teammate's thread out of the LEAD session's raw log.
+ *
+ * Teammate chunks are stored as the whole raw SDK message with
+ * `_isTeammateOutput`/`_teammateAgentId` spread in (TeammateManager
+ * streamTeammateOutput / deliverMessageToLead), interleaved with the lead's
+ * own messages in `ai_agent_messages`. Filter to the requested teammate, then
+ * run the same parser pipeline the rest of the app uses.
+ *
+ * @param leadRawMessages Every raw message of the lead session, in id order.
+ * @param agentId The teammate's agent id.
+ */
+export async function projectTeammateRawMessages(
+  leadRawMessages: RawMessage[],
+  agentId: string,
+): Promise<TranscriptViewMessage[]> {
+  const teammateMessages = leadRawMessages.filter((msg) => {
+    // Cheap reject first: lead sessions carry thousands of rows and only
+    // teammate chunks ever contain the tag.
+    if (typeof msg.content !== 'string' || !msg.content.includes('_teammateAgentId')) {
+      return false;
+    }
+    try {
+      return JSON.parse(msg.content)._teammateAgentId === agentId;
+    } catch {
+      return false;
+    }
+  });
+
+  return projectRawMessagesToViewMessages(teammateMessages, 'claude-code', {
+    teammateProjection: true,
+  });
 }

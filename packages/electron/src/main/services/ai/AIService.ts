@@ -24,6 +24,10 @@ import {
   OpenCodeProvider,
 } from '@nimbalyst/runtime/ai/server';
 import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
+import { projectTeammateRawMessages } from '@nimbalyst/runtime/ai/server/transcript/projectRawMessages';
+import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/transcript/TranscriptProjector';
+import { createRawMessageStoreAdapter } from '../TranscriptMigrationAdapters';
 import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
 import { reconcileClaudeCodeModels } from './claudeCodeModelReconcile';
 import { isModelEnabled } from './modelEnablementFilter';
@@ -3232,6 +3236,39 @@ export class AIService {
         },
       );
       return { success: delivered, wasIdle };
+    });
+
+    // A teammate has no session row of its own: its chunks live in the LEAD
+    // session's raw ai_agent_messages, tagged with its agent id, and are
+    // suppressed from the lead's visible stream. Project them here so the
+    // renderer gets TranscriptViewMessage[] without touching the DB itself.
+    // Raw rather than ai_transcript_events because the canonical table holds
+    // no teammate-scoped events.
+    safeHandle('ai:getTeammateTranscript', async (
+      _event,
+      sessionId: string,
+      agentId: string,
+      workspacePath: string,
+    ): Promise<TranscriptViewMessage[]> => {
+      if (!sessionId) throw new Error('sessionId is required');
+      if (!agentId) throw new Error('agentId is required');
+      if (!workspacePath) throw new Error('workspacePath is required');
+
+      const session = await AISessionsRepository.get(sessionId);
+      if (!session) return [];
+
+      // Same ownership rule as SessionManager.loadSession: a worktree session
+      // is reachable from either its parent workspace or its worktree.
+      const ownsSession = session.workspacePath === workspacePath
+        || (!!session.worktreePath && session.worktreePath === workspacePath);
+      if (session.workspacePath && !ownsSession) {
+        throw new Error(
+          `Session ${sessionId} belongs to ${session.workspacePath}, not ${workspacePath}`,
+        );
+      }
+
+      const rawMessages = await createRawMessageStoreAdapter().getMessages(sessionId);
+      return projectTeammateRawMessages(rawMessages, agentId);
     });
 
     // Settings handlers

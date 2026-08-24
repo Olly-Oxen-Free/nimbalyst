@@ -56,6 +56,20 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
     this.suppressResultChunkText = suppress;
   }
 
+  /**
+   * When true, chunks tagged `_isTeammateOutput` are parsed for a teammate's
+   * OWN thread view rather than for the lead's transcript. Off by default so
+   * the lead session's canonical events stay unchanged: in the lead's view
+   * these rows are suppressed or folded under the parent Task card, and
+   * turning them into user turns / status lines there would alter what the
+   * lead displays.
+   */
+  private teammateProjection = false;
+
+  setTeammateProjectionMode(enabled: boolean): void {
+    this.teammateProjection = enabled;
+  }
+
   async parseMessage(
     msg: RawMessage,
     context: ParseContext,
@@ -381,10 +395,42 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
             }
           }
         } else if (typeof parsed.message.content === 'string' && parsed.message.content.trim()) {
+          // Teammate thread view: a `user` chunk on the output stream tagged as
+          // teammate output is the lead's "[Message from team-lead]" injection
+          // echoed back by the SDK (TeammateManager.createInjectedUserMessageStream),
+          // so it belongs in the teammate's thread as a user turn -- not the
+          // status line the lead's transcript renders it as.
+          if (this.teammateProjection && parsed._isTeammateOutput) {
+            descriptors.push({
+              type: 'user_message',
+              text: parsed.message.content,
+              createdAt: msg.createdAt,
+            });
+          } else {
+            descriptors.push({
+              type: 'system_message',
+              text: parsed.message.content,
+              systemType: 'status',
+              createdAt: msg.createdAt,
+            });
+          }
+        }
+      } else if (this.teammateProjection && parsed.type === 'teammate_message_to_lead') {
+        // Synthetic chunk TeammateManager writes when a teammate reports back
+        // (deliverMessageToLead). No SDK analogue, so without this branch it
+        // matches nothing and vanishes from the thread.
+        const reportText =
+          typeof parsed.content === 'string' && parsed.content.trim()
+            ? parsed.content
+            : typeof parsed.summary === 'string'
+              ? parsed.summary
+              : '';
+        if (reportText.trim()) {
           descriptors.push({
             type: 'system_message',
-            text: parsed.message.content,
+            text: `Message to team-lead:\n\n${reportText}`,
             systemType: 'status',
+            searchable: false,
             createdAt: msg.createdAt,
           });
         }

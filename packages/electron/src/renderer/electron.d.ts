@@ -490,6 +490,14 @@ interface ElectronAPI {
     agentId: string,
     content: string,
   ) => Promise<{ success: boolean; error?: string; wasIdle?: boolean }>;
+  /** A teammate's own transcript, projected from the lead session's raw log. */
+  aiGetTeammateTranscript: (
+    sessionId: string,
+    agentId: string,
+    workspacePath: string,
+  ) => Promise<
+    import('@nimbalyst/runtime/ai/server/transcript/TranscriptProjector').TranscriptViewMessage[]
+  >;
   aiApplyEdit: (edit: any) => Promise<any>;
 
   // Flat-key settings -- single read-everything snapshot, single per-key write,

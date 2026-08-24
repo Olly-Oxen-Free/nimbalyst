@@ -9,6 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   projectRawMessagesToViewMessages,
+  projectTeammateRawMessages,
   rawMessagesToCanonicalEvents,
 } from '../projectRawMessages';
 import type { RawMessage } from '../TranscriptTransformer';
@@ -569,5 +570,148 @@ describe('projectRawMessagesToViewMessages', () => {
     const blocks = JSON.parse(toolCall?.toolCall?.result as string);
     expect(blocks[0].type).toBe('image');
     expect(blocks[0].source.data).toBe(imageData);
+  });
+});
+
+/**
+ * Teammate thread projection -- managed teammates have no session row of their
+ * own, so their chunks sit in the LEAD session's raw log tagged with an agent
+ * id (TeammateManager.streamTeammateOutput / deliverMessageToLead). These
+ * fixtures mirror the shapes actually persisted.
+ */
+describe('projectTeammateRawMessages', () => {
+  const AGENT = 'agent-scout-1';
+  const OTHER_AGENT = 'agent-builder-2';
+
+  function teammateChunk(id: number, chunk: Record<string, unknown>, agentId = AGENT): RawMessage {
+    return raw({
+      id,
+      content: JSON.stringify({ ...chunk, _isTeammateOutput: true, _teammateAgentId: agentId }),
+    });
+  }
+
+  const assistantWithThinking = (id: number, agentId?: string) =>
+    teammateChunk(id, {
+      type: 'assistant',
+      session_id: 'sdk-1',
+      message: {
+        id: `msg_${id}`,
+        role: 'assistant',
+        model: 'claude-opus-4',
+        content: [
+          { type: 'thinking', thinking: 'Read the file before answering.', signature: 'sig' },
+          { type: 'text', text: 'Checking the tests now.' },
+        ],
+      },
+    }, agentId);
+
+  it('projects assistant text, thinking, and a paired tool_use/tool_result', async () => {
+    const messages: RawMessage[] = [
+      assistantWithThinking(1),
+      teammateChunk(2, {
+        type: 'assistant',
+        session_id: 'sdk-1',
+        message: {
+          id: 'msg_2',
+          role: 'assistant',
+          model: 'claude-opus-4',
+          content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/a.ts' } }],
+        },
+      }),
+      teammateChunk(3, {
+        type: 'user',
+        session_id: 'sdk-1',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'export const a = 1;' }],
+        },
+      }),
+    ];
+
+    const vms = await projectTeammateRawMessages(messages, AGENT);
+
+    expect(vms.map((m) => m.type)).toEqual(['assistant_message', 'assistant_message', 'tool_call']);
+    expect(vms[0]).toMatchObject({ text: '', thinking: 'Read the file before answering.' });
+    expect(vms[1]).toMatchObject({ text: 'Checking the tests now.', model: 'claude-opus-4' });
+    expect(vms[2].toolCall).toMatchObject({
+      toolName: 'Read',
+      status: 'completed',
+      result: 'export const a = 1;',
+      isError: false,
+    });
+  });
+
+  it('renders the lead-injected message as a user turn, not a status line', async () => {
+    const messages: RawMessage[] = [
+      teammateChunk(1, {
+        type: 'user',
+        session_id: 'sdk-1',
+        parent_tool_use_id: null,
+        message: { role: 'user', content: '[Message from team-lead]\n\ncheck the tests' },
+      }),
+    ];
+
+    const vms = await projectTeammateRawMessages(messages, AGENT);
+
+    expect(vms).toHaveLength(1);
+    expect(vms[0]).toMatchObject({
+      type: 'user_message',
+      text: '[Message from team-lead]\n\ncheck the tests',
+    });
+  });
+
+  it('represents a teammate_message_to_lead chunk legibly instead of dropping it', async () => {
+    const messages: RawMessage[] = [
+      teammateChunk(1, {
+        type: 'teammate_message_to_lead',
+        _teammateName: 'Scout',
+        content: 'Tests pass locally.',
+        summary: 'tests pass',
+        timestamp: 1,
+      }),
+    ];
+
+    const vms = await projectTeammateRawMessages(messages, AGENT);
+
+    expect(vms).toHaveLength(1);
+    expect(vms[0].type).toBe('system_message');
+    expect(vms[0].text).toContain('Tests pass locally.');
+  });
+
+  it('returns only the requested teammate, ignoring the lead and other teammates', async () => {
+    const messages: RawMessage[] = [
+      raw({ id: 1, direction: 'input', content: JSON.stringify({ prompt: 'lead prompt' }) }),
+      raw({ id: 2, content: JSON.stringify({ type: 'text', content: 'lead answer' }) }),
+      assistantWithThinking(3, OTHER_AGENT),
+      assistantWithThinking(4),
+    ];
+
+    const vms = await projectTeammateRawMessages(messages, AGENT);
+
+    expect(vms.map((m) => m.text)).toEqual(['', 'Checking the tests now.']);
+  });
+
+  it('leaves lead-transcript parsing of the same chunks unchanged', async () => {
+    // The default (lead) projection must keep showing the injected message as a
+    // status line and keep dropping the synthetic report -- the teammate view
+    // opts in via projectTeammateRawMessages.
+    const messages: RawMessage[] = [
+      teammateChunk(1, {
+        type: 'user',
+        session_id: 'sdk-1',
+        message: { role: 'user', content: '[Message from team-lead]\n\ncheck the tests' },
+      }),
+      teammateChunk(2, {
+        type: 'teammate_message_to_lead',
+        content: 'Tests pass locally.',
+        summary: 'tests pass',
+      }),
+    ];
+
+    const vms = await projectRawMessagesToViewMessages(messages, 'claude-code');
+
+    expect(vms).toHaveLength(1);
+    expect(vms[0]).toMatchObject({ type: 'system_message' });
+    expect(vms[0].text).toBe('[Message from team-lead]\n\ncheck the tests');
   });
 });
