@@ -10,7 +10,7 @@
  * drain grace expires. Observed as a ~5 minute stall on 2026-08-04.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('electron', () => ({
   app: { isPackaged: false },
@@ -28,8 +28,15 @@ vi.mock('../../../../electron/claudeCodeEnvironment', () => ({
 import { ClaudeCodeProvider } from '../ClaudeCodeProvider';
 
 type ProviderInternals = {
-  activeTasks: Map<string, { taskId: string; description: string; status: string }>;
+  activeTasks: Map<string, {
+    taskId: string;
+    description: string;
+    status: string;
+    lastActivityAt?: number;
+  }>;
   hasRunningTasks: () => boolean;
+  handleSystemTask: (subtype: string, chunk: any, sessionId: string | undefined) => void;
+  reapStalledSubagentTasks: (staleMs: number, sessionId: string | undefined) => void;
 };
 
 function internals(provider: ClaudeCodeProvider): ProviderInternals {
@@ -67,5 +74,65 @@ describe('ClaudeCodeProvider background task reaping', () => {
     expect(state.activeTasks.get('waiting')?.status).toBe('stopped');
     // A task that already settled keeps its own terminal status.
     expect(state.activeTasks.get('done')?.status).toBe('completed');
+  });
+});
+
+/**
+ * Concurrent sub-agents share ONE post-result grace timer, and it resets on
+ * every chunk of any kind. With two draining at once, a healthy sibling's
+ * chunks kept resetting it forever, so a genuinely stalled sibling was never
+ * reaped. Per-task activity stamps make each one individually detectable.
+ */
+describe('ClaudeCodeProvider stalled sub-agent detection', () => {
+  const GRACE_MS = 5 * 60_000;
+  const T0 = 1_750_000_000_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('reaps a stalled sub-agent even while a healthy sibling keeps producing chunks', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+
+    const provider = new ClaudeCodeProvider();
+    const state = internals(provider);
+    state.handleSystemTask('task_started', { task_id: 'stalled', description: 'Never reports back' }, undefined);
+    state.handleSystemTask('task_started', { task_id: 'healthy', description: 'Still working' }, undefined);
+
+    // The healthy sibling streams progress across the whole grace window. In
+    // production each of these chunks resets the shared timer, which is exactly
+    // what used to mask the silent sibling.
+    for (const offset of [2 * 60_000, 4 * 60_000, GRACE_MS + 1_000]) {
+      vi.setSystemTime(T0 + offset);
+      state.handleSystemTask('task_progress', { task_id: 'healthy', usage: { tool_uses: 3 } }, undefined);
+      state.reapStalledSubagentTasks(GRACE_MS, undefined);
+    }
+
+    expect(state.activeTasks.get('stalled')?.status).toBe('stopped');
+    expect(state.activeTasks.get('healthy')?.status).toBe('running');
+    // The healthy sibling still holds the drain open.
+    expect(state.hasRunningTasks()).toBe(true);
+  });
+
+  it('leaves a solo silent sub-agent to the existing shared grace timer', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+
+    const provider = new ClaudeCodeProvider();
+    const state = internals(provider);
+    state.handleSystemTask('task_started', { task_id: 'solo', description: 'Alone and silent' }, undefined);
+
+    // No sibling, so no post-result chunk arrives to drive the per-task sweep.
+    // Advancing past the window must not reap it early via some background
+    // poller — the shared timer's teardown path still owns this case.
+    vi.setSystemTime(T0 + GRACE_MS * 2);
+    vi.advanceTimersByTime(GRACE_MS * 2);
+    expect(state.activeTasks.get('solo')?.status).toBe('running');
+    expect(state.hasRunningTasks()).toBe(true);
+
+    // ...and that teardown path still reaps it, unchanged.
+    provider.abort();
+    expect(state.activeTasks.get('solo')?.status).toBe('stopped');
   });
 });

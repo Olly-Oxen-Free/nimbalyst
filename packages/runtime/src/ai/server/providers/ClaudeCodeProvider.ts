@@ -114,6 +114,7 @@ import {
   isTaskAlive,
   countRunningTasks,
   reapRunningTasks,
+  findStalledTasks,
   shouldDeferTeardownForSubagents,
   shouldExitDrain,
   classifyDrainOutcome,
@@ -306,6 +307,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // isTaskAlive() in subagentDrain.ts.
     status: 'running' | 'blocked' | 'completed' | 'failed' | 'stopped';
     startedAt: number;
+    // Epoch ms of this task's own last chunk (starts at startedAt). The shared
+    // post-result grace timer resets on ANY chunk, so this is what lets a
+    // stalled sub-agent be spotted while a healthy sibling keeps streaming.
+    lastActivityAt: number;
     toolUseId?: string;
     toolCount: number;
     tokenCount: number;
@@ -1221,6 +1226,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
               // Activity continued after the real result -- reset the grace
               // timer so we don't kill stdin while the binary is still working.
               armPromptEndTimer('grace-period-reset-on-activity');
+              // That timer is shared by every draining sub-agent and resets on
+              // any chunk, so one healthy sub-agent's chunks would otherwise
+              // mask a stalled sibling forever. Each task carries its own
+              // last-activity stamp; reap the ones that individually went quiet
+              // for the same window.
+              this.reapStalledSubagentTasks(SUBAGENT_DRAIN_GRACE_MS, sessionId);
             }
           }
 
@@ -2679,6 +2690,25 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     return computeHasRunningTasks(this.activeTasks.values());
   }
 
+  /**
+   * Mark stopped every sub-agent task whose OWN last chunk is older than
+   * `staleMs`. Driven by post-result chunk activity, because that is exactly
+   * when the shared drain grace timer gets reset: with two sub-agents draining
+   * concurrently, a healthy sibling's chunks kept the shared timer alive
+   * forever and a stalled sibling was never reaped, so the drain loop never
+   * exited. A solo silent sub-agent produces no chunks at all, so nothing
+   * sweeps it — the shared timer still owns that (already correct) case.
+   */
+  private reapStalledSubagentTasks(staleMs: number, sessionId: string | undefined): void {
+    const stalled = findStalledTasks(this.activeTasks.values(), Date.now(), staleMs);
+    if (stalled.length === 0) return;
+    for (const task of stalled) {
+      task.status = 'stopped';
+      console.warn(`[CLAUDE-CODE] SUBAGENT_TASK_STALLED: id=${task.taskId} desc="${task.description.substring(0, 80)}" no activity for ${Date.now() - task.lastActivityAt}ms while sibling chunks kept the drain alive; marking stopped`);
+    }
+    this.emitTaskUpdate(sessionId).catch(() => {});
+  }
+
   private hasPendingUserInteraction(): boolean {
     return this.pendingExitPlanModeConfirmations.size > 0
       || this.pendingAskUserQuestions.size > 0
@@ -2781,12 +2811,16 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   /** Handle system task chunks (task_started, task_progress, task_notification) */
   private handleSystemTask(subtype: string, chunk: any, sessionId: string | undefined): void {
     if (subtype === 'task_started') {
+      const startedAt = Date.now();
       this.activeTasks.set(chunk.task_id, {
         taskId: chunk.task_id,
         description: chunk.description || '',
         taskType: chunk.task_type,
         status: 'running',
-        startedAt: Date.now(),
+        startedAt,
+        // A task that has not produced a progress chunk yet gets the full
+        // staleness window from its start, not an instant reap.
+        lastActivityAt: startedAt,
         toolUseId: chunk.tool_use_id,
         toolCount: 0,
         tokenCount: 0,
@@ -2797,6 +2831,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     } else if (subtype === 'task_progress') {
       const existing = this.activeTasks.get(chunk.task_id);
       if (existing) {
+        existing.lastActivityAt = Date.now();
         existing.toolCount = chunk.usage?.tool_uses ?? existing.toolCount;
         existing.tokenCount = chunk.usage?.total_tokens ?? existing.tokenCount;
         existing.durationMs = chunk.usage?.duration_ms ?? existing.durationMs;
@@ -2806,6 +2841,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     } else if (subtype === 'task_notification') {
       const existing = this.activeTasks.get(chunk.task_id);
       if (existing) {
+        existing.lastActivityAt = Date.now();
         existing.status = chunk.status || 'completed';
         existing.summary = chunk.summary;
         if (chunk.usage) {
@@ -2836,6 +2872,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       const existing = this.activeTasks.get(chunk.task_id);
       const patch = chunk.patch;
       if (existing && patch && typeof patch === 'object') {
+        existing.lastActivityAt = Date.now();
         if (patch.is_backgrounded === true) existing.isBackgrounded = true;
         if (typeof patch.description === 'string' && patch.description) existing.description = patch.description;
         // While draining, terminal status comes ONLY from task_notification —
@@ -3787,6 +3824,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // outcome must win.
     if (task?.status !== 'blocked') return;
     task.status = 'running';
+    // The prompt may have sat open for a long time; that silence was the user's,
+    // not the sub-agent's, so restart its staleness window here.
+    task.lastActivityAt = Date.now();
     this.emitTaskUpdate(sessionId).catch(() => {});
   }
 
