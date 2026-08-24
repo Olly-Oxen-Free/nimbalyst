@@ -1,0 +1,39 @@
+/**
+ * SubAgentChipRow - the two rules Tailwind can't express here.
+ *
+ * This project is on Tailwind 3.4 without `@tailwindcss/container-queries`, so
+ * the `@container` / `@[max-*]` utility classes compile to nothing. The chip
+ * row's responsive behavior is therefore a real CSS container query, not a
+ * `@media` query (docs/UI_PATTERNS.md).
+ */
+
+.sub-agent-chip-row {
+  container-type: inline-size;
+  container-name: sub-agent-chips;
+}
+
+/* 360px: below roughly this width a single horizontally-scrolling row hides
+   most of the chips behind a scroll gesture, so they wrap onto more lines and
+   labels take a tighter cap instead. */
+@container sub-agent-chips (max-width: 360px) {
+  .sub-agent-chip-row-items {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+
+  .sub-agent-chip-label {
+    max-width: 96px;
+  }
+}
+
+/* Amber glow drawing the eye to a sub-agent parked on a permission prompt.
+   Applied via `animate-[sub-agent-blocked-pulse_...]` in the component. */
+@keyframes sub-agent-blocked-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--nim-warning) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--nim-warning) 0%, transparent);
+  }
+}

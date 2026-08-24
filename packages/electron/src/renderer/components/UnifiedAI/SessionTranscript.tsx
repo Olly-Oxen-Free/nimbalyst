@@ -40,6 +40,7 @@ import { recordCodexActivity } from '../../store/listeners/codexUsageListeners';
 import { PendingReviewBanner } from '../AIChat/PendingReviewBanner';
 import { WakeupBanner } from '../AIChat/WakeupBanner';
 import { McpLockdownBanner } from '../AIChat/McpLockdownBanner';
+import { SubAgentChipRow } from '../AgentMode/SubAgentChipRow';
 import type { AIMode } from './ModeTag';
 // Note: ExitPlanMode, AskUserQuestion, and ToolPermission use inline widgets via InteractiveWidgetHost (in runtime package)
 import { SlashCommandSuggestions } from './SlashCommandSuggestions';
@@ -2666,6 +2667,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         onEdit={handleEditQueuedPrompt}
         onSendNow={isLoading && !isClaudeCliTerminalSession(provider) ? handleSendNowQueuedPrompt : undefined}
       />
+
+      {/* Sub-agent status chips - renders nothing when the session has none */}
+      <SubAgentChipRow sessionId={sessionId} />
 
       {/* Note: All interactive prompts (ToolPermission, ExitPlanMode, AskUserQuestion) use inline widgets in transcript */}
 
