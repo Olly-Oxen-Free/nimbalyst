@@ -55,6 +55,15 @@ export interface PendingMessage {
 }
 
 /**
+ * How a batch of teammates ended, carried on `teammates:allCompleted`.
+ *
+ * The event fires once no teammate is left, whatever killed them, so without
+ * this the host cannot tell a finished team from a crashed one and greets both
+ * with the completion chime.
+ */
+export type TeammatesCompletionOutcome = 'clean' | 'errored' | 'abandoned';
+
+/**
  * Dependency interface injected by the host provider (ClaudeCodeProvider).
  * Keeps TeammateManager decoupled from BaseAIProvider / EventEmitter.
  */
@@ -112,6 +121,12 @@ export class TeammateManager {
   // release the right one on resolution and to keep `blocked` sticky across
   // unrelated emits (see emitTeammateUpdate).
   private blockedTeammatesByRequest: Map<string, string> = new Map();
+
+  // Worst thing that happened to the current batch of teammates. Reset by the
+  // teammates:allCompleted emit, which only fires once the batch is empty, so a
+  // teammate that crashed early is still reported when a later sibling is the
+  // one that finishes the batch.
+  private batchOutcome: TeammatesCompletionOutcome = 'clean';
 
   private pendingLeadMessages: Map<string, PendingMessage[]> = new Map();
   private pendingLeadMessageFlushes: Set<string> = new Set();
@@ -188,6 +203,27 @@ export class TeammateManager {
   }
 
   /**
+   * Record that the current batch ended badly. An outright error outranks an
+   * abandon: it is the more specific thing to tell the user about.
+   */
+  private recordBatchFailure(outcome: Exclude<TeammatesCompletionOutcome, 'clean'>): void {
+    if (this.batchOutcome === 'errored') return;
+    this.batchOutcome = outcome;
+  }
+
+  /**
+   * Announce that no teammate is left and open a fresh batch. Every caller has
+   * already checked `hasActiveTeammates()`, which is what makes resetting here
+   * the batch boundary.
+   */
+  private emitAllCompleted(sessionId: string | undefined): void {
+    const outcome = this.batchOutcome;
+    this.batchOutcome = 'clean';
+    console.log(`[MANAGED-TEAMMATE] All teammates finished (${outcome}), emitting teammates:allCompleted`);
+    this.deps.emit('teammates:allCompleted', { sessionId, outcome });
+  }
+
+  /**
    * Abandon all idle teammates (mark completed, clear from idle map).
    * Called when the lead's transport dies and idle teammates can no longer
    * be resumed. Emits teammates:allCompleted if no running teammates remain.
@@ -203,12 +239,12 @@ export class TeammateManager {
       console.log(`[MANAGED-TEAMMATE] Abandoning idle teammate "${agentId}" (lead transport dead)`);
     }
     this.idleTeammates.clear();
+    this.recordBatchFailure('abandoned');
 
     this.scheduleEmitTeammateUpdate(sessionId, overrides);
 
     if (!this.hasActiveTeammates()) {
-      console.log(`[MANAGED-TEAMMATE] All teammates completed after idle abandon, emitting teammates:allCompleted`);
-      this.deps.emit('teammates:allCompleted', { sessionId });
+      this.emitAllCompleted(sessionId);
     }
   }
 
@@ -1319,8 +1355,7 @@ export class TeammateManager {
 
     // If no more active teammates remain, notify the host so the session can end
     if (!this.hasActiveTeammates()) {
-      console.log(`[MANAGED-TEAMMATE] All teammates completed/errored, emitting teammates:allCompleted`);
-      this.deps.emit('teammates:allCompleted', { sessionId });
+      this.emitAllCompleted(sessionId);
     }
   }
 
@@ -1339,11 +1374,11 @@ export class TeammateManager {
     if (!isBackground) void this.removeTeammateFromConfig(teamName, agentId);
     console.warn(`[MANAGED-TEAMMATE] "${agentId}" errored:`, err.message);
     this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'errored']]));
+    this.recordBatchFailure('errored');
 
     // If no more active teammates remain, notify the host so the session can end
     if (!this.hasActiveTeammates()) {
-      console.log(`[MANAGED-TEAMMATE] All teammates completed/errored, emitting teammates:allCompleted`);
-      this.deps.emit('teammates:allCompleted', { sessionId });
+      this.emitAllCompleted(sessionId);
     }
   }
 
@@ -1794,8 +1829,7 @@ export class TeammateManager {
         void this.removeTeammateFromConfig(idleInfo.teamName, agentId);
         this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'completed']]));
         if (!this.hasActiveTeammates()) {
-          console.log(`[MANAGED-TEAMMATE] All teammates completed/errored, emitting teammates:allCompleted`);
-          this.deps.emit('teammates:allCompleted', { sessionId });
+          this.emitAllCompleted(sessionId);
         }
         return;
       }
@@ -1811,8 +1845,7 @@ export class TeammateManager {
         void this.removeTeammateFromConfig(managedInfo.teamName, agentId);
         this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'completed']]));
         if (!this.hasActiveTeammates()) {
-          console.log(`[MANAGED-TEAMMATE] All teammates completed/errored, emitting teammates:allCompleted`);
-          this.deps.emit('teammates:allCompleted', { sessionId });
+          this.emitAllCompleted(sessionId);
         }
         return;
       }

@@ -116,6 +116,7 @@ import {
 import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
 import { installScopedProviderListener } from './providerListenerRegistry';
 import { shouldSettleUnterminatedTurn } from './sessionSettlePolicy';
+import { announceTeammatesCompletion, type TeammatesCompletionOutcome } from './teammateCompletionSignal';
 import { captureTutorialMilestone } from '../tutorial/tutorialAnalytics';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
@@ -1108,7 +1109,7 @@ export class MessageStreamingHandler {
     // Listen for all teammates completing. When the lead finished but teammates
     // were still active, endSession was deferred. Now that all teammates are
     // done, end the session and play the completion sound.
-    const onTeammatesAllCompleted = async (data: { sessionId: string }) => {
+    const onTeammatesAllCompleted = async (data: { sessionId: string; outcome?: TeammatesCompletionOutcome }) => {
       if (!data.sessionId) return;
       // Only end the session if it's still tracked as active (lead deferred ending)
       if (stateManager.isSessionActive(data.sessionId)) {
@@ -1129,9 +1130,21 @@ export class MessageStreamingHandler {
         await this.svc.hooklessWatcher.stopForSession(data.sessionId);
         codexEditWindowRegistry.clearSession(data.sessionId);
 
-        // Play completion sound now that the session is truly done
-        const soundService = SoundNotificationService.getInstance();
-        soundService.playCompletionSound(workspacePath);
+        // Tell the user the session is done -- the chime for a clean finish,
+        // a notification naming the failure for anything else.
+        await announceTeammatesCompletion(data.outcome, {
+          playCompletionSound: () => SoundNotificationService.getInstance().playCompletionSound(workspacePath),
+          showFailureNotification: async (reason) => {
+            logger.main.info(`[AIService] Teammates for ${data.sessionId} ended ${data.outcome}: ${reason}`);
+            const sessionTitle = await getCurrentSessionTitle(data.sessionId);
+            await notificationService.showAgentFailureNotification(
+              data.sessionId,
+              sessionTitle,
+              reason,
+              workspacePath
+            );
+          },
+        });
       }
     };
     this.installListener(provider, 'teammates:allCompleted', onTeammatesAllCompleted);

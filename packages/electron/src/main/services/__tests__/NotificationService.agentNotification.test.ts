@@ -606,6 +606,35 @@ describe('NotificationService agent notifications', () => {
     vi.resetModules();
   });
 
+  it('names a crashed agent as stopped, not as blocked or finished', async () => {
+    await notificationService.showAgentFailureNotification(
+      'session-1',
+      'Build release',
+      'a teammate ended with an error',
+      '/workspace/alpha',
+    );
+
+    expect(mocks.notificationConstructor).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Build release -- Agent Stopped Unexpectedly',
+      body: '"Build release": a teammate ended with an error',
+    }));
+  });
+
+  it('honours the session-blocked toggle for agent failures too', async () => {
+    // The failure notification replaces the completion chime, so a user who
+    // switched these off must not start receiving them from the teammate path.
+    mocks.sessionBlockedNotificationsEnabled.mockReturnValue(false);
+
+    await notificationService.showAgentFailureNotification(
+      'session-1',
+      'Build release',
+      'a teammate ended with an error',
+      '/workspace/alpha',
+    );
+
+    expect(mocks.notificationShow).not.toHaveBeenCalled();
+  });
+
   it('prefixes blocked notifications with the originating session name', async () => {
     await notificationService.showBlockedNotification(
       'session-1',
