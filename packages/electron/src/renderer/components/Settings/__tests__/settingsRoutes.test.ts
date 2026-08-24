@@ -111,10 +111,10 @@ describe('settings route registry', () => {
     });
 
     expect(hiddenRoutes.map((route) => route.id)).not.toEqual(
-      expect.arrayContaining(['claude', 'openai', 'lmstudio']),
+      expect.arrayContaining(['claude', 'openai', 'lmstudio', 'ollama']),
     );
     expect(visibleRoutes.map((route) => route.id)).toEqual(
-      expect.arrayContaining(['claude', 'openai', 'lmstudio']),
+      expect.arrayContaining(['claude', 'openai', 'lmstudio', 'ollama']),
     );
   });
 

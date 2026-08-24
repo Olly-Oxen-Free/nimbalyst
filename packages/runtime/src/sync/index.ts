@@ -140,13 +140,24 @@ export {
   OutboxDrainer,
   OutboxWriteRejectedError,
   isConfirmedOutboxRevocationCode,
+  outboxRetryDelayMs,
+  OUTBOX_RETRY_BASE_MS,
+  OUTBOX_RETRY_MAX_MS,
+  OUTBOX_STUCK_ATTEMPTS,
 } from './OutboxDrainer';
+export {
+  COLLAB_CLOSE_ACCESS_REVOKED,
+  COLLAB_CLOSE_REMOVED_FROM_TEAM,
+  collabAccessRevokedMessage,
+  isCollabAccessRevokedCloseCode,
+} from './collabCloseCodes';
 export type {
   OutboxDrainBatch,
   OutboxDrainSendResult,
   OutboxDrainTransport,
   OutboxDrainerOptions,
   OutboxDrainResult,
+  StuckOutboxDocument,
 } from './OutboxDrainer';
 export type {
   LocalDocumentReplicaOptions,

@@ -9,7 +9,15 @@
 import type { Database as DB } from 'better-sqlite3';
 import * as fs from 'fs';
 import { openDatabase } from '../db/openDatabase.js';
+import { isLocalKeyReference } from '../vendor/localIssueKey.js';
 import { dbRowToRecord, type TrackerRecord } from '../vendor/trackerRecord.js';
+import { computeReadinessForItems, type Readiness } from '../vendor/trackerReadiness.js';
+import {
+  getTrackerReadinessTypeModel,
+  READINESS_FILTER_FIELD,
+  replaceTrackerReadinessTypeModels,
+  type TrackerReadinessTypeModel,
+} from '../vendor/trackerStatusCategory.js';
 import {
   appendActivity,
   buildComment,
@@ -25,6 +33,7 @@ import {
   schemaError,
   writeNotPermittedError,
 } from '../cli/exitCodes.js';
+import { getTrackerDisplayRef, issueKeyStatus } from '../cli/output.js';
 import { discoverEndpoint } from './endpoint.js';
 import {
   MIN_SUPPORTED_SCHEMA,
@@ -151,6 +160,9 @@ export class DirectGateway implements TrackerGateway {
           'Start Nimbalyst, or drop --inbox to list without it.',
       );
     }
+    if (filters.where?.some((clause) => clause.field === READINESS_FILTER_FIELD)) {
+      return this.listTrackersWithReadiness(filters);
+    }
     const where: string[] = ['workspace = @workspace', 'deleted_at IS NULL'];
     const params: Record<string, unknown> = { workspace: filters.workspace };
 
@@ -252,27 +264,58 @@ export class DirectGateway implements TrackerGateway {
     return rows.map(dbRowToRecord);
   }
 
-  async getTracker(workspace: string, reference: string): Promise<TrackerRecord | null> {
-    const row = this.db
-      .prepare(
-        `SELECT * FROM tracker_items
-         WHERE (id = @ref OR issue_key = @ref) AND workspace = @ws AND deleted_at IS NULL
-         ORDER BY updated DESC LIMIT 1`,
-      )
-      .get({ ref: reference, ws: workspace }) as any;
-    if (!row) {
-      // Fall back to a workspace-agnostic lookup so `nim tracker get BUG-1`
-      // works even when workspace resolution picked a sibling.
-      const any = this.db
-        .prepare(
-          `SELECT * FROM tracker_items
-           WHERE (id = @ref OR issue_key = @ref) AND deleted_at IS NULL
-           ORDER BY updated DESC LIMIT 1`,
-        )
-        .get({ ref: reference }) as any;
-      return any ? dbRowToRecord(any) : null;
+  private listTrackersWithReadiness(filters: ListFilters): TrackerRecord[] {
+    const dateCol = filters.dateField === 'created' ? 'created' : 'updated';
+    const rows = this.db.prepare(
+      `SELECT ti.*, td.model AS __readiness_type_model
+       FROM tracker_items AS ti
+       LEFT JOIN tracker_type_defs AS td
+         ON td.workspace = ti.workspace AND td.type = ti.type AND td.deleted_at IS NULL
+       WHERE ti.workspace = @workspace AND ti.deleted_at IS NULL
+       ORDER BY ti.${dateCol} DESC`,
+    ).all({ workspace: filters.workspace }) as Array<Record<string, unknown>>;
+
+    const typeModels = readReadinessTypeModels(rows);
+    const modeledTypes = new Set(typeModels.map((model) => model.type));
+    const missingTypes = [...new Set(
+      rows.map((row) => String(row.type ?? '')).filter((type) => type && !modeledTypes.has(type)),
+    )].sort();
+    if (missingTypes.length > 0) {
+      throw schemaError(
+        `Cannot compute readiness because these tracker types have no materialized schema: ` +
+          `${missingTypes.join(', ')}. Open this workspace in Nimbalyst once to materialize them.`,
+      );
     }
-    return dbRowToRecord(row);
+    replaceTrackerReadinessTypeModels(typeModels);
+    const records = rows.map((row) => dbRowToRecord(row as any));
+    const readiness = computeReadinessForItems(records, {
+      getId: (record) => record.id,
+      getType: (record) => record.primaryType,
+      getStatus: (record) => {
+        const model = getTrackerReadinessTypeModel(record.primaryType);
+        const fieldName = model?.roles?.workflowStatus ?? 'status';
+        return String(record.fields[fieldName] ?? '');
+      },
+      getTitle: (record) => {
+        const model = getTrackerReadinessTypeModel(record.primaryType);
+        const fieldName = model?.roles?.title ?? 'title';
+        const title = record.fields[fieldName];
+        return typeof title === 'string' ? title : undefined;
+      },
+      getFieldValue: (record, fieldName) => record.fields[fieldName],
+      getReference: (record) => ({
+        ref: getTrackerDisplayRef(record),
+        refStatus: issueKeyStatus(record),
+      }),
+    });
+
+    return applyInMemoryListFilters(records, filters, readiness)
+      .slice(0, resolveLimit(filters.limit));
+  }
+
+  async getTracker(workspace: string, reference: string): Promise<TrackerRecord | null> {
+    const row = this.findRow(this.db, workspace, reference);
+    return row ? dbRowToRecord(row) : null;
   }
 
   async getTrackerByUrn(workspace: string, urn: string): Promise<TrackerRecord | null> {
@@ -394,8 +437,30 @@ export class DirectGateway implements TrackerGateway {
     }
   }
 
-  /** Resolve a row by id or issue key, workspace-first then workspace-agnostic. */
+  /**
+   * Resolve a row by id, issue key, or this machine's local number.
+   *
+   * A dotted local number resolves **only** inside the named workspace, and
+   * deliberately does not fall through to the workspace-agnostic lookup below:
+   * `NIM.4` means a different item in every project on the machine, so a
+   * cross-workspace match would confidently return the wrong one. That is the
+   * whole reason the dotted form is distinguishable from `NIM-4` at all.
+   *
+   * The workspace-agnostic fallback stays for ids and room keys, so
+   * `nim tracker get BUG-1` still works when workspace resolution picked a
+   * sibling directory.
+   */
   private findRow(db: DB, workspace: string, reference: string): any {
+    if (isLocalKeyReference(reference)) {
+      return db
+        .prepare(
+          `SELECT * FROM tracker_items
+           WHERE local_key = @ref AND workspace = @ws AND deleted_at IS NULL
+           ORDER BY updated DESC LIMIT 1`,
+        )
+        .get({ ref: reference.trim().toUpperCase(), ws: workspace });
+    }
+
     const inWs = db
       .prepare(
         `SELECT * FROM tracker_items
@@ -812,6 +877,85 @@ function resolveLimit(limit: number | undefined): number {
   if (limit === undefined) return DEFAULT_LIMIT;
   if (limit < 0) return ALL_CAP; // --all maps to a large cap by the caller
   return Math.min(limit, MAX_LIMIT);
+}
+
+function readReadinessTypeModels(
+  rows: Array<Record<string, unknown>>,
+): TrackerReadinessTypeModel[] {
+  const models = new Map<string, TrackerReadinessTypeModel>();
+  for (const row of rows) {
+    const raw = row.__readiness_type_model;
+    if (typeof raw !== 'string') continue;
+    try {
+      const model = JSON.parse(raw) as TrackerReadinessTypeModel;
+      if (model?.type) models.set(model.type, model);
+    } catch {
+      /* malformed materialized schema: status resolution stays conservative */
+    }
+  }
+  return [...models.values()];
+}
+
+function applyInMemoryListFilters(
+  records: TrackerRecord[],
+  filters: ListFilters,
+  readiness: ReadonlyMap<string, Readiness>,
+): TrackerRecord[] {
+  const dateField = filters.dateField === 'created' ? 'createdAt' : 'updatedAt';
+  return records.filter((record) => {
+    if (!filters.includeArchived && record.archived) return false;
+    if (filters.type && record.primaryType !== filters.type) return false;
+    if (filters.typeTag && !record.typeTags.includes(filters.typeTag)) return false;
+
+    const status = String(record.fields.status ?? '');
+    if (filters.status) {
+      if (isMetaStatus(filters.status)) {
+        const terminal = TERMINAL_STATUSES.has(status.toLowerCase());
+        if (filters.status === 'closed' ? !terminal : terminal) return false;
+      } else if (status !== filters.status) {
+        return false;
+      }
+    }
+
+    if (filters.priority && record.fields.priority !== filters.priority) return false;
+    if (filters.owner && record.fields.owner !== filters.owner) return false;
+    if (filters.search) {
+      const needle = filters.search.toLowerCase();
+      const title = String(record.fields.title ?? '').toLowerCase();
+      const description = String(record.fields.description ?? '').toLowerCase();
+      if (!title.includes(needle) && !description.includes(needle)) return false;
+    }
+    if (filters.since && (record.system[dateField] ?? '') < filters.since) return false;
+    if (filters.until && (record.system[dateField] ?? '') > filters.until) return false;
+
+    return (filters.where ?? []).every((clause) => {
+      const value = clause.field === READINESS_FILTER_FIELD
+        ? readiness.get(record.id)?.state
+        : record.fields[clause.field];
+      return matchesWhereClause(value, clause.op, clause.value);
+    });
+  });
+}
+
+function matchesWhereClause(
+  actual: unknown,
+  op: '=' | '!=' | '~' | 'in',
+  expected: string,
+): boolean {
+  const value = actual == null
+    ? ''
+    : typeof actual === 'string' ? actual : JSON.stringify(actual);
+  switch (op) {
+    case '=':
+      return value === expected;
+    case '!=':
+      return value !== expected;
+    case '~':
+      return value.toLowerCase().includes(expected.toLowerCase());
+    case 'in':
+      return expected.split(',').map((entry) => entry.trim()).includes(value);
+  }
+  return false;
 }
 
 /** SQLite json paths can't contain a literal single quote; field names are

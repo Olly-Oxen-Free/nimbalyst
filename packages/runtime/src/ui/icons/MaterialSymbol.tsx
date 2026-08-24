@@ -58,6 +58,16 @@ const CUSTOM_ICONS: Record<string, (size: number, className: string) => React.Re
     </svg>
   ),
 
+  // Ollama -- generic hub/network mark (local model server), distinct from LM Studio's logo
+  'ollama': (size, className) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}>
+      <circle cx="12" cy="5" r="2.5"/>
+      <circle cx="5" cy="16" r="2.5"/>
+      <circle cx="19" cy="16" r="2.5"/>
+      <path d="M12 7.5v4M12 11.5l-6 3M12 11.5l6 3" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+    </svg>
+  ),
+
   // Google Gemini logo (four-point spark)
   'gemini': (size, className) => (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}>

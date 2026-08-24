@@ -10,11 +10,74 @@
 
 import type { Doc } from 'yjs';
 
+export type TextQuoteCommentAnchor = {
+  kind: 'text-quote';
+  exact: string;
+  prefix?: string;
+  suffix?: string;
+};
+
+export type EntityCommentAnchor = {
+  kind: 'entity';
+  entityType: string;
+  entityId: string;
+  field?: string;
+  labelSnapshot?: string;
+};
+
+export type CommentAnchor = TextQuoteCommentAnchor | EntityCommentAnchor;
+
+export type UserCommentActor = {
+  kind: 'user';
+  userId?: string;
+  displayName: string;
+};
+
+export type AgentCommentActor = {
+  kind: 'agent';
+  sessionId: string;
+  sessionName: string;
+  onBehalfOfUserId: string;
+  onBehalfOfDisplayName?: string;
+};
+
+export type CommentActor = UserCommentActor | AgentCommentActor;
+
+export type Comment = {
+  actor?: CommentActor;
+  author: string;
+  clientMutationId?: string;
+  content: string;
+  deleted: boolean;
+  id: string;
+  replyToCommentId?: string;
+  timeStamp: number;
+  type: 'comment';
+};
+
+export type Thread = {
+  comments: Array<Comment>;
+  id: string;
+  quote: string;
+  anchor?: CommentAnchor;
+  resolved: boolean;
+  type: 'thread';
+};
+
+export type Comments = Array<Thread | Comment>;
+
 /** A team member that can be @-mentioned in a comment. */
 export interface CommentMember {
   userId: string;
   /** Display name shown in the mention picker. */
   name: string;
+  /**
+   * Address shown beneath the display name and also matched against while
+   * typing. `name` collapses to the email only when a member has no display
+   * name, so without this a roster of real names cannot be searched by the
+   * address people actually know each other by.
+   */
+  email?: string | null;
   /** The member's personal org id, when the roster carries one. */
   personalOrgId?: string | null;
 }
@@ -83,7 +146,10 @@ export interface CommentsConfig {
    * electron hosts route it to the org-scoped TeamInboxRoom); failures do not
    * roll back the Y.Doc mutation. No-op safe when undefined.
    */
-  onMention?: (recipientUserIds: string[], payload: CommentMentionPayload) => void;
+  onMention?: (
+    recipientUserIds: string[],
+    payload: CommentMentionPayload,
+  ) => void;
   /**
    * Called after a canonical reply is appended. The host owns delivery;
    * failures do not roll back the Y.Doc mutation.

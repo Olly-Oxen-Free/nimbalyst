@@ -1,0 +1,296 @@
+# ============================================================
+# NIMBLE TASK DEFINITIONS
+# Parsed by the orchestrator for execution planning.
+# ============================================================
+
+metadata:
+  prd_slug: "project-bar-top-placement"
+  created_at: "2026-08-20T00:00:00Z"
+  total_complexity: 31
+  task_count: 8
+
+tasks:
+  - id: "1a"
+    title: "Persisted project-bar layout settings (position + display mode)"
+    description: |
+      Add two new persisted settings following the existing Multi-project
+      Mode 4-layer pattern (store schema -> IPC -> renderer atom -> UI,
+      UI comes in task 2a): `projectRailPosition: 'left' | 'top'` and
+      `projectRailExpandedDisplay: 'always-visible' | 'hover-reveal'`.
+      Both are string unions (not booleans) so future values can be added
+      without a schema migration. Default `projectRailPosition` to
+      'left' and `projectRailExpandedDisplay` to 'always-visible' so
+      existing saved state with the field missing loads as today's
+      behavior (use the `??` default-merge idiom, not a hard default
+      object replace).
+
+      Fulfills R1 and R3.
+    depends_on: []
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Both fields exist in the app-settings store schema as string unions with getter/setter functions mirroring getMultiProjectMode/setMultiProjectMode"
+      - "IPC handlers app:get/set-project-rail-position and app:get/set-project-rail-expanded-display are registered via safeHandle"
+      - "Renderer atoms load via ?? default-merge and persist via store.sub, mirroring multiProjectModeAtom's initOpenProjects() wiring"
+      - "Loading a saved-state object missing these fields resolves to 'left' / 'always-visible' without throwing"
+    files_affected:
+      - "packages/electron/src/main/utils/store.ts"
+      - "packages/electron/src/main/ipc/SettingsHandlers.ts"
+      - "packages/electron/src/renderer/store/atoms/openProjects.ts"
+    agent_context: |
+      Clone the Multi-project Mode pattern exactly: schema field +
+      getMultiProjectMode/setMultiProjectMode (store.ts ~line 293,
+      2743-2749), IPC handlers app:get-multi-project-mode /
+      app:set-multi-project-mode (SettingsHandlers.ts ~626-632),
+      atom + store.sub persistence loaded in initOpenProjects()
+      (openProjects.ts ~267-283, ~334-339). These two new settings are
+      main-process files under require_review per .nimble/config.yaml —
+      expected, not a surprise at the single end-of-work review.
+
+  - id: "1b"
+    title: "Extract shared project-bar container logic from ProjectRail"
+    description: |
+      Pull ProjectRailIcon's rendering, active-state styling, hover
+      tooltip (floating-ui), close button, and context-menu logic AND
+      the container-level logic ProjectRail() currently owns directly —
+      the add-project flow (workspace:register-additional + dialog),
+      the close handler, isOpenProjectsAtCapAtom, and the
+      globalSessionActivityAtom/projectActivitySummaryAtom feeds per
+      icon — into standalone subcomponents/hooks that both the
+      left-docked rail and the top-docked WindowTopBar merge (task 3a)
+      can render without duplicating logic. ProjectRail.tsx keeps using
+      them for the left-docked case; no behavior change when position
+      stays 'left'. This is wider than icon-rendering alone precisely
+      so 3a doesn't have to re-implement add/close/capacity logic
+      inside WindowTopBar.
+    depends_on: []
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "New shared icon component exports the same active-state, tooltip, close, and context-menu behavior currently inline in ProjectRailIcon (ProjectRail.tsx:68-179)"
+      - "Add-project flow, close handler, and isOpenProjectsAtCapAtom/activity-atom wiring are extracted into shared, reusable logic (hook or subcomponent) rather than left inline in ProjectRail()"
+      - "ProjectRail.tsx renders the extracted pieces with zero visual/behavioral change in the left-docked case"
+      - "Extracted API accepts a layout/orientation prop so task 2b can style it for a horizontal context without a second implementation"
+    files_affected:
+      - "packages/electron/src/renderer/components/ProjectRail.tsx"
+      - "packages/electron/src/renderer/components/ProjectRailIcon.tsx"
+    agent_context: |
+      Source logic to extract lives in ProjectRail.tsx:68-179
+      (ProjectRailIcon), projectInitials() at 48-56, and the
+      container-level add-project/close/capacity logic inside
+      ProjectRail() itself (181-549, incl. the :202-219 add-project
+      dialog flow). Preserve the floating-ui + FloatingPortal +
+      windowControlsClearance() pattern already used for tooltips/menus
+      (ProjectRail.tsx:27) — do not hand-roll position:fixed per
+      floating-ui.md.
+
+  - id: "2a"
+    title: "Settings UI for project-bar position and display mode"
+    description: |
+      Add controls to AdvancedPanel for the two settings from 1a. The
+      position control is a segmented/select-style control (values are
+      a union, not boolean — SettingsToggle as-is doesn't fit) visible
+      only when multi-project mode is on. The display-mode control is
+      visible only when position = 'top', following the dependent-
+      visibility pattern already used by RestorePreviousProjectsToggle.
+
+      Fulfills R2 and part of R3.
+    depends_on: ["1a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "Position control renders only when multiProjectModeAtom is true, hidden otherwise"
+      - "Display-mode control renders only when position atom is 'top', hidden otherwise"
+      - "Changing either control updates the renderer atom and persists immediately, no restart required"
+      - "New control follows GlobalSettings/SettingsToggle.tsx's prop conventions (checked/onChange/name/description) where reusable, or a sibling component with matching visual style if a boolean toggle doesn't fit"
+    files_affected:
+      - "packages/electron/src/renderer/components/GlobalSettings/panels/AdvancedPanel.tsx"
+      - "packages/electron/src/renderer/components/GlobalSettings/SettingsToggle.tsx"
+    agent_context: |
+      Reference MultiProjectModeToggle() and RestorePreviousProjectsToggle()
+      in AdvancedPanel.tsx:688-753 for both the settings-row visual
+      pattern and the dependent-visibility-based-on-another-atom pattern.
+      SettingsToggle.tsx's existing two consumers are both booleans —
+      confirm whether it can be extended for a union value or whether a
+      small new segmented-control component is warranted; don't force a
+      boolean-shaped API onto a 2+ value setting.
+
+  - id: "2b"
+    title: "Horizontal-layout CSS variant for top-docked project bar"
+    description: |
+      New stylesheet (or variant) for the shared icon component from 1b
+      when rendered in a horizontal/top-docked context: no fixed
+      width/column layout, no absolutely-positioned vertical active
+      indicator, @container-based responsive sizing for many open
+      projects in a narrow window, and floating-ui tooltips/menus
+      reposition to open downward instead of sideways.
+
+      Fulfills R7.
+    depends_on: ["1b"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "No styles from ProjectRail.css (width:56px, flex-direction:column, left:-10px indicator) are reused as-is for the top-docked case"
+      - "@container query adjusts circle size/spacing or truncates the expanded name before horizontal overflow at narrow window widths"
+      - "Tooltip and context-menu floating-ui placements are configured to open below the bar, not beside it"
+      - "Only canonical --nim-* CSS variables are used (no ad hoc hex/px values duplicating existing tokens)"
+    files_affected:
+      - "packages/electron/src/renderer/components/ProjectRail.css"
+      - "packages/electron/src/renderer/components/ProjectRailIcon.tsx"
+    agent_context: |
+      ProjectRail.css:1-14 and 66-75 (verified during brief generation;
+      tasks.yaml previously cited 73-81, drifted) are the vertical-only
+      styles that must NOT be reused for this variant. Per UI_PATTERNS.md,
+      use @container queries, not @media. Per REACT_DOM_MARKERS.md, keep a
+      stable kebab-case class on the component root for this layout too.
+
+  - id: "3a"
+    title: "Merge project bar into WindowTopBar when position is top"
+    description: |
+      Structural change: App.tsx renders the rail in its current left
+      column only when position = 'left' (zero regression for existing
+      users). When position = 'top', WindowTopBar renders the shared
+      icon subcomponent set (from 1b/2b) in place of the current static
+      workspace-name text in window-top-bar__identity, reading the
+      active project's name from activeOpenProjectAtom instead of the
+      workspaceName prop. Every interactive element (circles, close,
+      add button) gets explicit NO_DRAG_REGION; empty bar space stays
+      a functioning drag region.
+
+      Fulfills R4, R5, and R6.
+    depends_on: ["1a", "1b"]
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "Position = 'left' (default): App.tsx and WindowTopBar.tsx take the same render branch as before this task existed — no new conditional touches the left-docked JSX output or props"
+      - "Position = 'top' replaces window-top-bar__identity's workspace-name content with the shared icon component showing the active project's full name from activeOpenProjectAtom"
+      - "The window-top-bar__identity container's existing pointer-events-none (WindowTopBar.tsx:529) is overridden/removed for the replaced content, or the circles are rendered outside that container — verify by clicking a circle and confirming the click registers, not just that NO_DRAG_REGION is present"
+      - "Clicking a non-selected circle writes activeWorkspacePathAtom via the same path ProjectRail uses today, switching the active project"
+      - "Close-project and add-project controls both function in the top-docked position"
+      - "Every interactive element has explicit NO_DRAG_REGION; dragging the window from empty bar space still works"
+      - "When multiProjectModeAtom is false and position = 'top', WindowTopBar shows no rail remnant — falls back to today's static workspace-name display, matching ProjectRail's existing return-null gating"
+      - "Right-click on a project circle (or the expanded active-project name) opens a context menu in the top-docked position, positioned via its own useFloating() instance in WindowTopBar.tsx (mirroring ProjectRail.tsx's existing context-menu pattern, opening downward per R7), wired to 1b's shared context-menu actions — this was missing from the original task scope (caught in reviewer validation: 1b's ProjectRailIconProps makes onContextMenu a required prop, and R7 requires context menus to exist in the top-docked position, but no task originally built the menu itself since 1b/2b deliberately keep floating-ui positioning per-consumer)"
+      - "The add-project (+) control's dropdown menu is a visibly positioned floating-ui element in WindowTopBar.tsx (its own useFloating() instance, not just the IPC handler being wired) — a bare button with no visible menu does not satisfy this criterion"
+    files_affected:
+      - "packages/electron/src/renderer/App.tsx"
+      - "packages/electron/src/renderer/components/WindowTopBar/WindowTopBar.tsx"
+    agent_context: |
+      App.tsx:2609-2639 is the current root layout tree — ProjectRail is
+      nested inside workspace-row today, below WindowTopBar, not a
+      sibling row of it, so this genuinely restructures the JSX, it's
+      not a CSS-only change. WindowTopBar.tsx:529-544 is
+      window-top-bar__identity (today's static workspaceName prop
+      display) — this is what gets replaced when position='top'. Note
+      window-top-bar__identity itself is pointer-events-none
+      (WindowTopBar.tsx:529) — every circle will be click-dead unless
+      this is explicitly handled, not just NO_DRAG_REGION'd.
+      WindowTopBar.tsx:520's env(titlebar-area-x/width) inset and the
+      DRAG_REGION/NO_DRAG_REGION classes (dragRegion.ts:13-14) are the
+      exact constraints; ProjectRail's existing floating menus already
+      use windowControlsClearance() middleware (ProjectRail.tsx:27) as
+      a working reference for clearing native traffic lights. This is
+      the highest-risk task in the PRD — get drag-region handling wrong
+      and either window-dragging or click targets break.
+
+  - id: "4a"
+    title: "Animated circle-to-text transition for selected project"
+    description: |
+      Within the top-docked WindowTopBar (established by 3a), the
+      selected project's avatar visually expands in place from its
+      circle form to its full-name form on mount, and re-animates when
+      the active project changes. Scope is expand-in-place inside the
+      top bar only — this does NOT attempt a shared-element morph
+      across the left-rail-unmount / top-bar-mount boundary when the
+      position setting itself changes live (no shared layout-animation
+      library is present in this codebase; that transition is a plain
+      crossfade/slide between the two layouts, not a literal circle
+      following the cursor from left to top).
+
+      Fulfills R9. Full-implementation scope (not deferred as MVP
+      polish) per explicit user direction during planning.
+    depends_on: ["3a", "2b"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "Loading directly into the top-docked state (or switching the active project while already top-docked) always renders the expand-in-place animation — no escape hatch, this is a hard requirement"
+      - "Toggling the position setting from left to top plays a defined crossfade/slide transition between the two layouts (explicitly not a cross-tree shared-element morph, per scope note above)"
+      - "Animation respects reduced-motion preferences if the codebase has an existing reduced-motion convention"
+    files_affected:
+      - "packages/electron/src/renderer/components/WindowTopBar/WindowTopBar.tsx"
+      - "packages/electron/src/renderer/components/ProjectRailIcon.tsx"
+      - "packages/electron/src/renderer/components/ProjectRail.css"
+    agent_context: |
+      Depends on 3a's merged structure existing and 2b's horizontal
+      sizing being in place before animating between the two shapes.
+      Do not pull in a new animation library for this — use CSS
+      transitions/keyframes consistent with the rest of the codebase
+      unless one is already a dependency.
+
+  - id: "4b"
+    title: "Hover-reveal for non-selected project circles"
+    description: |
+      When projectRailExpandedDisplay = 'hover-reveal', hovering
+      anywhere over the top project-bar area reveals the other
+      open-project circles; they hide again on mouse-leave. This
+      coexists with the bar's drag-region — accepted known limitation:
+      no keyboard/touch equivalent reveal path in this pass (see PRD
+      Open Questions Q1).
+
+      Fulfills R8. Full-implementation scope per explicit user
+      direction — this is the chosen trigger mechanism, not the
+      alternative disclosure-button design discussed earlier in
+      planning.
+    depends_on: ["3a", "2b", "4a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "When display mode = 'hover-reveal', only the expanded selected-project name shows by default"
+      - "Hovering the top bar area reveals the other open-project circles; they remain clickable to switch projects while revealed"
+      - "Moving the mouse off the bar hides the revealed circles again"
+      - "When display mode = 'always-visible' (default), all open-project circles remain visible regardless of hover state — no regression to that mode"
+    files_affected:
+      - "packages/electron/src/renderer/components/WindowTopBar/WindowTopBar.tsx"
+      - "packages/electron/src/renderer/components/ProjectRail.css"
+    agent_context: |
+      Hover state tracking over a native drag region is the known
+      fragile part here (see PRD Risks) — verify manually that
+      window-dragging still works with the hover listener attached,
+      don't assume it's fine because it compiles. Depends on 4a
+      completing first (not just for feature reasons — both tasks
+      touch WindowTopBar.tsx and ProjectRail.css, so this ordering also
+      avoids a same-wave file conflict on the shared branch).
+
+  - id: "5a"
+    title: "Tests for project-bar top-placement feature"
+    description: |
+      Dedicated end-of-work test task covering the settings persistence
+      (1a), the settings UI (2a), and the top-docked WindowTopBar merge
+      behavior (3a/4a/4b) — a single task per explicit user direction,
+      not tests embedded per task. Must land before the single
+      end-of-work integration review; npm run typecheck && npm run
+      test:prepush must be green.
+    depends_on: ["1a", "1b", "2a", "2b", "3a", "4a", "4b"]
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "Unit test confirms projectRailPosition and projectRailExpandedDisplay default to 'left'/'always-visible' when absent from saved state (default-merge behavior)"
+      - "Unit or component test confirms the position control in AdvancedPanel is hidden when multi-project mode is off, and the display-mode control is hidden when position != 'top'"
+      - "Test confirms WindowTopBar renders the active project's full name (from activeOpenProjectAtom) when position = 'top', and renders today's static workspace-name behavior unchanged when position = 'left'"
+      - "No presentation-only tests (icon names, exact pixel positions) per this repo's testing conventions — assert behavior/className, not visual detail"
+      - "openProjects.test.ts and WindowTopBar.test.tsx already exist (verified during brief generation, correcting an earlier PRD assumption) — extend them with new cases rather than creating parallel files; only AdvancedPanel.test.tsx is genuinely new"
+    files_affected:
+      - "packages/electron/src/renderer/store/atoms/__tests__/openProjects.test.ts"
+      - "packages/electron/src/renderer/components/GlobalSettings/panels/__tests__/AdvancedPanel.test.tsx"
+      - "packages/electron/src/renderer/components/WindowTopBar/__tests__/WindowTopBar.test.tsx"
+    agent_context: |
+      Follow this repo's testing rules: mock the narrowest module (never
+      the @nimbalyst/runtime barrel), add // @vitest-environment node to
+      any test that never touches the DOM, never assert on component
+      source text via readFileSync, and never use getBy*(...).toBeTruthy().
+      openProjects.test.ts and WindowTopBar.test.tsx already exist under
+      __tests__/ — extend them, don't duplicate. Only AdvancedPanel.test.tsx
+      under GlobalSettings/panels/__tests__/ is new; follow a sibling test
+      file's mocking pattern there (e.g. DatabasePanel.test.tsx's narrow
+      deep-path mock, not SyncPanel.test.tsx's @nimbalyst/runtime
+      barrel-spread mock, which this repo's CLAUDE.md names as the
+      anti-pattern to avoid).

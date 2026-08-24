@@ -75,6 +75,25 @@ export const multiProjectModeAtom = atom<boolean>(false);
 export const restorePreviousProjectsAtom = atom<boolean>(false);
 
 /**
+ * Where the project bar docks: the left edge (today's behavior) or merged
+ * into the top title bar.
+ *
+ * Persisted via `app:set-project-rail-position` IPC; seeded from store on
+ * launch by an effect that reads `app:get-project-rail-position`.
+ */
+export const projectRailPositionAtom = atom<'left' | 'top'>('left');
+
+/**
+ * When the project bar is top-docked, whether non-selected open projects
+ * stay always visible or only reveal on hover.
+ *
+ * Persisted via `app:set-project-rail-expanded-display` IPC; seeded from
+ * store on launch by an effect that reads
+ * `app:get-project-rail-expanded-display`.
+ */
+export const projectRailExpandedDisplayAtom = atom<'always-visible' | 'hover-reveal'>('always-visible');
+
+/**
  * Ordered list of open projects in the rail. First entry is leftmost.
  *
  * Capped at `MAX_OPEN_PROJECTS` to bound memory of warm projects.
@@ -271,16 +290,20 @@ export async function initOpenProjects(): Promise<void> {
   if (!window.electronAPI?.invoke) return;
 
   try {
-    const [mode, restorePrev, paths, activePath, initialState] = await Promise.all([
+    const [mode, restorePrev, paths, activePath, initialState, position, expandedDisplay] = await Promise.all([
       window.electronAPI.invoke('app:get-multi-project-mode') as Promise<boolean>,
       window.electronAPI.invoke('app:get-restore-previous-projects') as Promise<boolean>,
       window.electronAPI.invoke('app:get-open-projects') as Promise<string[]>,
       window.electronAPI.invoke('app:get-active-project-path') as Promise<string | null>,
       window.electronAPI.getInitialState?.() ?? Promise.resolve(null),
+      window.electronAPI.invoke('app:get-project-rail-position') as Promise<'left' | 'top' | undefined>,
+      window.electronAPI.invoke('app:get-project-rail-expanded-display') as Promise<'always-visible' | 'hover-reveal' | undefined>,
     ]);
 
     store.set(multiProjectModeAtom, !!mode);
     store.set(restorePreviousProjectsAtom, !!restorePrev);
+    store.set(projectRailPositionAtom, position ?? 'left');
+    store.set(projectRailExpandedDisplayAtom, expandedDisplay ?? 'always-visible');
 
     const windowState = getWindowBootstrapState(initialState);
     const { paths: initialPaths, activePath: initialActivePath } = resolveInitialOpenProjectsState({
@@ -341,6 +364,18 @@ export async function initOpenProjects(): Promise<void> {
       const value = store.get(restorePreviousProjectsAtom);
       window.electronAPI?.invoke?.('app:set-restore-previous-projects', value).catch((err: unknown) => {
         console.error('[openProjects] Failed to persist restorePreviousProjects:', err);
+      });
+    }),
+    store.sub(projectRailPositionAtom, () => {
+      const position = store.get(projectRailPositionAtom);
+      window.electronAPI?.invoke?.('app:set-project-rail-position', position).catch((err: unknown) => {
+        console.error('[openProjects] Failed to persist projectRailPosition:', err);
+      });
+    }),
+    store.sub(projectRailExpandedDisplayAtom, () => {
+      const mode = store.get(projectRailExpandedDisplayAtom);
+      window.electronAPI?.invoke?.('app:set-project-rail-expanded-display', mode).catch((err: unknown) => {
+        console.error('[openProjects] Failed to persist projectRailExpandedDisplay:', err);
       });
     }),
     store.sub(openProjectsAtom, () => schedulePersistOpenProjects()),

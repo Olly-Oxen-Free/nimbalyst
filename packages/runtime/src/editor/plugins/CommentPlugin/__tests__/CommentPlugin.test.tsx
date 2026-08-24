@@ -13,6 +13,7 @@ import {
 } from 'lexical';
 import { useEffect } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Doc, Map as YMap } from 'yjs';
 
 import { useCommentToolbarActions } from '../../../Editor';
 import type { CommentsConfig } from '../../../commenting/types';
@@ -72,6 +73,7 @@ describe('CommentsPlugin', () => {
     const anchorElem = document.createElement('div');
     paneElem.append(anchorElem);
     document.body.append(paneElem);
+    const yDoc = new Doc();
 
     let editor: LexicalEditor | undefined;
     render(
@@ -86,7 +88,10 @@ describe('CommentsPlugin', () => {
         }}
       >
         <TestEditorBridge onReady={(value) => (editor = value)} />
-        <CommentsPlugin config={commentsConfig} anchorElem={anchorElem} />
+        <CommentsPlugin
+          config={{ ...commentsConfig, getYDoc: () => yDoc }}
+          anchorElem={anchorElem}
+        />
       </LexicalComposer>,
     );
 
@@ -116,18 +121,18 @@ describe('CommentsPlugin', () => {
       ).not.toBeNull();
     });
 
+    // One composer, and it is the docked one: the popover variant opening
+    // alongside it is the regression this guards.
     expect(
       document.querySelectorAll('[data-testid="comment-composer"]'),
     ).toHaveLength(1);
     expect(document.querySelector('.nim-comment-composer-popover')).toBeNull();
-    expect(
-      paneElem?.querySelector('.nim-comment-btn-submit')?.textContent,
-    ).toBe('Comment');
-    expect(
-      paneElem
-        ?.querySelector('.nim-comment-composer-input')
-        ?.getAttribute('aria-placeholder'),
-    ).toBe('Add a comment... use @ to mention');
+    const sharedThread = yDoc.getArray('comments').get(0);
+    expect(sharedThread).toBeInstanceOf(YMap);
+    expect((sharedThread as YMap<unknown>).get('anchor')).toEqual({
+      kind: 'text-quote',
+      exact: 'Selected text',
+    });
 
     fireEvent.click(
       paneElem?.querySelector('.nim-comment-btn-cancel') as HTMLButtonElement,
@@ -230,3 +235,4 @@ describe('useCommentToolbarActions', () => {
     expect(hasCommentAction(result.current)).toBe(false);
   });
 });
+

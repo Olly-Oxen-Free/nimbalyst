@@ -13,6 +13,9 @@ import type { LexicalCommand } from '@nimbalyst/runtime';
 // aiChatBridge has been replaced by editorRegistry
 // Import editor styles (CSS side-effect)
 import '../../../runtime/src/editor/index.css';
+// Shared runtime UI rendered by extensions lives in the host document, so its
+// styles must be injected by the host rather than imported by extension code.
+import '../../../runtime/src/editor/commenting/ui/comments.css';
 // Import refactored hooks and utilities
 import { useIPCHandlers } from './hooks/useIPCHandlers';
 import { useWindowLifecycle } from './hooks/useWindowLifecycle';
@@ -156,7 +159,14 @@ import { initWakeupListeners } from './store/listeners/wakeupListener';
 import { TrackerMode } from './components/TrackerMode';
 import { PullRequestMode, type PullRequestModeRef } from './components/PullRequestMode';
 import { CollabMode, type CollabModeRef } from './components/CollabMode';
-import { TeamManagementApp } from './components/TeamMode';
+import {
+  OrgModeHost,
+  PROJECT_ORG_MODE_SURFACE_ID,
+  TeamManagementApp,
+  type OrgModeHostRef,
+} from './components/TeamMode';
+import { useProjectOrg } from './hooks/useProjectOrg';
+import { shouldLeaveOrgMode } from '../shared/orgProjectWalk';
 import { TrayPanelApp } from './components/TrayPanel/TrayPanelApp';
 import { TerminalBottomPanel } from './components/TerminalBottomPanel';
 import { SessionLaunchPopup } from './components/UnifiedAI/SessionLaunchPopup';
@@ -170,6 +180,7 @@ import { organizationDirectoryAtom, personalAccountsAtom } from './store/atoms/s
 import {
   activeWorkspacePathAtom,
   multiProjectModeAtom,
+  projectRailPositionAtom,
   addOpenProjectAtom as addOpenProjectAction,
 } from './store/atoms/openProjects';
 import { registerDocumentLinkPlugin } from './plugins/registerDocumentLinkPlugin';
@@ -246,6 +257,7 @@ import {
   showSessionImportDialogRequestAtom,
   showTrustToastRequestAtom,
   toggleAIChatPanelRequestAtom,
+  toggleExpandedTabRequestAtom,
 } from './store/atoms/appCommands';
 import { isCollabUri } from '@nimbalyst/collab-protocol';
 import {
@@ -254,7 +266,9 @@ import {
 } from './store/atoms/collabEditor';
 import {
   initTrackerPanelLayout,
+  toggleTrackerSidebarCollapsedAtom,
   trackerModeLayoutAtom,
+  trackerSidebarCollapsedAtom,
 } from './store/atoms/trackers';
 import { prNavigateRequestAtom } from './store/atoms/pullRequests';
 import {
@@ -570,6 +584,7 @@ export default function App() {
   // (which is wired to that state) re-renders for the new project.
   const isMultiProjectMode = useAtomValue(multiProjectModeAtom);
   const railActivePath = useAtomValue(activeWorkspacePathAtom);
+  const projectRailPosition = useAtomValue(projectRailPositionAtom);
   const addOpenProject = useSetAtom(addOpenProjectAction);
   const setRailActivePath = useSetAtom(activeWorkspacePathAtom);
   // NOTE: fileTree, sidebarWidth, isNewFileDialogOpen, newFileDirectory, isHistoryDialogOpen moved to EditorMode
@@ -632,9 +647,12 @@ export default function App() {
   const setActiveMode = useSetAtom(setWindowModeAtom);
   const toggleAgentCollapsed = useSetAtom(toggleSessionHistoryCollapsedAtom);
   const agentHistoryCollapsed = useAtomValue(sessionHistoryCollapsedAtom);
+  const toggleTrackerCollapsed = useSetAtom(toggleTrackerSidebarCollapsedAtom);
+  const trackerSidebarCollapsed = useAtomValue(trackerSidebarCollapsedAtom);
   const filesSidebarCollapsed = useAtomValue(sidebarCollapsedAtomFamily(workspacePath || ''));
   const filesAIChatCollapsed = useAtomValue(aiChatCollapsedAtomFamily(workspacePath || ''));
   const toggleAIChatPanelVersion = useAtomValue(toggleAIChatPanelRequestAtom);
+  const toggleExpandedTabVersion = useAtomValue(toggleExpandedTabRequestAtom);
   const gitStatus = useAtomValue(gitStatusAtom);
   const setGitStatus = useSetAtom(gitStatusAtom);
   const [gitActionState, setGitActionState] = useState<{
@@ -706,6 +724,17 @@ export default function App() {
       setActiveMode('files');
     }
   }, [activeMode, developerMode, setActiveMode]);
+
+  // Org mode is the project's own organization; the standalone org window keeps
+  // its own selection. Resolving it here also gates the gutter item, the
+  // shortcut and the mount.
+  const { org: projectOrg, loading: projectOrgLoading } = useProjectOrg(workspacePath);
+
+  useEffect(() => {
+    if (shouldLeaveOrgMode({ activeMode, projectOrg, projectOrgLoading })) {
+      setActiveMode('files');
+    }
+  }, [activeMode, projectOrg, projectOrgLoading, setActiveMode]);
 
   const openMarketplaceInstallRequest = useCallback((request: { extensionId: string; requestedAt?: string }) => {
     if (!request.extensionId) return;
@@ -1047,6 +1076,7 @@ export default function App() {
   const agentModeRef = useRef<AgentModeRef>(null);
   const editorModeRef = useRef<EditorModeRef>(null);
   const collabModeRef = useRef<CollabModeRef | null>(null);
+  const orgModeRef = useRef<OrgModeHostRef | null>(null);
   const pullRequestModeRef = useRef<PullRequestModeRef | null>(null);
 
   const toggleActiveLeftPane = useCallback(() => {
@@ -1057,8 +1087,12 @@ export default function App() {
       toggleAgentCollapsed();
     } else if (activeMode === 'collab') {
       collabModeRef.current?.toggleSidebarCollapsed();
+    } else if (activeMode === 'tracker') {
+      toggleTrackerCollapsed();
+    } else if (activeMode === 'org') {
+      orgModeRef.current?.toggleSidebarCollapsed();
     }
-  }, [activeMode, isFullscreenPanelActive, toggleAgentCollapsed]);
+  }, [activeMode, isFullscreenPanelActive, toggleAgentCollapsed, toggleTrackerCollapsed]);
 
   const toggleActiveRightPane = useCallback(() => {
     if (isFullscreenPanelActive) return;
@@ -1073,6 +1107,19 @@ export default function App() {
     }
   }, [activeMode, isFullscreenPanelActive]);
 
+  // Expand the active tab to fill the window — the menu/shortcut equivalent of
+  // double-clicking a tab. Only the modes that own editor tabs implement it.
+  const toggleActiveEditorMaximized = useCallback(() => {
+    if (isFullscreenPanelActive) return;
+    if (activeMode === 'files') {
+      editorModeRef.current?.toggleEditorMaximized();
+    } else if (activeMode === 'agent') {
+      agentModeRef.current?.toggleEditorMaximized();
+    } else if (activeMode === 'collab') {
+      collabModeRef.current?.toggleEditorMaximized();
+    }
+  }, [activeMode, isFullscreenPanelActive]);
+
   // Route the ApplicationMenu command through the same mode-owned pane action
   // used by WindowTopBar. Track the request version so React effect replays
   // cannot toggle the pane twice.
@@ -1082,6 +1129,13 @@ export default function App() {
     handledAIChatToggleVersionRef.current = toggleAIChatPanelVersion;
     toggleActiveRightPane();
   }, [toggleAIChatPanelVersion, toggleActiveRightPane]);
+
+  const handledExpandedTabVersionRef = useRef(toggleExpandedTabVersion);
+  useEffect(() => {
+    if (toggleExpandedTabVersion === handledExpandedTabVersionRef.current) return;
+    handledExpandedTabVersionRef.current = toggleExpandedTabVersion;
+    toggleActiveEditorMaximized();
+  }, [toggleExpandedTabVersion, toggleActiveEditorMaximized]);
 
   const windowTopBarPanelControls = useMemo<WindowTopBarPanelControls | undefined>(() => {
     if (isFullscreenPanelActive) return undefined;
@@ -1159,6 +1213,17 @@ export default function App() {
         },
       };
     }
+    if (activeMode === 'tracker') {
+      // Tracker Mode has no title-bar right pane; its detail panel is owned by
+      // the main view.
+      return {
+        left: {
+          label: 'Tracker sidebar',
+          collapsed: trackerSidebarCollapsed,
+          onToggle: toggleActiveLeftPane,
+        },
+      };
+    }
     if (activeMode === 'pr-review') {
       // The PR list remains visible; this mode currently exposes only its
       // persisted right-side AI pane through the title-bar controls.
@@ -1182,6 +1247,7 @@ export default function App() {
     prPanelState,
     toggleActiveLeftPane,
     toggleActiveRightPane,
+    trackerSidebarCollapsed,
   ]);
 
   const windowTopBarNewSessionControl = useMemo(() => {
@@ -1226,6 +1292,7 @@ export default function App() {
       agent: 'Agent',
       tracker: 'Tracker',
       collab: 'Shared Docs',
+      org: 'Organization',
       'pr-review': 'PR Review',
       settings: 'Settings',
     };
@@ -1902,6 +1969,7 @@ export default function App() {
     openHistoryForCurrentDocument,
     isFullscreenPanelActive,
     exitFullscreenPanel: () => setActiveExtensionPanel(null),
+    orgModeAvailable: !!projectOrg,
   });
 
   // Extension-contributed keybindings (reads from manifests, fires commands via registry)
@@ -2629,13 +2697,13 @@ export default function App() {
           }}
           panelControls={windowTopBarPanelControls}
           newSessionControl={windowTopBarNewSessionControl}
-          workspacePath={workspacePath}
         />
       )}
       <div data-layout="workspace-row" className="flex flex-row flex-1 min-h-0">
       {/* Far-left: project rail (Discord-style) — visible only when
-          multi-project mode is enabled in settings. */}
-      <ProjectRail />
+          multi-project mode is enabled in settings and docked left. When
+          docked top, WindowTopBar renders the rail's content instead. */}
+      {projectRailPosition !== 'top' && <ProjectRail />}
       {/* Left: Navigation Gutter - full height */}
       <NavigationGutter
         contentMode={activeMode}
@@ -2689,6 +2757,12 @@ export default function App() {
         }}
         onToggleCollabCollapsed={() => {
           collabModeRef.current?.toggleSidebarCollapsed();
+        }}
+        onToggleTrackerCollapsed={() => {
+          toggleTrackerCollapsed();
+        }}
+        onToggleOrgCollapsed={() => {
+          orgModeRef.current?.toggleSidebarCollapsed();
         }}
       />
 
@@ -2876,6 +2950,31 @@ export default function App() {
                   onPanelStateChange={setCollabPanelState}
                 />
               )}
+            </div>
+
+            {/* Org Mode - the project's organization inbox, rooms and DMs */}
+            <div
+              data-layout="org-mode-wrapper"
+              className={`flex-1 flex-col overflow-hidden min-h-0 ${
+                activeMode === 'org' && !isFullscreenPanelActive ? 'flex' : 'hidden'
+              }`}
+            >
+              {/* Activity: the surface holds a live room view and an inbox list,
+                  so hidden updates belong at background priority. */}
+              <Activity mode={activeMode === 'org' && !isFullscreenPanelActive ? 'visible' : 'hidden'}>
+                {projectOrg && (
+                  <OrgModeHost
+                    ref={orgModeRef}
+                    orgId={projectOrg.orgId}
+                    workspacePath={workspacePath || undefined}
+                    // Distinct from the standalone window's surface id, so the
+                    // two surfaces cannot navigate each other.
+                    surfaceId={PROJECT_ORG_MODE_SURFACE_ID}
+                    chrome="mode"
+                    isActive={activeMode === 'org'}
+                  />
+                )}
+              </Activity>
             </div>
 
             {/* Extension Fullscreen Panel Mode */}

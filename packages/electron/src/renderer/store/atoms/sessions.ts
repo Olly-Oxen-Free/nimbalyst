@@ -187,6 +187,12 @@ export interface AgentSessionAttentionGroups {
 /**
  * Active-workspace sessions that currently need attention, classified by
  * their highest-priority state so a session appears in exactly one group.
+ *
+ * `phase` is self-reported by the agent, and an agent sets `complete` before
+ * it emits its closing output -- the very output that flags the session
+ * unread. Filtering `complete` out up front therefore hid the sessions that
+ * had *just* finished, which is the opposite of what the popover is for. Only
+ * the running bucket honours the phase; unread and awaiting-input outrank it.
  */
 export const agentSessionAttentionAtom = atom<AgentSessionAttentionGroups>((get) => {
   const registry = get(sessionRegistryAtom);
@@ -194,7 +200,6 @@ export const agentSessionAttentionAtom = atom<AgentSessionAttentionGroups>((get)
   const sessions = Array.from(registry.values())
     .filter((session) =>
       !session.isArchived &&
-      session.phase !== 'complete' &&
       (!workspacePath || session.workspaceId === workspacePath)
     )
     .sort((a, b) => b.updatedAt - a.updatedAt);
@@ -209,7 +214,9 @@ export const agentSessionAttentionAtom = atom<AgentSessionAttentionGroups>((get)
     if (get(sessionHasPendingInteractivePromptAtom(session.id))) {
       groups.awaitingInput.push(session);
     } else if (get(sessionProcessingAtom(session.id))) {
-      groups.running.push(session);
+      if (session.phase !== 'complete') {
+        groups.running.push(session);
+      }
     } else if (get(sessionUnreadAtom(session.id))) {
       groups.unread.push(session);
     }
@@ -933,6 +940,15 @@ export const sessionEffortLevelRawAtom = atomFamily((sessionId: string) =>
   atom((get) => {
     const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
     return metadata?.effortLevel ?? null;
+  })
+);
+
+/** OpenCode session role (an `app.agents` primary agent), or null for its default. */
+export const sessionOpenCodeRoleAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
+    const role = metadata?.opencodeAgent;
+    return typeof role === 'string' && role.trim().length > 0 ? role : null;
   })
 );
 

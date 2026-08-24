@@ -28,6 +28,7 @@ import { OpenAICodexPanel } from '../GlobalSettings/panels/OpenAICodexPanel';
 import { OpenCodePanel } from '../GlobalSettings/panels/OpenCodePanel';
 import { CopilotCLIPanel } from '../GlobalSettings/panels/CopilotCLIPanel';
 import { LMStudioPanel } from '../GlobalSettings/panels/LMStudioPanel';
+import { OllamaPanel } from '../GlobalSettings/panels/OllamaPanel';
 import { AdvancedPanel } from '../GlobalSettings/panels/AdvancedPanel';
 import { DatabasePanel } from '../GlobalSettings/panels/DatabasePanel';
 import { AgentFeaturesPanel } from './AgentFeaturesPanel';
@@ -796,6 +797,23 @@ export function SettingsView({
         });
         debouncedSave();
       },
+      // Bulk toggle over an explicit subset, so a panel showing a filtered or
+      // dynamically discovered list can act on exactly what the user sees
+      // without a state update per row.
+      onSetVisibilityForModels: (modelIds: string[], visible: boolean) => {
+        setProviders(prev => {
+          const hidden = new Set(prev[providerId]?.hiddenModels || []);
+          for (const modelId of modelIds) {
+            if (visible) hidden.delete(modelId);
+            else hidden.add(modelId);
+          }
+          return {
+            ...prev,
+            [providerId]: { ...prev[providerId], hiddenModels: Array.from(hidden) },
+          };
+        });
+        debouncedSave();
+      },
     });
 
     // Helper to wrap provider panels with override wrapper when in project scope
@@ -868,11 +886,21 @@ export function SettingsView({
       case 'openai-codex':
         return wrapWithOverride('openai-codex', 'OpenAI Codex', <OpenAICodexPanel {...commonProps} />);
       case 'opencode':
-        return wrapWithOverride('opencode', 'OpenCode', <OpenCodePanel {...commonProps} />);
+        return wrapWithOverride(
+          'opencode',
+          'OpenCode',
+          <OpenCodePanel
+            {...commonProps}
+            {...makeVisibilityHandlers('opencode')}
+            workspacePath={workspacePath ?? undefined}
+          />,
+        );
       case 'copilot-cli':
         return wrapWithOverride('copilot-cli', 'GitHub Copilot', <CopilotCLIPanel {...commonProps} />);
       case 'lmstudio':
         return wrapWithOverride('lmstudio', 'LM Studio', <LMStudioPanel {...commonProps} />);
+      case 'ollama':
+        return wrapWithOverride('ollama', 'Ollama', <OllamaPanel {...commonProps} />);
       case 'advanced':
         // AdvancedPanel is self-contained - uses Jotai atoms and IPC directly
         return <AdvancedPanel />;

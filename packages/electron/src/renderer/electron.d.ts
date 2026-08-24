@@ -285,7 +285,7 @@ interface ElectronAPI {
   onOpenKeyboardShortcuts: (callback: () => void) => () => void;
   onOpenFeedback: (callback: () => void) => () => void;
   onThemeChange: (callback: (theme: string) => void) => () => void;
-  setTitleBarOverlayColors: (colors: { color: string; symbolColor: string }) => void;
+  setTitleBarOverlayColors: (colors: { color: string; symbolColor: string; backgroundColor?: string }) => void;
   getWindowFullScreen: () => Promise<boolean>;
   exitWindowFullScreen: () => void;
   getWindowMenuBar: () => Promise<import('../shared/menuBar').SerializedMenuBar>;
@@ -319,6 +319,7 @@ interface ElectronAPI {
   getTheme: () => Promise<string>;
   getThemeSync: () => string;
   getResolvedThemeSync: () => string;
+  getThemeBackgroundColorSync: () => string | null;
   getAppVersion: () => Promise<string>;
   setTheme: (theme: string) => Promise<void>;
 
@@ -475,7 +476,7 @@ interface ElectronAPI {
   // AI operations (flat methods)
   aiHasApiKey: () => Promise<boolean>;
   aiInitialize: (provider?: string, apiKey?: string) => Promise<any>;
-  aiCreateSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'opencode' | 'copilot-cli' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
+  aiCreateSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'opencode' | 'copilot-cli' | 'lmstudio' | 'ollama', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
   aiSendMessage: (message: string, documentContext?: any, sessionId?: string, workspacePath?: string) => Promise<any>;
   aiGetSessions: (workspacePath?: string) => Promise<any>;
   aiLoadSession: (sessionId: string, workspacePath?: string, trackAsResume?: boolean) => Promise<any>;
@@ -501,7 +502,7 @@ interface ElectronAPI {
 
   getAISettings: () => Promise<any>;
   saveAISettings: (settings: any) => Promise<void>;
-  testAIConnection: (provider: 'claude' | 'claude-code' | 'openai' | 'lmstudio') => Promise<any>;
+  testAIConnection: (provider: 'claude' | 'claude-code' | 'openai' | 'lmstudio' | 'ollama') => Promise<any>;
   getAIModels: () => Promise<{ success: boolean; models: any[]; grouped: Record<string, any[]> }>;
   aiGetSettings: () => Promise<any>;
   aiSaveSettings: (settings: any) => Promise<void>;
@@ -510,6 +511,13 @@ interface ElectronAPI {
   aiGetAllModels: () => Promise<any>;
   aiClearModelCache: () => Promise<void>;
   aiRefreshSessionProvider: (sessionId: string) => Promise<void>;
+  openCodeModelCatalogGet: () => Promise<import('../shared/openCodeModelCatalog').OpenCodeModelCatalogIpcResponse>;
+  openCodeModelCatalogRefresh: (
+    request: import('../shared/openCodeModelCatalog').OpenCodeModelCatalogRefreshRequest
+  ) => Promise<import('../shared/openCodeModelCatalog').OpenCodeModelCatalogIpcResponse>;
+  openCodeAgentCatalogGet: (
+    request: import('../shared/openCodeAgentCatalog').OpenCodeAgentCatalogRequest
+  ) => Promise<import('../shared/openCodeAgentCatalog').OpenCodeAgentCatalogIpcResponse>;
 
   // AI event listeners
   onAIStreamResponse: (callback: (data: any) => void) => () => void;
@@ -593,7 +601,7 @@ interface ElectronAPI {
   ai: {
     hasApiKey: () => Promise<boolean>;
     initialize: (provider?: string, apiKey?: string) => Promise<any>;
-    createSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
+    createSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'lmstudio' | 'ollama', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
     sendMessage: (message: string, documentContext?: any, sessionId?: string, workspacePath?: string) => Promise<any>;
     getSessions: (workspacePath?: string) => Promise<any>;
     getSessionList: (workspacePath?: string) => Promise<any>;
@@ -1490,6 +1498,8 @@ interface ElectronAPI {
         urlExtraQuery?: string;
       };
       error?: string;
+      /** Whether asking again could succeed. Absent on success. */
+      retryable?: boolean;
     }>;
     // WebSocket proxy (Cloudflare blocks browser WS upgrades; proxy through main process)
     wsConnect: (url: string) => Promise<{ success: boolean; wsId?: string; error?: string }>;

@@ -21,7 +21,9 @@ import {
   isAgentProvider,
   ClaudeCodeProvider,
   OpenAICodexProvider,
+  OpenCodeProvider,
 } from '@nimbalyst/runtime/ai/server';
+import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
 import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
 import { reconcileClaudeCodeModels } from './claudeCodeModelReconcile';
 import { isModelEnabled } from './modelEnablementFilter';
@@ -154,6 +156,32 @@ import {
 import { captureTutorialMilestone } from '../tutorial/tutorialAnalytics';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Catalogs that survive the provider instance that discovered them.
+ *
+ * The `/` typeahead runs before a session has a live provider, and a provider
+ * whose catalog is only learned from a running agent (claude-code from the SDK
+ * init payload, opencode from `command.list` against its server) has nothing to
+ * report at that moment. The static cache each of them keeps lets the commands
+ * a previous session discovered show up immediately.
+ *
+ * Registering here rather than branching per provider name keeps the next one a
+ * single line; providers absent from the map have no pre-instance catalog and
+ * fall through to an empty one.
+ */
+const CROSS_SESSION_WORKFLOW_CATALOGS: Partial<
+  Record<AIProviderType, () => { commands: string[]; skills: string[] }>
+> = {
+  'claude-code': () => ({
+    commands: ClaudeCodeProvider.getCachedSdkSlashCommands(),
+    skills: ClaudeCodeProvider.getCachedSdkSkills(),
+  }),
+  opencode: () => ({
+    commands: OpenCodeProvider.getCachedSdkSlashCommands(),
+    skills: [],
+  }),
+};
 
 // Debounced re-sync of the available-models list to mobile. The renderer can
 // send rapid providerSettings slices when toggling providers, so coalesce them
@@ -692,6 +720,11 @@ export class AIService {
                 enabled: false,
                 testStatus: "idle",
                 baseUrl: "http://127.0.0.1:8234"
+              },
+              ollama: {
+                enabled: false,
+                testStatus: "idle",
+                baseUrl: "http://localhost:11434"
               }
             }
           },
@@ -763,6 +796,8 @@ export class AIService {
       case 'openai-codex':
         return globalApiKeys['openai-codex'];
       case 'lmstudio':
+        return 'not-required';
+      case 'ollama':
         return 'not-required';
       default:
         return globalApiKeys[provider];
@@ -1659,14 +1694,7 @@ export class AIService {
 
     return resolveProviderWorkflowCatalog(effectiveType, {
       instance,
-      // claude-code learns its catalog from the SDK init payload, so it is the
-      // only provider with anything to say before a session exists.
-      cachedCatalog: effectiveType === 'claude-code'
-        ? () => ({
-            commands: ClaudeCodeProvider.getCachedSdkSlashCommands(),
-            skills: ClaudeCodeProvider.getCachedSdkSkills(),
-          })
-        : undefined,
+      cachedCatalog: CROSS_SESSION_WORKFLOW_CATALOGS[effectiveType as AIProviderType],
     });
   }
 
@@ -1832,6 +1860,11 @@ export class AIService {
                          providerSettings['lmstudio']?.models?.length > 0;
       if (hasLMStudio) return true;
 
+      // Check Ollama (doesn't need API key but needs enabled models)
+      const hasOllama = providerSettings['ollama']?.enabled === true &&
+                         providerSettings['ollama']?.models?.length > 0;
+      if (hasOllama) return true;
+
       return false;
     });
 
@@ -1936,6 +1969,9 @@ export class AIService {
             break;
           case 'lmstudio':
             // LMStudio doesn't need an API key, just the base URL
+            break;
+          case 'ollama':
+            // Ollama doesn't need an API key, just the base URL
             break;
           default:
             throw new Error(`Unknown provider: ${provider}`);
@@ -2086,6 +2122,13 @@ export class AIService {
         const lmstudioSettings = this.getSettingsStore().get('providerSettings.lmstudio', {}) as any;
         const storedApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
         initConfig.baseUrl = lmstudioSettings.baseUrl || storedApiKeys['lmstudio_url'] || 'http://127.0.0.1:8234';
+      }
+
+      // Add Ollama-specific config
+      if (provider === 'ollama') {
+        const ollamaSettings = this.getSettingsStore().get('providerSettings.ollama', {}) as any;
+        const storedApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
+        initConfig.baseUrl = ollamaSettings.baseUrl || storedApiKeys['ollama_url'] || 'http://localhost:11434';
       }
 
       // Pass through allowedTools and effort level settings for Claude Code
@@ -3279,6 +3322,10 @@ export class AIService {
           // lmstudio_url is a regular setting -- no masking, just write it.
           safeSet('ai.apiKey.lmstudio_url', settings.apiKeys.lmstudio_url);
         }
+        if (settings.apiKeys.ollama_url !== undefined) {
+          // ollama_url is a regular setting -- no masking, just write it.
+          safeSet('ai.apiKey.ollama_url', settings.apiKeys.ollama_url);
+        }
       }
 
       if (settings.providerSettings && typeof settings.providerSettings === 'object') {
@@ -3390,6 +3437,10 @@ export class AIService {
             break;
           case 'lmstudio':
             // LMStudio doesn't need an API key, just test the connection
+            apiKey = 'not-required';
+            break;
+          case 'ollama':
+            // Ollama doesn't need an API key, just test the connection
             apiKey = 'not-required';
             break;
           default:
@@ -3565,6 +3616,16 @@ export class AIService {
           }
         }
 
+        // For Ollama, test the endpoint
+        if (provider === 'ollama') {
+          const providerSettings = this.getSettingsStore().get('providerSettings', {}) as any;
+          const baseUrl = providerSettings['ollama']?.baseUrl || 'http://localhost:11434';
+          const response = await fetch(`${baseUrl}/v1/models`);
+          if (!response.ok) {
+            throw new Error(`Ollama server not responding at ${baseUrl}`);
+          }
+        }
+
         return { success: true, provider };
       } catch (error: any) {
         return { success: false, error: error.message };
@@ -3590,10 +3651,12 @@ export class AIService {
       if (providerSettings['openai-codex']?.enabled === true) enabledSet.add('openai-codex');
       if (providerSettings['opencode']?.enabled === true) enabledSet.add('opencode');
       if (providerSettings['lmstudio']?.enabled === true) enabledSet.add('lmstudio');
+      if (providerSettings['ollama']?.enabled === true) enabledSet.add('ollama');
 
       const modelsConfig = {
         ...apiKeys,
-        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234'
+        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234',
+        ollama_url: providerSettings['ollama']?.baseUrl || 'http://localhost:11434'
       };
       const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledSet);
 
@@ -3701,7 +3764,7 @@ export class AIService {
     // the literal string "/compact" as a user turn, which only ever worked for
     // providers whose SDK happens to interpret slash commands -- for Codex it
     // reached the model as prompt text and silently did nothing.
-    safeHandle('ai:compactSession', async (_event, sessionId: string) => {
+    safeHandle('ai:compactSession', async (event, sessionId: string) => {
       if (!sessionId) {
         throw new Error('ai:compactSession requires a sessionId');
       }
@@ -3714,6 +3777,23 @@ export class AIService {
         provider = ProviderFactory.getProvider(type, sessionId);
         if (provider) break;
       }
+
+      // The stored session is what a cold compact runs on: the Compact button
+      // is offered for every session of a provider that declares `rpc`,
+      // including one restored after a restart that has not sent a turn in this
+      // app launch and so has no provider instance. The conversation still
+      // exists on the agent's side, so hand the provider what it needs to reach
+      // it instead of refusing (#574).
+      const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+      const storedSession = await AISessionsRepository.get(sessionId);
+      if (!provider && storedSession?.provider) {
+        // Only for a type that declares `rpc`: everything else has nothing to
+        // call here, and the declaration fails closed for ids the factory does
+        // not build (extension-contributed agents).
+        if (agentCapabilitiesForProviderType(storedSession.provider).compaction === 'rpc') {
+          provider = ProviderFactory.createProvider(storedSession.provider as AIProviderType, sessionId);
+        }
+      }
       if (!provider) {
         return { success: false, error: 'Cannot compact: this session has no active provider yet.' };
       }
@@ -3723,12 +3803,38 @@ export class AIService {
       if (provider.getAgentCapabilities().compaction !== 'rpc') {
         return { success: false, error: 'This provider does not support compaction.' };
       }
-      const compactable = provider as unknown as { compactSession?: (id: string) => Promise<void> };
+      const compactable = provider as unknown as {
+        compactSession?: (
+          id: string,
+          options?: { workspacePath?: string; providerSessionId?: string },
+        ) => Promise<void>;
+      };
       if (typeof compactable?.compactSession !== 'function') {
         return { success: false, error: 'This provider does not support compaction.' };
       }
       try {
-        await compactable.compactSession(sessionId);
+        await compactable.compactSession(sessionId, {
+          workspacePath: storedSession?.worktreePath || storedSession?.workspacePath,
+          providerSessionId: storedSession?.providerSessionId,
+        });
+
+        // The conversation the meter was measuring no longer exists. Nothing
+        // here knows how large the summary is, so drop the reading rather than
+        // leave the pre-compaction one on screen -- the next turn reports a
+        // measured one. Without this, the one action whose whole purpose is
+        // reducing context left the session reading 90% until something else
+        // happened to refresh it. The denominator goes too: the meter falls
+        // back to cumulative spend over the window, which would replace a stale
+        // percentage with a confidently wrong one. Cumulative totals stay --
+        // compaction reset the context, not what the session has spent.
+        const storedUsage = (storedSession?.metadata as Record<string, unknown> | undefined)
+          ?.tokenUsage as SessionData['tokenUsage'] | undefined;
+        if (storedUsage?.currentContext || storedUsage?.contextWindow) {
+          const clearedUsage = { ...storedUsage, currentContext: undefined, contextWindow: undefined };
+          await this.sessionManager.updateSessionTokenUsage(sessionId, clearedUsage);
+          safeSend(event, 'ai:tokenUsageUpdated', { sessionId, tokenUsage: clearedUsage });
+        }
+
         return { success: true };
       } catch (error) {
         console.error('[AIService] compactSession failed:', error);
@@ -3793,6 +3899,11 @@ export class AIService {
           enabled: providerSettings['lmstudio']?.enabled === true,
           models: providerSettings['lmstudio']?.models,
           hiddenModels: providerSettings['lmstudio']?.hiddenModels
+        },
+        'ollama': {
+          enabled: providerSettings['ollama']?.enabled === true,
+          models: providerSettings['ollama']?.models,
+          hiddenModels: providerSettings['ollama']?.hiddenModels
         }
       };
 
@@ -3804,7 +3915,8 @@ export class AIService {
       );
       const modelsConfig = {
         ...apiKeys,
-        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234'
+        lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234',
+        ollama_url: providerSettings['ollama']?.baseUrl || 'http://localhost:11434'
       };
       const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledProviderSet);
 
@@ -4134,7 +4246,7 @@ export class AIService {
 
     // Extension SDK: List available chat models
     safeHandle('extensions:ai-list-models', async () => {
-      const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio'];
+      const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio', 'ollama'];
       const providerSettings = this.getNormalizedProviderSettings() as any;
       const globalApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
 
@@ -4148,7 +4260,9 @@ export class AIService {
         const apiKey = provider === 'claude' ? globalApiKeys['anthropic']
           : provider === 'openai' ? globalApiKeys['openai']
           : undefined;
-        const baseUrl = provider === 'lmstudio' ? (globalApiKeys['lmstudio_url'] || undefined) : undefined;
+        const baseUrl = provider === 'lmstudio' ? (globalApiKeys['lmstudio_url'] || undefined)
+          : provider === 'ollama' ? (globalApiKeys['ollama_url'] || undefined)
+          : undefined;
 
         try {
           const models = await ModelRegistry.getModelsForProvider(provider, apiKey, baseUrl);
@@ -4422,13 +4536,13 @@ export class AIService {
 
   /**
    * Resolve which chat provider and config to use for an extension completion request.
-   * Only chat providers (claude, openai, lmstudio) are supported.
+   * Only chat providers (claude, openai, lmstudio, ollama) are supported.
    */
   private async resolveExtensionChatProvider(
     event: Electron.IpcMainInvokeEvent,
     options: { model?: string; maxTokens?: number; temperature?: number; responseFormat?: any }
   ): Promise<{ provider: AIProvider; providerConfig: ProviderConfig; providerType: AIProviderType; syntheticSessionId: string }> {
-    const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio'];
+    const CHAT_PROVIDERS: AIProviderType[] = ['claude', 'openai', 'lmstudio', 'ollama'];
 
     // Determine provider from model ID or find first available
     let providerType: AIProviderType | undefined;
@@ -4463,12 +4577,12 @@ export class AIService {
     }
 
     if (!providerType) {
-      throw new Error('No chat provider available. Enable Claude, OpenAI, or LM Studio in Settings > AI.');
+      throw new Error('No chat provider available. Enable Claude, OpenAI, LM Studio, or Ollama in Settings > AI.');
     }
 
     // Get API key
     const apiKey = this.getApiKeyForProvider(providerType);
-    if (providerType !== 'lmstudio' && !apiKey) {
+    if (providerType !== 'lmstudio' && providerType !== 'ollama' && !apiKey) {
       throw new Error(`API key not configured for provider ${providerType}. Configure it in Settings > AI.`);
     }
 
@@ -4492,6 +4606,12 @@ export class AIService {
     if (providerType === 'lmstudio') {
       const globalApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
       providerConfig.baseUrl = globalApiKeys['lmstudio_url'] || 'http://127.0.0.1:1234';
+    }
+
+    // Ollama needs baseUrl
+    if (providerType === 'ollama') {
+      const globalApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
+      providerConfig.baseUrl = globalApiKeys['ollama_url'] || 'http://localhost:11434';
     }
 
     const syntheticSessionId = `ext-completion-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

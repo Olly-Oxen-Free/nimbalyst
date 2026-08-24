@@ -232,6 +232,7 @@ describe('AI model picker provider visibility', () => {
     claude: [{ id: 'claude:haiku', name: 'Haiku', provider: 'claude' }],
     openai: [{ id: 'openai:gpt-5', name: 'GPT-5', provider: 'openai' }],
     lmstudio: [{ id: 'lmstudio:local', name: 'Local Model', provider: 'lmstudio' }],
+    ollama: [{ id: 'ollama:qwen3:14b', name: 'Qwen3 (14b)', provider: 'ollama' }],
   };
 
   function mockModels() {

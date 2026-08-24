@@ -7,7 +7,6 @@ import type { SettingsCategory } from '../Settings/SettingsSidebar';
 import type { SettingsScope } from '../Settings/SettingsView';
 import { KeyboardShortcuts, getShortcutDisplay } from '../../../shared/KeyboardShortcuts';
 import { ThemeToggleButton } from '../ThemeToggleButton/ThemeToggleButton';
-import { SyncStatusButton } from '../SyncStatusButton/SyncStatusButton';
 import { TrustIndicator } from '../TrustIndicator';
 import { ExtensionDevIndicator } from '../ExtensionDevIndicator';
 import { ClaudeUsageIndicator } from '../ClaudeUsageIndicator';
@@ -21,7 +20,6 @@ import {
   developerModeAtom,
   terminalFeatureAvailableAtom,
   syncEnabledAtom,
-  syncEnabledProjectsAtom,
 } from '../../store/atoms/appSettings';
 import {
   hiddenGutterItemsAtom,
@@ -34,11 +32,12 @@ import { workspaceHasTeamAtom } from '../../store/atoms/collabDocuments';
 import { stytchIsSignedInAtom } from '../../store/atoms/stytchAuth';
 import { personalAccountsAtom } from '../../store/atoms/settingsDomains';
 import { orgInboxUnreadCountAtomFamily } from '../../store/atoms/teamInbox';
+import { formatUnreadCount } from '../../store/projectWindowUnreadViewModel';
 import { useProjectOrg } from '../../hooks/useProjectOrg';
-import { orgProjectWalkAtom } from '../../store/atoms/orgProjectWalk';
-import { openOrgProjectWalk } from '../../store/listeners/orgProjectWalkListeners';
 import { AlphaBadge } from '../common/AlphaBadge';
 import { AccountInspectorPopover } from '../Accounts/AccountInspectorPopover';
+import { summarizeSyncStatus } from '../Accounts/syncStatusSummary';
+import { useSyncStatus } from '../../hooks/useSyncStatus';
 import { GutterContextMenu } from './GutterContextMenu';
 import { CustomizeGutterPopover } from './CustomizeGutterPopover';
 import {
@@ -86,6 +85,10 @@ interface NavigationGutterProps {
   onToggleAgentCollapsed?: () => void;
   /** Callback to toggle Collab mode (Shared Docs) sidebar collapsed state */
   onToggleCollabCollapsed?: () => void;
+  /** Callback to toggle Tracker mode sidebar collapsed state */
+  onToggleTrackerCollapsed?: () => void;
+  /** Callback to toggle Org mode sidebar collapsed state */
+  onToggleOrgCollapsed?: () => void;
   /** Currently active extension bottom panel ID */
   activeExtensionBottomPanel?: string | null;
   /** Callback when an extension bottom panel is toggled */
@@ -94,7 +97,7 @@ interface NavigationGutterProps {
 
 // Shared nav-button styling. `active` swaps the filled/primary look.
 const NAV_BTN_BASE =
-  'nav-button relative w-9 h-9 flex items-center justify-center border-none rounded-md cursor-pointer transition-all duration-150 p-0 active:scale-95 focus-visible:outline-2 focus-visible:outline-[var(--nim-primary)] focus-visible:outline-offset-2';
+  'nav-button group relative w-9 h-9 flex items-center justify-center border-none rounded-md cursor-pointer transition-all duration-150 p-0 active:scale-95 focus-visible:outline-2 focus-visible:outline-[var(--nim-primary)] focus-visible:outline-offset-2';
 const navBtnClass = (active: boolean): string =>
   `${NAV_BTN_BASE} ${active ? 'active bg-nim-primary text-nim-on-primary hover:bg-nim-primary-hover' : 'bg-transparent text-nim-muted hover:bg-nim-tertiary hover:text-nim'}`;
 
@@ -114,6 +117,8 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
   onToggleFilesCollapsed,
   onToggleAgentCollapsed,
   onToggleCollabCollapsed,
+  onToggleTrackerCollapsed,
+  onToggleOrgCollapsed,
   activeExtensionBottomPanel,
   onExtensionBottomPanelChange,
 }) => {
@@ -135,10 +140,6 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
   const projectOrgUnread = useAtomValue(
     orgInboxUnreadCountAtomFamily(projectOrg?.orgId ?? ''),
   );
-  // An org the account belongs to with nothing bound here yet. Replaces the
-  // "No organization" row, which is a lie for an actual member.
-  const projectWalk = useAtomValue(orgProjectWalkAtom);
-
   // Global gutter customization (visibility + per-section order).
   const hiddenItems = useAtomValue(hiddenGutterItemsAtom);
   const sectionOrder = useAtomValue(gutterItemOrderAtom);
@@ -188,17 +189,20 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
 
   // Check if mobile sync is configured for this workspace
   const syncEnabled = useAtomValue(syncEnabledAtom);
-  const syncEnabledProjects = useAtomValue(syncEnabledProjectsAtom);
-  const isSyncConfigured = syncEnabled && !!workspacePath && syncEnabledProjects.includes(workspacePath);
-
-  // User is "connected" to this project if they have a team or mobile sync configured
-  const isProjectConnected = hasTeam || isSyncConfigured;
 
   // When sync is enabled but the user isn't signed in (creds missing/expired),
   // surface a logged-out indicator on the user button so the broken-sync state
   // isn't silent. Wait for the auth state to load before flipping the icon to
   // avoid flashing the logged-out look during startup.
   const needsSignIn = syncEnabled && isSignedIn === false;
+
+  // Sync state for the account popover's Sync row. It used to have its own
+  // gutter slot; the state now reaches the user through the avatar, which
+  // already carries the sign-in warning, so there is one place to look when
+  // something about the account needs attention rather than two.
+  const syncStatus = useSyncStatus(workspacePath || undefined);
+  const syncSummary = summarizeSyncStatus(syncStatus);
+  const accountNeedsAttention = needsSignIn || (syncSummary?.needsAttention ?? false);
 
   // Get extension panel buttons from the panel registry
   const extensionPanelButtons = useExtensionGutterButtons();
@@ -212,6 +216,8 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
     testId: string;
     /** Re-clicking the already-active mode (e.g. toggle sidebar collapse). */
     onReclick?: () => void;
+    /** Small glyph badged into the icon's lower-right corner (e.g. "shared with people"). */
+    badgeIcon?: string;
     /** Extra decoration (e.g. alpha badge). */
     decoration?: React.ReactNode;
     /** Interactive sibling rendered over the button (e.g. Agent attention bubble). */
@@ -244,6 +250,20 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
             data-testid={opts.testId}
           >
             <MaterialSymbol icon={opts.icon} size={20} fill={isActive} />
+            {opts.badgeIcon && (
+              // The disc tracks the button's own background so the badge glyph
+              // stays legible where it overlaps the main icon, in every state.
+              <span
+                className={`nav-mode-button-badge absolute bottom-[3px] right-[3px] flex items-center justify-center rounded-full p-[1px] pointer-events-none ${
+                  isActive
+                    ? 'bg-nim-primary group-hover:bg-nim-primary-hover'
+                    : 'bg-nim-secondary group-hover:bg-nim-tertiary'
+                }`}
+                aria-hidden="true"
+              >
+                <MaterialSymbol icon={opts.badgeIcon} size={12} fill />
+              </span>
+            )}
             {opts.decoration}
           </button>
         </HelpTooltip>
@@ -348,6 +368,7 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
         icon: 'assignment',
         label: `Tracker (${getShortcutDisplay(KeyboardShortcuts.view.trackerMode)})`,
         contentMode: 'tracker', testId: 'tracker-mode-button',
+        onReclick: () => onToggleTrackerCollapsed?.(),
       }),
     },
     ...(hasPrRemote ? [{
@@ -359,13 +380,45 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
       }),
     }] : []),
     ...(hasTeam ? [{
-      id: 'collab', section: 'modes' as GutterSection, icon: 'cloud_sync', label: 'Shared Docs', hideable: true,
+      id: 'collab', section: 'modes' as GutterSection, icon: 'description', label: 'Shared Docs', hideable: true,
       render: () => renderModeButton({
-        icon: 'cloud_sync',
+        icon: 'description',
+        badgeIcon: 'groups',
         label: `Shared Docs (${getShortcutDisplay(KeyboardShortcuts.view.collabMode)})`,
         contentMode: 'collab', testId: 'collab-mode-button',
         onReclick: () => onToggleCollabCollapsed?.(),
         decoration: <AlphaBadge size="dot" className="absolute top-0 right-0.5 pointer-events-none" />,
+      }),
+    }] : []),
+    // Org mode is gated on the project actually belonging to an organization,
+    // the same rule Shared Docs uses. Without one there is no inbox to show.
+    ...(projectOrg ? [{
+      id: 'org', section: 'modes' as GutterSection, icon: 'forum', label: 'Organization', hideable: true,
+      render: () => renderModeButton({
+        icon: 'forum',
+        label: `Organization (${getShortcutDisplay(KeyboardShortcuts.view.orgMode)})${
+          projectOrgUnread > 0 ? `, ${projectOrgUnread} unread` : ''
+        }`,
+        contentMode: 'org', testId: 'org-mode-button',
+        onReclick: () => onToggleOrgCollapsed?.(),
+        decoration: (
+          <>
+            <AlphaBadge size="dot" className="absolute top-0 right-0.5 pointer-events-none" />
+            {projectOrgUnread > 0 && (
+              // Same bubble the Agent gutter button uses, moved to the lower
+              // corner so it does not sit on top of the beta dot. The count is
+              // the mode's whole discoverability story, so it lives here rather
+              // than only inside a popover.
+              <span
+                className="org-mode-unread-bubble absolute -bottom-1.5 -right-1.5 z-10 flex h-[18px] min-w-[18px] items-center justify-center rounded-full border-2 border-[var(--nim-bg-secondary)] bg-nim-error px-1 text-[10px] font-bold leading-none text-white shadow-sm pointer-events-none"
+                aria-hidden="true"
+                data-testid="org-mode-unread"
+              >
+                {formatUnreadCount(projectOrgUnread)}
+              </span>
+            )}
+          </>
+        ),
       }),
     }] : []),
   ];
@@ -434,12 +487,6 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
           onOpenSettings={onOpenPermissions || (() => {})}
           onChangeMode={onChangeTrustMode}
         />
-      ),
-    },
-    {
-      id: 'sync-status', section: 'indicators', icon: 'sync', label: 'Sync Status', hideable: true,
-      render: () => (
-        <SyncStatusButton workspacePath={workspacePath || undefined} onOpenSettings={onOpenSettings} />
       ),
     },
     {
@@ -539,10 +586,9 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
               accounts={accounts}
               projectOrg={projectOrg}
               projectOrgLoading={projectOrgLoading}
-              enterableOrgs={projectWalk.enterableOrgs}
-              onJoinOrganizationProject={() => {
+              onAddProjectToOrganization={() => {
                 setUserMenuOpen(false);
-                openOrgProjectWalk();
+                handleNavigateSettings('project', 'project-sharing');
               }}
               anchorEl={userMenuButtonRef.current}
               onClose={() => setUserMenuOpen(false)}
@@ -565,27 +611,39 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
               messagesUnreadCount={projectOrgUnread}
               onOpenMessages={(orgId) => {
                 setUserMenuOpen(false);
-                void window.electronAPI?.team?.openManagementWindow?.({
-                  orgId,
-                  workspacePath: workspacePath ?? undefined,
-                });
+                if (projectOrg?.orgId === orgId) {
+                  onContentModeChange('org');
+                }
+              }}
+              sync={syncSummary}
+              onOpenSyncSettings={() => {
+                setUserMenuOpen(false);
+                // Per-project sync selection lives in the Mobile App panel.
+                handleNavigateSettings('account', 'account-mobile');
               }}
             />
           )}
           <HelpTooltip testId="gutter-user-button" placement="right">
             <button
               ref={userMenuButtonRef}
-              className={`account-inspector-trigger nav-button relative w-9 h-9 flex items-center justify-center border-none rounded-md cursor-pointer transition-all duration-150 p-0 active:scale-95 focus-visible:outline-2 focus-visible:outline-[var(--nim-primary)] focus-visible:outline-offset-2 ${userMenuOpen ? 'bg-nim-tertiary text-nim' : needsSignIn ? 'bg-transparent text-nim-warning hover:bg-nim-tertiary' : 'bg-transparent text-nim-muted hover:bg-nim-tertiary hover:text-nim'}`}
+              className={`account-inspector-trigger nav-button relative w-9 h-9 flex items-center justify-center border-none rounded-md cursor-pointer transition-all duration-150 p-0 active:scale-95 focus-visible:outline-2 focus-visible:outline-[var(--nim-primary)] focus-visible:outline-offset-2 ${userMenuOpen ? 'bg-nim-tertiary text-nim' : accountNeedsAttention ? 'bg-transparent text-nim-warning hover:bg-nim-tertiary' : 'bg-transparent text-nim-muted hover:bg-nim-tertiary hover:text-nim'}`}
               onClick={() => setUserMenuOpen(!userMenuOpen)}
-              aria-label={needsSignIn ? 'User menu (signed out -- sync requires sign in)' : 'User menu'}
+              aria-label={
+                needsSignIn
+                  ? 'User menu (signed out -- sync requires sign in)'
+                  : syncSummary?.needsAttention
+                    ? `User menu (sync: ${syncSummary.detail})`
+                    : 'User menu'
+              }
               aria-expanded={userMenuOpen}
               data-signed-in={isSignedIn === null ? undefined : isSignedIn}
               data-needs-sign-in={needsSignIn || undefined}
+              data-sync-attention={syncSummary?.needsAttention || undefined}
               data-testid="gutter-user-button"
             >
               {accounts.length > 0 ? (
                 <>
-                  <span className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold text-white ${needsSignIn ? 'bg-[var(--nim-bg-tertiary)] text-[var(--nim-warning)]' : 'bg-[var(--nim-primary)]'}`}>
+                  <span className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold text-white ${accountNeedsAttention ? 'bg-[var(--nim-bg-tertiary)] text-[var(--nim-warning)]' : 'bg-[var(--nim-primary)]'}`}>
                     {(accounts.find((account) => account.isSyncAccount)?.email?.[0] ?? accounts[0]?.email?.[0] ?? '?').toUpperCase()}
                   </span>
                   {accounts.length > 1 && <span className="absolute -bottom-0.5 -right-0.5 rounded-full border border-[var(--nim-border)] bg-[var(--nim-bg-tertiary)] px-1 text-[8px] font-semibold leading-3">{accounts.length}</span>}

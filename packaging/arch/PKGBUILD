@@ -9,9 +9,9 @@
 # makepkg just repackages what's already built.
 
 pkgname=nimbalyst
-pkgver=0.73.2
-pkgrel=4
-pkgdesc="AI coding workspace (personal fork: live theme-reload fix, Wayland glass transparency, no background auto-update)"
+pkgver=0.75.0
+pkgrel=2
+pkgdesc="AI coding workspace (personal fork: live theme-reload fix, Wayland glass transparency, top-dockable project bar, no background auto-update)"
 arch=('x86_64')
 url="https://github.com/Olly-Oxen-Free/nimbalyst"
 license=('MIT')

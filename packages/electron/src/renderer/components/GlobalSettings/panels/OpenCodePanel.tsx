@@ -2,8 +2,8 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ProviderConfig } from '../../Settings/SettingsView';
 import { SettingsToggle } from '../SettingsToggle';
 import { AlphaBadge, SETTINGS_ALPHA_TOOLTIP } from '../../common/AlphaBadge';
-import { OPENCODE_PRESET_MODELS } from '@nimbalyst/runtime/ai/modelConstants';
 import type { OpenCodeFileConfig } from '@nimbalyst/runtime/ai/server';
+import { OpenCodeModelsSection } from './OpenCodeModelsSection';
 
 interface OpenCodePanelProps {
   config: ProviderConfig;
@@ -16,10 +16,15 @@ interface OpenCodePanelProps {
   onSelectAllModels: (selectAll: boolean) => void;
   onTestConnection: () => Promise<void>;
   onConfigChange: (updates: Partial<ProviderConfig>) => void;
+  /** Directory OpenCode discovers providers for. */
+  workspacePath?: string;
+  onModelVisibilityToggle: (modelId: string, visible: boolean) => void;
+  onSetVisibilityForModels: (modelIds: string[], visible: boolean) => void;
 }
 
 type CLIStatus = 'checking' | 'installed' | 'not-installed' | 'installing' | 'install-error';
 type LMStudioStatus = 'idle' | 'configuring' | 'success' | 'error';
+type OllamaStatus = 'idle' | 'configuring' | 'success' | 'error';
 
 interface OpenCodeConfigReadResponse {
   success: boolean;
@@ -41,38 +46,11 @@ interface OpenCodeLMStudioResponse {
   error?: string;
 }
 
-interface ModelOption {
-  id: string;
-  label: string;
-  group: 'preset' | 'lmstudio' | 'custom';
-}
-
-function buildModelOptions(config: OpenCodeFileConfig | null): ModelOption[] {
-  const presetIds = new Set<string>();
-  const presets: ModelOption[] = OPENCODE_PRESET_MODELS.map((m) => {
-    const id = `${m.providerID}/${m.modelID}`;
-    presetIds.add(id);
-    return { id, label: m.name, group: 'preset' };
-  });
-
-  const extras: ModelOption[] = [];
-  const providers = config?.provider ?? {};
-  for (const [providerID, entry] of Object.entries(providers)) {
-    const models = entry.models ?? {};
-    const providerLabel = entry.name || providerID;
-    for (const [modelID, modelEntry] of Object.entries(models)) {
-      const id = `${providerID}/${modelID}`;
-      if (presetIds.has(id)) continue;
-      const baseLabel = modelEntry?.name || modelID;
-      extras.push({
-        id,
-        label: `${baseLabel} (${providerLabel})`,
-        group: providerID === 'lmstudio' ? 'lmstudio' : 'custom',
-      });
-    }
-  }
-
-  return [...presets, ...extras];
+interface OpenCodeOllamaResponse {
+  success: boolean;
+  config?: OpenCodeFileConfig;
+  modelIds?: string[];
+  error?: string;
 }
 
 export function OpenCodePanel({
@@ -81,6 +59,9 @@ export function OpenCodePanel({
   onToggle,
   onApiKeyChange,
   onTestConnection,
+  workspacePath,
+  onModelVisibilityToggle,
+  onSetVisibilityForModels,
 }: OpenCodePanelProps) {
   const [cliStatus, setCLIStatus] = useState<CLIStatus>('checking');
   const [cliVersion, setCLIVersion] = useState<string | null>(null);
@@ -90,8 +71,11 @@ export function OpenCodePanel({
   const [configError, setConfigError] = useState<string | null>(null);
   const [lmStudioStatus, setLmStudioStatus] = useState<LMStudioStatus>('idle');
   const [lmStudioMessage, setLmStudioMessage] = useState<string | null>(null);
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus>('idle');
+  const [ollamaMessage, setOllamaMessage] = useState<string | null>(null);
 
   const existingBridgeBaseUrl = openCodeConfig?.provider?.lmstudio?.options?.baseURL as string | undefined;
+  const existingOllamaBridgeBaseUrl = openCodeConfig?.provider?.ollama?.options?.baseURL as string | undefined;
 
   // The LM Studio bridge URL field. Default to LM Studio's standard local port;
   // if opencode.json already contains a bridge entry we seed from that exactly
@@ -105,6 +89,19 @@ export function OpenCodePanel({
       seededFromConfig.current = true;
     }
   }, [existingBridgeBaseUrl]);
+
+  // The Ollama bridge URL field. Default to Ollama's standard local port;
+  // if opencode.json already contains a bridge entry we seed from that exactly
+  // once via the ref guard so an async config load doesn't cause a render loop.
+  const [ollamaBaseUrl, setOllamaBaseUrl] = useState<string>('http://localhost:11434');
+  const seededOllamaFromConfig = useRef(false);
+  useEffect(() => {
+    if (seededOllamaFromConfig.current) return;
+    if (existingOllamaBridgeBaseUrl) {
+      setOllamaBaseUrl(existingOllamaBridgeBaseUrl.replace(/\/v\d+\/?$/, ''));
+      seededOllamaFromConfig.current = true;
+    }
+  }, [existingOllamaBridgeBaseUrl]);
 
   const checkCLI = useCallback(async () => {
     setCLIStatus('checking');
@@ -196,7 +193,9 @@ export function OpenCodePanel({
         setOpenCodeConfig(response.config);
         setLmStudioStatus('success');
         const count = response.modelIds?.length ?? 0;
-        setLmStudioMessage(`Configured ${count} ${count === 1 ? 'model' : 'models'} from LM Studio.`);
+        setLmStudioMessage(
+          `Configured ${count} ${count === 1 ? 'model' : 'models'} from LM Studio. Use "Discover models" above to add them to the picker.`
+        );
       } else {
         setLmStudioStatus('error');
         setLmStudioMessage(response.error ?? 'Failed to configure LM Studio bridge');
@@ -225,11 +224,56 @@ export function OpenCodePanel({
     }
   };
 
-  const modelOptions = buildModelOptions(openCodeConfig);
+  const handleConnectOllama = async () => {
+    setOllamaStatus('configuring');
+    setOllamaMessage(null);
+    try {
+      const response = await window.electronAPI.invoke('opencode-config:upsert-ollama', {
+        baseUrl: ollamaBaseUrl,
+        modelIds: [],
+        autoDiscoverModels: true,
+        displayName: 'Ollama (local)',
+      }) as OpenCodeOllamaResponse;
+      if (response.success && response.config) {
+        setOpenCodeConfig(response.config);
+        setOllamaStatus('success');
+        const count = response.modelIds?.length ?? 0;
+        setOllamaMessage(`Configured ${count} ${count === 1 ? 'model' : 'models'} from Ollama.`);
+      } else {
+        setOllamaStatus('error');
+        setOllamaMessage(response.error ?? 'Failed to configure Ollama bridge');
+      }
+    } catch (err) {
+      setOllamaStatus('error');
+      setOllamaMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDisconnectOllama = async () => {
+    setOllamaStatus('configuring');
+    try {
+      const response = await window.electronAPI.invoke('opencode-config:remove-ollama') as OpenCodeConfigMergeResponse;
+      if (response.success) {
+        setOpenCodeConfig(response.config ?? null);
+        setOllamaStatus('idle');
+        setOllamaMessage(null);
+      } else {
+        setOllamaStatus('error');
+        setOllamaMessage(response.error ?? 'Failed to remove Ollama bridge');
+      }
+    } catch (err) {
+      setOllamaStatus('error');
+      setOllamaMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
   const selectedModel = openCodeConfig?.model ?? '';
   const lmStudioBridgeConfigured = !!openCodeConfig?.provider?.lmstudio;
   const lmStudioBridgeModelCount = openCodeConfig?.provider?.lmstudio?.models
     ? Object.keys(openCodeConfig.provider.lmstudio.models).length
+    : 0;
+  const ollamaBridgeConfigured = !!openCodeConfig?.provider?.ollama;
+  const ollamaBridgeModelCount = openCodeConfig?.provider?.ollama?.models
+    ? Object.keys(openCodeConfig.provider.ollama.models).length
     : 0;
   const autoUpdateOptedOut = openCodeConfig?.autoupdate === false;
 
@@ -313,43 +357,14 @@ export function OpenCodePanel({
 
       {config.enabled && (
         <>
-          <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
-            <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Default model</h4>
-            <p className="text-[13px] text-[var(--nim-text-muted)] mb-3 leading-relaxed">
-              Choose which model OpenCode uses by default. This writes the <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">model</code> field
-              of your <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">~/.config/opencode/opencode.json</code>.
-            </p>
-            <select
-              data-testid="opencode-model-select"
-              value={selectedModel}
-              onChange={(e) => handleModelChange(e.target.value)}
-              className="w-full py-2 px-3 rounded-md bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] text-[var(--nim-text)] outline-none focus:border-[var(--nim-primary)]"
-            >
-              <option value="">OpenCode default</option>
-              <optgroup label="Hosted">
-                {modelOptions.filter((m) => m.group === 'preset').map((m) => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))}
-              </optgroup>
-              {modelOptions.some((m) => m.group === 'lmstudio') && (
-                <optgroup label="LM Studio (local)">
-                  {modelOptions.filter((m) => m.group === 'lmstudio').map((m) => (
-                    <option key={m.id} value={m.id}>{m.label}</option>
-                  ))}
-                </optgroup>
-              )}
-              {modelOptions.some((m) => m.group === 'custom') && (
-                <optgroup label="Custom providers">
-                  {modelOptions.filter((m) => m.group === 'custom').map((m) => (
-                    <option key={m.id} value={m.id}>{m.label}</option>
-                  ))}
-                </optgroup>
-              )}
-            </select>
-            <p className="text-xs text-[var(--nim-text-muted)] mt-2">
-              Picking a hosted model requires the matching API key to be set up in OpenCode's own config.
-            </p>
-          </div>
+          <OpenCodeModelsSection
+            workspacePath={workspacePath}
+            hiddenModels={config.hiddenModels || []}
+            selectedModelId={selectedModel}
+            onSelectModel={(modelId) => { void handleModelChange(modelId); }}
+            onVisibilityToggle={onModelVisibilityToggle}
+            onSetVisibilityForModels={onSetVisibilityForModels}
+          />
 
           <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
             <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">LM Studio integration</h4>
@@ -395,6 +410,54 @@ export function OpenCodePanel({
             {lmStudioMessage && (
               <div className={`text-xs mt-2 ${lmStudioStatus === 'error' ? 'text-[var(--nim-error)]' : 'text-[var(--nim-text-muted)]'}`}>
                 {lmStudioMessage}
+              </div>
+            )}
+          </div>
+
+          <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
+            <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Ollama integration</h4>
+            <p className="text-[13px] text-[var(--nim-text-muted)] mb-3 leading-relaxed">
+              Point at a running Ollama server and Nimbalyst will query <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">/api/tags</code>,
+              then write a <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">provider.ollama</code> block into your <code className="text-[var(--nim-code-text)] bg-[var(--nim-code-bg)] px-1 rounded">opencode.json</code>.
+              You don't need to enable Ollama as a separate Nimbalyst chat provider.
+            </p>
+            <div className="flex items-center gap-2 flex-wrap mb-2">
+              <input
+                data-testid="opencode-ollama-base-url"
+                type="text"
+                value={ollamaBaseUrl}
+                onChange={(e) => { setOllamaBaseUrl(e.target.value); seededOllamaFromConfig.current = true; }}
+                onFocus={(e) => e.target.select()}
+                placeholder="http://localhost:11434"
+                className="flex-1 min-w-[220px] py-2 px-3 rounded-md bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] text-[var(--nim-text)] outline-none font-mono focus:border-[var(--nim-primary)]"
+              />
+              <button
+                data-testid="opencode-ollama-connect"
+                className="inline-flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium cursor-pointer transition-all bg-[var(--nim-primary)] text-white border border-[var(--nim-primary)] hover:opacity-90 disabled:opacity-60 disabled:cursor-wait"
+                onClick={handleConnectOllama}
+                disabled={ollamaStatus === 'configuring' || !ollamaBaseUrl.trim()}
+              >
+                {ollamaStatus === 'configuring' ? 'Configuring...' : (ollamaBridgeConfigured ? 'Refresh' : 'Connect')}
+              </button>
+              {ollamaBridgeConfigured && (
+                <button
+                  data-testid="opencode-ollama-disconnect"
+                  className="inline-flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium cursor-pointer transition-all bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)] border border-[var(--nim-border)] hover:bg-[var(--nim-bg-hover)]"
+                  onClick={handleDisconnectOllama}
+                  disabled={ollamaStatus === 'configuring'}
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            {ollamaBridgeConfigured && (
+              <p className="text-xs text-[var(--nim-text-muted)]">
+                Bridge active with {ollamaBridgeModelCount} {ollamaBridgeModelCount === 1 ? 'model' : 'models'}. Select one above to use it as the default.
+              </p>
+            )}
+            {ollamaMessage && (
+              <div className={`text-xs mt-2 ${ollamaStatus === 'error' ? 'text-[var(--nim-error)]' : 'text-[var(--nim-text-muted)]'}`}>
+                {ollamaMessage}
               </div>
             )}
           </div>

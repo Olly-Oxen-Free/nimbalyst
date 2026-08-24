@@ -53,6 +53,7 @@ const PROVIDERS: ProviderInfo[] = [
   { id: 'claude', name: 'Claude', subtitle: 'Anthropic API', apiKeyField: 'anthropic' },
   { id: 'openai', name: 'OpenAI', subtitle: 'GPT Models', apiKeyField: 'openai' },
   { id: 'lmstudio', name: 'LM Studio', subtitle: 'Local Models' },
+  { id: 'ollama', name: 'Ollama', subtitle: 'Local Models' },
 ];
 
 export function ProjectAIProvidersPanel({ workspacePath, workspaceName }: ProjectAIProvidersPanelProps) {

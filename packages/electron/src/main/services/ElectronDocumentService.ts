@@ -407,6 +407,15 @@ export class ElectronDocumentService implements DocumentService {
   private metadataByPath: Map<string, DocumentMetadataEntry> = new Map();
   private metadataWatchers: Map<string, (change: MetadataChangeEvent) => void> = new Map();
   private fileStateCache: Map<string, { mtime: number; size: number; hash?: string }> = new Map();
+  /**
+   * Markdown files observed to contain no inline tracker markers and to own no
+   * `tracker_items` rows, keyed by the content hash that was true of. Lets
+   * `updateTrackerItemsCache` skip both of its queries for the common case.
+   * TTL-bounded because other writers can create a row for a path without
+   * touching the file.
+   */
+  private trackerItemsEmptyCache: Map<string, { hash: string; expiresAt: number }> = new Map();
+  private readonly TRACKER_ITEMS_EMPTY_TTL_MS = 5 * 60 * 1000;
   private initializationPromise: Promise<void> | null = null;
 
   // Tracker items cache
@@ -1334,8 +1343,13 @@ export class ElectronDocumentService implements DocumentService {
   }
 
   private async listMergedTrackerItems(): Promise<TrackerItem[]> {
+    // `deleted_at IS NULL` because a tombstone is a row, not an absence: both a
+    // teammate's delta (`applyRemoteItem`) and our own queued offline delete
+    // (`applyOptimistic`) mark the row rather than removing it. Without this
+    // filter the deleted item vanished from the atoms via the `removed`
+    // broadcast and then came back on the next full list.
     const result = await database.query<any>(
-      `SELECT * FROM tracker_items WHERE workspace = $1 ORDER BY kanban_sort_order ASC NULLS LAST, last_indexed DESC`,
+      `SELECT * FROM tracker_items WHERE workspace = $1 AND deleted_at IS NULL ORDER BY kanban_sort_order ASC NULLS LAST, last_indexed DESC`,
       [this.workspacePath]
     );
     await this.assignLocalKeysFrom(result.rows);
@@ -2330,7 +2344,13 @@ export class ElectronDocumentService implements DocumentService {
       // so a draft item's body save would otherwise leak to
       // the room. The legit frontmatter body-share path (shareFrontmatterBody)
       // still passes here because by then the row carries the share flag.
-      if (isTrackerSyncActive(item.workspace) && this.shouldSyncItemNow(item)) {
+      //
+      // Offline, mark the row pending instead. Without the else the bumped
+      // `body_version` never reached the room, so cold peers kept reading a
+      // stale body version indefinitely (NIM-3657).
+      if (this.shouldSyncItemNow(item) && !isTrackerSyncActive(item.workspace)) {
+        await this.updateTrackerItemSyncStatus(item.id, 'pending');
+      } else if (isTrackerSyncActive(item.workspace) && this.shouldSyncItemNow(item)) {
         try {
           await syncTrackerItem(item);
         } catch (syncErr) {
@@ -2496,12 +2516,18 @@ export class ElectronDocumentService implements DocumentService {
 
     // Push archived state to sync server so other clients see it. Gate on the
     // per-item publication state (NIM-880) so a draft item doesn't leak to the
-    // room just because it was archived.
-    if (isTrackerSyncActive(item.workspace) && this.shouldSyncItemNow(item)) {
-      try {
-        await syncTrackerItem(item);
-      } catch (syncErr) {
-        console.error('[DocumentService] archiveTrackerItem sync failed:', syncErr);
+    // room just because it was archived. Offline, mark the row pending so the
+    // reconnect drain pushes it -- without the else, an offline archive of an
+    // already-synced item never entered the candidate set (NIM-3657).
+    if (this.shouldSyncItemNow(item)) {
+      if (isTrackerSyncActive(item.workspace)) {
+        try {
+          await syncTrackerItem(item);
+        } catch (syncErr) {
+          console.error('[DocumentService] archiveTrackerItem sync failed:', syncErr);
+        }
+      } else {
+        await this.updateTrackerItemSyncStatus(item.id, 'pending');
       }
     }
 
@@ -2540,13 +2566,21 @@ export class ElectronDocumentService implements DocumentService {
       [rowId]
     );
 
-    // Notify sync server so other clients remove the item too
-    if (isTrackerSyncActive(this.workspacePath)) {
-      try {
-        await unsyncTrackerItem(rowId, this.workspacePath);
-      } catch (syncErr) {
-        console.error('[DocumentService] deleteTrackerItem sync failed:', syncErr);
-      }
+    // Notify sync server so other clients remove the item too.
+    //
+    // Deliberately NOT gated on `isTrackerSyncActive`. The local row is already
+    // hard-deleted, so an offline delete that skips the engine leaves nothing
+    // behind to carry the intent -- not even for the next launch's drain, which
+    // selects surviving rows. Deleting the newest item also lowers
+    // `MAX(sync_id)`, so the next bootstrap re-delivers it and re-inserts it
+    // (NIM-3658). The engine is the right place to decide: it enqueues into
+    // `tracker_transactions`, sends now if the socket is open, and otherwise
+    // replays on the next reconnect and across restarts. `unsyncTrackerItem`
+    // is already a no-op for a workspace with no engine.
+    try {
+      await unsyncTrackerItem(rowId, this.workspacePath);
+    } catch (syncErr) {
+      console.error('[DocumentService] deleteTrackerItem sync failed:', syncErr);
     }
 
     const changeEvent: TrackerItemChangeEvent = {
@@ -2845,6 +2879,9 @@ export class ElectronDocumentService implements DocumentService {
       return { item: null, skipped: false, error: 'Failed to read back created item' };
     }
 
+    // Same reason as createTrackerItem: number the row before it is broadcast.
+    await this.assignLocalKeysFrom(result.rows);
+
     const created = this.rowToTrackerItem(result.rows[0]);
 
     // Notify watchers
@@ -3025,6 +3062,11 @@ export class ElectronDocumentService implements DocumentService {
       throw new Error(`Failed to create tracker item ${payload.id}`);
     }
 
+    // The insert leaves `local_key` NULL. Sweep before mapping, so the item
+    // handed to the watcher -- which the renderer inserts optimistically --
+    // carries its number instead of rendering keyless until the next re-list.
+    await this.assignLocalKeysFrom(result.rows);
+
     const created = this.rowToTrackerItem(result.rows[0]);
 
     // Notify watchers
@@ -3043,9 +3085,8 @@ export class ElectronDocumentService implements DocumentService {
    * Parse tracker items from markdown content
    * Note: This function is only called for .md and .markdown files
    */
-  private async parseTrackerItems(filePath: string, relativePath: string): Promise<ParsedInlineTrackerCandidate[]> {
+  private parseTrackerItems(content: string, relativePath: string): ParsedInlineTrackerCandidate[] {
     try {
-      const content = await fs.readFile(filePath, 'utf-8');
       const items: ParsedInlineTrackerCandidate[] = [];
       const lines = content.split('\n');
 
@@ -3192,9 +3233,28 @@ export class ElectronDocumentService implements DocumentService {
     // console.log(`[DocumentService] updateTrackerItemsCache called for: ${relativePath}`);
     // console.log(`[DocumentService] Full path: ${fullPath}`);
 
+    // Most markdown files contain no inline tracker markers, and this runs on
+    // every metadata refresh — 14,709 calls in a five-minute window (~49/s),
+    // two tracker_items round trips each, on a FIFO single-lane DB worker where
+    // round-trip count is the cost. Once a file is known to have no markers and
+    // no rows, an unchanged copy of it has nothing to do; skip both queries.
+    let content: string;
+    try {
+      content = await fs.readFile(fullPath, 'utf-8');
+    } catch (error) {
+      console.error(`[DocumentService] Failed to read ${relativePath} for tracker items:`, error);
+      return;
+    }
+    const contentHash = crypto.createHash('md5').update(content).digest('hex');
+    const nowMs = Date.now();
+    const knownEmpty = this.trackerItemsEmptyCache.get(relativePath);
+    if (knownEmpty && knownEmpty.hash === contentHash && knownEmpty.expiresAt > nowMs) {
+      return;
+    }
+
     try {
       // Parse tracker items from the file
-      const parsedItems = await this.parseTrackerItems(fullPath, relativePath);
+      const parsedItems = this.parseTrackerItems(content, relativePath);
       // TODO: Debug logging - uncomment if needed for troubleshooting
       // console.log(`[DocumentService] Found ${items.length} tracker items in ${relativePath}`);
       // if (items.length > 0) {
@@ -3210,6 +3270,18 @@ export class ElectronDocumentService implements DocumentService {
         [this.workspacePath, relativePath]
       );
       // console.log(`[DocumentService] Found ${existingResult.rows.length} existing tracker items in database`);
+      // Nothing in the file, nothing in the table: remember it against this
+      // exact content so re-refreshes of an unchanged file cost no queries.
+      // The entry expires so a row written for this path by another writer
+      // (MCP tracker_create, the tracker store) still gets reconciled.
+      if (parsedItems.length === 0 && existingResult.rows.length === 0) {
+        this.trackerItemsEmptyCache.set(relativePath, {
+          hash: contentHash,
+          expiresAt: nowMs + this.TRACKER_ITEMS_EMPTY_TTL_MS,
+        });
+      } else {
+        this.trackerItemsEmptyCache.delete(relativePath);
+      }
       const existingIds = new Set(existingResult.rows.map(row => row.id));
       const items = resolveInlineTrackerIds(parsedItems, existingResult.rows, relativePath);
       const newIds = new Set(items.map(item => item.id));

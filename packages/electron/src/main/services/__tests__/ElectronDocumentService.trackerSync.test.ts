@@ -26,6 +26,7 @@ const {
   mockGlobalRegistryGet,
   mockIpcHandlers,
   mockSafeHandle,
+  mockAssignLocalKeysToRows,
 } = vi.hoisted(() => ({
   mockQuery: vi.fn(),
   mockSyncTrackerItem: vi.fn(),
@@ -35,6 +36,7 @@ const {
   mockGlobalRegistryGet: vi.fn((..._args: any[]) => undefined as any),
   mockIpcHandlers: new Map<string, (...args: any[]) => any>(),
   mockSafeHandle: vi.fn(),
+  mockAssignLocalKeysToRows: vi.fn(async (..._args: any[]) => new Map<string, string>()),
 }));
 
 mockSafeHandle.mockImplementation((channel: string, handler: (...args: any[]) => any) => {
@@ -69,6 +71,12 @@ vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel', () =
   globalRegistry: {
     get: mockGlobalRegistryGet,
   },
+}));
+
+// Counter behaviour is covered in tracker/__tests__/localKeyAllocator.test.ts.
+// Here we only care that the create paths sweep themselves.
+vi.mock('../tracker/localKeyAllocator', () => ({
+  assignLocalKeysToRows: mockAssignLocalKeysToRows,
 }));
 
 import { trackerItemToRecord } from '@nimbalyst/runtime/core/TrackerRecord';
@@ -137,6 +145,7 @@ beforeEach(async () => {
   mockQuery.mockReset();
   mockGetWorkspaceState.mockReturnValue({});
   mockGlobalRegistryGet.mockReturnValue(undefined);
+  mockAssignLocalKeysToRows.mockImplementation(async (..._args: any[]) => new Map<string, string>());
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tracker-sync-test-'));
   service = new ElectronDocumentService(tempDir);
 });
@@ -165,15 +174,23 @@ describe('deleteTrackerItem sync integration', () => {
     expect(mockUnsyncTrackerItem).toHaveBeenCalledWith('bug-001', tempDir);
   });
 
-  it('should NOT call unsyncTrackerItem when sync is not active', async () => {
+  it('queues the room tombstone while disconnected instead of dropping the delete', async () => {
+    // NIM-3658: the local row is hard-deleted, so an offline delete that skips
+    // the engine leaves nothing behind to carry the intent -- not even for the
+    // next launch's drain, which selects surviving rows. Worse, deleting the
+    // newest item lowers `MAX(sync_id)`, so the next bootstrap re-delivers the
+    // item and re-inserts it. Handing it to the engine regardless of status
+    // puts it in `tracker_transactions`, which replays on every reconnect and
+    // survives a restart.
     mockIsTrackerSyncActive.mockReturnValue(false);
+    mockUnsyncTrackerItem.mockResolvedValue(undefined);
 
     mockQuery.mockResolvedValueOnce({ rows: [{ source: 'tracked', document_path: '' }] });
     mockQuery.mockResolvedValueOnce({ rows: [] });
 
     await service.deleteTrackerItem('bug-001');
 
-    expect(mockUnsyncTrackerItem).not.toHaveBeenCalled();
+    expect(mockUnsyncTrackerItem).toHaveBeenCalledWith('bug-001', tempDir);
   });
 
   it('should still delete locally even if sync fails', async () => {
@@ -436,15 +453,25 @@ describe('archiveTrackerItem sync integration', () => {
     expect(mockSyncTrackerItem).toHaveBeenCalled();
   });
 
-  it('should NOT call syncTrackerItem when sync is not active', async () => {
+  it('marks the row pending when sync is not active so the reconnect drain pushes it', async () => {
+    // NIM-3657: the `if (connected)` here had no `else`, so an offline archive
+    // of an already-synced item (sync_status='synced', sync_id set) never
+    // entered the drain's candidate set and never reached the room at all.
     mockIsTrackerSyncActive.mockReturnValue(false);
 
     mockQuery.mockResolvedValueOnce({ rows: [makeTrackerRow({ source: 'tracked' })] });
     mockQuery.mockResolvedValueOnce({ rows: [makeTrackerRow({ archived: true })] });
+    // `updateTrackerItemSyncStatus` re-resolves the row and re-reads it for the
+    // watcher broadcast, so every later lookup must find the item.
+    mockQuery.mockResolvedValue({ rows: [makeTrackerRow({ archived: true })] });
 
     await service.archiveTrackerItem('bug-001', true);
 
     expect(mockSyncTrackerItem).not.toHaveBeenCalled();
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.stringContaining('SET sync_status = $1'),
+      ['pending', 'bug-001'],
+    );
   });
 
   it('should still archive locally if sync fails', async () => {
@@ -512,6 +539,39 @@ describe('createTrackerItem sync status policy', () => {
     // INSERT is the second query (index 1) after kanbanSortOrder; sync_status
     // is the 6th INSERT param ($6) -- after id, type, type_tags, data, workspace.
     expect(mockQuery.mock.calls[1]?.[1]?.[5]).toBe('pending');
+  });
+
+  // The insert leaves `local_key` NULL, and numbers used to be minted only by
+  // the list query. The item this returns is what the renderer inserts
+  // optimistically, so without a sweep here it renders "No key yet" until the
+  // next full re-list (NIM.2842).
+  it('numbers a newly created personal item before returning it', async () => {
+    mockGlobalRegistryGet.mockReturnValue({ sharing: 'personal', draftByDefault: false });
+    mockIsTrackerSyncActive.mockReturnValue(false);
+    mockAssignLocalKeysToRows.mockResolvedValue(new Map([['bug-local', 'NIM.42']]));
+
+    mockQuery.mockResolvedValueOnce({ rows: [{ min_key: null }] }); // kanbanSortOrder MIN
+    mockQuery.mockResolvedValueOnce({ rows: [] }); // INSERT
+    mockQuery.mockResolvedValueOnce({
+      rows: [makeTrackerRow({ id: 'bug-local', sync_status: 'local', local_key: null })],
+    }); // read-back
+
+    const created = await service.createTrackerItem({
+      id: 'bug-local',
+      type: 'bug',
+      title: 'Local bug',
+      status: 'to-do',
+      priority: 'high',
+      workspace: WORKSPACE,
+    });
+
+    expect(mockAssignLocalKeysToRows).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      tempDir,
+      ['bug-local'],
+    );
+    expect(created.localKey).toBe('NIM.42');
   });
 });
 

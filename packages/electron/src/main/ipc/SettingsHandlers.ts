@@ -7,7 +7,7 @@ import * as path from 'path';
 import { app } from 'electron';
 import {
     getWorkspaceState, updateWorkspaceState,
-    getTheme, getThemeSync, getResolvedThemeSync,
+    getTheme, getThemeSync, getResolvedThemeSync, getThemeBackgroundColor,
     isCompletionSoundEnabled, setCompletionSoundEnabled,
     getCompletionSoundType, setCompletionSoundType, CompletionSoundType,
     getCompletionSoundCustomPath, setCompletionSoundCustomPath,
@@ -28,6 +28,8 @@ import {
     isShowTrayIcon,
     setPreferredAgentLanguage,
     getMultiProjectMode, setMultiProjectMode,
+    getProjectRailPosition, setProjectRailPosition, ProjectRailPosition,
+    getProjectRailExpandedDisplay, setProjectRailExpandedDisplay, ProjectRailExpandedDisplay,
     getOpenProjectPaths, setOpenProjectPaths,
     getActiveProjectPath, setActiveProjectPath,
     getRestorePreviousProjectsOnLaunch, setRestorePreviousProjectsOnLaunch,
@@ -367,6 +369,14 @@ export function registerSettingsHandlers() {
         event.returnValue = theme;
     });
 
+    // The active theme's resolved --nim-bg, for the same flash-prevention
+    // script. The base theme classes only carry base colours, so an extension
+    // or file-based theme would still paint light/dark white until React
+    // resolves it; this seeds the variable before the first stylesheet applies.
+    safeOn('get-theme-background-color-sync', (event) => {
+        event.returnValue = getThemeBackgroundColor() ?? null;
+    });
+
     // Get app version (from app.getVersion)
     safeHandle('get-app-version', () => {
         const { app } = require('electron');
@@ -629,6 +639,22 @@ export function registerSettingsHandlers() {
 
     safeHandle('app:set-multi-project-mode', async (_event, enabled: boolean) => {
         setMultiProjectMode(enabled);
+    });
+
+    safeHandle('app:get-project-rail-position', async () => {
+        return getProjectRailPosition();
+    });
+
+    safeHandle('app:set-project-rail-position', async (_event, position: ProjectRailPosition) => {
+        setProjectRailPosition(position);
+    });
+
+    safeHandle('app:get-project-rail-expanded-display', async () => {
+        return getProjectRailExpandedDisplay();
+    });
+
+    safeHandle('app:set-project-rail-expanded-display', async (_event, mode: ProjectRailExpandedDisplay) => {
+        setProjectRailExpandedDisplay(mode);
     });
 
     safeHandle('app:get-open-projects', async () => {

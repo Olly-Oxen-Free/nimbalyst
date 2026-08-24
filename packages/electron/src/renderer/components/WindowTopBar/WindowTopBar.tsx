@@ -1,20 +1,29 @@
-import React from 'react';
+import React, { useCallback, useLayoutEffect, useRef } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { MAIN_WINDOW_TITLE_BAR_HEIGHT } from '../../../shared/windowChrome';
-import { FloatingPortal, useFloatingMenu } from '../../hooks/useFloatingMenu';
+import { FloatingPortal, useFloatingMenu, virtualElement } from '../../hooks/useFloatingMenu';
 import {
   setTrackerModeLayoutAtom,
   trackerModeDocumentItemIdAtom,
   trackerModeLayoutAtom,
 } from '../../store/atoms/trackers';
-import { orgInboxUnreadCountAtomFamily } from '../../store/atoms/teamInbox';
 import { windowFullScreenAtom } from '../../store/atoms/windowFullScreen';
-import { formatUnreadCount } from '../../store/projectWindowUnreadViewModel';
-import { useProjectOrg } from '../../hooks/useProjectOrg';
+import {
+  multiProjectModeAtom,
+  projectRailPositionAtom,
+  projectRailExpandedDisplayAtom,
+  type OpenProject,
+} from '../../store/atoms/openProjects';
+import { ProjectRailIcon, useProjectRailController, REVEAL_LABEL } from '../ProjectRailIcon';
 import { TRACKER_DOCUMENT_PANEL_MODES } from '../TrackerMode/trackerDocumentPanelModes';
 import { DRAG_REGION, NO_DRAG_REGION } from './dragRegion';
 import { WindowMenuBar } from './WindowMenuBar';
+// Top-docked project bar reuses ProjectRail's classes (project-rail-item,
+// project-rail-top, project-rail-context-menu, etc.) — import here too since
+// <ProjectRail /> isn't mounted when position='top' (App.tsx gates it out),
+// so its own `import './ProjectRail.css'` side effect wouldn't otherwise fire.
+import '../ProjectRail.css';
 
 export interface WindowTopBarGitStatus {
   branch: string;
@@ -68,8 +77,6 @@ export interface WindowTopBarProps {
   gitActions: WindowTopBarGitActions;
   panelControls?: WindowTopBarPanelControls;
   newSessionControl?: WindowTopBarNewSessionControl;
-  /** Root project path, used to resolve which organization's inbox to open. */
-  workspacePath?: string | null;
 }
 
 const GIT_FEEDBACK_MAX_LINES = 6;
@@ -112,57 +119,6 @@ export function clampGitFeedbackMessage(
     truncated = true;
   }
   return truncated ? `${clamped}…` : clamped;
-}
-
-/**
- * Entry point to the organization inbox, which lives in the org window.
- *
- * Present whenever the project belongs to an organization, not only when
- * something is unread — before this control the only ways in were a menu item
- * and a footer chip that appeared solely while unread was non-zero, so a user
- * with a quiet inbox had no way to find messaging at all. The count is scoped to
- * this project's organization so the badge never refers to an inbox outside the
- * org being worked in.
- */
-function InboxButton({ workspacePath }: { workspacePath?: string | null }) {
-  const { org: projectOrg } = useProjectOrg(workspacePath);
-  const unreadCount = useAtomValue(
-    orgInboxUnreadCountAtomFamily(projectOrg?.orgId ?? ''),
-  );
-
-  if (!projectOrg) return null;
-
-  const label = unreadCount > 0 ? `Messages, ${unreadCount} unread` : 'Messages';
-
-  return (
-    <button
-      type="button"
-      className={`window-top-bar__inbox w-7 ${CONTROL_BASE} ${CONTROL_GHOST} ${NO_DRAG_REGION}`}
-      data-testid="window-top-bar-inbox"
-      aria-label={label}
-      title="Open organization inbox"
-      onClick={() => {
-        void (window as { electronAPI?: any }).electronAPI?.team?.openManagementWindow?.({
-          orgId: projectOrg.orgId,
-          workspacePath: workspacePath ?? undefined,
-        });
-      }}
-    >
-      <span className="relative inline-flex items-center justify-center">
-        <MaterialSymbol icon="inbox" size={18} />
-        {unreadCount > 0 && (
-          <span
-            // Ringed in the bar's own background so the count stays legible
-            // where it overlaps the glyph.
-            className="window-top-bar__inbox-badge absolute -top-1.5 -right-2.5 min-w-[15px] rounded-full px-[3px] text-[9.5px] font-bold leading-[15px] text-white bg-nim-error shadow-[0_0_0_2px_var(--nim-bg-secondary)]"
-            data-testid="window-top-bar-inbox-unread"
-          >
-            {formatUnreadCount(unreadCount)}
-          </span>
-        )}
-      </span>
-    </button>
-  );
 }
 
 function PanelButton({
@@ -459,6 +415,201 @@ function ExitFullScreenButton() {
   );
 }
 
+/**
+ * Top-docked project bar (R4-R6): renders when `projectRailPositionAtom`
+ * is 'top' and multi-project mode is on, replacing the static
+ * `window-top-bar__identity` block. All open projects render, in their
+ * natural open-order, via the shared `ProjectRailIcon` (1b) in
+ * `orientation="horizontal"` — the active project is NOT pulled out to a
+ * separate title element (an earlier version did this; changed per
+ * explicit user feedback during verification). Instead ProjectRailIcon
+ * itself expands the active project in place from its abbreviated-
+ * initials circle into a full-name pill (R5), still wrapped in a rounded
+ * pill shape, while every other project stays a small circle.
+ *
+ * This is a structurally separate container from the default identity
+ * block, without `pointer-events-none` — see the RISK FLAG in this task's
+ * brief: `pointer-events-none` and `-webkit-app-region: drag` are two
+ * independent mechanisms and both must be handled for circles to be
+ * clickable while empty bar space stays draggable.
+ */
+function TopDockedProjectBar() {
+  const expandedDisplay = useAtomValue(projectRailExpandedDisplayAtom);
+  const controller = useProjectRailController();
+
+  // Right-click context menu ("Open in new window" / reveal / "Close
+  // project"), mirroring ProjectRail.tsx's own instance but opening
+  // downward (bottom-start) per R7, since this is the top-docked layout.
+  const contextMenu = useFloatingMenu({
+    placement: 'bottom-start',
+    open: controller.contextMenuProject !== null,
+    onOpenChange: (open) => {
+      if (!open) controller.closeContextMenu();
+    },
+  });
+  const handleContextMenu = useCallback(
+    (project: OpenProject, x: number, y: number) => {
+      contextMenu.refs.setPositionReference(virtualElement(x, y));
+      controller.openContextMenu(project);
+    },
+    [contextMenu.refs, controller]
+  );
+
+  // Add-project ("+") dropdown, anchored to its own button, also opening
+  // downward.
+  const addButtonRef = useRef<HTMLButtonElement | null>(null);
+  const addMenu = useFloatingMenu({
+    placement: 'bottom-start',
+    open: controller.addMenuOpen,
+    onOpenChange: (open) => (open ? controller.openAddMenu() : controller.closeAddMenu()),
+  });
+  useLayoutEffect(() => {
+    if (addButtonRef.current) {
+      addMenu.refs.setReference(addButtonRef.current);
+    }
+  }, [addMenu.refs]);
+
+  const contextMenuProject = controller.contextMenuProject;
+
+  // R8: when 'hover-reveal', non-selected circles stay hidden until the
+  // user hovers the bar area — pure CSS `:hover` (see ProjectRail.css),
+  // so no mouse listener is attached to the drag-region element and
+  // window-dragging from empty bar space is unaffected either way.
+  const revealClass = expandedDisplay === 'hover-reveal' ? ' project-rail-top--hover-reveal' : '';
+
+  return (
+    <div
+      className={`window-top-bar__identity-rail project-rail-top flex items-center justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)]${revealClass}`}
+    >
+      {/*
+       * Projects render in their natural open-order, active project
+       * included in place — it does not get pulled out to a separate
+       * "title" element. Instead ProjectRailIcon itself expands the
+       * active project from its abbreviated-initials circle into a
+       * full-name pill (still wrapped in a rounded pill shape) when
+       * `isActive && orientation === 'horizontal'`, per explicit user
+       * feedback during verification of this feature — see
+       * ProjectRailIcon.tsx and the is-active.is-horizontal rules in
+       * ProjectRail.css. data-testid stays on the currently-active
+       * icon's name element (see ProjectRailIcon) for any selector
+       * previously keyed to "window-top-bar-workspace-name".
+       */}
+      <div className={`window-top-bar__identity-icons flex items-center gap-1.5 ${NO_DRAG_REGION}`}>
+        {controller.openProjects.map((project) => {
+          const activity = controller.getActivity(project.path);
+          return (
+            <ProjectRailIcon
+              key={project.path}
+              project={project}
+              isActive={project.path === controller.activePath}
+              processingCount={activity.processingCount}
+              unreadCount={activity.unreadCount}
+              orientation="horizontal"
+              onActivate={controller.activate}
+              onClose={controller.close}
+              onContextMenu={handleContextMenu}
+            />
+          );
+        })}
+      </div>
+
+      <button
+        ref={addButtonRef}
+        type="button"
+        className={`window-top-bar__identity-add w-5 h-5 ${CONTROL_BASE} ${CONTROL_GHOST} ${NO_DRAG_REGION}`}
+        onClick={controller.openAddMenu}
+        disabled={controller.atCap}
+        data-testid="window-top-bar-add-project"
+        aria-label="Add project to rail"
+      >
+        <MaterialSymbol icon="add" size={14} />
+      </button>
+
+      {controller.addMenuOpen && (
+        <FloatingPortal>
+          <div
+            ref={addMenu.refs.setFloating}
+            style={addMenu.floatingStyles}
+            {...addMenu.getFloatingProps()}
+            className={`project-rail-context-menu project-rail-add-menu ${NO_DRAG_REGION}`}
+            data-testid="window-top-bar-add-project-menu"
+          >
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => {
+                controller.closeAddMenu();
+                controller.pickFolder();
+              }}
+            >
+              Open folder…
+            </button>
+            {controller.filteredRecents.length > 0 && (
+              <>
+                <div className="project-rail-context-menu-divider" />
+                <div className="project-rail-context-menu-heading">Recent projects</div>
+                {controller.filteredRecents.map((recent) => (
+                  <button
+                    key={recent.path}
+                    type="button"
+                    className="project-rail-context-menu-item project-rail-context-menu-item-recent"
+                    onClick={() => {
+                      controller.closeAddMenu();
+                      controller.addProjectByPath(recent.path);
+                    }}
+                    title={recent.path}
+                  >
+                    <span className="project-rail-context-menu-item-name">{recent.name || recent.path}</span>
+                    <span className="project-rail-context-menu-item-path">{recent.path}</span>
+                  </button>
+                ))}
+              </>
+            )}
+          </div>
+        </FloatingPortal>
+      )}
+
+      {contextMenuProject && (
+        <FloatingPortal>
+          <div
+            ref={contextMenu.refs.setFloating}
+            style={contextMenu.floatingStyles}
+            {...contextMenu.getFloatingProps()}
+            className={`project-rail-context-menu ${NO_DRAG_REGION}`}
+            data-testid="window-top-bar-project-context-menu"
+          >
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => controller.openInNewWindow(contextMenuProject)}
+            >
+              Open in new window
+            </button>
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => controller.revealInFinder(contextMenuProject)}
+            >
+              {REVEAL_LABEL}
+            </button>
+            <div className="project-rail-context-menu-divider" />
+            <button
+              type="button"
+              className="project-rail-context-menu-item"
+              onClick={() => {
+                controller.closeContextMenu();
+                controller.close(contextMenuProject);
+              }}
+            >
+              Close project
+            </button>
+          </div>
+        </FloatingPortal>
+      )}
+    </div>
+  );
+}
+
 export function WindowTopBar({
   workspaceName,
   activeModeLabel,
@@ -466,12 +617,14 @@ export function WindowTopBar({
   gitActions,
   panelControls,
   newSessionControl,
-  workspacePath,
 }: WindowTopBarProps) {
   const trackerDocumentItemId = useAtomValue(trackerModeDocumentItemIdAtom);
   const trackerLayout = useAtomValue(trackerModeLayoutAtom);
   const setTrackerLayout = useSetAtom(setTrackerModeLayoutAtom);
   const trackerDocumentActive = activeModeLabel === 'Tracker' && trackerDocumentItemId !== null;
+  const projectRailPosition = useAtomValue(projectRailPositionAtom);
+  const isMultiProjectMode = useAtomValue(multiProjectModeAtom);
+  const showTopDockedRail = projectRailPosition === 'top' && isMultiProjectMode;
   const visiblePanelControls: WindowTopBarPanelControls | undefined = trackerDocumentActive
     ? {
         left: {
@@ -526,22 +679,26 @@ export function WindowTopBar({
           <WindowMenuBar />
         </div>
 
-        <div className="window-top-bar__identity flex items-baseline justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)] whitespace-nowrap pointer-events-none">
-          <span
-            className="window-top-bar__workspace-name min-w-0 overflow-hidden text-ellipsis text-nim text-xs font-semibold"
-            data-testid="window-top-bar-workspace-name"
-            title={workspaceName}
-          >
-            {workspaceName}
-          </span>
-          <span className="window-top-bar__identity-separator text-nim-muted text-[11px]" aria-hidden="true">—</span>
-          <span
-            className="window-top-bar__mode-label min-w-0 overflow-hidden text-ellipsis text-nim-muted text-[11px]"
-            data-testid="window-top-bar-mode-label"
-          >
-            {activeModeLabel}
-          </span>
-        </div>
+        {showTopDockedRail ? (
+          <TopDockedProjectBar />
+        ) : (
+          <div className="window-top-bar__identity flex items-baseline justify-center gap-1.5 min-w-0 max-w-[min(42vw,520px)] whitespace-nowrap pointer-events-none">
+            <span
+              className="window-top-bar__workspace-name min-w-0 overflow-hidden text-ellipsis text-nim text-xs font-semibold"
+              data-testid="window-top-bar-workspace-name"
+              title={workspaceName}
+            >
+              {workspaceName}
+            </span>
+            <span className="window-top-bar__identity-separator text-nim-muted text-[11px]" aria-hidden="true">—</span>
+            <span
+              className="window-top-bar__mode-label min-w-0 overflow-hidden text-ellipsis text-nim-muted text-[11px]"
+              data-testid="window-top-bar-mode-label"
+            >
+              {activeModeLabel}
+            </span>
+          </div>
+        )}
 
         <div className="window-top-bar__right grid grid-cols-[minmax(0,1fr)_auto] items-center self-stretch min-w-0">
           {gitStatus && (
@@ -557,7 +714,6 @@ export function WindowTopBar({
             className="window-top-bar__right-actions flex items-center justify-end gap-1"
             data-testid="window-top-bar-right-actions"
           >
-            <InboxButton workspacePath={workspacePath} />
             {newSessionControl && (
               <button
                 type="button"

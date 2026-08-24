@@ -10,24 +10,39 @@ import {
   getInitialTrackerSyncStatus,
   shouldSyncTrackerItem,
 } from '../../services/TrackerPolicyService';
-import { isTrackerSyncActive, syncTrackerItem } from '../../services/TrackerSyncManager';
+import { isTrackerSyncActive, isTrackerSyncConfigured, syncTrackerItem } from '../../services/TrackerSyncManager';
 import { awaitServerIssueKey } from '../../services/tracker/awaitServerIssueKey';
-import { isLocalIssueKey } from '../../../shared/localIssueKey';
+import { isLocalIssueKey, resolveDisplayIssueKey } from '../../../shared/localIssueKey';
 import { applyHeadlessBodyMarkdown } from '../../services/MainBodyDocService';
 import { applyRelationshipFieldWrites } from '../../services/tracker/relationshipFieldWrite';
 import { appendActivity } from '../../services/tracker/trackerActivity';
+import { assignLocalKeysToRows } from '../../services/tracker/localKeyAllocator';
+import { workspaceLocalKeyStore } from '../../services/tracker/workspaceLocalKeyStore';
 import { extractItemCustomFields } from '../../services/tracker/trackerRowCustomFields';
 import { nestRelationshipFieldsIntoCustomFields, readStoredFieldValue, writeStoredFieldValue } from '../../services/tracker/relationshipFieldStorage';
-import { isRelationshipField, matchesFilterSet, isUntriaged } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
+import {
+  isRelationshipField,
+  matchesFilterSet,
+  isUntriaged,
+  priorityOptionsFor,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import { humanOnlyStatusMessage, isHumanOnlyStatus } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerReview';
 import {
+  READINESS_FILTER_FIELD,
   STATUS_CATEGORY_FILTER_FIELD,
   isTerminalStatus,
   statusCategoryOfItem,
   type StatusCategory,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerStatusCategory';
+import { computeReadiness, type Readiness } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerReadiness';
+import {
+  describeUnresolvedBlockers,
+  projectBlockedBy,
+  type BlockerVisibilityScope,
+  type ProjectedBlockerRef,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerBlockerVisibility';
 import { trackerItemToRecord } from '@nimbalyst/runtime/core/TrackerRecord';
-import { resolveRoleFieldName } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
+import { getRecordStatus, resolveRoleFieldName } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
 import { getVisibleTrackerLinkedSessions, shouldPersistTrackerLinkedSessions } from '../../../shared/trackerSessionLinks';
 import { buildFullDocumentTrackerId } from '@nimbalyst/runtime/plugins/TrackerPlugin/documentHeader/frontmatterUtils';
 import { normalizeLegacyLabelValues } from '@nimbalyst/runtime/sync';
@@ -50,10 +65,12 @@ import {
   getAssignedIssueKey,
   getTrackerDisplayRef,
   issueKeyAvailabilityNote,
+  issueKeyMessage,
   issueKeyStatus,
+  localIssueKeyResponseMessage,
+  TRACKER_TRACKS_EXPLANATION,
   type BodyWriteFailure,
   type McpToolResult,
-  UNPUBLISHED_ISSUE_KEY_MESSAGE,
 } from './trackerToolResult';
 
 export {
@@ -330,6 +347,9 @@ export function rowToTrackerItem(row: any): any {
       : row.id,
     issueNumber: row.issue_number ?? undefined,
     issueKey: row.issue_key ?? undefined,
+    // `getTrackerDisplayRef` falls back to the raw id without this, so an
+    // unpublished item reports a uuid to the agent instead of its number.
+    localKey: row.local_key ?? undefined,
     type: row.type,
     typeTags,
     title: data.title || row.title,
@@ -504,6 +524,11 @@ export const trackerToolSchemas = [
           description:
             "Filter by lifecycle category: 'backlog', 'unstarted', 'started', 'done', or 'cancelled'. Unlike `status`, this is comparable across types -- each type closes on a different status value ('done' for a bug, 'completed' for a plan, 'rejected' for an idea) but they share a category. Implies includeClosed when set to 'done' or 'cancelled'.",
         },
+        readiness: {
+          type: 'string',
+          enum: ['ready', 'blocked', 'any'],
+          description: 'Filter by dependency readiness: \'ready\', \'blocked\', or \'any\' (default). Setting this also returns `blockedBy`, `unblocks`, and `unresolvedBlockerIds` (declared dependencies that no longer exist, which do not block) for each item. A blocker your own type or archived scope excluded is still counted, and still reports its status, but is marked `outOfScope` and withholds its title and reference -- widen those filters to see it.',
+        },
         includeClosed: {
           type: "boolean",
           description:
@@ -554,6 +579,24 @@ export const trackerToolSchemas = [
         full: {
           type: "boolean",
           description: "Return every stored field per item (custom fields, linked sessions/commits, source refs, origin). Off by default so results stay small; only turn it on when you actually need those extra fields, and pair it with `type`/`where` to keep the set narrow.",
+        },
+      },
+    },
+  },
+  {
+    name: 'tracker_ready',
+    description:
+      'Find the open tracker items that can be started now. This is the ready work queue for deciding what to work on next: items are ranked by how much other work they unblock, then by priority, grouped into independent tracks, and always include readiness explanations. ' + TRACKER_TRACKS_EXPLANATION + ' Items in a dependency cycle never appear because every member remains blocked; use tracker_list with readiness \'blocked\' to inspect blocked work.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        type: {
+          type: 'string',
+          description: 'Filter by primary item type (e.g., \'bug\', \'task\', \'plan\', \'idea\', \'decision\')',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of items to return (default: 50, capped at 250).',
         },
       },
     },
@@ -1008,9 +1051,12 @@ export const trackerToolSchemas = [
   },
 ];
 
+type TrackerListMode = 'list' | 'ready';
+
 export async function handleTrackerList(
   args: any,
-  workspacePath: string | undefined
+  workspacePath: string | undefined,
+  mode: TrackerListMode = 'list',
 ): Promise<McpToolResult> {
   try {
     const requestedLimit = Number(args.limit);
@@ -1031,9 +1077,30 @@ export async function handleTrackerList(
       tempDocService = docService;
     }
     const rawItems = docService ? await docService.listTrackerItems() : [];
+    const readinessWasSet = args.readiness !== undefined;
+    const requestedReadiness = args.readiness === 'ready' || args.readiness === 'blocked'
+      ? args.readiness
+      : 'any';
+    const includeReadiness = mode === 'ready' || readinessWasSet || args.full === true;
+    const full = args.full === true;
+
+    // Built on first use and never at all for the calls that don't ask about
+    // readiness, which is nearly all of them: a record projection of the whole
+    // corpus plus a dependency-graph Tarjan pass is far too much to spend on
+    // every tracker_list. It must keep reading `rawItems` -- the FULL corpus --
+    // and never the filtered `items` below. Readiness computed over a list that
+    // already dropped closed or archived items turns every satisfied blocker
+    // into a dangling id, and every blocked item then reports ready.
+    let readinessByItemId: Map<string, Readiness> | undefined;
+    const getReadiness = (): Map<string, Readiness> => (
+      readinessByItemId ??= computeReadiness(rawItems.map(trackerItemToRecord), getRecordStatus)
+    );
 
     const getFieldValue = (item: TrackerItem, field: string): unknown => {
       const record = item as unknown as Record<string, unknown>;
+      if (field === READINESS_FILTER_FIELD) {
+        return getReadiness().get(item.id)?.state;
+      }
       // The lifecycle category is synthetic -- no item stores it -- and it is
       // the only field a "not closed" clause can be written over uniformly,
       // because each type closes on a different status value. Kept in step with
@@ -1057,6 +1124,66 @@ export async function handleTrackerList(
         return getTrackerRoleField(args.type, role) ?? fallback;
       }
       return fallback;
+    };
+
+    const ownerField = resolveFieldForFilter('assignee', 'owner');
+    const statusField = resolveFieldForFilter('workflowStatus', 'status');
+    const priorityField = resolveFieldForFilter('priority', 'priority');
+    const searchTerm = args.search ? String(args.search).toLowerCase() : '';
+    const rawItemById = new Map(rawItems.map((item) => [item.id, item]));
+    const priorityRankByItemId = mode === 'ready'
+      ? new Map(rawItems.map((item) => {
+          const itemPriorityField = getTrackerRoleField(item.type, 'priority') ?? 'priority';
+          const priority = String(getFieldValue(item, itemPriorityField) ?? '').toLowerCase();
+          const options = priorityOptionsFor(item.type).map((option) => option.toLowerCase());
+          const schemaRank = options.indexOf(priority);
+          const fallbackRank = ['low', 'medium', 'high', 'critical'].indexOf(priority);
+          return [item.id, schemaRank >= 0 ? schemaRank : fallbackRank] as const;
+        }))
+      : undefined;
+
+    // Readiness stays derived over the full corpus above; what narrows here is
+    // only what leaves the handler. The scoping filters -- type, archive, and
+    // the workspace the caller named -- carve off items this caller chose not to
+    // look at, and a blocker sitting in one of them must not hand back its title
+    // or its private reference. Built on first use, alongside the readiness map
+    // and for the same reason.
+    let blockerScope: BlockerVisibilityScope | undefined;
+    const getBlockerScope = (): BlockerVisibilityScope => (blockerScope ??= {
+      type: typeof args.type === 'string' && args.type ? args.type : undefined,
+      excludedItemIds: new Set(
+        rawItems
+          .filter((item) => (workspacePath !== undefined && item.workspace !== workspacePath)
+            || fromDbBoolean(item.archived) !== Boolean(args.archived))
+          .map((item) => item.id),
+      ),
+    });
+
+    const readinessDetailsFor = (item: TrackerItem): {
+      blockedBy: ProjectedBlockerRef[];
+      unblocks: number;
+      unresolvedBlockerIds?: string[];
+    } => {
+      const readiness = getReadiness().get(item.id);
+      const blockedBy = (readiness?.blockedBy ?? []).map((blocker) => {
+        const blockerItem = rawItemById.get(blocker.itemId);
+        return blockerItem ? {
+          ...blocker,
+          ref: getTrackerDisplayRef(blockerItem),
+          refStatus: issueKeyStatus(blockerItem),
+        } : blocker;
+      });
+      const unresolvedBlockerIds = readiness?.unresolvedBlockerIds ?? [];
+      return {
+        blockedBy: projectBlockedBy(blockedBy, getBlockerScope()),
+        unblocks: readiness?.unblocks ?? 0,
+        // A declared dependency that resolves to nothing does not block, but
+        // omitting it entirely leaves an item indistinguishable from genuinely
+        // dependency-free work with a broken link nobody can see. Present only
+        // when there is one: an empty array on every row of a long ready queue
+        // costs more context than the rare warning is worth.
+        ...(unresolvedBlockerIds.length > 0 ? { unresolvedBlockerIds } : {}),
+      };
     };
 
     // A `where` clause with `=`/`!=` and an empty operand means "match items
@@ -1093,12 +1220,10 @@ export async function handleTrackerList(
       .filter((item) => !args.typeTag || (item.typeTags || [item.type]).includes(args.typeTag))
       .filter((item) => {
         if (!args.owner) return true;
-        const ownerField = resolveFieldForFilter('assignee', 'owner');
         return String(getFieldValue(item, ownerField) ?? '') === String(args.owner);
       })
       .filter((item) => {
         if (!args.status) return true;
-        const statusField = resolveFieldForFilter('workflowStatus', 'status');
         return String(getFieldValue(item, statusField) ?? '').toLowerCase() === String(args.status).toLowerCase();
       })
       .filter((item) => {
@@ -1112,14 +1237,14 @@ export async function handleTrackerList(
         // turns it off: asking for done items and being handed nothing would be
         // the one failure this default must never produce.
         if (includeClosed) return true;
-        const statusField = resolveFieldForFilter('workflowStatus', 'status');
         return !isTerminalStatus(item.type, String(getFieldValue(item, statusField) ?? ''));
       })
       .filter((item) => {
         if (!args.priority) return true;
-        const priorityField = resolveFieldForFilter('priority', 'priority');
         return String(getFieldValue(item, priorityField) ?? '').toLowerCase() === String(args.priority).toLowerCase();
       })
+      .filter((item) => requestedReadiness === 'any'
+        || getReadiness().get(item.id)?.state === requestedReadiness)
       .filter((item) => {
         if (!args.inbox) return true;
         // The same predicate the triage inbox renders, so "what still needs a
@@ -1143,7 +1268,7 @@ export async function handleTrackerList(
         );
       })
       .filter((item) => {
-        if (!args.search) return true;
+        if (!searchTerm) return true;
         const haystack = [
           item.issueKey,
           String(item.issueNumber ?? ''),
@@ -1152,14 +1277,25 @@ export async function handleTrackerList(
           item.module,
           Array.isArray(item.tags) ? item.tags.join(' ') : '',
         ].filter(Boolean).join(' ').toLowerCase();
-        return haystack.includes(String(args.search).toLowerCase());
+        return haystack.includes(searchTerm);
       })
-      .sort((a, b) => String(b.updated || '').localeCompare(String(a.updated || '')))
+      .sort((a, b) => {
+        if (mode === 'ready') {
+          const leverage = (getReadiness().get(b.id)?.unblocks ?? 0)
+            - (getReadiness().get(a.id)?.unblocks ?? 0);
+          if (leverage !== 0) return leverage;
+          const priority = (priorityRankByItemId?.get(b.id) ?? -1)
+            - (priorityRankByItemId?.get(a.id) ?? -1);
+          if (priority !== 0) return priority;
+        }
+        return String(b.updated || '').localeCompare(String(a.updated || ''));
+      })
       .slice(0, limit)
       .map((item) => ({
         id: item.id,
         issueNumber: item.issueNumber ?? undefined,
         issueKey: getAssignedIssueKey(item),
+        localKey: item.localKey ?? undefined,
         issueKeyStatus: issueKeyStatus(item),
         type: item.type,
         typeTags: item.typeTags && item.typeTags.length > 0 ? item.typeTags : [item.type],
@@ -1180,15 +1316,64 @@ export async function handleTrackerList(
         linkedSessions: item.linkedSessions,
         linkedCommitSha: item.linkedCommitSha,
         origin: item.origin,
+        ...(includeReadiness ? readinessDetailsFor(item) : {}),
+        ...(mode === 'ready' ? {
+          trackId: getReadiness().get(item.id)?.trackId ?? item.id,
+        } : {}),
       }));
+
+    const readyTrackOrder = new Map<string, number>();
+    if (mode === 'ready') {
+      for (const item of items) {
+        const trackId = (item as any).trackId as string;
+        if (!readyTrackOrder.has(trackId)) readyTrackOrder.set(trackId, readyTrackOrder.size);
+      }
+      items.sort((a: any, b: any) => (
+        (readyTrackOrder.get(a.trackId) ?? 0) - (readyTrackOrder.get(b.trackId) ?? 0)
+      ));
+    }
+
+    const cycleItems = mode === 'ready'
+      ? rawItems
+          .filter((item) => !workspacePath || item.workspace === workspacePath)
+          .filter((item) => fromDbBoolean(item.archived) === false)
+          .filter((item) => !args.type || item.type === args.type)
+          .filter((item) => getReadiness().get(item.id)?.inCycle)
+          .map((item) => ({
+            id: item.id,
+            ref: getTrackerDisplayRef(item),
+            refStatus: issueKeyStatus(item),
+            type: item.type,
+            title: item.title || '',
+            status: item.status || '',
+            issueKey: getAssignedIssueKey(item),
+            localKey: item.localKey ?? undefined,
+          }))
+      : [];
     tempDocService?.destroy?.();
 
-    const summary = items
-      .map(
-        (item: any) =>
-          `- [${item.type}] ${item.title} (${item.status || "no status"}, ${item.priority || "no priority"}, ${item.syncStatus}) [ref: ${item.issueKey || item.id}]${item.issueKey ? '' : ` — ${UNPUBLISHED_ISSUE_KEY_MESSAGE}`}`
-      )
-      .join("\n");
+    // The ref is whatever actually resolves: a room key, else this machine's
+    // number, else the raw id. Explaining the absence is only worth a line when
+    // there is no number either -- repeating the private-number caveat on every
+    // row of a long list would drown the list it is annotating.
+    const listCanIssueKeys = isTrackerSyncConfigured(workspacePath);
+    const localKeyMessage = localIssueKeyResponseMessage([
+      ...items,
+      ...items.flatMap((item: any) => item.blockedBy
+        ?.filter((blocker: any) => blocker.refStatus === 'local')
+        .map((blocker: any) => ({ localKey: blocker.ref })) ?? []),
+      ...cycleItems,
+    ], { canIssueKeys: listCanIssueKeys });
+    const formatSummaryItem = (item: any): string =>
+      `- [${item.type}] ${item.title} (${item.status || "no status"}, ${item.priority || "no priority"}, ${item.syncStatus}) [ref: ${getTrackerDisplayRef(item)}]${item.issueKeyStatus === 'unassigned' ? ` — ${issueKeyMessage(item, { canIssueKeys: listCanIssueKeys })}` : ''}`;
+    const summary = mode === 'ready'
+      ? [...readyTrackOrder.keys()]
+          .map((trackId) => `Track ${trackId}:\n${items
+            .filter((item: any) => item.trackId === trackId)
+            .map(formatSummaryItem)
+            .join('\n')}`)
+          .join('\n\n')
+      : items.map(formatSummaryItem).join("\n");
 
     const filters: Record<string, string> = {};
     if (args.type) filters.type = args.type;
@@ -1198,11 +1383,11 @@ export async function handleTrackerList(
     if (args.owner) filters.owner = args.owner;
     if (args.search) filters.search = args.search;
     if (args.inbox) filters.inbox = 'true';
+    if (readinessWasSet || mode === 'ready') filters.readiness = requestedReadiness;
 
     // Lean by default so an ordinary agent list stays small; `full` adds the
     // heavy fields (custom fields, links, origin) the CLI/export path needs.
     // Passing every stored field on every list was a large, silent token cost.
-    const full = args.full === true;
     const structured = {
       action: "listed" as const,
       filters,
@@ -1211,6 +1396,7 @@ export async function handleTrackerList(
         id: item.id,
         issueNumber: item.issueNumber,
         issueKey: item.issueKey,
+        localKey: item.localKey,
         issueKeyStatus: item.issueKeyStatus,
         type: item.type,
         typeTags: item.typeTags,
@@ -1222,6 +1408,12 @@ export async function handleTrackerList(
         source: item.source,
         syncStatus: item.syncStatus,
         updated: item.updated,
+        ...(includeReadiness ? {
+          blockedBy: item.blockedBy,
+          unblocks: item.unblocks,
+          ...(item.unresolvedBlockerIds ? { unresolvedBlockerIds: item.unresolvedBlockerIds } : {}),
+        } : {}),
+        ...(mode === 'ready' ? { trackId: item.trackId } : {}),
         ...(full ? {
           customFields: item.customFields,
           sourceRef: item.sourceRef,
@@ -1234,7 +1426,32 @@ export async function handleTrackerList(
           origin: item.origin,
         } : {}),
       })),
+      ...(mode === 'ready' ? {
+        trackCount: readyTrackOrder.size,
+        dependencyCycleItems: cycleItems.map(({
+          issueKey: _issueKey,
+          localKey: _localKey,
+          ...item
+        }) => item),
+      } : {}),
     };
+
+    const cycleSummary = cycleItems.length > 0
+      ? `\n\n${cycleItems.length} open item(s) are in a dependency cycle and cannot appear in this queue:\n${cycleItems.map((item) => `- [${item.type}] ${item.title} [ref: ${item.ref}]`).join('\n')}`
+      : '';
+    const localKeySummary = localKeyMessage ? `\n\nIssue key note: ${localKeyMessage}` : '';
+    // Once per response, not per row -- same call the private-number caveat
+    // makes. Counted over distinct targets, because one deleted item cited by
+    // three dependents is one broken link to go and fix.
+    const unresolvedBlockerCount = new Set(
+      items.flatMap((item: any) => item.unresolvedBlockerIds ?? []),
+    ).size;
+    const unresolvedBlockerSummary = unresolvedBlockerCount > 0
+      ? `\n\nBroken dependency links: ${describeUnresolvedBlockers(unresolvedBlockerCount)} The targets are listed as \`unresolvedBlockerIds\` on the items that declare them.`
+      : '';
+    const trackAvailabilitySummary = mode === 'ready'
+      ? `${readyTrackOrder.size} independent track${readyTrackOrder.size === 1 ? '' : 's'} available. ${TRACKER_TRACKS_EXPLANATION}\n\n`
+      : '';
 
     return {
       content: [
@@ -1242,9 +1459,9 @@ export async function handleTrackerList(
           type: "text",
           text: JSON.stringify({
             structured,
-            summary: items.length > 0
-              ? `Found ${items.length} tracker item(s):\n\n${summary}`
-              : "No tracker items found matching the filters.",
+            summary: trackAvailabilitySummary + (items.length > 0
+              ? `Found ${items.length} tracker item(s):\n\n${summary}${cycleSummary}${unresolvedBlockerSummary}${localKeySummary}`
+              : `No tracker items found matching the filters.${cycleSummary}${unresolvedBlockerSummary}${localKeySummary}`),
           }),
         },
       ],
@@ -1262,6 +1479,21 @@ export async function handleTrackerList(
       isError: true,
     };
   }
+}
+
+export function handleTrackerReady(
+  args: { type?: string; limit?: number },
+  workspacePath: string | undefined,
+): Promise<McpToolResult> {
+  const requestedLimit = Number(args.limit);
+  const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, 250)
+    : undefined;
+  return handleTrackerList(
+    { type: args.type, limit, readiness: 'ready' },
+    workspacePath,
+    'ready',
+  );
 }
 
 export async function handleTrackerGet(
@@ -1298,7 +1530,11 @@ export async function handleTrackerGet(
       item = await docService.getTrackerItemById(args.id);
       if (!item && args.id) {
         const all = await docService.listTrackerItems();
-        item = all.find(candidate => candidate.issueKey === args.id) || null;
+        // Match the local number too. `tracker_create` hands one back as the
+        // item's ref, so refusing to resolve it here makes the tool contradict
+        // itself one call later.
+        item = all.find(candidate => candidate.issueKey === args.id
+          || candidate.localKey === args.id) || null;
       }
     }
 
@@ -1321,7 +1557,21 @@ export async function handleTrackerGet(
     lines.push("");
     lines.push(`**Type**: ${item.type}`);
     const assignedIssueKey = getAssignedIssueKey(item);
-    lines.push(`**Issue Key**: ${assignedIssueKey ?? UNPUBLISHED_ISSUE_KEY_MESSAGE}`);
+    const getCanIssueKeys = isTrackerSyncConfigured(workspacePath);
+    // Show the reference that resolves, then explain what kind it is. Printing
+    // the message *instead of* the number was the #1346 symptom: an item with
+    // `NIM.75` sitting in `local_key` reported that it had no key at all.
+    //
+    // `resolveDisplayIssueKey`, not `getTrackerDisplayRef`: the latter falls
+    // back to the raw row id, and an id dressed up as a key is exactly what
+    // TRACKER_SCHEMA_SHARING.md forbids on this line. With no key of either
+    // kind the message stands alone, as before.
+    const getDisplayKey = resolveDisplayIssueKey(item);
+    const getIssueKeyMessage = issueKeyMessage(item, { canIssueKeys: getCanIssueKeys });
+    lines.push(`**Issue Key**: ${getDisplayKey ?? getIssueKeyMessage}`);
+    if (getDisplayKey && getIssueKeyMessage) {
+      lines.push(`**Issue Key Note**: ${getIssueKeyMessage}`);
+    }
     if (item.status) lines.push(`**Status**: ${item.status}`);
     if (item.priority) lines.push(`**Priority**: ${item.priority}`);
     if (item.tags?.length)
@@ -1400,7 +1650,9 @@ export async function handleTrackerGet(
         id: item.id,
         issueNumber: item.issueNumber ?? undefined,
         issueKey: assignedIssueKey,
+        localKey: item.localKey ?? undefined,
         issueKeyStatus: issueKeyStatus(item),
+        ...(getIssueKeyMessage ? { issueKeyMessage: getIssueKeyMessage } : {}),
         type: item.type,
         typeTags: item.typeTags && item.typeTags.length > 0 ? item.typeTags : [item.type],
         title: item.title || "Untitled",
@@ -1665,6 +1917,18 @@ export async function handleTrackerCreate(
       [id, args.type, typeTags, JSON.stringify(data), workspacePath, syncStatus, contentJson, originSource, originSourceRef]
     );
 
+    // Number the row before it is read back, so an agent-created item reports
+    // its key in this tool's own result rather than only after the next list
+    // sweep. Failure is not fatal -- an unnumbered item still works, and the
+    // list will pick it up.
+    if (workspacePath) {
+      try {
+        await assignLocalKeysToRows(db, workspaceLocalKeyStore, workspacePath, [id]);
+      } catch (error) {
+        console.error('[MCP Server] tracker_create local number assignment failed:', error);
+      }
+    }
+
     let createdRow = await resolveTrackerRowByReference(db, id, workspacePath);
     let createdItem = createdRow ? rowToTrackerItem(createdRow) : null;
 
@@ -1793,13 +2057,20 @@ export async function handleTrackerCreate(
     }
 
     const createdRef = createdItem || { id };
+    const createdKeyContext = {
+      published: shouldSyncTrackerItem(sharingPolicy, data),
+      canIssueKeys: isTrackerSyncConfigured(workspacePath),
+    };
+    const createdKeyMessage = issueKeyMessage(createdRef, createdKeyContext);
     const structured = {
       action: "created" as const,
       item: {
         id,
         issueNumber: createdItem?.issueNumber,
         issueKey: getAssignedIssueKey(createdRef),
+        localKey: createdRef.localKey ?? undefined,
         issueKeyStatus: issueKeyStatus(createdRef),
+        ...(createdKeyMessage ? { issueKeyMessage: createdKeyMessage } : {}),
         type: args.type,
         typeTags,
         title: data[titleField],
@@ -1816,7 +2087,7 @@ export async function handleTrackerCreate(
           type: "text",
           text: JSON.stringify({
             structured,
-            summary: `Created tracker item:\n- **Type**: ${args.type}\n- **Title**: ${data[titleField]}\n- **Status**: ${data[statusField]}\n- **Ref**: ${getTrackerDisplayRef(createdRef)}\n- **ID**: ${id}${issueKeyAvailabilityNote(createdRef, shouldSyncTrackerItem(sharingPolicy, data))}${bodyWriteResult ? `\n- **Body write**: Failed — ${bodyWriteResult.message}` : ''}`,
+            summary: `Created tracker item:\n- **Type**: ${args.type}\n- **Title**: ${data[titleField]}\n- **Status**: ${data[statusField]}\n- **Ref**: ${getTrackerDisplayRef(createdRef)}\n- **ID**: ${id}${issueKeyAvailabilityNote(createdRef, createdKeyContext)}${bodyWriteResult ? `\n- **Body write**: Failed — ${bodyWriteResult.message}` : ''}`,
           }),
         },
       ],
@@ -2145,6 +2416,7 @@ export async function handleTrackerUpdate(
                   id: refreshedItem.id,
                   issueNumber: refreshedItem.issueNumber ?? undefined,
                   issueKey: getAssignedIssueKey(refreshedItem),
+                  localKey: refreshedItem.localKey ?? undefined,
                   issueKeyStatus: issueKeyStatus(refreshedItem),
                   type: refreshedItem.type,
                   typeTags: refreshedItem.typeTags && refreshedItem.typeTags.length > 0
@@ -2154,9 +2426,11 @@ export async function handleTrackerUpdate(
                   changes,
                 },
                 summary: [
-                  `Updated tracker item ${getTrackerDisplayRef({ id: refreshedItem.id, issueKey: refreshedItem.issueKey ?? undefined })}:`,
+                  `Updated tracker item ${getTrackerDisplayRef(refreshedItem)}:`,
                   ...updateSummaryParts,
-                ].join('\n') + issueKeyAvailabilityNote(refreshedItem),
+                ].join('\n') + issueKeyAvailabilityNote(refreshedItem, {
+                  canIssueKeys: isTrackerSyncConfigured(workspacePath),
+                }),
               }),
             },
           ],
@@ -2538,13 +2812,18 @@ export async function handleTrackerUpdate(
       const updatedRef = {
         id: publicTrackerId,
         issueKey: postSyncRow?.issue_key ?? refreshedRow?.issue_key ?? row.issue_key ?? undefined,
+        localKey: postSyncRow?.local_key ?? refreshedRow?.local_key ?? row.local_key ?? undefined,
       };
+      const updatedKeyContext = { canIssueKeys: isTrackerSyncConfigured(effectiveWorkspacePath) };
+      const updatedKeyMessage = issueKeyMessage(updatedRef, updatedKeyContext);
       const structured: Record<string, any> = {
         action: "updated" as const,
         id: publicTrackerId,
         issueNumber: postSyncRow?.issue_number ?? refreshedRow?.issue_number ?? row.issue_number ?? undefined,
         issueKey: getAssignedIssueKey(updatedRef),
+        localKey: updatedRef.localKey,
         issueKeyStatus: issueKeyStatus(updatedRef),
+        ...(updatedKeyMessage ? { issueKeyMessage: updatedKeyMessage } : {}),
         type: row.type,
         typeTags: currentTypeTags,
         title: data[rf('title', 'title')],
@@ -2555,7 +2834,7 @@ export async function handleTrackerUpdate(
       const summaryLines = [
         `Updated tracker item ${getTrackerDisplayRef(updatedRef)}:`,
         ...updateSummaryParts,
-        ...(issueKeyAvailabilityNote(updatedRef) ? [issueKeyAvailabilityNote(updatedRef).slice(1)] : []),
+        ...(updatedKeyMessage ? [`- **Issue key**: ${updatedKeyMessage}`] : []),
         ...(bodyWriteResult ? [`- **Body write**: Failed — ${bodyWriteResult.message}`] : []),
       ];
 
@@ -2685,12 +2964,18 @@ export async function handleTrackerLinkSession(
       const linkedIds = readLinkedTrackerItemIds(sessionResult.rows[0]?.metadata);
       await notifySessionLinkedTrackerChanged(targetSessionId, linkedIds);
 
+      const linkedRef = {
+        id: item.id,
+        issueKey: item.issueKey ?? existing.issue_key ?? undefined,
+        localKey: item.localKey ?? existing.local_key ?? undefined,
+      };
       const structured = {
         action: "linked" as const,
         trackerId: item.id,
         issueNumber: item.issueNumber ?? existing.issue_number ?? undefined,
-        issueKey: getAssignedIssueKey({ issueKey: item.issueKey ?? existing.issue_key ?? undefined }),
-        issueKeyStatus: issueKeyStatus({ issueKey: item.issueKey ?? existing.issue_key ?? undefined }),
+        issueKey: getAssignedIssueKey(linkedRef),
+        localKey: linkedRef.localKey,
+        issueKeyStatus: issueKeyStatus(linkedRef),
         type: item.type || existing.type || "",
         title: item.title || trackerData.title || "",
         linkedCount: linkedSessions.length,
@@ -2703,7 +2988,7 @@ export async function handleTrackerLinkSession(
             type: "text",
             text: JSON.stringify({
               structured,
-              summary: `Linked session ${targetSessionId} to tracker item ${getTrackerDisplayRef({ id: item.id, issueKey: item.issueKey ?? undefined })}. Total linked sessions: ${linkedSessions.length}${issueKeyAvailabilityNote(item)}`,
+              summary: `Linked session ${targetSessionId} to tracker item ${getTrackerDisplayRef(linkedRef)}. Total linked sessions: ${linkedSessions.length}${issueKeyAvailabilityNote(linkedRef, { canIssueKeys: isTrackerSyncConfigured(workspacePath) })}`,
             }),
           },
         ],
@@ -2805,12 +3090,18 @@ export async function handleTrackerUnlinkSession(
         await notifySessionLinkedTrackerChanged(targetSessionId, linkedIds);
       }
 
+      const unlinkedRef = {
+        id: item.id,
+        issueKey: item.issueKey ?? existing.issue_key ?? undefined,
+        localKey: item.localKey ?? existing.local_key ?? undefined,
+      };
       const structured = {
         action: "unlinked" as const,
         trackerId: item.id,
         issueNumber: item.issueNumber ?? existing.issue_number ?? undefined,
-        issueKey: getAssignedIssueKey({ issueKey: item.issueKey ?? existing.issue_key ?? undefined }),
-        issueKeyStatus: issueKeyStatus({ issueKey: item.issueKey ?? existing.issue_key ?? undefined }),
+        issueKey: getAssignedIssueKey(unlinkedRef),
+        localKey: unlinkedRef.localKey,
+        issueKeyStatus: issueKeyStatus(unlinkedRef),
         type: item.type || existing.type || "",
         title: item.title || trackerData.title || "",
         linkedCount: linkedSessions.length,
@@ -2818,12 +3109,11 @@ export async function handleTrackerUnlinkSession(
         removed,
       };
 
-      const unlinkedRef = { id: item.id, issueKey: item.issueKey ?? undefined };
       const displayRef = getTrackerDisplayRef(unlinkedRef);
       const summary = (removed
         ? `Unlinked session ${targetSessionId} from tracker item ${displayRef}. Total linked sessions: ${linkedSessions.length}`
         : `Session ${targetSessionId} was not linked to tracker item ${displayRef}. Total linked sessions: ${linkedSessions.length}`)
-        + issueKeyAvailabilityNote(unlinkedRef);
+        + issueKeyAvailabilityNote(unlinkedRef, { canIssueKeys: isTrackerSyncConfigured(workspacePath) });
 
       return {
         content: [
@@ -3023,6 +3313,12 @@ export async function handleTrackerAddComment(
         : false,
     );
 
+    const commentedRef = {
+      id: row.id,
+      issueKey: row.issue_key ?? undefined,
+      localKey: row.local_key ?? undefined,
+    };
+
     return {
       content: [
         {
@@ -3032,12 +3328,13 @@ export async function handleTrackerAddComment(
               action: "commented" as const,
               trackerId: row.id,
               issueNumber: row.issue_number ?? undefined,
-              issueKey: getAssignedIssueKey({ issueKey: row.issue_key ?? undefined }),
-              issueKeyStatus: issueKeyStatus({ issueKey: row.issue_key ?? undefined }),
+              issueKey: getAssignedIssueKey(commentedRef),
+              localKey: commentedRef.localKey,
+              issueKeyStatus: issueKeyStatus(commentedRef),
               commentId,
               author: authorIdentity.displayName,
             },
-            summary: `Added comment to ${getTrackerDisplayRef({ id: row.id, issueKey: row.issue_key ?? undefined })} by ${authorIdentity.displayName}${issueKeyAvailabilityNote({ issueKey: row.issue_key ?? undefined })}`,
+            summary: `Added comment to ${getTrackerDisplayRef(commentedRef)} by ${authorIdentity.displayName}${issueKeyAvailabilityNote(commentedRef, { canIssueKeys: isTrackerSyncConfigured(workspacePath) })}`,
           }),
         },
       ],

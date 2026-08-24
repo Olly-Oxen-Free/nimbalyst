@@ -1,10 +1,11 @@
-import { app, BrowserWindow, dialog, nativeImage, nativeTheme, session } from 'electron';
+import { app, BrowserWindow, dialog, nativeImage, nativeTheme, session, shell } from 'electron';
 import {
     parseTrackerDeepLink,
     type TrackerDeepLinkTarget,
     type TrackerDeepLinkView,
 } from '../shared/trackerDeepLinks';
 import { parseInviteDeepLink, type InviteDeepLinkTarget } from '../shared/inviteDeepLinks';
+import { resolveOrgMessagingDestination } from '../shared/orgMessagingRouting';
 import { safeHandle, safeOn } from './utils/ipcRegistry';
 import { installMicrophoneGate } from './mediaPermissionGate';
 import { markBootComplete } from './utils/bootState';
@@ -118,8 +119,11 @@ import {
     getAppSetting,
     getClaudeCodeSettings,
     getAttachmentStagingConfig,
+    getOpenCodeModelCatalogCache,
+    getProviderApiKeyFromSettings,
     isSettingsAgentToolsDisabled,
     isTrackersAgentToolsEnabled,
+    setOpenCodeModelCatalogCache,
     store
 } from './utils/store';
 import { shouldShowFirstLaunchOnboarding } from './utils/firstLaunchOnboarding';
@@ -127,6 +131,7 @@ import { getAIProviderOverridesWithWorktreeFallback } from './utils/aiSettingsMe
 import { registerMCPConfigHandlers } from './ipc/MCPConfigHandlers';
 import { registerMcpSessionStatusHandlers } from './ipc/McpSessionStatusHandlers';
 import { getOpenCodeConfigService, registerOpenCodeConfigHandlers } from './ipc/OpenCodeConfigHandlers';
+import { createOpenCodeModelCatalogCacheKey } from './services/OpenCodeModelCatalogService';
 import { registerClaudeCodePluginHandlers } from './ipc/ClaudeCodePluginHandlers';
 import { registerExportHandlers } from './ipc/ExportHandlers';
 import { registerSemanticSearchHandlers } from './ipc/SemanticSearchHandlers';
@@ -202,7 +207,14 @@ import { installExtensionAgentBridge } from './extensions/extensionAgentBridge';
 import { getAgentWorkflowService } from './services/AgentWorkflowService';
 import { queueMarketplaceInstallRequest, registerExtensionMarketplaceHandlers, runExtensionAutoUpdate } from './ipc/ExtensionMarketplaceHandlers';
 import { getRegisteredExtensions } from './extensions/RegisteredFileTypes';
-import { ClaudeCodeProvider, OpenAICodexProvider, OpenAICodexACPProvider, OpenCodeProvider, CopilotCLIProvider } from '@nimbalyst/runtime/ai/server';
+import {
+  ClaudeCodeProvider,
+  OpenAICodexProvider,
+  OpenAICodexACPProvider,
+  OpenCodeProvider,
+  CopilotCLIProvider,
+  configureOpenCodeModelCatalog,
+} from '@nimbalyst/runtime/ai/server';
 import { configureMcpServers } from '@nimbalyst/runtime/ai/server';
 import { matchesAllowPattern } from '@nimbalyst/runtime/ai/server/permissions/toolPermissionHelpers';
 import { resolveCodexPreEditHookScriptPath } from './services/ai/codexPreEditHookPath';
@@ -223,6 +235,8 @@ import { autoUpdaterService, AutoUpdaterService } from './services/autoUpdater';
 import { initializeDatabase } from './database/initialize';
 import { database, HandledError } from './database/PGLiteDatabaseWorker';
 import { buildDatabaseInitializationErrorProperties } from './database/DatabaseErrorTelemetry';
+import { findRestorableBackups } from './database/sqlite/recoveryArtifacts';
+import { buildDatabaseFailureDialog } from './database/databaseFailureDialog';
 import { resolveTrackerDeepLinkId } from './services/tracker/resolveTrackerDeepLinkId';
 import { AnalyticsService } from "./services/analytics/AnalyticsService.ts";
 import { registerAnalyticsHandlers } from "./ipc/AnalyticsHandlers.ts";
@@ -237,6 +251,7 @@ import {
 } from './services/StytchAuthService';
 import { requestMobilePush } from './services/ai/mobilePushRequest';
 import { registerTrackerSyncHandlers, initializeTrackerSync } from './services/TrackerSyncManager';
+import { ensureWorkspaceLocalNumbersInBackground } from './services/tracker/ensureWorkspaceLocalNumbers';
 import { initTrackerSchemaService, updateTrackerSchemaWorkspace } from './services/TrackerSchemaService';
 import { registerTrackerLifecycleIpc } from './services/tracker/trackerLifecycleService';
 import { initTrackerNavigationService } from './services/TrackerNavigationService';
@@ -250,9 +265,19 @@ import {
   type InviteDeepLinkOutcome,
 } from './services/TeamService';
 import { registerOrgProjectWalkHandlers } from './services/OrgProjectWalkService';
+import {
+    consumePendingOrgFeedbackLink,
+    queuePendingOrgFeedbackLink,
+} from './services/PendingOrgFeedbackLinks';
 import { registerSignInAttributionHandlers } from './services/SignInAttribution';
 import { registerProjectWalkClaimHandlers } from './services/ProjectWalkClaim';
-import { windowStates, windows, resolveActiveWorkspacePath } from './window/windowState';
+import {
+    getWindowIdForWindow,
+    resolveActiveWorkspacePath,
+    resolveActiveWorkspacePathForWindowId,
+    windowStates,
+    windows,
+} from './window/windowState';
 import { getRecentItems } from './utils/store';
 import { registerTeamCustodyHandlers } from './services/TeamCustodyService';
 import { purgeLegacyKeyFiles } from './services/LegacyKeyFilePurge';
@@ -813,7 +838,26 @@ let pendingDeepLinkUrl: string | null = null;
 // Per-workspace queue of shared-document deep links waiting for the renderer
 // to be ready (e.g., a window we just created for the project). Drained via
 // the `deep-link:consume-pending-shared-doc` IPC during listener init.
-const pendingSharedDocLinks = new Map<string, { documentId: string; orgId: string }>();
+const pendingSharedDocLinks = new Map<string, { documentId: string; orgId: string; threadId?: string }>();
+
+/**
+ * A comment notification carries the thread it is about, and nothing else about
+ * where that thread lives. Identity only — no DOM selector, node key, or
+ * coordinate ever goes in a notification URL, because the anchor is resolved by
+ * whichever editor is mounted when the link is followed.
+ */
+const MAX_DEEP_LINK_THREAD_ID_CHARS = 200;
+
+function parseDeepLinkThreadId(parsed: URL): string | undefined {
+    const raw = parsed.searchParams.get('threadId');
+    if (!raw) return undefined;
+    const threadId = raw.trim();
+    if (!threadId || threadId.length > MAX_DEEP_LINK_THREAD_ID_CHARS) return undefined;
+    // Control characters cannot appear in a thread id and are how a crafted
+    // link would smuggle a newline into a log line or a renderer payload.
+    if (/[\u0000-\u001F\u007F]/u.test(threadId)) return undefined;
+    return threadId;
+}
 
 safeHandle('deep-link:consume-pending-shared-doc', (_event, workspacePath: string) => {
     if (!workspacePath) return null;
@@ -821,6 +865,19 @@ safeHandle('deep-link:consume-pending-shared-doc', (_event, workspacePath: strin
     if (!pending) return null;
     pendingSharedDocLinks.delete(workspacePath);
     return { ...pending, workspacePath };
+});
+
+// Project-org feedback requests land in Org mode. Queued by workspace so a
+// renderer still mounting can consume the same target as a live window; see
+// PendingOrgFeedbackLinks for why the sender's own window decides.
+safeHandle('deep-link:consume-pending-org-feedback-request', (event, workspacePath: string) => {
+    // The sender's path is resolved with the same resolver that keyed the
+    // entry in `openFeedbackRequestFromDeepLink`, so the two sides agree on
+    // what "this window's project" means.
+    const senderWorkspacePath = resolveActiveWorkspacePathForWindowId(
+        getWindowIdForWindow(BrowserWindow.fromWebContents(event.sender)),
+    );
+    return consumePendingOrgFeedbackLink(workspacePath, senderWorkspacePath);
 });
 
 // Same pattern for tracker deep links:
@@ -873,7 +930,9 @@ async function openInboxSourceFromDeepLink(rawUrl: string): Promise<boolean> {
         }
         if (parsed.host === 'doc' && orgId) {
             const documentId = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
-            return documentId ? openSharedDocumentFromDeepLink(documentId, orgId) : false;
+            return documentId
+                ? openSharedDocumentFromDeepLink(documentId, orgId, parseDeepLinkThreadId(parsed))
+                : false;
         }
         if (parsed.host === 'conversation' && orgId) {
             const conversation = parseConversationDeepLink(rawUrl);
@@ -1012,7 +1071,7 @@ async function handleDeepLink(url: string): Promise<void> {
                 return;
             }
 
-            await openSharedDocumentFromDeepLink(documentId, orgId);
+            await openSharedDocumentFromDeepLink(documentId, orgId, parseDeepLinkThreadId(parsed));
         } else if (parsed.host === 'folder' || parsed.pathname?.startsWith('/folder/')) {
             // Handle shared folder link: nimbalyst://folder/{folderId}?orgId={orgId}
             const encoded = parsed.host === 'folder'
@@ -1202,8 +1261,13 @@ async function findWorkspaceForOrgId(orgId: string): Promise<string | null> {
  * Route a shared-document deep link to the renderer holding the matching
  * team workspace. Queues the payload in `pendingSharedDocLinks` so a freshly
  * created window's renderer can drain it on listener init.
+ *
+ * `threadId` is present when the link came from a comment notification. It is
+ * carried verbatim to the renderer, which opens the document's comments panel
+ * on that thread; resolving where the thread is anchored is the mounted
+ * editor's job, never this payload's.
  */
-async function openSharedDocumentFromDeepLink(documentId: string, orgId: string): Promise<boolean> {
+async function openSharedDocumentFromDeepLink(documentId: string, orgId: string, threadId?: string): Promise<boolean> {
     const reason = !isAuthenticated() ? 'not-authenticated' : 'no-workspace';
     const workspacePath = isAuthenticated() ? await findWorkspaceForOrgId(orgId) : null;
 
@@ -1221,7 +1285,7 @@ async function openSharedDocumentFromDeepLink(documentId: string, orgId: string)
     // Queue first; the renderer drains by workspacePath on listener init.
     // For an already-loaded window we also fire the live event below; the
     // renderer treats it as idempotent against the pending queue.
-    pendingSharedDocLinks.set(workspacePath, { documentId, orgId });
+    pendingSharedDocLinks.set(workspacePath, { documentId, orgId, ...(threadId ? { threadId } : {}) });
 
     const existing = findWindowByWorkspace(workspacePath);
     if (existing && !existing.isDestroyed()) {
@@ -1231,6 +1295,7 @@ async function openSharedDocumentFromDeepLink(documentId: string, orgId: string)
             documentId,
             orgId,
             workspacePath,
+            ...(threadId ? { threadId } : {}),
         });
         logger.main.info('[DeepLink] Routed shared doc to existing window:', { workspacePath, documentId });
         return true;
@@ -1283,7 +1348,8 @@ async function openSharedFolderFromDeepLink(folderId: string, orgId: string): Pr
 }
 
 /**
- * Route a feedback-request deep link to the organization window's Inbox.
+ * Route a feedback-request deep link to the project's Org mode or the
+ * standalone organization window's Inbox.
  *
  * The destination is a *selected row*, not a tab: the respond card renders
  * inline in the Inbox's context pane, while `virtual://feedback-request/` is the
@@ -1298,11 +1364,53 @@ async function openFeedbackRequestFromDeepLink(
     requestId: string,
     orgId: string,
 ): Promise<boolean> {
-    const reason = !isAuthenticated() ? 'not-authenticated' : 'no-workspace';
-    const workspacePath = isAuthenticated() ? await findWorkspaceForOrgId(orgId) : null;
+    if (!isAuthenticated()) {
+        logger.main.warn('[DeepLink] Cannot route feedback request:', {
+            reason: 'not-authenticated',
+            orgId,
+            requestId,
+        });
+        return false;
+    }
+
+    const focusedWindow = getMostRecentlyFocusedWorkspaceWindow();
+    const focusedWorkspacePath = resolveActiveWorkspacePathForWindowId(
+        getWindowIdForWindow(focusedWindow),
+    );
+    const focusedProjectOrgId = focusedWorkspacePath
+        ? (await findTeamForWorkspace(focusedWorkspacePath))?.orgId
+        : null;
+
+    if (
+        focusedWindow
+        && !focusedWindow.isDestroyed()
+        && focusedWorkspacePath
+        && resolveOrgMessagingDestination(focusedProjectOrgId, orgId) === 'project-mode'
+    ) {
+        queuePendingOrgFeedbackLink(focusedWorkspacePath, { requestId, orgId });
+        if (focusedWindow.isMinimized()) focusedWindow.restore();
+        focusedWindow.focus();
+        focusedWindow.webContents.send('deep-link:open-org-feedback-request', {
+            requestId,
+            orgId,
+            workspacePath: focusedWorkspacePath,
+        });
+        logger.main.info('[DeepLink] Routed feedback request to project Org mode:', {
+            orgId,
+            requestId,
+            workspacePath: focusedWorkspacePath,
+        });
+        return true;
+    }
+
+    const workspacePath = await findWorkspaceForOrgId(orgId);
 
     if (!workspacePath) {
-        logger.main.warn('[DeepLink] Cannot route feedback request:', { reason, orgId, requestId });
+        logger.main.warn('[DeepLink] Cannot route feedback request:', {
+            reason: 'no-workspace',
+            orgId,
+            requestId,
+        });
         return false;
     }
 
@@ -1791,23 +1899,48 @@ app.whenReady().then(async () => {
 
         // Show appropriate error dialog
         if (isWasmRuntimeCrash) {
-            // Get database path for the error message (use actual expanded path)
-            const dbPath = join(app.getPath('userData'), 'pglite-db');
+            // This dialog used to end with "delete the database folder: <path>".
+            // Users followed it, and because the project list lives in
+            // electron-store rather than the database, the app came back up
+            // looking healthy with every session and all document history gone
+            // (#1347). Never instruct a delete: say what is recoverable, and
+            // give the user a way to reach it.
+            const userDataPath = app.getPath('userData');
+            const backups = findRestorableBackups(userDataPath);
+            const content = buildDatabaseFailureDialog(backups);
 
-            dialog.showErrorBox(
-                'Nimbalyst - Database Initialization Failed',
-                `The database system failed to start.\n\n` +
-                `This usually indicates:\n` +
-                `1. Another process has the database locked\n` +
-                `2. Database files are corrupted\n` +
-                `3. Insufficient file system permissions\n\n` +
-                `To fix this:\n` +
-                `1. Close any other Nimbalyst windows\n` +
-                `2. Restart your computer (clears stale locks)\n` +
-                `3. If the problem persists, delete the database folder:\n` +
-                `   ${dbPath}\n\n` +
-                `Nimbalyst will now close.`
-            );
+            const choice = dialog.showMessageBoxSync({
+                type: 'error',
+                title: content.title,
+                message: content.message,
+                detail: content.detail,
+                buttons: content.buttons,
+                defaultId: content.defaultId,
+                cancelId: content.cancelId,
+                noLink: true,
+            });
+
+            const revealed = content.revealPath !== null && choice === 0;
+            if (revealed) {
+                try {
+                    shell.showItemInFolder(content.revealPath!);
+                } catch (revealErr) {
+                    logger.main.warn('[Database] Could not reveal backup folder', revealErr);
+                }
+            }
+
+            // NIM-3624: this dialog was previously invisible in telemetry, so
+            // there was no way to see how many users it sent to delete their
+            // database. Report that it was shown and what the user did.
+            try {
+                AnalyticsService.getInstance().sendEvent('database_init_failure_dialog', {
+                    backup_count: backups.length,
+                    largest_backup_bytes: backups.reduce((max, b) => Math.max(max, b.bytes), 0),
+                    action: revealed ? 'show_backups' : 'quit',
+                });
+            } catch {
+                // Analytics failure shouldn't block error handling
+            }
         } else {
             dialog.showErrorBox(
                 'Nimbalyst - Database Initialization Failed',
@@ -2218,9 +2351,35 @@ app.whenReady().then(async () => {
     OpenCodeProvider.setEnhancedPathLoader(() => getEnhancedPath());
     CopilotCLIProvider.setEnhancedPathLoader(() => getEnhancedPath());
 
-    // Inject opencode.json loader so OpenCodeProvider.getModels() can surface
-    // user-configured providers (e.g. an LM Studio bridge) in the model picker.
-    OpenCodeProvider.setConfigLoader(() => getOpenCodeConfigService().readConfig());
+    configureOpenCodeModelCatalog({
+      loadCache: () => getOpenCodeModelCatalogCache(),
+      saveCache: (cache) => setOpenCodeModelCatalogCache(cache),
+      getCacheKey: (workspacePath) => {
+        const shellEnvironment = getShellEnvironment();
+        return createOpenCodeModelCatalogCacheKey({
+          enhancedPath: getEnhancedPath(),
+          configPath: getOpenCodeConfigService().getConfigPath(),
+          workspacePath,
+          xdgDataHome: shellEnvironment?.XDG_DATA_HOME ?? process.env.XDG_DATA_HOME,
+          configuredApiKey: getProviderApiKeyFromSettings('opencode'),
+        });
+      },
+      getRetainedModelIds: async () => {
+        // The model the user picked in settings stays in the catalog even if
+        // discovery stops reporting its provider as connected, so a revoked or
+        // not-yet-added credential never silently erases the selection (#916).
+        try {
+          const config = await getOpenCodeConfigService().readConfig();
+          return config?.model ? [config.model] : [];
+        } catch {
+          return [];
+        }
+      },
+      getEnvironment: () => ({
+        ...(getShellEnvironment() ?? {}),
+        PATH: getEnhancedPath(),
+      }),
+    });
 
     // Inject SDK module loader for packaged builds where dynamic import('@openai/codex-sdk')
     // can't resolve the package from within app.asar.
@@ -2995,6 +3154,10 @@ app.whenReady().then(async () => {
             // inherit synchronous git/process work on the startup tick.
             void autoMatchTeamForWorkspace(workspacePath).catch(() => {});
             void initializeTrackerSync(workspacePath).catch(() => {});
+            // Sibling, not a step inside tracker sync: that path returns early
+            // for a workspace with no team, which is exactly the workspace whose
+            // items have nothing but a local number.
+            ensureWorkspaceLocalNumbersInBackground(workspacePath);
             updateTrackerSchemaWorkspace(workspacePath);
         }, 0);
 

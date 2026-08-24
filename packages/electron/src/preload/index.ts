@@ -30,6 +30,14 @@ import type {
   FeedbackRequestServiceTarget,
 } from '../shared/feedbackRequest.ts';
 import type { TutorialEntryPoint, TutorialStartResult, TutorialStatusResult } from '../shared/tutorial.ts';
+import type {
+  OpenCodeModelCatalogIpcResponse,
+  OpenCodeModelCatalogRefreshRequest,
+} from '../shared/openCodeModelCatalog.ts';
+import type {
+  OpenCodeAgentCatalogIpcResponse,
+  OpenCodeAgentCatalogRequest,
+} from '../shared/openCodeAgentCatalog.ts';
 
 type StytchAuthFlowOptions = {
   intent: 'sign-in' | 'add-account' | 'reauth';
@@ -282,9 +290,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return 'light';
     }
   },
+  getThemeBackgroundColorSync: () => {
+    try {
+      return ipcRenderer.sendSync('get-theme-background-color-sync');
+    } catch (err) {
+      console.error('[preload] getThemeBackgroundColorSync error:', err);
+      return null;
+    }
+  },
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   setTheme: (theme: string) => ipcRenderer.invoke('set-theme', theme),
-  setTitleBarOverlayColors: (colors: { color: string; symbolColor: string }) =>
+  setTitleBarOverlayColors: (colors: { color: string; symbolColor: string; backgroundColor?: string }) =>
     ipcRenderer.send('window-chrome:set-overlay-colors', colors),
 
   // Fullscreen state for the custom title bar's own exit control
@@ -545,7 +561,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // AI operations (new unified interface)
   aiHasApiKey: () => ipcRenderer.invoke('ai:hasApiKey'),
   aiInitialize: (provider?: string, apiKey?: string) => ipcRenderer.invoke('ai:initialize', provider, apiKey),
-  aiCreateSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'opencode' | 'copilot-cli' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => {
+  aiCreateSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'opencode' | 'copilot-cli' | 'lmstudio' | 'ollama', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => {
     // console.log('[Preload] aiCreateSession called:', { provider, workspacePath, sessionType, worktreeId });
     return ipcRenderer.invoke('ai:createSession', provider, documentContext, workspacePath, modelId, sessionType, worktreeId);
   },
@@ -582,7 +598,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   getAISettings: () => ipcRenderer.invoke('ai:getSettings'),
   saveAISettings: (settings: any) => ipcRenderer.invoke('ai:saveSettings', settings),
-  testAIConnection: (provider: 'claude' | 'claude-code' | 'openai' | 'lmstudio') => ipcRenderer.invoke('ai:testConnection', provider),
+  testAIConnection: (provider: 'claude' | 'claude-code' | 'openai' | 'lmstudio' | 'ollama') => ipcRenderer.invoke('ai:testConnection', provider),
   getAIModels: () => ipcRenderer.invoke('ai:getModels'),
   // Aliases for consistency with component naming
   aiGetSettings: () => ipcRenderer.invoke('ai:getSettings'),
@@ -593,6 +609,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   aiGetAllModels: () => ipcRenderer.invoke('ai:getAllModels'),
   aiClearModelCache: () => ipcRenderer.invoke('ai:clearModelCache'),
   aiRefreshSessionProvider: (sessionId: string) => ipcRenderer.invoke('ai:refreshSessionProvider', sessionId),
+  openCodeModelCatalogGet: (): Promise<OpenCodeModelCatalogIpcResponse> =>
+    ipcRenderer.invoke('opencode-model-catalog:get'),
+  openCodeModelCatalogRefresh: (
+    request: OpenCodeModelCatalogRefreshRequest
+  ): Promise<OpenCodeModelCatalogIpcResponse> =>
+    ipcRenderer.invoke('opencode-model-catalog:refresh', request),
+  openCodeAgentCatalogGet: (
+    request: OpenCodeAgentCatalogRequest
+  ): Promise<OpenCodeAgentCatalogIpcResponse> =>
+    ipcRenderer.invoke('opencode-agent-catalog:get', request),
 
   // Per-session MCP status (NIM-2272). Pull for first render, push for live
   // transitions — the push listener only exists once a message has been sent.
@@ -815,7 +841,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ai: {
     hasApiKey: () => ipcRenderer.invoke('ai:hasApiKey'),
     initialize: (provider?: string, apiKey?: string) => ipcRenderer.invoke('ai:initialize', provider, apiKey),
-    createSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) =>
+    createSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'lmstudio' | 'ollama', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) =>
       ipcRenderer.invoke('ai:createSession', provider, documentContext, workspacePath, modelId, sessionType, worktreeId),
     sendMessage: (message: string, documentContext?: any, sessionId?: string, workspacePath?: string) =>
       ipcRenderer.invoke('ai:sendMessage', message, documentContext, sessionId, workspacePath),
@@ -1404,6 +1430,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
           teamMemberId: TeamMemberId;
         };
         error?: string;
+        retryable?: boolean;
       }>,
     // WebSocket proxy: create WebSocket connections in main process (Node.js)
     // to work around Cloudflare blocking browser WebSocket upgrades

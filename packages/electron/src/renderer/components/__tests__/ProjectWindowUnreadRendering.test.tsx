@@ -4,11 +4,10 @@ import type { TeamInboxSnapshot } from '@nimbalyst/runtime/sync';
 import { Provider, createStore } from 'jotai';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { OrgSwitcher } from '../OrgSwitcher';
 import { AccountInspectorPopover } from '../Accounts/AccountInspectorPopover';
-import { WindowTopBar } from '../WindowTopBar';
 import { dialogRef } from '../../contexts/DialogContext';
 import { DIALOG_IDS } from '../../dialogs/registry';
 import { activeWorkspacePathAtom } from '../../store/atoms/openProjects';
@@ -119,75 +118,6 @@ describe('project window unread rendering', () => {
     });
   });
 
-  // The top-bar badge counts only the project's own organization, so it can
-  // never report unread that belongs to an inbox the user isn't working in.
-  it('badges the top-bar inbox with the project org count and opens that org', async () => {
-    installApi();
-    findForWorkspace.mockResolvedValue({ team: { orgId: 'org-b', name: 'Beta' } });
-
-    renderWithStore(
-      <WindowTopBar
-        workspaceName="Repo"
-        activeModeLabel="Files"
-        gitStatus={null}
-        gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
-        workspacePath="/workspace/window-root"
-      />,
-      snapshot([
-        delivery('a-1', 'org-a', 'Acme'),
-        delivery('a-2', 'org-a', 'Acme'),
-        delivery('b-1', 'org-b', 'Beta'),
-      ]),
-    );
-
-    await waitFor(() => {
-      expect(screen.getByTestId('window-top-bar-inbox-unread').textContent).toBe('1');
-    });
-    expect(findForWorkspace).toHaveBeenCalledWith('/workspace/acme');
-
-    fireEvent.click(screen.getByTestId('window-top-bar-inbox'));
-
-    expect(openManagementWindow).toHaveBeenCalledWith({
-      orgId: 'org-b',
-      workspacePath: '/workspace/window-root',
-    });
-  });
-
-  it('keeps the top-bar inbox with no badge at zero unread, and drops it without an org', async () => {
-    installApi();
-    findForWorkspace.mockResolvedValue({ team: { orgId: 'org-b', name: 'Beta' } });
-
-    const withOrg = renderWithStore(
-      <WindowTopBar
-        workspaceName="Repo"
-        activeModeLabel="Files"
-        gitStatus={null}
-        gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
-        workspacePath="/workspace/window-root"
-      />,
-      snapshot([delivery('b-read', 'org-b', 'Beta', { readAt: 12 })]),
-    );
-
-    await waitFor(() => screen.getByTestId('window-top-bar-inbox'));
-    expect(screen.queryByTestId('window-top-bar-inbox-unread')).toBeNull();
-    withOrg.unmount();
-
-    findForWorkspace.mockResolvedValue({ team: null });
-    renderWithStore(
-      <WindowTopBar
-        workspaceName="Repo"
-        activeModeLabel="Files"
-        gitStatus={null}
-        gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
-        workspacePath="/workspace/window-root"
-      />,
-      snapshot([]),
-    );
-
-    await waitFor(() => expect(findForWorkspace).toHaveBeenCalledTimes(2));
-    expect(screen.queryByTestId('window-top-bar-inbox')).toBeNull();
-  });
-
   // The rows above are the menu's unread list, so they open the messages
   // window. Everything below the divider is administration, which is a dialog
   // in this window since NIM-2322 — no second OS window for it.
@@ -258,5 +188,41 @@ describe('project window unread rendering', () => {
       snapshot([]),
     );
     expect(screen.queryByTestId('account-inspector-messages-row')).toBeNull();
+  });
+
+  // Switching the project rail restarts the org lookup, and until it answers
+  // the previous project's org is not this project's. Routing on it sent the
+  // user to Org mode for one organization after they clicked the row for
+  // another — the window is what shows the org they actually picked.
+  it('opens the window rather than Org mode while the new project org is unresolved', async () => {
+    installApi();
+    organizationList.mockResolvedValue({
+      teams: [
+        { orgId: 'org-a', name: 'Acme', role: 'admin', membershipType: 'active_member' },
+        { orgId: 'org-b', name: 'Beta', role: 'member', membershipType: 'active_member' },
+      ],
+    });
+    findForWorkspace.mockResolvedValue({ team: { orgId: 'org-a', name: 'Acme' } });
+
+    const store = createStore();
+    store.set(activeWorkspacePathAtom, '/workspace/acme');
+    store.set(teamInboxSnapshotAtom, snapshot([]));
+    render(<Provider store={store}><OrgSwitcher /></Provider>);
+
+    await waitFor(() => expect(findForWorkspace).toHaveBeenCalledWith('/workspace/acme'));
+    await waitFor(() => screen.getByTestId('org-switcher'));
+
+    // The rail moves to Beta's project; that lookup has not answered yet.
+    findForWorkspace.mockReturnValue(new Promise(() => {}));
+    act(() => store.set(activeWorkspacePathAtom, '/workspace/beta'));
+    await waitFor(() => expect(findForWorkspace).toHaveBeenCalledWith('/workspace/beta'));
+
+    fireEvent.click(screen.getByTestId('org-switcher'));
+    fireEvent.click(screen.getByTestId('org-switcher-org-row-org-a'));
+
+    expect(openManagementWindow).toHaveBeenCalledWith({
+      orgId: 'org-a',
+      workspacePath: '/workspace/beta',
+    });
   });
 });

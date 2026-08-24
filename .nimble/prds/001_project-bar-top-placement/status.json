@@ -1,0 +1,29 @@
+{
+  "slug": "project-bar-top-placement",
+  "status": "done",
+  "created_at": "2026-08-20T00:00:00Z",
+  "execution_mode": "feature-branch",
+  "branch_strategy": "use-worktree-branch-directly",
+  "branch": "worktree/project-bar-movement",
+  "phase": "complete",
+  "verification": {
+    "typecheck": "PASS (independently re-run, exit 0)",
+    "targeted_unit_tests": "PASS (independently re-run, 48/48)",
+    "monorepo_test_prepush": "PASS per nimble-pm report (10200/10232, 6 pre-existing failures tracked in bd nby-6el, confirmed unrelated to this PRD)",
+    "manual_e2e_verification": "PASS — user built and installed the packaged app (packaging/arch), manually exercised the top-docked bar (position toggle, click-to-switch, right-click context menu, drag), found and reported one real bug (blank title bar) and two UX issues (icon size, active-project placement). All three fixed and re-verified live; user confirmed working.",
+    "post_execution_fixes": [
+      "container-type: inline-size on .project-rail-top collapsed the top-docked bar to 0px width (CSS Containment spec circularity with the parent grid's auto-sized track) — root-caused via live CDP inspection (Runtime.evaluate against the running packaged app), fixed by removing containment; the @container narrow-window auto-shrink feature was descoped as a result (documented in ProjectRail.css)",
+      "icons resized from 40px to 24px for the top-docked bar per user feedback",
+      "active project now renders in its natural position in the open-project order and expands in place into a pill, instead of being pulled out to a separate title element, per user feedback"
+    ]
+  },
+  "tracker": {
+    "issue_key": null,
+    "item_id": "plan_1787289447069_qb6yvp",
+    "type": "plan",
+    "created_at": "2026-08-21T00:00:00Z",
+    "escalations": [],
+    "publish_status": "unassigned",
+    "publish_note": "tracker_update published:true failed — 'No document service is available to change Draft/Published state. Open the workspace and retry.' Retry when workspace is open."
+  }
+}

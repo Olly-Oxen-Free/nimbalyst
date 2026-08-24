@@ -62,7 +62,7 @@ const {
   mockGlobalRegistry: {
     // `(): any` so tests can return partial models; inferring `undefined` from
     // this default made every such override an error.
-    get: vi.fn((): any => undefined),
+    get: vi.fn((_type?: string): any => undefined),
     getAll: vi.fn(() => []),
     validate: vi.fn(() => ({ valid: true, errors: [] as Array<{ field: string; message: string }> })),
   },
@@ -101,6 +101,7 @@ vi.mock('../../../services/TrackerPolicyService', () => ({
 
 vi.mock('../../../services/TrackerSyncManager', () => ({
   isTrackerSyncActive: vi.fn(() => false),
+  isTrackerSyncConfigured: vi.fn(() => false),
   syncTrackerItem: vi.fn(),
   onTrackerItemApplied: mockOnTrackerItemApplied,
 }));
@@ -149,6 +150,7 @@ vi.mock('../../../window/WindowManager', () => ({
 
 vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel', () => ({
   globalRegistry: mockGlobalRegistry,
+  getRoleField: (model: any, role: string) => model?.roles?.[role],
 }));
 
 vi.mock('electron', () => ({
@@ -168,6 +170,12 @@ vi.mock('../../../services/MainBodyDocService', () => ({
   applyHeadlessBodyMarkdown: mockApplyHeadlessBodyMarkdown,
 }));
 
+// Counter behaviour lives in tracker/__tests__/localKeyAllocator.test.ts; the
+// create path only has to sweep itself.
+vi.mock('../../../services/tracker/localKeyAllocator', () => ({
+  assignLocalKeysToRows: vi.fn(async () => new Map<string, string>()),
+}));
+
 import {
   createBidirectionalLink,
   handleTrackerCreate,
@@ -178,20 +186,28 @@ import {
   handleTrackerLinkSession,
   handleTrackerList,
   handleTrackerListTypes,
+  handleTrackerReady,
   handleTrackerUnlinkSession,
   handleTrackerUpdate,
   readLinkedTrackerItemIds,
   removeBidirectionalLink,
   rowToTrackerItem,
 } from '../trackerToolHandlers';
-import { isTrackerSyncActive, syncTrackerItem } from '../../../services/TrackerSyncManager';
+import { getTrackerDisplayRef, issueKeyMessage, issueKeyStatus } from '../trackerToolResult';
+import { isTrackerSyncActive, isTrackerSyncConfigured, syncTrackerItem } from '../../../services/TrackerSyncManager';
+import { assignLocalKeysToRows } from '../../../services/tracker/localKeyAllocator';
 import { getEffectiveTrackerSharingPolicy, shouldSyncTrackerItem } from '../../../services/TrackerPolicyService';
-import { resolveTrackerPromotionEligibility } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerLifecycle';
+import {
+  resolveTrackerPromotionEligibility,
+  TRACKER_LOCAL_ISSUE_KEY_MESSAGE,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerLifecycle';
+import { READINESS_FILTER_FIELD } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerStatusCategory';
 
 describe('handleTrackerList structured records', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockDocumentServices.clear();
+    mockGlobalRegistry.get.mockReturnValue(undefined);
   });
 
   it('returns custom fields under `full` and honors the all-items sentinel', async () => {
@@ -240,6 +256,454 @@ describe('handleTrackerList structured records', () => {
     // The blank binary clause must select the empty-owner item, not vanish and
     // return everything (the pre-`is-empty` idiom).
     expect(items.map((i: any) => i.id)).toEqual(['a']);
+  });
+
+  it('computes readiness before open and archive filters remove blockers', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => type === 'task' ? {
+      type: 'task',
+      roles: { workflowStatus: 'status' },
+      fields: [
+        {
+          name: 'status',
+          type: 'select',
+          options: [
+            { value: 'to-do', label: 'To Do', category: 'unstarted' },
+            { value: 'in-progress', label: 'In Progress', category: 'started' },
+            { value: 'done', label: 'Done', category: 'done' },
+          ],
+        },
+        {
+          name: 'dependsOn',
+          type: 'relationship',
+          relationshipTypeKey: 'depends-on',
+        },
+      ],
+    } : undefined);
+    mockDocService.listTrackerItems.mockResolvedValue([
+      {
+        id: 'terminal-blocker',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Terminal blocker',
+        status: 'done',
+        workspace: '/tmp/ws',
+        archived: 1,
+      },
+      {
+        id: 'open-blocker',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Open blocker',
+        status: 'in-progress',
+        workspace: '/tmp/ws',
+        archived: 1,
+      },
+      {
+        id: 'cleared-dependent',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Cleared dependent',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        archived: 0,
+        customFields: { dependsOn: [{ itemId: 'terminal-blocker' }] },
+      },
+      {
+        id: 'blocked-dependent',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Blocked dependent',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        archived: 0,
+        customFields: { dependsOn: [{ itemId: 'open-blocker' }] },
+      },
+    ]);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleTrackerList(
+      { where: [{ field: READINESS_FILTER_FIELD, op: '=', value: 'ready' }] },
+      '/tmp/ws',
+    );
+    const items = JSON.parse(result.content[0].text!).structured.items;
+
+    expect(items.map((item: any) => item.id)).toEqual(['cleared-dependent']);
+  });
+
+  it('ranks ready work by leverage before priority', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => type === 'task' ? {
+      type: 'task',
+      roles: { workflowStatus: 'status', priority: 'priority' },
+      fields: [
+        {
+          name: 'status',
+          type: 'select',
+          options: [
+            { value: 'to-do', label: 'To Do', category: 'unstarted' },
+            { value: 'done', label: 'Done', category: 'done' },
+          ],
+        },
+        {
+          name: 'priority',
+          type: 'select',
+          options: ['low', 'medium', 'high', 'critical'],
+        },
+        {
+          name: 'dependsOn',
+          type: 'relationship',
+          relationshipTypeKey: 'depends-on',
+        },
+      ],
+    } : undefined);
+    mockDocService.listTrackerItems.mockResolvedValue([
+      {
+        id: 'high-priority',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'High priority',
+        status: 'to-do',
+        priority: 'critical',
+        workspace: '/tmp/ws',
+        updated: '2026-08-22T12:00:00.000Z',
+      },
+      {
+        id: 'high-leverage',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'High leverage',
+        status: 'to-do',
+        priority: 'low',
+        workspace: '/tmp/ws',
+        updated: '2026-08-22T11:00:00.000Z',
+      },
+      ...['dependent-a', 'dependent-b'].map((id) => ({
+        id,
+        type: 'task',
+        typeTags: ['task'],
+        title: id,
+        status: 'to-do',
+        priority: 'high',
+        workspace: '/tmp/ws',
+        customFields: { dependsOn: [{ itemId: 'high-leverage' }] },
+      })),
+    ]);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleTrackerReady({ type: 'task' }, '/tmp/ws');
+    const items = JSON.parse(result.content[0].text!).structured.items;
+
+    expect(items.map((item: any) => item.id)).toEqual(['high-leverage', 'high-priority']);
+    expect(items.map((item: any) => item.unblocks)).toEqual([2, 0]);
+  });
+
+  // Readiness is derived over the unfiltered corpus (pinned by the test above)
+  // and must stay that way, so the explanation reaching the caller is the only
+  // thing the caller's own scope may narrow. A blocker the filters excluded
+  // still has to be counted -- work that reads unready with no reason is its own
+  // bug -- but its title is attacker-influenced free text landing in an agent's
+  // context, and its dotted ref is private to this machine.
+  it('counts a filtered-out blocker without disclosing its title or ref', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => {
+      const statusField = (options: Array<{ value: string; category: string }>) => ({
+        name: 'status',
+        type: 'select',
+        options: options.map((option) => ({ ...option, label: option.value })),
+      });
+      if (type === 'bug') {
+        return {
+          type: 'bug',
+          roles: { workflowStatus: 'status' },
+          fields: [
+            statusField([
+              { value: 'to-do', category: 'unstarted' },
+              { value: 'in-progress', category: 'started' },
+              { value: 'done', category: 'done' },
+            ]),
+            { name: 'dependsOn', type: 'relationship', relationshipTypeKey: 'depends-on' },
+          ],
+        };
+      }
+      if (type === 'plan') {
+        return {
+          type: 'plan',
+          roles: { workflowStatus: 'status' },
+          fields: [
+            statusField([
+              { value: 'in-progress', category: 'started' },
+              { value: 'completed', category: 'done' },
+            ]),
+          ],
+        };
+      }
+      return undefined;
+    });
+    mockDocService.listTrackerItems.mockResolvedValue([
+      {
+        id: 'visible-blocker',
+        localKey: 'NIM.10',
+        type: 'bug',
+        typeTags: ['bug'],
+        title: 'Open bug blocker',
+        status: 'in-progress',
+        workspace: '/tmp/ws',
+        archived: 0,
+      },
+      {
+        id: 'hidden-blocker',
+        localKey: 'NIM.9001',
+        type: 'plan',
+        typeTags: ['plan'],
+        title: 'Confidential roadmap',
+        status: 'in-progress',
+        workspace: '/tmp/ws',
+        archived: 1,
+      },
+      {
+        id: 'dependent',
+        localKey: 'NIM.11',
+        type: 'bug',
+        typeTags: ['bug'],
+        title: 'Dependent bug',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        archived: 0,
+        customFields: {
+          dependsOn: [{ itemId: 'hidden-blocker' }, { itemId: 'visible-blocker' }],
+        },
+      },
+    ]);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleTrackerList({ type: 'bug', readiness: 'blocked' }, '/tmp/ws');
+    const text = result.content[0].text!;
+    const items = JSON.parse(text).structured.items;
+
+    expect(items.map((item: any) => item.id)).toEqual(['dependent']);
+    // Exact, not `objectContaining`: the point of the redaction is the fields
+    // that are absent, and a partial match would pass with the title present.
+    expect(items[0].blockedBy).toEqual([
+      {
+        itemId: 'hidden-blocker',
+        type: 'plan',
+        status: 'in-progress',
+        statusCategory: 'started',
+        outOfScope: true,
+      },
+      {
+        itemId: 'visible-blocker',
+        ref: 'NIM.10',
+        refStatus: 'local',
+        title: 'Open bug blocker',
+        type: 'bug',
+        status: 'in-progress',
+        statusCategory: 'started',
+      },
+    ]);
+    expect(text).not.toContain('Confidential roadmap');
+    expect(text).not.toContain('NIM.9001');
+  });
+
+  // A dangling target does not block -- it is far likelier to be a deletion than
+  // real outstanding work -- but swallowing it leaves the item indistinguishable
+  // from genuinely dependency-free work with a broken link nobody can see.
+  it('reports a dangling dependency on work it still classifies as ready', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => type === 'task' ? {
+      type: 'task',
+      roles: { workflowStatus: 'status' },
+      fields: [
+        {
+          name: 'status',
+          type: 'select',
+          options: [
+            { value: 'to-do', label: 'To Do', category: 'unstarted' },
+            { value: 'done', label: 'Done', category: 'done' },
+          ],
+        },
+        { name: 'dependsOn', type: 'relationship', relationshipTypeKey: 'depends-on' },
+      ],
+    } : undefined);
+    mockDocService.listTrackerItems.mockResolvedValue([
+      {
+        id: 'orphaned',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Declares a deleted blocker',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        customFields: { dependsOn: [{ itemId: 'deleted-blocker' }] },
+      },
+    ]);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const payload = JSON.parse(
+      (await handleTrackerReady({ type: 'task' }, '/tmp/ws')).content[0].text!,
+    );
+
+    expect(payload.structured.items).toEqual([
+      expect.objectContaining({
+        id: 'orphaned',
+        blockedBy: [],
+        unresolvedBlockerIds: ['deleted-blocker'],
+      }),
+    ]);
+    expect(payload.summary).toContain('no longer in this workspace');
+  });
+
+  it('groups ready work into graph-derived tracks and reports the independent track count', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => type === 'task' ? {
+      type: 'task',
+      roles: { workflowStatus: 'status' },
+      fields: [
+        {
+          name: 'status',
+          type: 'select',
+          options: [
+            { value: 'to-do', label: 'To Do', category: 'unstarted' },
+            { value: 'done', label: 'Done', category: 'done' },
+          ],
+        },
+        {
+          name: 'dependsOn',
+          type: 'relationship',
+          relationshipTypeKey: 'depends-on',
+        },
+      ],
+    } : undefined);
+    mockDocService.listTrackerItems.mockResolvedValue([
+      {
+        id: 'component-a-dependent',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Component A dependent',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        customFields: {
+          dependsOn: [{ itemId: 'component-a-root-1' }, { itemId: 'component-a-root-2' }],
+        },
+      },
+      {
+        id: 'component-a-root-1',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Component A root 1',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        updated: '2026-08-22T14:00:00.000Z',
+      },
+      {
+        id: 'isolated',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Isolated',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        updated: '2026-08-22T13:00:00.000Z',
+      },
+      {
+        id: 'component-a-root-2',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Component A root 2',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        updated: '2026-08-22T12:00:00.000Z',
+      },
+      {
+        id: 'component-b-dependent',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Component B dependent',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        customFields: { dependsOn: [{ itemId: 'component-b-root' }] },
+      },
+      {
+        id: 'component-b-root',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Component B root',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        updated: '2026-08-22T11:00:00.000Z',
+      },
+    ]);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleTrackerReady({ type: 'task' }, '/tmp/ws');
+    const payload = JSON.parse(result.content[0].text!);
+
+    expect(payload.structured.trackCount).toBe(3);
+    expect(payload.structured.items.map((item: any) => [item.id, item.trackId])).toEqual([
+      ['component-b-root', 'component-b-dependent'],
+      ['component-a-root-1', 'component-a-dependent'],
+      ['component-a-root-2', 'component-a-dependent'],
+      ['isolated', 'isolated'],
+    ]);
+  });
+
+  it('formats personal blocker refs and emits the local caveat once per response', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => type === 'task' ? {
+      type: 'task',
+      roles: { workflowStatus: 'status' },
+      fields: [
+        {
+          name: 'status',
+          type: 'select',
+          options: [
+            { value: 'to-do', label: 'To Do', category: 'unstarted' },
+            { value: 'done', label: 'Done', category: 'done' },
+          ],
+        },
+        {
+          name: 'dependsOn',
+          type: 'relationship',
+          relationshipTypeKey: 'depends-on',
+        },
+      ],
+    } : undefined);
+    mockDocService.listTrackerItems.mockResolvedValue([
+      {
+        id: 'blocker',
+        localKey: 'NIM.75',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Local blocker',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+      },
+      {
+        id: 'dependent',
+        localKey: 'NIM.76',
+        type: 'task',
+        typeTags: ['task'],
+        title: 'Local dependent',
+        status: 'to-do',
+        workspace: '/tmp/ws',
+        customFields: { dependsOn: [{ itemId: 'blocker' }] },
+      },
+    ]);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleTrackerList({ readiness: 'blocked' }, '/tmp/ws');
+    const text = result.content[0].text!;
+    const payload = JSON.parse(text);
+
+    expect(payload.structured.items).toEqual([
+      expect.objectContaining({
+        id: 'dependent',
+        localKey: 'NIM.76',
+        blockedBy: [expect.objectContaining({
+          itemId: 'blocker',
+          ref: 'NIM.75',
+          refStatus: 'local',
+        })],
+        unblocks: 0,
+      }),
+    ]);
+    expect(payload.structured.items[0]).not.toHaveProperty('issueKey');
+    expect(payload.summary).toContain('[ref: NIM.76]');
+    expect(text).not.toContain('NIM-75');
+    expect(text.split(TRACKER_LOCAL_ISSUE_KEY_MESSAGE)).toHaveLength(2);
   });
 
   // NIM-2072 / NIM-2280: on the SQLite backend `archived` reaches the handler as
@@ -343,6 +807,8 @@ describe('handleTrackerCreate issue-key timing', () => {
     mockGlobalRegistry.validate.mockReturnValue({ valid: true, errors: [] });
     mockAwaitServerIssueKey.mockResolvedValue(null);
     vi.mocked(isTrackerSyncActive).mockReturnValue(true);
+    // Connected implies a room exists; only the offline test parts them.
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(true);
     vi.mocked(shouldSyncTrackerItem).mockReturnValue(true);
   });
 
@@ -352,6 +818,7 @@ describe('handleTrackerCreate issue-key timing', () => {
     // survives `clearAllMocks` -- either one leaking turns a later test's
     // unrelated create into a synced one.
     vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(false);
     vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
     mockQuery.mockReset();
   });
@@ -376,8 +843,32 @@ describe('handleTrackerCreate issue-key timing', () => {
     return JSON.parse(result.content[0].text);
   }
 
+  // NIM-3659: `canIssueKeys` used to be `isTrackerSyncActive`, which is false
+  // whenever the room is merely disconnected. A published item in a real team
+  // tracker created offline was therefore told the workspace has no team and
+  // that publishing would never produce a key -- both false, and the opposite
+  // polarity of the #1346 failure this message exists to prevent. Whether a key
+  // can EVER be minted is a question about the team, not about the socket.
+  it('tells an offline create the key is pending, not that there is no team', async () => {
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(true);
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(true);
+    setupUnkeyedCreateQueue({ published: true, serverKeyArrives: false });
+
+    const result = await handleTrackerCreate({ type: 'bug', title: 'Offline bug' }, '/tmp/ws');
+    const { structured } = parseResult(result);
+
+    expect(structured.item.issueKeyStatus).toBe('unassigned');
+    expect(structured.item.issueKeyMessage).toMatch(/still pending/);
+    expect(structured.item.issueKeyMessage).not.toMatch(/no team/);
+    // Nothing to wait for while the socket is closed -- that stays on the
+    // connected predicate, or every offline create pays the 2s timeout.
+    expect(mockAwaitServerIssueKey).not.toHaveBeenCalled();
+  });
+
   it('leaves a personal tracker item without any key', async () => {
     vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(false);
     vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
     setupUnkeyedCreateQueue({ published: false, serverKeyArrives: false });
 
@@ -389,6 +880,47 @@ describe('handleTrackerCreate issue-key timing', () => {
     expect(summary).toContain('This item has no key until it is published.');
     expect(mockAwaitServerIssueKey).not.toHaveBeenCalled();
     expect(mockQuery.mock.calls.some(([sql]) => /UPDATE tracker_items[\s\S]*SET[\s\S]*issue_key|MAX\(issue_number\)|LC-/.test(String(sql)))).toBe(false);
+  });
+
+  // Without the sweep + the `local_key` mapping in `rowToTrackerItem`, an
+  // unpublished item reports its uuid to the agent: it has no team key, and
+  // its number was only minted by a later list (NIM.2842).
+  it('reports the local number as the ref for an unpublished item', async () => {
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
+    const numbered = makeRow({
+      id: 'bug_test',
+      workspace: '/tmp/ws',
+      issue_key: null,
+      issue_number: null,
+      local_key: 'NIM.7',
+    });
+    mockQuery
+      .mockResolvedValueOnce({ rows: [] })         // INSERT
+      .mockResolvedValueOnce({ rows: [numbered] }) // resolve created
+      .mockResolvedValueOnce({ rows: [numbered] }); // notifyTrackerItemAdded
+
+    const result = await handleTrackerCreate({ type: 'bug', title: 'Personal bug' }, '/tmp/ws');
+    const { structured, summary } = parseResult(result);
+
+    // The handler mints the id, so match the shape rather than a literal.
+    expect(assignLocalKeysToRows).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      '/tmp/ws',
+      [expect.any(String)],
+    );
+    expect(summary).toContain('**Ref**: NIM.7');
+    // A local number is not a *shared* key -- `issueKey` stays empty and only
+    // the room can fill it. But it is a real reference, so the status says
+    // `local`, not `unassigned`. Reporting a numbered item as unassigned is
+    // what made the tool contradict its own ref one line above (#1346).
+    expect(structured.item.issueKeyStatus).toBe('local');
+    expect(structured.item.issueKey).toBeUndefined();
+    expect(structured.item.localKey).toBe('NIM.7');
+    // Sync is inactive here, so "publish it" is not advice this workspace can
+    // act on and must not appear.
+    expect(summary).not.toContain('until it is published');
   });
 
   it('leaves a team draft without any key', async () => {
@@ -581,6 +1113,61 @@ describe('rowToTrackerItem content decoding', () => {
   it('returns undefined when content is null', () => {
     const item = rowToTrackerItem(makeRow({ content: null }));
     expect(item.content).toBeUndefined();
+  });
+});
+
+/**
+ * The agent-facing key contract. A numbered item reporting `unassigned` sent
+ * agents to a publish action that a personal tracker refuses outright, and told
+ * team-less workspaces a key was still coming when nothing would ever mint one
+ * (#1346, #1243). Table-driven because the bug lives in the combinations, not
+ * in any single input.
+ */
+describe('issue key status and message', () => {
+  const LOCAL = 'NIM.75';
+  const TEAM = 'NIM-75';
+
+  it.each([
+    // ref,                        published, canIssueKeys, status,       messageMatch
+    [{ issueKey: TEAM },                false, true,  'assigned',   null],
+    [{ issueKey: TEAM, localKey: LOCAL }, false, true,  'assigned',   null],
+    [{ localKey: LOCAL },               false, true,  'local',      /private to this project/],
+    [{ localKey: LOCAL },               false, false, 'local',      /no team/],
+    [{},                                false, true,  'unassigned', /until it is published/],
+    [{},                                true,  true,  'unassigned', /still pending/],
+    // The #1346 shape: published, healthy auth, and no room to answer.
+    [{},                                true,  false, 'unassigned', /no team/],
+  ] as const)(
+    'reports %j as %s',
+    (ref, published, canIssueKeys, expectedStatus, messageMatch) => {
+      expect(issueKeyStatus(ref)).toBe(expectedStatus);
+      const message = issueKeyMessage(ref, { published, canIssueKeys });
+      if (messageMatch === null) expect(message).toBe('');
+      else expect(message).toMatch(messageMatch);
+    },
+  );
+
+  it('never advises publishing an item that has no room to publish to', () => {
+    for (const ref of [{ localKey: LOCAL }, {}]) {
+      const message = issueKeyMessage(ref, { canIssueKeys: false, published: true });
+      expect(message).not.toMatch(/until it is published/);
+      expect(message).not.toMatch(/still pending/);
+    }
+  });
+
+  it('still explains the private number when it also explains the missing room', () => {
+    // Both facts matter: why there is no key, and what the reference in hand
+    // actually is. Reporting only the first leaves the agent with a number it
+    // does not know the rules for.
+    const message = issueKeyMessage({ localKey: LOCAL }, { canIssueKeys: false });
+    expect(message).toMatch(/no team/);
+    expect(message).toMatch(/private to this project/);
+  });
+
+  it('prefers the room key over the local number as the display ref', () => {
+    expect(getTrackerDisplayRef({ id: 'row_1', issueKey: TEAM, localKey: LOCAL })).toBe(TEAM);
+    expect(getTrackerDisplayRef({ id: 'row_1', localKey: LOCAL })).toBe(LOCAL);
+    expect(getTrackerDisplayRef({ id: 'row_1' })).toBe('row_1');
   });
 });
 

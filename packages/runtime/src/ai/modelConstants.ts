@@ -489,6 +489,7 @@ export const DEFAULT_MODELS = {
   'openai-codex': 'openai-codex:gpt-5.6-sol',
   'openai-codex-acp': 'openai-codex-acp:gpt-5.6-sol',
   lmstudio: 'lmstudio:local-model',
+  ollama: 'ollama:local-model',
   opencode: 'opencode:anthropic/claude-sonnet-4-5',
   'copilot-cli': 'copilot-cli:default',
 };

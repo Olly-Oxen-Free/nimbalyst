@@ -1,0 +1,183 @@
+prd: ollama-provider
+tasks:
+  - id: T1
+    title: "Ollama runtime chat provider"
+    complexity: 5
+    priority: must
+    depends_on: []
+    description: >
+      Add packages/runtime/src/ai/server/providers/OllamaProvider.ts, modeled on
+      LMStudioProvider.ts: initialize() connection-tests against baseUrl (default
+      http://localhost:11434) via GET /v1/models; sendMessage() streams SSE chat
+      completions from POST /v1/chat/completions with the same OpenAI-style
+      messages[]/tool-calling handling as LMStudioProvider; getCapabilities() returns
+      the same chat-provider profile (streaming: true, tools: true, mcpSupport: false,
+      edits: true, resumeSession: false, supportsFileTools: false); static getModels()/
+      getDefaultModels()/getDefaultModel() for dynamic model discovery.
+      Register the new provider: add 'ollama' to AI_PROVIDER_TYPES in types.ts (do NOT
+      add it to any agent-provider allow-list — it stays a chat provider), add a
+      construction case in ProviderFactory.ts, wire dynamic discovery in
+      ModelRegistry.ts (shouldFetch/getModelsForProvider, keyed on apiKeys['ollama_url'],
+      mirroring the lmstudio_url pattern), add an `ollama: NO_AGENT_CAPABILITIES` entry
+      to agentCapabilities.ts, and export the new provider from the runtime barrel
+      (server/index.ts) so packages/electron can import it.
+      Adding 'ollama' to AI_PROVIDER_TYPES makes two exhaustive object literals outside
+      this provider's own files fail to typecheck — fix both here so T1 lands
+      independently green rather than leaving the repo red until T2a merges:
+      AIService.ts's `enabledProviders: Record<AIProviderType, ...>` literal
+      (~line 3724, add a minimal `ollama: { enabled: false }` entry — T2a fills in the
+      real wiring around it later) and modelConstants.ts's `DEFAULT_MODELS` map
+      (~line 491, add an `ollama` entry alongside `lmstudio`).
+    files:
+      - packages/runtime/src/ai/server/providers/OllamaProvider.ts
+      - packages/runtime/src/ai/providers/__tests__/OllamaProvider.test.ts
+      - packages/runtime/src/ai/server/index.ts
+      - packages/runtime/src/ai/server/types.ts
+      - packages/runtime/src/ai/server/ProviderFactory.ts
+      - packages/runtime/src/ai/server/ModelRegistry.ts
+      - packages/runtime/src/ai/server/agentCapabilities.ts
+      - packages/runtime/src/ai/modelConstants.ts
+      - packages/electron/src/main/services/ai/AIService.ts
+    acceptance_criteria:
+      - "OllamaProvider.initialize() throws a clear error when the daemon is unreachable, and resolves a real model list when it is (verified live against http://localhost:11434)."
+      - "ProviderFactory.createProvider('ollama', ...) returns an OllamaProvider instance, and BUILTIN_AGENT_CAPABILITIES.ollama === NO_AGENT_CAPABILITIES."
+      - "Unit tests in OllamaProvider.test.ts stub global.fetch only (no vi.mock('@nimbalyst/runtime', ...) — OllamaProvider extends BaseAIProvider and the barrel drags in the Lexical tree at ~2.6s/file; import from the deep path), and cover: successful model discovery, connection failure, and a streamed chat completion with a tool call. File starts with `// @vitest-environment node` — it never touches the DOM."
+      - "npm run typecheck passes repo-wide (this task alone, before T2a/T2b exist) — the enabledProviders and DEFAULT_MODELS fixups above are what make that true."
+      - "Manual verification: from a Claude-backed session, create_session({ provider: 'ollama', model: 'ollama:<a loaded tag>', prompt: '...' }) successfully spins up a working child session that streams a real response from the local daemon — confirms cross-provider subagent dispatch (Claude orchestrator -> local Ollama model) works end-to-end, not just that OllamaProvider works in isolation."
+
+  - id: T2a
+    title: "Wire Ollama into the Electron main process (settings, AIService, sync)"
+    complexity: 4
+    priority: must
+    depends_on: [T1]
+    description: >
+      Add 'ollama' everywhere 'lmstudio' is currently special-cased in the main
+      process. shared/settings/keys.ts: add `ai.provider.ollama` (ProviderConfigSchema,
+      default `{ enabled: false, baseUrl: 'http://localhost:11434', testStatus: 'idle' }`)
+      AND `ai.apiKey.ollama_url` (bare string setting, default
+      'http://localhost:11434') — mirroring lmstudio_url exactly. That second key is
+      not a credential; it's the same apiKeys-namespaced URL convention LM Studio
+      already uses, and ModelRegistry/chatProviderVisibility read the base URL from
+      there, not from provider settings alone. AIService.ts: complete the wiring begun
+      in T1 (default provider-settings shape, getApiKeyForProvider 'not-required'
+      sentinel — NEVER a process.env fallback, hasAnyProviderConfigured, connection
+      test against /v1/models, init-config baseUrl resolution, both CHAT_PROVIDERS
+      literal arrays, persisted-settings write path including ai.apiKey.ollama_url,
+      extension completion provider resolution). MessageStreamingHandler.ts: API-key
+      bypass, baseUrl injection on reinit/refresh, the ['claude','openai','lmstudio']
+      membership checks. SyncManager.ts (~line 1246-1250): add 'ollama' to the mobile
+      model-sync enabledSet and modelsConfig.ollama_url — omitting this means Ollama
+      models silently never reach the mobile app. preload/index.ts and electron.d.ts:
+      extend the IPC-typed surface to match.
+      Confirm aiServiceUtils.test.ts's only 'lmstudio' reference is a comment before
+      touching it — don't edit it just because it's in the grep hit list.
+    files:
+      - packages/electron/src/shared/settings/keys.ts
+      - packages/electron/src/main/services/ai/AIService.ts
+      - packages/electron/src/main/services/ai/MessageStreamingHandler.ts
+      - packages/electron/src/main/services/SyncManager.ts
+      - packages/electron/src/preload/index.ts
+      - packages/electron/src/renderer/electron.d.ts
+    acceptance_criteria:
+      - "ai.apiKey.ollama_url setting exists, defaults to http://localhost:11434, and is what ModelRegistry/chatProviderVisibility read (verified in T2b, not duplicated here)."
+      - "Both CHAT_PROVIDERS literal arrays in AIService.ts include 'ollama'."
+      - "Connection-test IPC path succeeds against the live local Ollama daemon."
+      - "SyncManager includes 'ollama' in the mobile model-sync enabledSet and modelsConfig."
+      - "No process.env fallback introduced for Ollama config anywhere in this diff — this is a review-time check on the PR, not an automated test (getApiKeyForProvider is awkward to unit-test in isolation)."
+      - "npm run typecheck passes for packages/electron's main process."
+
+  - id: T3
+    title: "OpenCode-Ollama coding-agent bridge"
+    complexity: 4
+    priority: must
+    depends_on: []
+    description: >
+      The 'ollama' chat provider (T1/T2a/T2b) is chat-only, matching lmstudio's
+      capability profile (no MCP, no file tools) — it does NOT make Ollama models
+      usable as coding agents. Real coding-agent capability comes from a separate,
+      independent mechanism: OpenCode (already a full agent provider — MCP, file
+      tools, permissions, session resume, extends BaseAgentProvider) already has a
+      built-in bridge pattern for pointing its own agent loop at a local
+      OpenAI-compatible server as its model backend:
+      OpenCodeConfigService.upsertLMStudioBridge() (~line 159) writes a
+      `provider.lmstudio` block into opencode.json using the generic
+      `@ai-sdk/openai-compatible` npm adapter, pointed at LM Studio's `/v1` endpoint.
+      OpenCode then treats those models as first-class, with full tool/MCP/file-edit
+      access — the agent loop is OpenCode's, not the model backend's. The file's own
+      header comment (line 33) already names Ollama as a config users have gotten
+      working manually this way, referencing issue #284.
+      Mirror this exactly for Ollama: add `upsertOllamaBridge()` /
+      `removeOllamaBridge()` to OpenCodeConfigService.ts (provider key 'ollama', same
+      `@ai-sdk/openai-compatible` npm package, baseURL defaulting to
+      http://localhost:11434/v1, model list populated from live discovery). Add
+      `fetchOllamaModels(baseUrl)` to OpenCodeConfigHandlers.ts hitting Ollama's
+      `/api/tags` (its authoritative, always-present model-list endpoint — richer and
+      more reliable than the OpenAI-compat shim's `/v1/models` for this purpose), and
+      register `opencode-config:upsert-ollama` / `opencode-config:remove-ollama`
+      IPC handlers mirroring the lmstudio ones exactly.
+      Add an Ollama bridge section to OpenCodePanel.tsx mirroring the existing LM
+      Studio section verbatim in structure: base URL field (default
+      http://localhost:11434), connect/disconnect buttons, bridge-active status with
+      model count, and an 'ollama' model group in the picker dropdown.
+      This task has no file overlap with T1/T2a/T2b and no dependency on them — it
+      can run in parallel with T1.
+    files:
+      - packages/electron/src/main/services/OpenCodeConfigService.ts
+      - packages/electron/src/main/services/__tests__/OpenCodeConfigService.ollamaBridge.test.ts
+      - packages/electron/src/main/ipc/OpenCodeConfigHandlers.ts
+      - packages/electron/src/renderer/components/GlobalSettings/panels/OpenCodePanel.tsx
+    acceptance_criteria:
+      - "upsertOllamaBridge() writes a provider.ollama block (npm: '@ai-sdk/openai-compatible', options.baseURL normalized to end in /v1, models map deduped against existing entries) without disturbing other provider blocks (e.g. an existing provider.lmstudio block survives untouched)."
+      - "removeOllamaBridge() cleanly deletes only the provider.ollama key."
+      - "New unit test (OpenCodeConfigService.ollamaBridge.test.ts) covers upsert-creates, upsert-merges-into-existing, and remove — this is the first unit test of the bridge pattern at all (LM Studio's own bridge has none to copy structurally, only OpenCodeConfigService.paths.test.ts exists and covers unrelated path-resolution logic)."
+      - "OpenCodePanel renders an Ollama bridge section structurally mirroring the LM Studio one (base URL default http://localhost:11434, connect/disconnect, model count status) — no new presentation-only test required for this UI addition per repo convention."
+      - "Manual end-to-end verification, not just config-write correctness: connect the bridge, select an Ollama model (e.g. qwen2.5-coder:14b) in OpenCode's model picker, and run a real OpenCode agent session against it that performs an actual file edit. This is the proof that MCP/file-tools genuinely work through Ollama as the backend, satisfying the 'usable as coding agents' requirement — a config write alone does not prove this."
+      - "npm run typecheck && npm run test:prepush pass."
+
+  - id: T2b
+    title: "Wire Ollama into Electron settings UI and model picker"
+    complexity: 3
+    priority: must
+    depends_on: [T2a]
+    description: >
+      Add GlobalSettings/panels/OllamaPanel.tsx (new file, modeled directly on
+      LMStudioPanel.tsx): a base-URL field defaulting to http://localhost:11434 and a
+      connection-test button, wired into SettingsView.tsx's provider switch (~line
+      874-875, same shape as `case 'lmstudio': return wrapWithOverride('lmstudio', ...)`)
+      and into SettingsSidebar.tsx / settingsRoutes.ts. Also wire
+      Settings/panels/ProjectAIProvidersPanel.tsx (per-project override),
+      appSettings.ts atoms, ModelSelector.tsx, modelUtils.ts, aiApi.ts.
+      chatProviderVisibility.ts needs new logic, not a list entry: it currently
+      hardcodes `if (providerId !== 'lmstudio') return false` and compares against the
+      exported DEFAULT_LM_STUDIO_BASE_URL constant. Adding 'ollama' to
+      DIRECT_CHAT_PROVIDER_IDS alone leaves Ollama permanently reported as "not
+      meaningfully configured." Add an explicit ollama branch (its own default
+      base-URL constant, checked against config.baseUrl / apiKeys.ollama_url) so the
+      function actually detects a configured Ollama provider.
+      Cosmetic, non-blocking: add an 'ollama' case to
+      ui/icons/MaterialSymbol.tsx (provider icon) and
+      ui/AgentTranscript/components/RichTranscriptView.tsx (provider display name;
+      already has a `default:` fallback so this doesn't block typecheck, just fixes
+      the label shown in transcripts).
+    files:
+      - packages/electron/src/renderer/store/atoms/appSettings.ts
+      - packages/electron/src/renderer/components/Settings/SettingsView.tsx
+      - packages/electron/src/renderer/components/Settings/SettingsSidebar.tsx
+      - packages/electron/src/renderer/components/Settings/settingsRoutes.ts
+      - packages/electron/src/renderer/components/GlobalSettings/panels/OllamaPanel.tsx
+      - packages/electron/src/renderer/components/Settings/panels/ProjectAIProvidersPanel.tsx
+      - packages/electron/src/renderer/components/UnifiedAI/ModelSelector.tsx
+      - packages/electron/src/renderer/utils/modelUtils.ts
+      - packages/electron/src/renderer/utils/chatProviderVisibility.ts
+      - packages/electron/src/renderer/services/aiApi.ts
+      - packages/runtime/src/ui/icons/MaterialSymbol.tsx
+      - packages/runtime/src/ui/AgentTranscript/components/RichTranscriptView.tsx
+      - packages/electron/src/renderer/components/Settings/__tests__/settingsRoutes.test.ts
+      - packages/electron/src/renderer/components/UnifiedAI/__tests__/modelPickerKeyboard.test.tsx
+      - packages/electron/src/renderer/utils/__tests__/chatProviderVisibility.test.ts
+    acceptance_criteria:
+      - "OllamaPanel renders in Settings > AI Providers with an editable base URL field (default http://localhost:11434) and a working connection-test button."
+      - "chatProviderVisibility.test.ts gets a new test case exercising the ollama branch's own logic — not just an updated fixture list (that branch is new behavior, not a data change)."
+      - "modelPickerKeyboard.test.tsx is updated only as an existing-fixture-list change — no new assertions on element ordering, count, or label text (presentation-only, not worth a test per repo convention)."
+      - "An Ollama-backed chat session appears in the model picker and streams a real response end-to-end in a running dev instance — manual verification, per end-to-end-verification.md; requires the user's dev server."
+      - "npm run typecheck && npm run test:prepush pass."

@@ -30,12 +30,13 @@
  *   gates the initial editor mount. After that, no more re-renders.
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MarkdownEditor, MonacoEditor, DocumentPathProvider } from '@nimbalyst/runtime';
 import { $convertFromEnhancedMarkdownString, getEditorTransformers, type CommentsConfig } from '@nimbalyst/runtime/editor';
 import {
   getTeamSyncProvider,
+  getSharedDocumentsForScopeKey,
   sharedDocumentsAtom,
   sharedFoldersAtom,
 } from '../../store/atoms/collabDocuments';
@@ -74,6 +75,7 @@ import {
   type DocumentReplicaCacheListener,
 } from '../../services/DocumentReplicaCache';
 import {
+  markCollabRenderFailed,
   publishCollabTransportState,
   resetCollabDocumentState,
   setCollabOutboxState,
@@ -105,6 +107,7 @@ import type { DocumentSessionActions } from './DocumentSessionControl';
 import {
   CollabDocumentHeaderMeta,
   CollabRecoveryBanner,
+  CollabRenderFailureBanner,
 } from './CollabDocumentHeaderMeta';
 import {
   getSharedDocumentDisplayPath,
@@ -114,8 +117,16 @@ import {
   createCollaborationContext,
   createCollabExtensionHost,
   createExtensionAwarenessBridge,
+  disposeCollaborationContext,
+  getHostedCollaborationComments,
   notifyCollabStatus,
 } from './collabExtensionHost';
+import type { CollaborationCommentsHostConfig } from './collaborationCommentsService';
+import {
+  CollabCommentsPanelDock,
+  useCollabCommentsPanel,
+} from './CollabCommentsPanelDock';
+import { createCommentPanelOpener } from './collabCommentPanelRequests';
 import { hasCollabReplicaPreloadSupport } from '../../store/listeners/collabReplicaListeners';
 import { getCollaborativeDocumentTypeCatalog } from '../../services/CollaborativeDocumentTypeCatalog';
 import { getCodeCollabExportFileName } from '../../utils/CodeCollabContentAdapter';
@@ -127,6 +138,7 @@ import {
   toStableAnalyticsCategory,
 } from '../../../shared/analytics/teamAnalytics';
 import { trackTeamAnalyticsEvent } from '../../utils/teamAnalytics';
+import { resolveDocumentCommentCapabilities } from '../../../../../collab-bundle/src/editor/commenting';
 
 interface CollaborativeTabEditorProps {
   /** The collab:// URI for this document */
@@ -564,6 +576,13 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
             console.warn('[CollaborativeTabEditor] Backup serialization failed:', error);
           }
         },
+        // A remote update applied to the Y.Doc but threw while rendering. The
+        // socket stays open and presence keeps flowing, so nothing else marks
+        // this document as degraded.
+        onEditorBindingError: (error) => {
+          console.error('[CollaborativeTabEditor] Editor binding failed to render a remote update:', error);
+          markCollabRenderFailed(filePath);
+        },
         onStatusChange: (status) => {
           observeHealth(status);
           publishCollabTransportState(filePath, status);
@@ -756,6 +775,12 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
                 console.warn('[CollaborativeTabEditor] Backup serialization failed:', error);
               }
             },
+            // See the sibling handler above: a binding failure is otherwise
+            // invisible because transport and outbox both stay healthy.
+            onEditorBindingError: (error) => {
+              console.error('[CollaborativeTabEditor] Editor binding failed to render a remote update:', error);
+              markCollabRenderFailed(filePath);
+            },
             onLocalUpdate: recordFirstLocalEdit,
             onStatusChange: events.onTransportStateChange,
             onOfflineMetric: recordOfflineMetric,
@@ -909,6 +934,7 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
         .map((m) => ({
           userId: m.userId,
           name: teamMemberDisplayName(m),
+          email: m.email,
           personalOrgId: m.personalOrgId,
         }));
     },
@@ -1456,6 +1482,8 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
         onDiscardLocalCopy={handleDiscardLocalCopy}
       />
 
+      <CollabRenderFailureBanner filePath={filePath} />
+
       {/* Editor area */}
       <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', position: 'relative' }}>
         {/* NIM-949: gate editing until the room hydrates, so a server-only doc
@@ -1719,6 +1747,24 @@ interface ExtensionCollabBranchProps {
   onDirtyChange?: (isDirty: boolean) => void;
 }
 
+type DocumentCommentAccessSource = {
+  canAccess(input: {
+    orgId?: string | null;
+    projectId?: string | null;
+    action: 'view' | 'edit' | 'admin';
+  }): Promise<{ allowed: boolean }>;
+};
+
+function getDocumentCommentAccessSource():
+  | DocumentCommentAccessSource
+  | undefined {
+  return (
+    window.electronAPI as ElectronAPI & {
+      org?: DocumentCommentAccessSource;
+    }
+  ).org;
+}
+
 const ExtensionCollabBranch: React.FC<ExtensionCollabBranchProps> = ({
   registration,
   syncProvider,
@@ -1732,6 +1778,9 @@ const ExtensionCollabBranch: React.FC<ExtensionCollabBranchProps> = ({
 }) => {
   const setHistoryDialogFile = useSetAtom(historyDialogFileAtom);
   const bumpHistoryControllers = useSetAtom(collabHistoryControllerBumpAtom);
+  const commentInstanceId = useId();
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
   const adapterRef = useRef<import('@nimbalyst/runtime').RevisionSnapshotAdapter | null>(null);
   const unregisterControllerRef = useRef<(() => void) | null>(null);
 
@@ -1813,18 +1862,102 @@ const ExtensionCollabBranch: React.FC<ExtensionCollabBranchProps> = ({
     }
   }, [publishHistoryController]);
 
+  const commentsHostConfig = useMemo<
+    CollaborationCommentsHostConfig | undefined
+  >(() => {
+    if (typeof getDocumentCommentAccessSource()?.canAccess !== 'function') {
+      return undefined;
+    }
+    const documentUri = buildCollabUri(
+      activeConfig.orgId,
+      activeConfig.documentId,
+    );
+    const currentUser = {
+      id: activeConfig.teamMemberId,
+      name:
+        activeConfig.userName ||
+        activeConfig.userEmail ||
+        activeConfig.teamMemberId,
+    };
+    return {
+      currentUser,
+      documentId: activeConfig.documentId,
+      documentTitle: activeConfig.title,
+      documentUri,
+      instanceId: commentInstanceId,
+      isActive: () => isActiveRef.current,
+      isVisible: () => isActiveRef.current,
+      isHydrated: () => syncProvider.isSynced(),
+      getMembers: () => {
+        const teamProvider = getTeamSyncProvider(activeConfig.scope);
+        return (teamProvider?.getTeamState()?.members ?? [])
+          .filter((member) => member.userId !== currentUser.id)
+          .map((member) => ({
+            userId: member.userId,
+            name: teamMemberDisplayName(member),
+            email: member.email,
+            personalOrgId: member.personalOrgId,
+          }));
+      },
+      resolveCapabilities: async () => {
+        const canAccess = getDocumentCommentAccessSource()?.canAccess;
+        const document = getSharedDocumentsForScopeKey(
+          activeConfig.scope.scopeKey,
+        ).find(
+          (candidate) => candidate.documentId === activeConfig.documentId,
+        );
+        if (typeof canAccess !== 'function' || !document) {
+          return { read: false, comment: false };
+        }
+        const accessInput = {
+          orgId: activeConfig.orgId,
+          projectId: document.teamProjectId,
+        };
+        return resolveDocumentCommentCapabilities(canAccess, accessInput);
+      },
+      onMention: (recipientUserIds, payload) => {
+        notifyDocumentCommentRecipients({
+          workspacePath: activeConfig.scope.scopeKey,
+          documentId: activeConfig.documentId,
+          reason: 'mention',
+          recipientUserIds,
+          payload,
+        });
+      },
+      onReply: (recipientUserIds, payload) => {
+        notifyDocumentCommentRecipients({
+          workspacePath: activeConfig.scope.scopeKey,
+          documentId: activeConfig.documentId,
+          reason: 'reply',
+          recipientUserIds,
+          payload,
+        });
+      },
+      // This branch always mounts the host-owned comments pane below, so
+      // `openPanel` is honest here. A host that cannot show one leaves this
+      // undefined and the SDK method stays absent rather than a silent no-op.
+      onOpenPanel: createCommentPanelOpener(documentUri),
+    };
+  }, [activeConfig, commentInstanceId, syncProvider]);
+
   const collaboration = useMemo(
     () =>
       createCollaborationContext({
         syncProvider,
         awareness: bridgeRef.current!.awareness,
         activeConfig,
+        comments: commentsHostConfig,
         onRevisionAdapterChange: (adapter) => {
           adapterRef.current = adapter;
           publishHistoryController(adapter);
         },
       }),
-    [activeConfig, publishHistoryController, syncProvider]
+    [activeConfig, commentsHostConfig, publishHistoryController, syncProvider]
+  );
+
+  useEffect(
+    () => () => disposeCollaborationContext(collaboration),
+    [collaboration],
   );
 
   // Tear down the controller when the branch unmounts.
@@ -1873,11 +2006,38 @@ const ExtensionCollabBranch: React.FC<ExtensionCollabBranchProps> = ({
     [filePath, fileName, isActive, activeConfig, collaboration, onDirtyChange, setHistoryDialogFile]
   );
 
+  // The comments pane is the platform's, not the extension's: it mounts beside
+  // whatever the extension renders whenever this host can honestly provide
+  // comment authority for the document. The extension contributes only its
+  // anchor adapter and its own markers.
+  const hostedComments = useMemo(
+    () => getHostedCollaborationComments(collaboration) ?? null,
+    [collaboration],
+  );
+  const commentPanel = useCollabCommentsPanel({
+    documentUri: commentsHostConfig?.documentUri ?? '',
+    panelSource: hostedComments?.panelSource ?? null,
+  });
+
   const ExtensionEditor = registration.component;
   return (
     <DocumentPathProvider documentPath={filePath}>
-      <div style={{ flex: 1, overflow: 'hidden' }}>
-        <ExtensionEditor host={host} />
+      <div
+        className="extension-collab-branch"
+        style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}
+      >
+        <div
+          className="extension-collab-branch-editor"
+          style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}
+        >
+          <ExtensionEditor host={host} />
+        </div>
+        {hostedComments && (
+          <CollabCommentsPanelDock
+            hosted={hostedComments}
+            panel={commentPanel}
+          />
+        )}
       </div>
     </DocumentPathProvider>
   );

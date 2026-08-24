@@ -1,0 +1,20 @@
+{
+  "slug": "ollama-provider",
+  "status": "ready-for-merge",
+  "tracker": {
+    "linked_item_id": "tsk_mt3lum1zoerbrt",
+    "note": "Existing task item reused; no separate plan item filed per user request to avoid duplication."
+  },
+  "execution": {
+    "branch": "feature/ollama-provider",
+    "waves_completed": [
+      { "wave": 1, "tasks": ["T1", "T3"], "status": "merged" },
+      { "wave": 2, "tasks": ["T2a"], "status": "merged" },
+      { "wave": 3, "tasks": ["T2b"], "status": "merged" }
+    ],
+    "waves_remaining": [],
+    "unverified": [
+      "Manual dev-instance check: an Ollama-backed chat session streams a real response end-to-end. No dev server was running during execution (packaged build detected); user must run npm run dev and verify, or ask the agent to verify once it's running."
+    ]
+  }
+}

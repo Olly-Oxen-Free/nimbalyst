@@ -9,6 +9,8 @@ const CONFIG_REL_PATH = ['.config', 'opencode', 'opencode.json'];
 const CONFIG_SCHEMA_URL = 'https://opencode.ai/config.json';
 const LMSTUDIO_PROVIDER_KEY = 'lmstudio';
 const LMSTUDIO_NPM_PACKAGE = '@ai-sdk/openai-compatible';
+const OLLAMA_PROVIDER_KEY = 'ollama';
+const OLLAMA_NPM_PACKAGE = LMSTUDIO_NPM_PACKAGE;
 
 /**
  * Resolve the opencode.json path in priority order matching the
@@ -72,6 +74,15 @@ export interface LMStudioBridgeOptions {
   /** LM Studio server base URL as configured in Nimbalyst (e.g. http://127.0.0.1:1234). */
   baseUrl: string;
   /** Model ids discovered from LM Studio's /v1/models response. */
+  modelIds: string[];
+  /** Optional human-readable display name for the provider entry. */
+  displayName?: string;
+}
+
+export interface OllamaBridgeOptions {
+  /** Ollama server base URL as configured in Nimbalyst (e.g. http://localhost:11434). */
+  baseUrl: string;
+  /** Model ids discovered from Ollama's /api/tags response. */
   modelIds: string[];
   /** Optional human-readable display name for the provider entry. */
   displayName?: string;
@@ -187,6 +198,47 @@ export class OpenCodeConfigService {
     const current = await this.readConfig();
     if (!current?.provider?.[LMSTUDIO_PROVIDER_KEY]) return current;
     const { [LMSTUDIO_PROVIDER_KEY]: _omit, ...rest } = current.provider;
+    const next: OpenCodeFileConfig = { ...current, provider: rest };
+    await this.writeConfigRaw(next);
+    return next;
+  }
+
+  /**
+   * Add or update an OpenCode provider block that bridges to a local Ollama server.
+   * Existing entries under `provider.ollama` are preserved -- new model ids are
+   * appended, and the baseURL is updated to match the user's current Ollama config.
+   */
+  async upsertOllamaBridge(options: OllamaBridgeOptions): Promise<OpenCodeFileConfig> {
+    const baseURL = normalizeOpenAICompatibleBaseUrl(options.baseUrl);
+    const current = (await this.readConfig()) ?? {};
+    const provider = { ...(current.provider ?? {}) };
+    const existing: OpenCodeFileProvider = provider[OLLAMA_PROVIDER_KEY] ?? {};
+    const existingModels = existing.models ?? {};
+
+    const models: Record<string, { name?: string }> = { ...existingModels };
+    for (const modelId of options.modelIds) {
+      if (!modelId) continue;
+      if (!models[modelId]) {
+        models[modelId] = { name: modelId };
+      }
+    }
+
+    provider[OLLAMA_PROVIDER_KEY] = {
+      ...existing,
+      name: options.displayName ?? existing.name ?? 'Ollama (local)',
+      npm: existing.npm ?? OLLAMA_NPM_PACKAGE,
+      options: { ...(existing.options ?? {}), baseURL },
+      models,
+    };
+
+    return this.mergeConfig({ provider });
+  }
+
+  /** Remove the `provider.ollama` block entirely. */
+  async removeOllamaBridge(): Promise<OpenCodeFileConfig | null> {
+    const current = await this.readConfig();
+    if (!current?.provider?.[OLLAMA_PROVIDER_KEY]) return current;
+    const { [OLLAMA_PROVIDER_KEY]: _omit, ...rest } = current.provider;
     const next: OpenCodeFileConfig = { ...current, provider: rest };
     await this.writeConfigRaw(next);
     return next;

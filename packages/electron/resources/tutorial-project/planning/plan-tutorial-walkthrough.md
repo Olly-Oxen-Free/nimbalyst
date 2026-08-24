@@ -7,11 +7,30 @@ planStatus:
   priority: medium
   owner: tutorial
   stakeholders: []
-  tags: [tutorial, onboarding]
-  created: "2026-07-30"
-  startDate: "2026-07-30"
-  updated: "2026-07-30"
+  tags:
+    - tutorial
+    - onboarding
+  created: '2026-07-30'
+  startDate: '2026-07-30'
+  updated: '2026-07-30'
   progress: 40
+planId: plan-tutorial-walkthrough
+title: Tutorial walkthrough
+status: in-development
+planType: feature
+priority: medium
+owner: tutorial
+stakeholders: []
+tags:
+  - tutorial
+  - onboarding
+created: '2026-07-30'
+startDate: '2026-07-30'
+updated: '2026-08-20'
+progress: 40
+archived: 'true'
+trackerStatus:
+  type: plan
 ---
 
 # Tutorial walkthrough

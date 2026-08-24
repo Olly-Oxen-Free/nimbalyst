@@ -16,6 +16,7 @@ import {
   ORG_PROJECT_WALK_DISMISSED_SETTING_KEY,
 } from '../../shared/orgProjectWalk';
 import { normalizeCodexProviderConfig, omitModelsField } from '@nimbalyst/runtime/ai/server/utils/modelConfigUtils';
+import type { OpenCodeModelCatalogCache } from '@nimbalyst/runtime/ai/server';
 
 // Theme can be a built-in theme or an extension theme ID (format: "extensionId:themeId")
 export type AppTheme = 'dark' | 'light' | 'system' | 'auto' | 'crystal-dark' | string;
@@ -23,6 +24,8 @@ export type { SessionState, SessionWindow } from '../types';
 
 export type CompletionSoundType = 'chime' | 'bell' | 'pop' | 'alert' | 'custom' | 'none';
 export type ReleaseChannel = 'stable' | 'alpha';
+export type ProjectRailPosition = 'left' | 'top';
+export type ProjectRailExpandedDisplay = 'always-visible' | 'hover-reveal';
 export type PreferredTerminalShell = 'auto' | 'pwsh' | 'powershell' | 'git-bash' | 'wsl' | 'cmd';
 export type WorkspaceFileTreeFilter = 'all' | 'markdown' | 'known' | 'git-uncommitted' | 'git-worktree' | 'ai-read' | 'ai-written';
 export type AttachmentStagingMode = 'temp' | 'workspace' | 'custom';
@@ -82,6 +85,10 @@ export const DEFAULT_DATABASE_MAINTENANCE: DatabaseMaintenanceSettings = {
 interface AppStoreSchema {
   theme: AppTheme;
   themeIsDark?: boolean; // Whether the current theme is dark (used for extension themes)
+  // The active theme's resolved --nim-bg, reported by the renderer once it has
+  // applied the theme. Lets window creation paint the real colour before CSS
+  // parses; cleared on a theme change until the new theme reports its own.
+  themeBackgroundColor?: string;
   // Set when the active theme disappeared (extension uninstalled/disabled or
   // file removed) and the runtime fell back to a base theme. Cleared when the
   // user explicitly applies a theme or dismisses the banner in the Themes panel.
@@ -188,6 +195,8 @@ interface AppStoreSchema {
     // path retained as an escape hatch.
     transport?: 'sdk' | 'app-server';
   };
+  /** Live provider.list catalog, keyed by OpenCode binary + auth identity. */
+  openCodeModelCatalogCache?: OpenCodeModelCatalogCache;
   // Unified agent workflow registry source settings
   agentWorkflowSources?: {
     workspaceClaudeCompatibilityEnabled?: boolean;
@@ -291,6 +300,12 @@ interface AppStoreSchema {
   // Multi-project rail: opt-in flag to host multiple projects in a single
   // window. When false (default), each project still gets its own window.
   multiProjectMode?: boolean;
+  // Project-bar layout: dock the multi-project rail on the left edge or
+  // merge it into the top title bar. Defaults to 'left' (today's behavior).
+  projectRailPosition?: ProjectRailPosition;
+  // When the project bar is top-docked, whether non-selected projects stay
+  // always visible or only reveal on hover. Defaults to 'always-visible'.
+  projectRailExpandedDisplay?: ProjectRailExpandedDisplay;
   // Workspace paths currently warm in the multi-project rail, in display
   // order. Empty when multiProjectMode is off or before the user adds any.
   openProjects?: string[];
@@ -1005,6 +1020,23 @@ export function setTheme(theme: AppTheme, isDark?: boolean): void {
 
 export function getThemeIsDark(): boolean | undefined {
   return getAppStore().get('themeIsDark');
+}
+
+export function setThemeBackgroundColor(color: string): void {
+  getAppStore().set('themeBackgroundColor', color);
+}
+
+export function getThemeBackgroundColor(): string | undefined {
+  return getAppStore().get('themeBackgroundColor');
+}
+
+/**
+ * Drop the remembered canvas colour. Called on a theme change: until the
+ * renderer applies the new theme and reports its --nim-bg, the stored colour
+ * belongs to the theme we just left and would paint the wrong flash.
+ */
+export function clearThemeBackgroundColor(): void {
+  getAppStore().delete('themeBackgroundColor');
 }
 
 export function getPendingThemeFallback(): { missingId: string; appliedId: string } | undefined {
@@ -1730,6 +1762,14 @@ export function getDefaultAIModel(): string | undefined {
 
 export function setDefaultAIModel(model: string): void {
   getAppStore().set('defaultAIModel', model);
+}
+
+export function getOpenCodeModelCatalogCache(): OpenCodeModelCatalogCache | null {
+  return getAppStore().get('openCodeModelCatalogCache') ?? null;
+}
+
+export function setOpenCodeModelCatalogCache(cache: OpenCodeModelCatalogCache): void {
+  getAppStore().set('openCodeModelCatalogCache', cache);
 }
 
 // Default Effort Level Settings (Opus 4.6 adaptive reasoning)
@@ -2746,6 +2786,22 @@ export function getMultiProjectMode(): boolean {
 
 export function setMultiProjectMode(enabled: boolean): void {
   getAppStore().set('multiProjectMode', enabled);
+}
+
+export function getProjectRailPosition(): ProjectRailPosition {
+  return getAppStore().get('projectRailPosition', 'left');
+}
+
+export function setProjectRailPosition(position: ProjectRailPosition): void {
+  getAppStore().set('projectRailPosition', position);
+}
+
+export function getProjectRailExpandedDisplay(): ProjectRailExpandedDisplay {
+  return getAppStore().get('projectRailExpandedDisplay', 'always-visible');
+}
+
+export function setProjectRailExpandedDisplay(mode: ProjectRailExpandedDisplay): void {
+  getAppStore().set('projectRailExpandedDisplay', mode);
 }
 
 export function getOpenProjectPaths(): string[] {
