@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import React from 'react';
-import { cleanup, render } from '@testing-library/react';
+import { act, cleanup, fireEvent, render } from '@testing-library/react';
 import { Provider, createStore } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TeammateInfo } from '../TeammatePanel';
@@ -28,7 +28,7 @@ function teammate(name: string, status: TeammateInfo['status'], teamName = 'squa
   return { name, agentId: `agent-${name}`, teamName, agentType: 'general', status };
 }
 
-function task(description: string, status: TaskInfo['status']): TaskInfo {
+function task(description: string, status: TaskInfo['status'], lastToolName?: string): TaskInfo {
   return {
     taskId: `task-${description}`,
     description,
@@ -37,6 +37,7 @@ function task(description: string, status: TaskInfo['status']): TaskInfo {
     toolCount: 0,
     tokenCount: 0,
     durationMs: 0,
+    lastToolName,
   };
 }
 
@@ -111,5 +112,71 @@ describe('SubAgentChipRow', () => {
     chips()[0].click();
     expect(chips()[0].getAttribute('role')).toBe('button');
     expect(onTeammateClick).toHaveBeenCalledWith('agent-code-reviewer', chips()[0]);
+  });
+
+  describe('Task-chip read-only status popover', () => {
+    it('opens on a Task chip click and shows status + active tool name', async () => {
+      testState.teammates = [teammate('code-reviewer', 'running')];
+      testState.tasks = [task('db-migration', 'blocked', 'Bash')];
+
+      const onTeammateClick = vi.fn();
+      const { chips } = renderRow({ onTeammateClick });
+      const taskChip = chips().find(c => c.dataset.kind === 'task')!;
+      await act(async () => { taskChip.click(); });
+
+      const popover = document.querySelector('.sub-agent-task-status-popover');
+      expect(popover).not.toBeNull();
+      expect(popover!.textContent).toContain('db-migration');
+      expect(popover!.textContent).toContain('Blocked');
+      expect(popover!.textContent).toContain('Bash');
+    });
+
+    it('shows an explicit empty state when there is no active tool', async () => {
+      testState.tasks = [task('docs-update', 'running')];
+
+      const { chips } = renderRow({ onTeammateClick: vi.fn() });
+      await act(async () => { chips()[0].click(); });
+
+      expect(document.querySelector('.sub-agent-task-status-popover')!.textContent).toContain('—');
+    });
+
+    it('does not open for a Teammate chip click, and leaves onTeammateClick unaffected', async () => {
+      testState.teammates = [teammate('code-reviewer', 'running')];
+      testState.tasks = [task('db-migration', 'blocked')];
+
+      const onTeammateClick = vi.fn();
+      const { chips } = renderRow({ onTeammateClick });
+      const teammateChip = chips().find(c => c.dataset.kind === 'teammate')!;
+      await act(async () => { teammateChip.click(); });
+
+      expect(onTeammateClick).toHaveBeenCalledWith('agent-code-reviewer', teammateChip);
+      expect(document.querySelector('.sub-agent-task-status-popover')).toBeNull();
+    });
+
+    it('dismisses on outside click', async () => {
+      testState.tasks = [task('db-migration', 'blocked')];
+      const { chips } = renderRow({ onTeammateClick: vi.fn() });
+      await act(async () => { chips()[0].click(); });
+      expect(document.querySelector('.sub-agent-task-status-popover')).not.toBeNull();
+
+      await act(async () => {
+        fireEvent.pointerDown(document.body);
+      });
+
+      expect(document.querySelector('.sub-agent-task-status-popover')).toBeNull();
+    });
+
+    it('dismisses on Escape', async () => {
+      testState.tasks = [task('db-migration', 'blocked')];
+      const { chips } = renderRow({ onTeammateClick: vi.fn() });
+      await act(async () => { chips()[0].click(); });
+      expect(document.querySelector('.sub-agent-task-status-popover')).not.toBeNull();
+
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      });
+
+      expect(document.querySelector('.sub-agent-task-status-popover')).toBeNull();
+    });
   });
 });

@@ -21,8 +21,18 @@
  * stays until the entry leaves session metadata, matching `TeammatePanel`.
  */
 
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useLayoutEffect, useMemo, useState } from 'react';
 import { useAtomValue } from 'jotai';
+import {
+  useFloating,
+  offset,
+  flip,
+  shift,
+  FloatingPortal,
+  useInteractions,
+  useDismiss,
+  useRole,
+} from '@floating-ui/react';
 import { sessionTeammatesAtom, sessionTasksAtom } from '../../store/atoms/agentMode';
 import {
   mapTaskStatus,
@@ -131,6 +141,68 @@ const SubAgentChip: React.FC<SubAgentChipProps> = React.memo(({ label, status, k
 
 SubAgentChip.displayName = 'SubAgentChip';
 
+const STATUS_LABELS: Record<SubAgentStatus, string> = {
+  working: 'Working',
+  waiting: 'Waiting',
+  blocked: 'Blocked',
+  complete: 'Complete',
+  error: 'Error',
+};
+
+interface TaskStatusPopoverProps {
+  label: string;
+  status: SubAgentStatus;
+  lastToolName: string | undefined;
+  anchorEl: HTMLElement;
+  onClose: () => void;
+}
+
+/**
+ * Read-only status/tool-name popover for a Task sub-agent chip (R6). A
+ * deliberate visibility ceiling, not a stepping stone toward a full thread
+ * view — Task sub-agent turns stay hidden from the transcript by design
+ * (`claudeCliSubAgentTracker.ts:20-22`). No buttons, no navigation.
+ */
+const TaskStatusPopover: React.FC<TaskStatusPopoverProps> = ({ label, status, lastToolName, anchorEl, onClose }) => {
+  const { refs, floatingStyles, context } = useFloating({
+    placement: 'top',
+    open: true,
+    onOpenChange: (open) => { if (!open) onClose(); },
+    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 })],
+  });
+
+  useLayoutEffect(() => {
+    refs.setPositionReference(anchorEl);
+  }, [anchorEl, refs]);
+
+  const dismiss = useDismiss(context);
+  const role = useRole(context, { role: 'dialog' });
+  const { getFloatingProps } = useInteractions([dismiss, role]);
+
+  return (
+    <FloatingPortal>
+      <div
+        ref={refs.setFloating}
+        style={floatingStyles}
+        {...getFloatingProps()}
+        className="sub-agent-task-status-popover flex flex-col gap-1 p-2.5 rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] shadow-lg w-[200px] z-50 text-[11px]"
+      >
+        <div className="sub-agent-task-status-popover-title font-medium text-[var(--nim-text)] truncate">{label}</div>
+        <div className="flex items-center justify-between text-[var(--nim-text-faint)]">
+          <span>Status</span>
+          <span className="text-[var(--nim-text)]">{STATUS_LABELS[status]}</span>
+        </div>
+        <div className="flex items-center justify-between text-[var(--nim-text-faint)]">
+          <span>Active tool</span>
+          <span className="text-[var(--nim-text)] truncate max-w-[110px]">{lastToolName ?? '—'}</span>
+        </div>
+      </div>
+    </FloatingPortal>
+  );
+};
+
+TaskStatusPopover.displayName = 'TaskStatusPopover';
+
 interface SubAgentChipEntry {
   key: string;
   id: string;
@@ -160,6 +232,11 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
   const allTeammates = useAtomValue(sessionTeammatesAtom(sessionId));
   const tasks = useAtomValue(sessionTasksAtom(sessionId));
 
+  // Task-chip read-only status popover (R6). A separate, purely local flow
+  // from the Teammate click-to-thread path below — does not touch it.
+  const [openTaskPopover, setOpenTaskPopover] = useState<{ taskId: string; anchorEl: HTMLElement } | null>(null);
+  const openTask = openTaskPopover ? tasks.find(t => t.taskId === openTaskPopover.taskId) ?? null : null;
+
   const entries = useMemo<SubAgentChipEntry[]>(() => [
     // Same filter as TeammatePanel: _background/_subagent entries are dead
     // legacy rows left over from before SDK-native sub-agents.
@@ -182,8 +259,12 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
   ], [allTeammates, tasks]);
 
   const handleChipClick = useCallback((entry: SubAgentChipEntry, e: React.SyntheticEvent<HTMLDivElement>) => {
-    if (entry.kind === 'teammate') onTeammateClick?.(entry.id, e.currentTarget);
-    else onTaskClick?.(entry.id);
+    if (entry.kind === 'teammate') {
+      onTeammateClick?.(entry.id, e.currentTarget);
+    } else {
+      onTaskClick?.(entry.id);
+      setOpenTaskPopover({ taskId: entry.id, anchorEl: e.currentTarget });
+    }
   }, [onTeammateClick, onTaskClick]);
 
   if (entries.length === 0) {
@@ -212,6 +293,15 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
           />
         ))}
       </div>
+      {openTask && openTaskPopover && (
+        <TaskStatusPopover
+          label={openTask.description}
+          status={mapTaskStatus(openTask.status)}
+          lastToolName={openTask.lastToolName}
+          anchorEl={openTaskPopover.anchorEl}
+          onClose={() => setOpenTaskPopover(null)}
+        />
+      )}
     </div>
   );
 });
