@@ -36,9 +36,8 @@ PRD §2 Amendment Context and §3 Non-Goals). Task 4a is the Task-sub-agent-spec
 set; 4b (Teammate stream-stall watchdog) and 4c (silent-drop wake-delivery fallback) are its
 siblings, each a separate task/brief.
 
-This task runs in **Wave 2** of the execution plan (`execution_plan.yaml`), alongside 2a (status
-mapping) and 3a (Teammate error/crash notification) — none of which touch the same file region as
-this task.
+This task runs in **Wave 2** of the execution plan (`execution_plan.yaml`), alongside 1a (add
+`blocked` to `TeammateInfo.status`) — which does not touch the same file region as this task.
 
 ---
 

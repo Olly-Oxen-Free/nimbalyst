@@ -42,9 +42,11 @@ per-Task override. That shared callback currently has no way to know *which* Tas
 any) the permission request came from, so this task cannot just flip a status field; it must first
 establish the attribution.
 
-This task is part of **Wave 1** — the foundation wave. It has no upstream dependencies and runs in
-parallel with task 1a (which does the equivalent work for `TeammateInfo.status`). Task 2a (build
-the normalized `SubAgentStatus` mapping) depends on both 1a and 1b completing.
+This task is part of **Wave 1** — the foundation wave. It has no upstream dependencies. Task 1a
+(the equivalent work for `TeammateInfo.status`) now depends on this task completing first (both
+edit `ClaudeCodeProvider.ts`, sequenced to avoid a concurrent edit window — see task 1a's brief)
+and runs in Wave 2. Task 2a (build the normalized `SubAgentStatus` mapping) depends on both 1a and
+1b completing, and runs in Wave 3.
 
 ---
 

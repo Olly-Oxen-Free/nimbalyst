@@ -5,7 +5,7 @@
 **Priority:** must
 **Complexity:** 4/10
 **Model:** sonnet
-**Wave:** 2
+**Wave:** 3
 **Feature Issue:** TBD — assigned by PM agent during Phase 2 issue creation (no GitHub issue number was present in PRD metadata at brief-generation time; `github_project` is unset in `PRD_agent-visibility.md`)
 
 ---
@@ -15,7 +15,7 @@
 Create a single, exhaustive display-layer mapping that normalizes the two independent status
 vocabularies used by Nimbalyst's in-conversation sub-agents — `TeammateInfo.status` and
 `TaskInfo.status` — into one shared five-value status (`working / waiting / blocked / complete /
-error`). This mapping is the data layer the horizontal chip row (task 2b, wave 3) will use to
+error`). This mapping is the data layer the horizontal chip row (task 2b, wave 4) will use to
 color every teammate/Task-sub-agent chip consistently, regardless of which of the two underlying
 systems produced the status.
 
@@ -33,18 +33,19 @@ child sessions (its own `getStatusTone`/`getBarTone` enum). This PRD closes a tr
 today, none of Teammates/Task sub-agents shows in a chip row above the chat input, none has a
 `blocked` state, and a crashed sub-agent produces the same notification (none) as a clean finish.
 
-This task is the **data-normalization step** in that effort. Two upstream tasks (1a, 1b, wave 1)
-each add a new `blocked` value to one of the two source status enums. This task does not add any
+This task is the **data-normalization step** in that effort. Two upstream tasks (1b, wave 1; 1a,
+wave 2) each add a new `blocked` value to one of the two source status enums. This task does not add any
 new status value itself — it builds the mapping *from* those (now five-valued) enums *to* the
 shared five-value `SubAgentStatus` the chip row will render. The PRD explicitly scopes this
 normalization to Teammates + Task sub-agents only; Meta-Agent Mode's independent status enum is out
 of scope and must not be touched or folded in (§3 Non-Goals, §12 Assumption 2 of the PRD).
 
-This task is part of **Wave 2** — the status-foundation wave that converges the wave-1 `blocked`
-additions (1a: Teammates, 1b: Task sub-agents) into one normalized mapping. Wave 2 runs 2a in
-parallel with 3a (notification wiring off 1a) and 4a (stall-masking fix off 1b) — none of those
-siblings touches the same files as 2a. Wave 3 (task 2b, the chip row itself) depends directly on
-this task's output.
+This task is part of **Wave 3** — the status-foundation wave that converges the `blocked`
+additions from 1b (wave 1: Task sub-agents) and 1a (wave 2: Teammates) into one normalized
+mapping. Wave 3 runs 2a in parallel with 3a (notification wiring off 1a) — none of those siblings
+touches the same files as 2a. (4a, the stall-masking fix off 1b, now runs earlier, in wave 2, per
+the Phase-2 brief review correction that serialized 1a after 1b.) Wave 4 (task 2b, the chip row
+itself) depends directly on this task's output.
 
 ---
 
@@ -161,8 +162,8 @@ to import from wherever you place it.
 
 ### File Ownership Notes
 
-`agentMode.ts` is also touched by tasks 1a and 1b (both wave 1, both upstream of this task) and,
-later, indirectly informs task 2b (wave 3). Because 2a `depends_on: [1a, 1b]`, both of their edits
+`agentMode.ts` is also touched by tasks 1a (wave 2) and 1b (wave 1, both upstream of this task) and,
+later, indirectly informs task 2b (wave 4). Because 2a `depends_on: [1a, 1b]`, both of their edits
 to `agentMode.ts` (1b adds `blocked` to the `TaskInfo` interface at line 233; 1a's `agentMode.ts`
 edit is more minor since `TeammateInfo` is declared in `TeammatePanel.tsx`, not here) should already
 be present by the time you start — this is sequential by construction, not a live conflict. Do not
@@ -273,7 +274,7 @@ None of this task's files (`subAgentStatus.ts`, `agentMode.ts`) are in `.nimble/
 `packages/electron/src/main/utils/protocolRegistration.ts`, `CHANGELOG.md`,
 `packages/collab-protocol/*`, `packages/collab-client/*`, `packages/collab-bundle/*`,
 `packages/collab-adapters/*`). No review gate is triggered by this task on its own — the PRD's only
-review gate is after wave 5, triggered by task 5a's `CHANGELOG.md` edit.
+review gate is after wave 6, triggered by task 5a's `CHANGELOG.md` edit.
 
 ---
 
@@ -295,9 +296,9 @@ diff.
 
 ### Downstream Impact
 
-Tasks that depend on this one (directly or transitively): **2b** (wave 3, chip row — consumes this
-mapping to color chips), and transitively **2c** (wave 4, click-to-thread, depends on 2b), **2d**
-(wave 5, Task sub-agent popover, depends on 2b/2c), and **5a** (wave 6, CHANGELOG/gate task, depends
+Tasks that depend on this one (directly or transitively): **2b** (wave 4, chip row — consumes this
+mapping to color chips), and transitively **2c** (wave 5, click-to-thread, depends on 2b), **2d**
+(wave 6, Task sub-agent popover, depends on 2b/2c), and **5a** (wave 7, CHANGELOG/gate task, depends
 on the whole chain). A bug or incomplete coverage in this task's mapping propagates directly into
 every chip's displayed color in the finished feature.
 
@@ -345,4 +346,4 @@ Before creating PR:
 ---
 
 *Generated by NIMBLE Brief Writer*
-*PRD: agent-visibility | Task: 2a | Wave: 2*
+*PRD: agent-visibility | Task: 2a | Wave: 3*

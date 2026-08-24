@@ -10,7 +10,7 @@
 
 | Task | Depends On | Rationale |
 |------|------------|-----------|
-| 1a | - | Adds `blocked` to `TeammateInfo.status`; no upstream dependency |
+| 1a | 1b | Adds `blocked` to `TeammateInfo.status`; both edit `ClaudeCodeProvider.ts` — 1a adds `toolPermission:pending`/`toolPermission:resolved` listeners in the constructor, 1b edits the `canUseTool` routing at `:3648`/`:3705-3760`, serialized to avoid a concurrent edit window, matching this PRD's existing convention for 1b→4a and 3a→4b/4c |
 | 1b | - | Adds `blocked` to `TaskInfo.status`; no upstream dependency |
 | 2a | 1a, 1b | Normalized status mapping needs both source enums finalized first |
 | 3a | 1a | Notification wiring needs the `blocked`/error status signal from 1a |
@@ -44,10 +44,12 @@ _No runtime dependencies discovered yet — execution has not started._
 | ----- | ----- | ---- |
 | `packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx` | 1a, 2b, 2c | `TeammateInfo.status` is declared here, not in `agentMode.ts` (which only imports the type); 1a adds `blocked` here, 2b/2c extend it later. Sequential per the dependency chain (2b depends on 2a which depends on 1a; 2c depends on 2b) — no real conflict. |
 | `packages/runtime/src/ai/server/providers/TeammateManager.ts` | 1a, 3a, 4b | Sequential by construction (3a depends on 1a; 4b depends on 3a — 4b adds a stall watchdog to the same spawn loop 3a's error-path notification wiring touches). |
-| `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts` | 1b, 4a | Sequential by construction (4a depends on 1b) — 1b touches the canUseTool routing (:3648/:3705-3760), 4a touches the post-result drain-grace timer (:1038-1052/:1197-1200), different sections of the same file. |
+| `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts` | 1a, 1b, 4a | Sequential by construction (1a depends_on 1b; 4a depends_on 1b) — 1a adds `toolPermission:pending`/`toolPermission:resolved` listeners in the constructor, 1b touches the canUseTool routing (:3648/:3705-3760), 4a touches the post-result drain-grace timer (:1038-1052/:1197-1200) — three different sections of the same file, serialized to avoid a concurrent edit window. |
 | `packages/electron/src/main/services/NotificationService.ts` | 3a, 3b | Sequential by construction (3b depends on 3a). |
 | `packages/electron/src/main/services/ai/MessageStreamingHandler.ts` | 3a, 4c | Sequential by construction (4c depends on 3a) — 3a wires notification into `onTeammatesAllCompleted`, 4c adds the missing fallback notification to `onTeammateMessageWhileIdle` (window-not-found, window-destroyed, and handler-absent cases). |
-| New chip-row component (`SubAgentChipRow.tsx`, exact path TBD) | 2b, 2c, 2d | 2c and 2d both extend this file; sequencing is now enforced structurally via `2d depends_on 2c` (2c in wave 4, 2d in wave 5) rather than left as prose-only PM guidance. |
+| New chip-row component (`SubAgentChipRow.tsx`, exact path TBD) | 2b, 2c, 2d | 2c and 2d both extend this file; sequencing is now enforced structurally via `2d depends_on 2c` (2c in wave 5, 2d in wave 6) rather than left as prose-only PM guidance. |
+| `packages/electron/src/renderer/components/UnifiedAI/SessionTranscript.tsx` | 2b | Single task, no collision — integration point discovered by 2b's own investigation (renders `<SubAgentChipRow>` above the chat input). |
+| `packages/electron/src/main/services/ai/AIService.ts` (new IPC handler, exact file an implementation choice per 2c's brief) | 2c | Single task, no collision — new IPC channel for teammate-initiated message send, discovered by 2c's own investigation. |
 
 ---
 

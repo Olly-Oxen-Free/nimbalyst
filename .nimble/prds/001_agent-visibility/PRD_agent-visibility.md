@@ -278,10 +278,12 @@ dependency identified.
 | ----- | ----- | ---- |
 | `packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx` | 1a, 2b, 2c | `TeammateInfo.status` is actually declared here (not in `agentMode.ts`, which only imports the type); 1a adds the `blocked` value here, and 2b/2c both extend this file later. Sequential per the dependency chain (2b depends on 2a which depends on 1a; 2c depends on 2b) — no real conflict. |
 | `packages/runtime/src/ai/server/providers/TeammateManager.ts` | 1a, 3a, 4b | 3a depends on 1a; 4b depends on 3a — 4b adds a stall watchdog to the same spawn loop 3a's error-path notification wiring touches; sequential by construction. |
-| `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts` | 1b, 4a | 4a depends on 1b — 1b touches the canUseTool routing (:3648/:3705-3760), 4a touches the post-result drain-grace timer (:1038-1052/:1197-1200), different sections of the same file; sequential by construction. |
+| `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts` | 1a, 1b, 4a | Sequential by construction (1a depends_on 1b; 4a depends_on 1b) — 1a adds `toolPermission:pending`/`toolPermission:resolved` listeners in the constructor, 1b touches the canUseTool routing (:3648/:3705-3760), 4a touches the post-result drain-grace timer (:1038-1052/:1197-1200), three different sections of the same file. |
 | `packages/electron/src/main/services/NotificationService.ts` | 3a, 3b | 3b depends on 3a; sequential by construction. |
 | `packages/electron/src/main/services/ai/MessageStreamingHandler.ts` | 3a, 4c | 4c depends on 3a — 3a wires notification into `onTeammatesAllCompleted`, 4c adds the missing `else` branch/fallback notification to `onTeammateMessageWhileIdle`; sequential by construction. |
-| New chip-row component file (path TBD by investigator/brief-writer, e.g. `packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx`) | 2b, 2c, 2d | 2c and 2d both extend the same new component; sequencing is now enforced structurally via `2d depends_on 2c` (2c in wave 4, 2d in wave 5) rather than left as prose-only PM guidance. |
+| New chip-row component file (path TBD by investigator/brief-writer, e.g. `packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx`) | 2b, 2c, 2d | 2c and 2d both extend the same new component; sequencing is now enforced structurally via `2d depends_on 2c` (2c in wave 5, 2d in wave 6) rather than left as prose-only PM guidance. |
+| `packages/electron/src/renderer/components/UnifiedAI/SessionTranscript.tsx` | 2b | Single task, no collision — integration point discovered by 2b's own investigation. |
+| New IPC handler file (exact path an implementation choice per 2c's brief, e.g. `packages/electron/src/main/services/ai/AIService.ts`) | 2c | Single task, no collision — new IPC channel for teammate-initiated message send, discovered by 2c's own investigation. |
 
 ### Risks & Mitigations
 
@@ -430,7 +432,7 @@ this is an internal verification/gap-closure PRD; no new dependency is introduce
 
 | ID | Title | Complexity | Model | Priority | Dependencies |
 |----|-------|------------|-------|----------|--------------|
-| 1a | Add `blocked` status to `TeammateInfo.status` | 5 | opus | must | - |
+| 1a | Add `blocked` status to `TeammateInfo.status` | 5 | opus | must | 1b |
 | 1b | Add `blocked` status to `TaskInfo.status` | 6 | opus | must | - |
 | 2a | Build normalized `SubAgentStatus` mapping | 4 | sonnet | must | 1a, 1b |
 | 2b | Build horizontal chip row above chat input | 6 | opus | must | 2a |
@@ -479,15 +481,16 @@ was made by default rather than asked. **Review this section before approving ex
    before task 2b's brief is finalized.
 
 5. **Orchestration and complexity assessment (Round 2.5/2.6), computed rather than asked:**
-   12 tasks, 6 waves, 57 total complexity points, 0 high-risk (7+) tasks — below all three
+   12 tasks, 7 waves, 57 total complexity points, 0 high-risk (7+) tasks — below all three
    points/task/wave slicing thresholds. (Complexity was 41/5 waves at initial planning; task 1b
    was bumped from 5 to 6 to account for the added investigation step required to confirm a
    correlation key for attributing blocked permission prompts to individual Task sub-agents, and
    waves 4-5 were split so task 2d — which now structurally depends on 2c, not just 2b, since both
-   extend the same new `SubAgentChipRow.tsx` file — runs after it rather than in parallel.)
+   extend the same new `SubAgentChipRow.tsx` file — runs after it rather than in parallel. Total
+   waves rose from 6 to 7 after the Phase-2 brief review correction described in item 11 below.)
    However, task 5a touches `CHANGELOG.md`, which is in
    `require_review` per `.nimble/config.yaml` — this **auto-triggers a gate** regardless of the
-   points threshold. Recommendation: **1 gate, after wave 5, before wave 6** (`pause` model, since
+   points threshold. Recommendation: **1 gate, after wave 6, before wave 7** (`pause` model, since
    no automated review provider is configured), labeled "Pre-merge review: CHANGELOG entry + full
    chip-row/notification diff." Integration cadence defaulted to `worktree` (no high-risk tasks to
    justify heavier `wave` cadence); review trigger defaulted to `per-task`/`pr-diff` (no configured
@@ -528,4 +531,9 @@ was made by default rather than asked. **Review this section before approving ex
     shared timer resets on ANY concurrent sub-agent's activity, masking one stalled sibling while
     another stays healthy. R11 and task 4a were corrected to target that instead — see R11's text
     above for the corrected mechanism.
+
+11. **Phase-2 brief review (2026-08-24) found 1a needs an undeclared edit to
+    `ClaudeCodeProvider.ts` colliding with 1b in the same wave; fixed by adding `depends_on: [1b]`
+    to 1a, which shifted total waves from 6 to 7 and the gate from after-wave-5 to after-wave-6.
+    Also backfilled `files_affected` for 1a/2b/2c to match each brief's own investigation.**
 ```

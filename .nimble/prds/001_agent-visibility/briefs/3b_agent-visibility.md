@@ -295,8 +295,8 @@ Also, per this PRD's Agent Boundaries (§11):
 Per `.nimble/config.yaml` `require_review` list, none of this task's files
 (`MetaAgentService.ts`, `MetaAgentMode.tsx`, `NotificationService.ts`) are in that list — this task
 does not itself trigger the human-review gate. (The PRD's gate is triggered later, by task 5a's
-`CHANGELOG.md` edit — see PRD §12 Assumption 5: one `pause`-model gate after wave 5, before wave
-6.)
+`CHANGELOG.md` edit — see PRD §12 Assumption 5: one `pause`-model gate after wave 6, before wave
+7.)
 
 ---
 

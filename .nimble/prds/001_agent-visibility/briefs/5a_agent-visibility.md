@@ -5,14 +5,14 @@
 **Priority:** must
 **Complexity:** 1/10
 **Model:** sonnet
-**Wave:** 6 (final wave)
+**Wave:** 7 (final wave)
 **Feature Issue:** Not configured — the PRD frontmatter has `links: []`; no GitHub issue tracks this feature as a whole. Reference the tracker item `tsk_mt1xxymgata1sw` (Nimbalyst's own tracker, not GitHub) if you need a human-readable origin pointer.
 
 ---
 
 ## Objective
 
-Add exactly one user-facing bullet to `CHANGELOG.md`'s `[Unreleased]` section summarizing the **entire agent-visibility feature** shipped across this PRD's 11 prior tasks — not just this task's own (nonexistent) code slice. This task is a pure documentation edit and, because `CHANGELOG.md` is in `.nimble/config.yaml`'s `require_review` list, it is also the designated trigger for this PRD's one human-review gate (defined in `execution_plan.yaml`, `after_wave: 5`, model `pause`). Do not merge past this task without that review.
+Add exactly one user-facing bullet to `CHANGELOG.md`'s `[Unreleased]` section summarizing the **entire agent-visibility feature** shipped across this PRD's 11 prior tasks — not just this task's own (nonexistent) code slice. This task is a pure documentation edit and, because `CHANGELOG.md` is in `.nimble/config.yaml`'s `require_review` list, it is also the designated trigger for this PRD's one human-review gate (defined in `execution_plan.yaml`, `after_wave: 6`, model `pause`). Do not merge past this task without that review.
 
 ---
 
@@ -22,7 +22,7 @@ Add exactly one user-facing bullet to `CHANGELOG.md`'s `[Unreleased]` section su
 
 Nimbalyst has three separate "spawned agent" systems (SDK-native Task sub-agents, Nimbalyst Teammates, Meta-Agent Mode child sessions), each with its own status vocabulary and UI surface. Compared to native Claude Code's sub-agent UX, none of five requested behaviors was fully implemented for the two systems used inside a normal chat conversation (Teammates, Task sub-agents): a sub-agent could block on a permission prompt or die outright with no distinct signal in the main thread, no horizontal chip row existed above the chat input, and an errored teammate produced the identical "all done" chime as a clean finish. This PRD closes that gap. A later amendment (2026-08-22, tasks 4a-4c) added a second, related fix set: sub-agents that hang silently (no error, no chunk, ever) and a wake-delivery path that silently drops a teammate's message when the target window is gone.
 
-This task is part of **Wave 6**, the final wave — it runs only after every functional task (waves 1-5) has landed, and it is gated: `execution_plan.yaml` defines a `pause` gate after wave 5, before this task, requiring a human to review the full diff of tasks 1a through 4c before merge. This task's own success criteria are satisfied by writing the CHANGELOG bullet; the gate's precondition (full diff available for review) is not something this task itself produces or asserts — it is a property of the PM/orchestrator's merge sequencing.
+This task is part of **Wave 7**, the final wave — it runs only after every functional task (waves 1-6) has landed, and it is gated: `execution_plan.yaml` defines a `pause` gate after wave 6, before this task, requiring a human to review the full diff of tasks 1a through 4c before merge. This task's own success criteria are satisfied by writing the CHANGELOG bullet; the gate's precondition (full diff available for review) is not something this task itself produces or asserts — it is a property of the PM/orchestrator's merge sequencing.
 
 ### The full shipped feature set this bullet must summarize
 
@@ -127,7 +127,7 @@ None of these are anywhere near this task's scope (a single markdown file), but 
 
 ### Files Requiring Review
 
-`CHANGELOG.md` itself is on `.nimble/config.yaml`'s `require_review` list (alongside `packages/runtime/src/auth/*`, `packages/electron/src/main/database/*`, `packages/electron/src/main/index.ts`, `packages/electron/src/main/bootstrap.ts`, `packages/electron/src/main/utils/protocolRegistration.ts`, and the `collab-*` packages — none of which this task touches). **This task's edit to `CHANGELOG.md` is precisely what triggers the pre-merge human-review gate** defined in `execution_plan.yaml` (`after_wave: 5`, label "Pre-merge review: CHANGELOG entry + full chip-row/notification diff", model `pause`). Do not treat this gate as optional or as something this task can wave through — the gate's precondition (the full diff of tasks 1a-4c being available for review) must be satisfied by the orchestrator/PM before merge proceeds past this task.
+`CHANGELOG.md` itself is on `.nimble/config.yaml`'s `require_review` list (alongside `packages/runtime/src/auth/*`, `packages/electron/src/main/database/*`, `packages/electron/src/main/index.ts`, `packages/electron/src/main/bootstrap.ts`, `packages/electron/src/main/utils/protocolRegistration.ts`, and the `collab-*` packages — none of which this task touches). **This task's edit to `CHANGELOG.md` is precisely what triggers the pre-merge human-review gate** defined in `execution_plan.yaml` (`after_wave: 6`, label "Pre-merge review: CHANGELOG entry + full chip-row/notification diff", model `pause`). Do not treat this gate as optional or as something this task can wave through — the gate's precondition (the full diff of tasks 1a-4c being available for review) must be satisfied by the orchestrator/PM before merge proceeds past this task.
 
 ---
 
@@ -144,13 +144,13 @@ None of these are anywhere near this task's scope (a single markdown file), but 
 | 4b | Teammate stream-stall watchdog | Confirm merged; regression test proves stalled and healthy teammate cases both pass |
 | 4c | `onTeammateMessageWhileIdle` silent-drop fallback fix | Confirm merged; regression test proves all four delivery cases (window missing, destroyed, handler absent, normal) pass |
 
-Transitively, this task also depends on the full chain beneath these six: 1a, 1b (blocked status), 2a (normalized `SubAgentStatus` mapping), 2b (chip row), and 3a (Teammate error/crash notification guarantee) — all of which must be merged for the feature described in this brief's Context section to actually be true. Read `dependencies.md` in this PRD's folder for the full dependency graph if any of the above six tasks appears incomplete.
+Transitively, this task also depends on the full chain beneath these six: 1b, 1a (blocked status), 2a (normalized `SubAgentStatus` mapping), 2b (chip row), and 3a (Teammate error/crash notification guarantee) — all of which must be merged for the feature described in this brief's Context section to actually be true. Read `dependencies.md` in this PRD's folder for the full dependency graph if any of the above six tasks appears incomplete.
 
-**Before starting:** Confirm all 12 tasks' worktrees/PRs show a merged or ready-to-merge state (this task is wave 6 of 6 — every other task should already be done). If any upstream task is not actually complete, do not write a CHANGELOG bullet describing behavior that doesn't exist yet — stop and flag it rather than guessing.
+**Before starting:** Confirm all 12 tasks' worktrees/PRs show a merged or ready-to-merge state (this task is wave 7 of 7 — every other task should already be done). If any upstream task is not actually complete, do not write a CHANGELOG bullet describing behavior that doesn't exist yet — stop and flag it rather than guessing.
 
 ### Downstream Impact
 
-None — this is the final task in the PRD's dependency chain (wave 6 of 6, `longest_chain` per `execution_plan.yaml`: `1a -> 2a -> 2b -> 2c -> 2d -> 5a`). No task depends on 5a.
+None — this is the final task in the PRD's dependency chain (wave 7 of 7, `longest_chain` per `execution_plan.yaml`: `1b -> 1a -> 2a -> 2b -> 2c -> 2d -> 5a`). No task depends on 5a.
 
 ---
 
@@ -200,4 +200,4 @@ Before creating PR:
 ---
 
 *Generated by NIMBLE Brief Writer*
-*PRD: agent-visibility | Task: 5a | Wave: 6*
+*PRD: agent-visibility | Task: 5a | Wave: 7*

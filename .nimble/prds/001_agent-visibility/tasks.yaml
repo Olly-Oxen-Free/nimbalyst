@@ -24,7 +24,7 @@ tasks:
       Clear it back to the prior/next status once the prompt resolves.
 
       Fulfills requirement R1.
-    depends_on: []
+    depends_on: ["1b"]
     complexity: 5
     priority: "must"
     success_criteria:
@@ -37,6 +37,7 @@ tasks:
       - "packages/electron/src/renderer/store/atoms/agentMode.ts"
       - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
       - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts"
     agent_context: |
       Read TeammateManager.ts:1465 (createCanUseToolHandler call) and the surrounding emit path
       (emitTeammateUpdate) before editing — the permission-pending signal already exists for
@@ -162,6 +163,7 @@ tasks:
     files_affected:
       - "packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx"
       - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+      - "packages/electron/src/renderer/components/UnifiedAI/SessionTranscript.tsx"
     agent_context: |
       Reference TeammatePanel.tsx's existing spinner/hollow-circle/filled-dot status-coloring
       convention (:342-355 teammates, :267-277 tasks) for visual consistency, but this is a new,
@@ -201,6 +203,8 @@ tasks:
       - "packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx"
       - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
       - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/electron/src/main/services/ai/AIService.ts"
+      - "packages/electron/src/preload/index.ts"
     agent_context: |
       Open question (PRD §9 Q4): research found appendToInbox/flushPendingMessages "could support"
       a direct-message flow but did not confirm a wired UI control exists end-to-end. Run an
@@ -461,8 +465,8 @@ tasks:
       scaffolding (atom names, IPC channel names, file paths) in the bullet.
 
       This task touches CHANGELOG.md, which is in .nimble/config.yaml's require_review list —
-      it is the designated gate task for this PRD (see PRD §12 Assumption 5: gate after wave 5,
-      before this wave 6 task, model=pause).
+      it is the designated gate task for this PRD (see PRD §12 Assumption 5: gate after wave 6,
+      before this wave 7 task, model=pause).
     depends_on: ["2c", "2d", "3b", "4a", "4b", "4c"]
     complexity: 1
     priority: "must"
