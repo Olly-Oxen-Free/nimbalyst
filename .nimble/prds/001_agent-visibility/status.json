@@ -35,7 +35,7 @@
     "1b": { "status": "done", "wave": 1, "model": "opus", "commit": "646ce7cb6" },
     "1a": { "status": "done", "wave": 2, "model": "opus", "commit": "39191908b" },
     "4a": { "status": "done", "wave": 2, "model": "opus", "commit": "245d9faeb" },
-    "2a": { "status": "queued", "wave": 3, "model": "sonnet" },
+    "2a": { "status": "done", "wave": 3, "model": "sonnet", "commit": "a5102380e" },
     "3a": { "status": "queued", "wave": 3, "model": "opus" },
     "2b": { "status": "queued", "wave": 4, "model": "opus" },
     "3b": { "status": "queued", "wave": 4, "model": "opus" },
