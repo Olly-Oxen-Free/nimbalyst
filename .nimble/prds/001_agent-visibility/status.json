@@ -40,7 +40,7 @@
     "2b": { "status": "queued", "wave": 4, "model": "opus" },
     "3b": { "status": "queued", "wave": 4, "model": "opus" },
     "4b": { "status": "queued", "wave": 4, "model": "opus" },
-    "4c": { "status": "queued", "wave": 4, "model": "sonnet" },
+    "4c": { "status": "done", "wave": 4, "model": "sonnet", "commit": "4ac480083" },
     "2c": { "status": "queued", "wave": 5, "model": "opus" },
     "2d": { "status": "queued", "wave": 6, "model": "sonnet" },
     "5a": { "status": "queued", "wave": 7, "model": "sonnet" }
