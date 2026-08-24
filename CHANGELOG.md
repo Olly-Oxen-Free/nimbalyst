@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Spreadsheet columns can now hold dates with times, times, checkboxes, links, and tracker items, alongside accounting and scientific number styles, custom date patterns, red or parenthesized negatives, and your own alignment. A tracker cell shows the item's live title and status and opens it when clicked, columns can detect their own type, and sorting and filtering now follow the column's type instead of its text. You can also style any range of cells — bold, italic, underline, strikethrough, text and fill color, alignment — and date formulas now do arithmetic, so `=A1+7` and `=B1-A1` work.
 - Tracker board cards now have a run/resume/focus button to start, reopen, or jump to that item's AI session without leaving the board.
 - The prompt sent when dispatching a tracker item into a session is now customizable, globally and per project, in Settings.
+- Teammates and sub-agents you spawn now show up as a colored chip row above the chat input, with a distinct "blocked" color when one is waiting on a permission prompt; clicking a teammate's chip lets you message it directly, and a sub-agent that errors, crashes, hangs, or can't be reached now reliably notifies you instead of failing silently.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
