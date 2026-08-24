@@ -15,6 +15,7 @@ import path from 'path';
 import fsp from 'fs/promises';
 import os from 'os';
 import { resolveClaudeConfigDir } from './claudeCode/claudeConfigDir';
+import { raceNextChunkWithStallWatchdog, resolveStreamStallMs } from './claudeCode/streamStallWatchdog';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -1582,8 +1583,80 @@ export class TeammateManager {
     let approvedShutdown = false;
     let capturedResultText: string | undefined;
     let sentMessageToLead = false;
+    // Tools this teammate has started but not yet seen a result for. Tool
+    // execution is a legitimate silence, so it disarms the stall watchdog below.
+    let outstandingToolCalls = 0;
 
-    for await (const chunk of teammateQuery) {
+    // A wedged subprocess emits no chunk, no error, and never ends its iterator,
+    // so `for await` here blocked forever and the teammate stayed "running" while
+    // the lead waited on a report that was never coming. Race each chunk against
+    // a stall timer instead, exactly as the lead's own stream does. NIM-1481.
+    const iterator = (teammateQuery as AsyncIterable<any>)[Symbol.asyncIterator]();
+    const streamStallMs = resolveStreamStallMs();
+    // Teammates have no interrupt-with-message channel; the only interruption is
+    // an explicit stop(name)/killAll(), which aborts this controller. Racing the
+    // abort event lands the stop immediately rather than waiting for the SDK to
+    // reject the in-flight next().
+    const abortPromise = new Promise<'interrupted'>(resolve => {
+      if (abortController.signal.aborted) {
+        resolve('interrupted');
+        return;
+      }
+      abortController.signal.addEventListener('abort', () => resolve('interrupted'), { once: true });
+    });
+
+    while (true) {
+      const nextPromise = iterator.next();
+      // Armed only while the teammate itself is expected to be producing output.
+      // A running tool or an open permission prompt is the user's silence, not a
+      // stall, and reaping either would destroy real work. Re-evaluated every
+      // iteration so the disarm is never a one-way switch.
+      //
+      // Tradeoff, deliberate: while disarmed the loop waits indefinitely, so a
+      // tool that never returns or a prompt nobody answers still hangs the
+      // teammate. Both are visible to the user (the teammate shows as blocked,
+      // the prompt is on screen), unlike the silent wedge this watchdog exists
+      // to catch. The lead's own loop makes the same trade.
+      const watchdogActive = outstandingToolCalls === 0 && this.statusForManaged(agentId) !== 'blocked';
+      const raceResult = await raceNextChunkWithStallWatchdog<any>({
+        nextPromise,
+        interruptPromise: abortPromise,
+        watchdogActive,
+        stallMs: streamStallMs,
+      });
+
+      if (raceResult.kind === 'interrupted') {
+        void nextPromise.catch(() => {});
+        // Throw rather than break: an aborted teammate must not land in
+        // handleStreamCompletion and be filed as idle-and-resumable, which is
+        // what the SDK's own abort rejection used to prevent.
+        throw new Error(`Teammate "${name}" was stopped.`);
+      }
+
+      if (raceResult.kind === 'stalled') {
+        // Abandon the pending next() so its abort-induced rejection isn't an
+        // unhandled rejection, then tear down the wedged subprocess.
+        void nextPromise.catch(() => {});
+        console.error(`[MANAGED-TEAMMATE] STREAM_STALL_DETECTED for "${agentId}": no chunk for ${streamStallMs}ms. Aborting wedged subprocess.`);
+        try { abortController.abort(); } catch { /* best effort */ }
+        // Throw so the existing .catch(handleStreamError) at every call site
+        // marks the teammate errored and the host announces the failure instead
+        // of the completion chime.
+        throw new Error(
+          `Teammate "${name}" stopped responding: no output for ${Math.round(streamStallMs / 1000)}s.`
+        );
+      }
+
+      if (raceResult.kind === 'chunk-error') {
+        // Preserve the pre-existing behavior: an iterator.next() rejection
+        // propagates to the caller's catch handler.
+        throw raceResult.error;
+      }
+
+      const iterResult = raceResult.result;
+      if (iterResult.done) break;
+      const chunk = iterResult.value;
+
       if (chunk.session_id && !capturedSessionId) {
         capturedSessionId = chunk.session_id;
         // Fail loud if we asked the SDK to resume this teammate's session X and it
@@ -1631,13 +1704,24 @@ export class TeammateManager {
           );
         }
 
+        if (chunk.type === 'user' && Array.isArray(chunk.message?.content)) {
+          for (const block of chunk.message.content) {
+            // Tool finished -- re-arm the stall watchdog for whatever the
+            // teammate does next.
+            if (block.type === 'tool_result') {
+              outstandingToolCalls = Math.max(0, outstandingToolCalls - 1);
+            }
+          }
+        }
+
         if (chunk.type === 'assistant' && chunk.message?.content && Array.isArray(chunk.message.content)) {
           // Count tool_use blocks for activity tracking
-          if (managedEntry) {
-            for (const block of chunk.message.content) {
-              if (block.type === 'tool_use') {
-                managedEntry.toolCallCount++;
-              }
+          for (const block of chunk.message.content) {
+            if (block.type === 'tool_use') {
+              if (managedEntry) managedEntry.toolCallCount++;
+              // A tool is now executing; silence until its result comes back is
+              // legitimate, so disarm the stall watchdog until then.
+              outstandingToolCalls++;
             }
           }
 
