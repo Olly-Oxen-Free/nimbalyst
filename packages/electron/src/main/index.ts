@@ -2744,6 +2744,8 @@ app.whenReady().then(async () => {
             (options) => notificationService.showNotificationWithResult(options),
             (sessionId, title, body, options) =>
                 requestMobilePush(sessionId, title, body, options),
+            (sessionId, sessionName, blockingType, workspacePath) =>
+                notificationService.showBlockedNotification(sessionId, sessionName, blockingType, workspacePath),
         );
     } catch (error) {
         logger.mcp.error('Failed to start meta-agent MCP server:', error);
