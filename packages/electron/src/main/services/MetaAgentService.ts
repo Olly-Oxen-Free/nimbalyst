@@ -20,7 +20,7 @@ import { AIService } from './ai/AIService';
 import { setMetaAgentToolFns } from '../mcp/metaAgentServer';
 import { computeNotificationSignature } from './metaAgentNotificationSignature';
 import { extractMessageText, extractUserPrompts } from './metaAgentMessageText';
-import type { NotificationOptions, NotificationResult } from './NotificationService';
+import type { NotificationOptions, NotificationResult, BlockingType } from './NotificationService';
 import type { MobilePushResult } from '@nimbalyst/runtime/sync/types';
 import { composeNotificationTitle } from '../../shared/notificationTitle';
 
@@ -142,6 +142,22 @@ type RequestMobilePush = (
   options: { force?: boolean; reason?: string }
 ) => Promise<MobilePushResult | null>;
 
+/** Same injection rationale as RequestMobilePush: showBlockedNotification lives on
+ *  NotificationService, which pulls in WindowManager -- not something every test
+ *  importing MetaAgentService should have to load. */
+type ShowBlockedNotification = (
+  sessionId: string,
+  sessionName: string,
+  blockingType: BlockingType,
+  workspacePath: string,
+) => Promise<void>;
+
+const BLOCKING_TYPE_BY_PROMPT_TYPE: Record<string, BlockingType> = {
+  permission_request: 'permission',
+  ask_user_question_request: 'question',
+  exit_plan_mode_request: 'plan_approval',
+};
+
 /** Notification-only bound for the reinjected original task text. The stored,
  *  returned `SessionResultData.originalPrompt` value itself stays unbounded --
  *  only the text appended into a `[Child Session Update]` notification (which
@@ -199,6 +215,7 @@ export class MetaAgentService {
   private ipcHandlersRegistered = false;
   private showNotificationWithResult: ShowNotificationWithResult | null = null;
   private requestMobilePush: RequestMobilePush | null = null;
+  private showBlockedNotification: ShowBlockedNotification | null = null;
 
   private constructor() {}
 
@@ -240,7 +257,8 @@ export class MetaAgentService {
   public async start(
     aiService: AIService,
     showNotificationWithResult: ShowNotificationWithResult,
-    requestMobilePush?: RequestMobilePush
+    requestMobilePush?: RequestMobilePush,
+    showBlockedNotification?: ShowBlockedNotification
   ): Promise<void> {
     if (this.started) {
       return;
@@ -255,6 +273,7 @@ export class MetaAgentService {
       this.aiService = aiService;
       this.showNotificationWithResult = showNotificationWithResult;
       this.requestMobilePush = requestMobilePush ?? null;
+      this.showBlockedNotification = showBlockedNotification ?? null;
       this.sessionManager = new SessionManager();
       await this.sessionManager.initialize();
 
@@ -320,6 +339,7 @@ export class MetaAgentService {
     this.unsubscribeStateListener = null;
     this.notificationSignatures.clear();
     this.showNotificationWithResult = null;
+    this.showBlockedNotification = null;
     // No standalone HTTP server to tear down (Phase 7); the injected toolFns are
     // process-lifetime singletons.
     this.serverPort = null;
@@ -1259,6 +1279,10 @@ export class MetaAgentService {
       }
       this.notificationSignatures.set(sessionId, signature);
 
+      if (eventType === 'session:waiting' && result.pendingPrompt) {
+        await this.notifyChildBlocked(sessionId, result.title, result.pendingPrompt.promptType, session.workspacePath);
+      }
+
       if (result.pendingPrompt?.promptType === 'exit_plan_mode_request') {
         await this.ensurePlanTrackerItem(session.workspacePath, sessionId, result);
       }
@@ -1288,6 +1312,32 @@ export class MetaAgentService {
       }
     } catch (error) {
       console.error(`[MetaAgentService] handleChildSessionEvent failed for session ${sessionId} (${eventType}):`, error);
+    }
+  }
+
+  /** A blocked Meta-Agent child previously surfaced only as a passive "Waiting
+   *  for ..." label in the dashboard -- easy to miss if the architect isn't
+   *  looking at it. Fire the same OS notification a blocked top-level session
+   *  gets. Wrapped in its own try/catch, deliberately separate from the
+   *  handleChildSessionEvent-level catch: a notification failure must not
+   *  prevent the [Child Session Update] hand-off to the parent that follows. */
+  private async notifyChildBlocked(
+    sessionId: string,
+    sessionName: string,
+    promptType: string,
+    workspacePath: string,
+  ): Promise<void> {
+    if (!this.showBlockedNotification) {
+      return;
+    }
+    const blockingType = BLOCKING_TYPE_BY_PROMPT_TYPE[promptType];
+    if (!blockingType) {
+      console.error(`[MetaAgentService] Unrecognized pendingPrompt.promptType "${promptType}" for session ${sessionId}, falling back to "question"`);
+    }
+    try {
+      await this.showBlockedNotification(sessionId, sessionName, blockingType ?? 'question', workspacePath);
+    } catch (error) {
+      console.error(`[MetaAgentService] notifyChildBlocked failed for session ${sessionId}:`, error);
     }
   }
 
