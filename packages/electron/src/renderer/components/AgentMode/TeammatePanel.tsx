@@ -35,6 +35,10 @@ export interface TeammateInfo {
   startedAt?: number;
   lastActiveAt?: number;
   toolCallCount?: number;
+  // The teammate's own SDK session id, not the lead's. Absent until the
+  // teammate's first chunk lands, and on teammates recorded before it was
+  // persisted at all.
+  sessionId?: string;
 }
 
 interface TeammatePanelProps {

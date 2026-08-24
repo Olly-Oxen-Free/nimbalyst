@@ -13,9 +13,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import os from 'os';
 import path from 'path';
 
+/** Teammate rows the lead session's metadata holds, as a restarted app would find them. */
+let persistedTeammates: Array<Record<string, unknown>> = [];
+
 vi.mock('../../../../storage/repositories/AISessionsRepository', () => ({
   AISessionsRepository: {
-    get: async () => ({ metadata: { currentTeammates: [] } }),
+    get: async () => ({ metadata: { currentTeammates: persistedTeammates } }),
     updateMetadata: async () => {},
   },
 }));
@@ -58,6 +61,7 @@ describe('TeammateManager.sendMessageFromHost', () => {
   beforeEach(() => {
     queryMock.mockReset();
     queryMock.mockReturnValue(endsImmediately());
+    persistedTeammates = [];
   });
 
   it('delivers to a running teammate via the existing queue/flush path', async () => {
@@ -100,6 +104,70 @@ describe('TeammateManager.sendMessageFromHost', () => {
     const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
 
     const result = await manager.sendMessageFromHost('lead-session', 'ghost@team', 'anyone there?');
+
+    expect(result).toEqual({ delivered: false, wasIdle: false });
+  });
+});
+
+/**
+ * The second boot. Both teammate maps are memory-only, so after a restart the
+ * only surviving handle on an idle teammate is the session id the emit path
+ * persisted -- and none of the lead-derived config streamTeammateOutput reads
+ * off the manager has been assigned, because the lead's own query never ran.
+ */
+describe('TeammateManager.sendMessageFromHost after a restart', () => {
+  const persistedRow = (overrides: Record<string, unknown> = {}) => ({
+    name: 'bob',
+    agentId: 'bob@team',
+    teamName: 'team',
+    agentType: 'general-purpose',
+    status: 'idle',
+    sessionId: 'sdk-session-9',
+    startedAt: 111,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    queryMock.mockReturnValue(endsImmediately());
+    persistedTeammates = [];
+  });
+
+  it('resumes a teammate held only in persisted metadata, seeding the lead config the resume needs', async () => {
+    const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
+    const resumeSpy = vi.spyOn(internals(manager), 'resumeIdleTeammate').mockImplementation(() => {});
+    persistedTeammates = [persistedRow()];
+
+    const result = await manager.sendMessageFromHost('lead-session', 'bob@team', 'still there?', {
+      cwd: '/repo',
+      permissionsPath: '/repo-parent',
+    });
+
+    expect(result).toEqual({ delivered: true, wasIdle: true });
+    expect(resumeSpy).toHaveBeenCalledWith(
+      'lead-session',
+      'bob@team',
+      expect.objectContaining({ sessionId: 'sdk-session-9', name: 'bob', teamName: 'team', startedAt: 111 }),
+      'still there?',
+    );
+    expect(manager.lastUsedCwd).toBe('/repo');
+    expect(manager.lastUsedPermissionsPath).toBe('/repo-parent');
+  });
+
+  it('does not resume a teammate persisted before session ids were recorded', async () => {
+    const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
+    persistedTeammates = [persistedRow({ sessionId: undefined })];
+
+    const result = await manager.sendMessageFromHost('lead-session', 'bob@team', 'still there?');
+
+    expect(result).toEqual({ delivered: false, wasIdle: false });
+  });
+
+  it('does not resume a teammate that already reached a terminal status', async () => {
+    const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
+    persistedTeammates = [persistedRow({ status: 'completed' })];
+
+    const result = await manager.sendMessageFromHost('lead-session', 'bob@team', 'still there?');
 
     expect(result).toEqual({ delivered: false, wasIdle: false });
   });

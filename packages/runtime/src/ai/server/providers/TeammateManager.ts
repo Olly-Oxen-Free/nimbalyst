@@ -48,6 +48,32 @@ export interface IdleTeammate {
   startedAt?: number;    // epoch ms when originally spawned (preserved across idle)
 }
 
+/**
+ * A teammate row as it sits in the lead session's `currentTeammates` metadata.
+ * Every field is optional: rows written before a field existed keep their old
+ * shape, and nothing validates them on the way back in.
+ */
+interface PersistedTeammateRow {
+  agentId?: string;
+  name?: string;
+  teamName?: string;
+  agentType?: string;
+  status?: string;
+  model?: string;
+  startedAt?: number;
+  sessionId?: string;
+}
+
+/**
+ * Lead-derived config a host send carries, so a teammate can be resumed in a
+ * process where the lead's own query never ran (i.e. after a restart) and
+ * TeammateManager's `lastUsed*` fields are therefore unset.
+ */
+export interface TeammateResumeContext {
+  cwd?: string;
+  permissionsPath?: string;
+}
+
 export interface PendingMessage {
   recipient: string;
   content: string;
@@ -141,6 +167,8 @@ export class TeammateManager {
 
   private static readonly MAX_COMPLETED_TEAMMATES = 100;
   private static readonly TEAMMATE_COLORS = ['blue', 'green', 'yellow', 'purple'];
+  /** Persisted statuses a teammate can be resumed from after a restart. */
+  private static readonly RESUMABLE_PERSISTED_STATUSES = new Set(['idle', 'running', 'blocked']);
   private teammateColorIndex: number = 0;
   private bgAgentCounter: number = 0;
   private subAgentCounter: number = 0;
@@ -1163,6 +1191,7 @@ export class TeammateManager {
     leadSessionId: string | undefined,
     agentId: string,
     content: string,
+    resumeContext?: TeammateResumeContext,
   ): Promise<{ delivered: boolean; wasIdle: boolean }> {
     const running = this.managedTeammates.get(agentId);
     if (running) {
@@ -1183,7 +1212,86 @@ export class TeammateManager {
       return { delivered: true, wasIdle: true };
     }
 
+    // Both maps are memory-only, so a Nimbalyst restart empties them while the
+    // teammate's SDK session is still on disk and resumable. Rehydrate from the
+    // session metadata the emit path already persists.
+    const rehydrated = await this.rehydrateIdleTeammate(leadSessionId, agentId);
+    if (rehydrated) {
+      // streamTeammateOutput reads cwd/permissions off the manager instance,
+      // and nothing has assigned them in a process where the lead never ran.
+      this.seedLeadContext(resumeContext);
+      this.resumeIdleTeammate(leadSessionId, agentId, rehydrated, content);
+      return { delivered: true, wasIdle: true };
+    }
+
     return { delivered: false, wasIdle: false };
+  }
+
+  /**
+   * Fill in the lead-derived config streamTeammateOutput needs, for a process
+   * where the lead's own query never ran. Only fills gaps: a live lead's values
+   * are authoritative.
+   */
+  private seedLeadContext(resumeContext?: TeammateResumeContext): void {
+    if (!resumeContext) return;
+    this.lastUsedCwd ??= resumeContext.cwd;
+    this.lastUsedPermissionsPath ??= resumeContext.permissionsPath;
+  }
+
+  /**
+   * Rebuild an IdleTeammate from persisted session metadata for a teammate this
+   * process never spawned. Returns undefined when there is nothing resumable --
+   * no row, no persisted SDK session id (pre-feature data), or a teammate that
+   * already reached a terminal status.
+   */
+  private async rehydrateIdleTeammate(
+    leadSessionId: string | undefined,
+    agentId: string,
+  ): Promise<IdleTeammate | undefined> {
+    if (!leadSessionId) return undefined;
+
+    let entry: PersistedTeammateRow | undefined;
+    try {
+      const { AISessionsRepository } = await import('../../../storage/repositories/AISessionsRepository');
+      const session = await AISessionsRepository.get(leadSessionId);
+      const teammates = session?.metadata?.currentTeammates;
+      entry = Array.isArray(teammates)
+        ? (teammates as PersistedTeammateRow[]).find(tm => tm?.agentId === agentId)
+        : undefined;
+    } catch (error) {
+      console.error(`[MANAGED-TEAMMATE] Failed to read persisted teammates for "${agentId}":`, error);
+      return undefined;
+    }
+
+    const sessionId = entry?.sessionId;
+    if (!entry || typeof sessionId !== 'string' || !sessionId) return undefined;
+
+    // 'running'/'blocked' rows are stale after a restart -- the subprocess died
+    // with the app -- so they resume exactly like 'idle'. 'completed'/'errored'
+    // are terminal and must not be brought back.
+    if (!entry.status || !TeammateManager.RESUMABLE_PERSISTED_STATUSES.has(entry.status)) return undefined;
+
+    const [fallbackName, fallbackTeam] = agentId.split('@');
+    return {
+      teamName: entry.teamName ?? fallbackTeam ?? 'team',
+      name: entry.name ?? fallbackName ?? agentId,
+      sessionId,
+      agentType: entry.agentType ?? 'general-purpose',
+      model: entry.model,
+      color: TeammateManager.colorForAgentId(agentId),
+      cwd: this.lastUsedCwd || process.cwd(),
+      prompt: '',
+      startedAt: entry.startedAt,
+    };
+  }
+
+  /** Stable stand-in for the spawn-order color, which is not persisted. */
+  private static colorForAgentId(agentId: string): string {
+    let hash = 0;
+    for (let i = 0; i < agentId.length; i++) {
+      hash = (hash * 31 + agentId.charCodeAt(i)) >>> 0;
+    }
+    return TeammateManager.TEAMMATE_COLORS[hash % TeammateManager.TEAMMATE_COLORS.length];
   }
 
   /**
@@ -1275,6 +1383,12 @@ export class TeammateManager {
         startedAt?: number;
         lastActiveAt?: number;
         toolCallCount?: number;
+        /**
+         * The teammate's own SDK session id. Absent on rows written before this
+         * field existed, and on a teammate emitted before its first chunk was
+         * seen -- never assume it is present.
+         */
+        sessionId?: string;
       }> = Array.isArray(currentMetadata.currentTeammates) ? currentMetadata.currentTeammates as any[] : [];
 
       const seenAgentIds = new Set<string>();
@@ -1285,6 +1399,9 @@ export class TeammateManager {
           startedAt: managed.startedAt,
           lastActiveAt: managed.lastActiveAt,
           toolCallCount: managed.toolCallCount,
+          // Captured mid-stream, well after the teammate was first emitted, so
+          // it has to be re-read on every emit rather than written once at spawn.
+          sessionId: managed.sessionId ?? tm.sessionId,
         } : {};
         if (statusOverrides?.has(tm.agentId)) {
           return { ...tm, ...activityFields, status: statusOverrides.get(tm.agentId)! };
@@ -1294,7 +1411,11 @@ export class TeammateManager {
           // is still open.
           return { ...tm, ...activityFields, status: this.statusForManaged(tm.agentId) };
         } else if (this.idleTeammates.has(tm.agentId)) {
-          return { ...tm, status: 'idle' as const };
+          return {
+            ...tm,
+            sessionId: this.idleTeammates.get(tm.agentId)?.sessionId ?? tm.sessionId,
+            status: 'idle' as const,
+          };
         }
         return tm;
       });
@@ -1311,6 +1432,7 @@ export class TeammateManager {
             startedAt: tm.startedAt,
             lastActiveAt: tm.lastActiveAt,
             toolCallCount: tm.toolCallCount,
+            sessionId: tm.sessionId,
           });
         }
       }
@@ -1325,6 +1447,7 @@ export class TeammateManager {
             status: statusOverrides?.has(agentId) ? statusOverrides.get(agentId)! : 'idle',
             model: tm.model,
             startedAt: tm.startedAt,
+            sessionId: tm.sessionId,
           });
         }
       }

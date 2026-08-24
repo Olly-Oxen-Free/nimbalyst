@@ -11,7 +11,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-type StoredTeammate = { agentId: string; status: string };
+type StoredTeammate = { agentId: string; status: string; sessionId?: string };
 
 let storedTeammates: StoredTeammate[] = [];
 
@@ -179,5 +179,35 @@ describe('TeammateManager batch outcome', () => {
     manager.abandonIdleTeammates('session-1');
 
     expect(allCompletedOutcomes(manager)).toEqual(['abandoned']);
+  });
+});
+
+/**
+ * A teammate's SDK session id is the only durable handle on its transcript and
+ * the only way to resume it after a restart, but it is captured from the first
+ * chunk -- long after the teammate was first emitted with no session id at all.
+ * These cover that late capture reaching persisted metadata, and surviving the
+ * transition to idle.
+ */
+describe('TeammateManager teammate session id persistence', () => {
+  const sessionIdOf = (agentId: string) => storedTeammates.find(tm => tm.agentId === agentId)?.sessionId;
+
+  it('persists a session id captured after the teammate was already emitted, and keeps it through idle', async () => {
+    const manager = await managerWith('alice@team');
+    expect(sessionIdOf('alice@team')).toBeUndefined();
+
+    // What the first chunk's capture does to the managed entry.
+    (internals(manager).managedTeammates.get('alice@team') as { sessionId?: string }).sessionId = 'sdk-alice-1';
+    await manager.emitTeammateUpdate('session-1');
+    expect(sessionIdOf('alice@team')).toBe('sdk-alice-1');
+
+    internals(manager).handleStreamCompletion('session-1', 'alice@team', 'team', idleTemplateFor('alice@team'), {
+      capturedSessionId: 'sdk-alice-1',
+      approvedShutdown: false,
+      sentMessageToLead: false,
+    });
+
+    await settled({ 'alice@team': 'idle' });
+    expect(sessionIdOf('alice@team')).toBe('sdk-alice-1');
   });
 });

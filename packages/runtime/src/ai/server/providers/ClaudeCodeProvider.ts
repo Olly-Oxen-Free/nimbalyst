@@ -54,7 +54,7 @@ import type { InterruptTurnResult } from '../AIProvider';
 import { isBedrockToolSearchError } from '../utils/errorDetection';
 import { AgentMessagesRepository } from '../../../storage/repositories/AgentMessagesRepository';
 import { TranscriptMigrationRepository } from '../../../storage/repositories/TranscriptMigrationRepository';
-import { TeammateManager, type TeammateToLeadMessage } from './TeammateManager';
+import { TeammateManager, type TeammateResumeContext, type TeammateToLeadMessage } from './TeammateManager';
 import { describeUnusableWorkspacePath } from './workspacePreconditions';
 import path from 'path';
 import os from 'os';
@@ -2583,9 +2583,19 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    * Deliver a UI-initiated message to a specific managed teammate, by agentId
    * (not the fuzzy name matching the lead model's own SendMessage tool uses --
    * the UI already has the exact agentId from TeammateInfo).
+   *
+   * `leadSessionId` is passed in rather than read from `this.currentSessionId`,
+   * which is only assigned while a live lead query is streaming and is therefore
+   * undefined for the first send after a restart -- the exact case the resume
+   * path exists to serve.
    */
-  public async sendMessageToManagedTeammate(agentId: string, content: string): Promise<{ delivered: boolean; wasIdle: boolean }> {
-    return this.teammateManager.sendMessageFromHost(this.currentSessionId, agentId, content);
+  public async sendMessageToManagedTeammate(
+    agentId: string,
+    content: string,
+    leadSessionId: string,
+    resumeContext?: TeammateResumeContext,
+  ): Promise<{ delivered: boolean; wasIdle: boolean }> {
+    return this.teammateManager.sendMessageFromHost(leadSessionId, agentId, content, resumeContext);
   }
 
   /**

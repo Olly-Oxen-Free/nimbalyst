@@ -3220,7 +3220,17 @@ export class AIService {
         return { success: false, error: 'No active provider for session' };
       }
 
-      const { delivered, wasIdle } = await (provider as ClaudeCodeProvider).sendMessageToManagedTeammate(agentId, content);
+      // After a restart the provider has no live query, so the lead session id
+      // and the lead's cwd/permission paths have to come from the session record.
+      const { delivered, wasIdle } = await (provider as ClaudeCodeProvider).sendMessageToManagedTeammate(
+        agentId,
+        content,
+        sessionId,
+        {
+          cwd: session.worktreePath || session.workspacePath,
+          permissionsPath: session.worktreeProjectPath || session.worktreePath || session.workspacePath,
+        },
+      );
       return { success: delivered, wasIdle };
     });
 
