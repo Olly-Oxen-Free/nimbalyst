@@ -1,11 +1,11 @@
 {
   "slug": "teammate-thread-view",
-  "status": "queued",
+  "status": "in-review",
   "created_at": "2026-08-24T00:00:00Z",
   "execution_mode": "feature-branch",
   "branch_strategy": "use-worktree-branch-directly",
   "branch": "worktree-agent-a5755e12821ebe3c1",
-  "phase": "planned",
+  "phase": "validating",
   "beads": {
     "tier": "cli",
     "resolved_at": "2026-08-24T00:00:00Z",
@@ -17,11 +17,53 @@
     "note": "mcp__nimbalyst-trackers tools not available in the planning session; file on next opportunity"
   },
   "tasks": {
-    "1a": { "status": "pending", "wave": 1, "complexity": 8 },
-    "1b": { "status": "pending", "wave": 2, "complexity": 7 },
-    "2a": { "status": "pending", "wave": 3, "complexity": 4 },
-    "2b": { "status": "pending", "wave": 4, "complexity": 6 },
-    "3a": { "status": "pending", "wave": 5, "complexity": 3 },
-    "4a": { "status": "pending", "wave": 6, "complexity": 2 }
+    "1a": {
+      "status": "done",
+      "wave": 1,
+      "complexity": 8,
+      "bead_id": "nby-5rt",
+      "commit": "f3b8214cf"
+    },
+    "1b": {
+      "status": "done",
+      "wave": 2,
+      "complexity": 7,
+      "bead_id": "nby-270",
+      "commit": "6134632b3"
+    },
+    "2a": {
+      "status": "done",
+      "wave": 3,
+      "complexity": 4,
+      "bead_id": "nby-cv6",
+      "commit": "5a4ba09bc"
+    },
+    "2b": {
+      "status": "done",
+      "wave": 4,
+      "complexity": 6,
+      "bead_id": "nby-xax",
+      "commit": "4a88e0d28"
+    },
+    "3a": {
+      "status": "done",
+      "wave": 5,
+      "complexity": 3,
+      "bead_id": "nby-7n2",
+      "commit": "6d0e0d0fb"
+    },
+    "4a": {
+      "status": "done",
+      "wave": 6,
+      "complexity": 2,
+      "bead_id": "nby-cml",
+      "commit": "6949eed2d"
+    }
+  },
+  "verification": {
+    "typecheck": "PASS (23/23 workspaces, re-run by PM after final integration)",
+    "targeted_unit_tests": "PASS (independently re-run by PM: 53 files, 676 tests, providers+transcript+AgentMode)",
+    "monorepo_test_prepush": "PASS per task 4a report (10681 passed, 6 pre-existing failures in AgentTranscript localStorage-mock env, triaged unrelated, tracked in bd)",
+    "manual_e2e": "PENDING -- live spawn/observe/stop not yet exercised by a human"
   }
 }
