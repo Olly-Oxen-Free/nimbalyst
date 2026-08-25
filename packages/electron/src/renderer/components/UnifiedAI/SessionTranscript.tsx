@@ -2268,13 +2268,11 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const [openTeammateThread, setOpenTeammateThread] = useState<{
     agentId: string;
     name: string;
-    isActive: boolean;
     anchorEl: HTMLElement;
   } | null>(null);
   const handleTeammateChipClick = useCallback((agentId: string, anchorEl: HTMLElement) => {
     const teammate = allTeammatesForThread.find(t => t.agentId === agentId);
-    const isActive = teammate ? teammate.status !== 'completed' && teammate.status !== 'errored' : false;
-    setOpenTeammateThread({ agentId, name: teammate?.name ?? agentId, isActive, anchorEl });
+    setOpenTeammateThread({ agentId, name: teammate?.name ?? agentId, anchorEl });
   }, [allTeammatesForThread]);
 
   // Scroll-to-message: when PromptQuickOpen selects a prompt, scroll to the
@@ -2701,7 +2699,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
           sessionId={sessionId}
           agentId={openTeammateThread.agentId}
           teammateName={openTeammateThread.name}
-          isActive={openTeammateThread.isActive}
+          workspacePath={workspacePath}
           anchorEl={openTeammateThread.anchorEl}
           onClose={() => setOpenTeammateThread(null)}
         />

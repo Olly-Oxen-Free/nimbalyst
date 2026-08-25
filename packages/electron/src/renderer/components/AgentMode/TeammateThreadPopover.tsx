@@ -1,24 +1,46 @@
 /**
  * TeammateThreadPopover - opens when a Teammate chip in `SubAgentChipRow` is
- * clicked. Lets the architect send a message directly to that teammate,
- * without navigating away from the current transcript.
- *
- * Teammates have no persisted `ai_sessions` row (see task 2c's brief,
- * Finding 1), so there is no existing transcript to render here - this is a
- * compose-only surface, not a full thread view. That satisfies R5's "opens/
- * loads that teammate's own thread and allows sending it a message directly"
- * without inventing a new streamed-transcript feature.
+ * clicked. Shows that teammate's own thread (projected out of the lead
+ * session's raw log by `ai:getTeammateTranscript`) and lets the architect
+ * message it directly, without navigating away from the current transcript.
  */
 
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useAtomValue } from 'jotai';
+import { RichTranscriptView } from '@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView';
+import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
 import { useFloatingMenu, FloatingPortal } from '../../hooks/useFloatingMenu';
+import {
+  sessionTeammatesAtom,
+  teammateTranscriptSignalAtomFamily,
+  teammateTranscriptSignalKey,
+} from '../../store/atoms/agentMode';
+import { mapTeammateStatus } from '../../store/atoms/subAgentStatus';
+
+/** Same knobs as the session transcript peek, except thinking stays visible:
+ *  a teammate's reasoning is most of what the architect opens this to read. */
+const TEAMMATE_TRANSCRIPT_SETTINGS = {
+  showToolCalls: true,
+  compactMode: true,
+  collapseTools: true,
+  showThinking: true,
+  showSessionInit: false,
+};
+
+const STATUS_LABELS: Record<ReturnType<typeof mapTeammateStatus>, string> = {
+  working: 'Working',
+  waiting: 'Waiting',
+  blocked: 'Blocked',
+  complete: 'Complete',
+  error: 'Error',
+};
 
 export interface TeammateThreadPopoverProps {
+  /** The LEAD session id - a teammate's chunks live in the lead's raw log. */
   sessionId: string;
   agentId: string;
   teammateName: string;
-  /** false for a completed/errored teammate - delivery is not attempted. */
-  isActive: boolean;
+  workspacePath: string;
   anchorEl: HTMLElement;
   onClose: () => void;
 }
@@ -27,7 +49,7 @@ export const TeammateThreadPopover: React.FC<TeammateThreadPopoverProps> = ({
   sessionId,
   agentId,
   teammateName,
-  isActive,
+  workspacePath,
   anchorEl,
   onClose,
 }) => {
@@ -39,6 +61,55 @@ export const TeammateThreadPopover: React.FC<TeammateThreadPopoverProps> = ({
       if (!open) onClose();
     },
   });
+
+  const teammates = useAtomValue(sessionTeammatesAtom(sessionId));
+  const teammate = useMemo(
+    () => teammates.find(t => t.agentId === agentId),
+    [teammates, agentId],
+  );
+  // Delivery is plausible while the teammate is running/blocked/idle; a
+  // completed or errored teammate has no process left to receive a message.
+  const canCompose = !!teammate
+    && teammate.status !== 'completed'
+    && teammate.status !== 'errored';
+
+  const [messages, setMessages] = useState<TranscriptViewMessage[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const fetchGenerationRef = useRef(0);
+
+  const fetchTranscript = useCallback(async () => {
+    const generation = ++fetchGenerationRef.current;
+    try {
+      const next = await window.electronAPI.aiGetTeammateTranscript(sessionId, agentId, workspacePath);
+      if (generation !== fetchGenerationRef.current) return;
+      setMessages(next);
+    } catch {
+      if (generation !== fetchGenerationRef.current) return;
+      setMessages(previous => previous ?? []);
+    }
+    setLoading(false);
+  }, [sessionId, agentId, workspacePath]);
+
+  useEffect(() => {
+    void fetchTranscript();
+    return () => {
+      fetchGenerationRef.current += 1;
+    };
+  }, [fetchTranscript]);
+
+  // Live follow: teammate chunks never reach ai_transcript_events, so the
+  // refetch trigger is the per-teammate signal, debounced like the peek's.
+  const transcriptSignal = useAtomValue(
+    teammateTranscriptSignalAtomFamily(teammateTranscriptSignalKey(sessionId, agentId)),
+  );
+  const initialSignalRef = useRef(transcriptSignal);
+  useEffect(() => {
+    if (transcriptSignal === initialSignalRef.current) return;
+    const debounceTimer = window.setTimeout(() => {
+      void fetchTranscript();
+    }, 1_500);
+    return () => window.clearTimeout(debounceTimer);
+  }, [fetchTranscript, transcriptSignal]);
 
   const [message, setMessage] = useState('');
   const [sendState, setSendState] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle');
@@ -67,19 +138,58 @@ export const TeammateThreadPopover: React.FC<TeammateThreadPopoverProps> = ({
     }
   }, [handleSend]);
 
+  // Never the lead's id: RichTranscriptView caches virtual-list state per
+  // sessionId, and reusing the lead's would clobber the main transcript's.
+  const transcriptKey = teammate?.sessionId ?? `${sessionId}:${agentId}`;
+
   return (
     <FloatingPortal>
       <div
         ref={menu.refs.setFloating}
-        style={menu.floatingStyles}
+        style={{
+          ...menu.floatingStyles,
+          width: 'min(600px, calc(100vw - 16px))',
+          height: 'min(420px, calc(100vh - 16px))',
+        }}
         {...menu.getFloatingProps()}
-        className="teammate-thread-popover flex flex-col gap-2 p-3 rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] shadow-lg w-[280px] z-50"
+        className="teammate-thread-popover flex flex-col gap-2 p-3 rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] shadow-lg z-50"
       >
-        <div className="teammate-thread-popover-title text-[12px] font-medium text-[var(--nim-text)] truncate">
-          {teammateName}
+        <div className="teammate-thread-popover-header flex flex-col gap-0.5">
+          <div className="teammate-thread-popover-title text-[12px] font-medium text-[var(--nim-text)] truncate">
+            {teammate?.name ?? teammateName}
+          </div>
+          <div className="teammate-thread-popover-meta flex flex-wrap gap-x-2 text-[10px] text-[var(--nim-text-faint)]">
+            {teammate && <span>{STATUS_LABELS[mapTeammateStatus(teammate.status)]}</span>}
+            {teammate?.model && <span>{teammate.model}</span>}
+            {teammate?.startedAt !== undefined && (
+              <span>Started {new Date(teammate.startedAt).toLocaleTimeString()}</span>
+            )}
+            {teammate?.toolCallCount !== undefined && (
+              <span>{teammate.toolCallCount} tool calls</span>
+            )}
+          </div>
         </div>
 
-        {!isActive ? (
+        <div className="teammate-thread-popover-body flex-1 min-h-0 overflow-hidden rounded border border-[var(--nim-border)]">
+          {loading ? (
+            <div className="teammate-thread-popover-loading flex h-full items-center justify-center text-[11px] text-[var(--nim-text-faint)]">
+              Loading thread…
+            </div>
+          ) : messages && messages.length > 0 ? (
+            <RichTranscriptView
+              sessionId={transcriptKey}
+              messages={messages}
+              settings={TEAMMATE_TRANSCRIPT_SETTINGS}
+              persistScrollState={false}
+            />
+          ) : (
+            <div className="teammate-thread-popover-empty flex h-full items-center justify-center text-[11px] italic text-[var(--nim-text-faint)]">
+              No activity yet from this teammate.
+            </div>
+          )}
+        </div>
+
+        {!canCompose ? (
           <div className="teammate-thread-popover-inactive text-[11px] text-[var(--nim-text-faint)]">
             This teammate is no longer active — messages can&apos;t be delivered.
           </div>
@@ -89,7 +199,7 @@ export const TeammateThreadPopover: React.FC<TeammateThreadPopoverProps> = ({
               className="teammate-thread-popover-input text-[12px] p-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg)] text-[var(--nim-text)] resize-none focus:outline-none focus:border-[var(--nim-primary)]"
               rows={3}
               value={message}
-              placeholder={`Message ${teammateName}…`}
+              placeholder={`Message ${teammate?.name ?? teammateName}…`}
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={sendState === 'sending'}
