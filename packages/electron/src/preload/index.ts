@@ -711,6 +711,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('ai:sendMessageToTeammate', sessionId, agentId, content),
   aiGetTeammateTranscript: (sessionId: string, agentId: string, workspacePath: string) =>
     ipcRenderer.invoke('ai:getTeammateTranscript', sessionId, agentId, workspacePath),
+  aiStopTeammate: (sessionId: string, agentId: string, workspacePath: string) =>
+    ipcRenderer.invoke('ai:stopTeammate', sessionId, agentId, workspacePath),
   aiApplyEdit: (edit: any) => ipcRenderer.invoke('ai:applyEdit', edit),
   onAIEditRequest: (callback: (edit: any) => void) => {
     const handler = (_event: any, edit: any) => callback(edit);

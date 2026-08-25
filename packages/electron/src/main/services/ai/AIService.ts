@@ -3238,6 +3238,41 @@ export class AIService {
       return { success: delivered, wasIdle };
     });
 
+    safeHandle('ai:stopTeammate', async (
+      _event,
+      sessionId: string,
+      agentId: string,
+      workspacePath: string,
+    ): Promise<{ success: boolean; error?: string }> => {
+      if (!sessionId) throw new Error('sessionId is required');
+      if (!agentId) throw new Error('agentId is required');
+      if (!workspacePath) throw new Error('workspacePath is required');
+
+      const session = await AISessionsRepository.get(sessionId);
+      if (!session) return { success: false, error: 'Session not found' };
+
+      // Same ownership rule as ai:getTeammateTranscript: a worktree session
+      // is reachable from either its parent workspace or its worktree.
+      const ownsSession = session.workspacePath === workspacePath
+        || (!!session.worktreePath && session.worktreePath === workspacePath);
+      if (session.workspacePath && !ownsSession) {
+        throw new Error(
+          `Session ${sessionId} belongs to ${session.workspacePath}, not ${workspacePath}`,
+        );
+      }
+      if (session.provider !== 'claude-code') {
+        return { success: false, error: 'Teammates only exist under the claude-code provider' };
+      }
+
+      const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
+      if (!provider || typeof (provider as any).stopManagedTeammateById !== 'function') {
+        return { success: false, error: 'No active provider for session' };
+      }
+
+      const { stopped } = (provider as ClaudeCodeProvider).stopManagedTeammateById(agentId, sessionId);
+      return { success: stopped };
+    });
+
     // A teammate has no session row of its own: its chunks live in the LEAD
     // session's raw ai_agent_messages, tagged with its agent id, and are
     // suppressed from the lead's visible stream. Project them here so the

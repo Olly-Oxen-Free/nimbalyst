@@ -257,3 +257,54 @@ describe('TeammateManager teammate session id persistence', () => {
     expect(sessionIdOf('alice@team')).toBe('sdk-alice-1');
   });
 });
+
+/**
+ * User-initiated stop from the thread popover (R7). `stopByAgentId` addresses
+ * the exact agentId (no fuzzy name matching) and takes the lead sessionId
+ * explicitly, unlike `stop(name)` which leans on `this.lastUsedSessionId` --
+ * unset here, matching a manager that never ran a live lead query (the
+ * post-restart case).
+ */
+describe('TeammateManager.stopByAgentId', () => {
+  const withAbort = (manager: TeammateManager, agentId: string) => {
+    const abort = { abort: vi.fn() };
+    Object.assign(internals(manager).managedTeammates.get(agentId) as object, { abort });
+    return abort;
+  };
+
+  it('stops the exact agentId and emits with the explicitly-passed sessionId when lastUsedSessionId is unset', async () => {
+    const manager = await managerWith('alice@team');
+    expect(manager.lastUsedSessionId).toBeUndefined();
+    const abort = withAbort(manager, 'alice@team');
+
+    const result = manager.stopByAgentId('alice@team', 'session-explicit');
+
+    expect(result).toEqual({ stopped: true });
+    expect(abort.abort).toHaveBeenCalled();
+    expect(internals(manager).managedTeammates.has('alice@team')).toBe(false);
+    await settled({ 'alice@team': 'errored' });
+  });
+
+  it('logs a distinct user-stop marker, not the stall-watchdog abort message', async () => {
+    const manager = await managerWith('alice@team');
+    withAbort(manager, 'alice@team');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    manager.stopByAgentId('alice@team', 'session-explicit');
+
+    const loggedUserStop = logSpy.mock.calls.some(([msg]) =>
+      typeof msg === 'string' && msg.includes('user requested'));
+    const loggedWatchdog = logSpy.mock.calls.some(([msg]) =>
+      typeof msg === 'string' && msg.includes('STREAM_STALL_DETECTED'));
+    expect(loggedUserStop).toBe(true);
+    expect(loggedWatchdog).toBe(false);
+    logSpy.mockRestore();
+  });
+
+  it('is a graceful no-op, not a throw, for an already-terminal or unknown teammate', () => {
+    const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
+
+    expect(() => manager.stopByAgentId('ghost@team', 'session-explicit')).not.toThrow();
+    expect(manager.stopByAgentId('ghost@team', 'session-explicit')).toEqual({ stopped: false });
+  });
+});

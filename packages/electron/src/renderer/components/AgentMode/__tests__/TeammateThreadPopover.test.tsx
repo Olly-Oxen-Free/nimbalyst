@@ -43,6 +43,7 @@ import {
 
 const getTeammateTranscript = vi.fn();
 const sendMessageToTeammate = vi.fn();
+const stopTeammate = vi.fn();
 
 function teammate(status: TeammateInfo['status']): TeammateInfo {
   return {
@@ -88,9 +89,11 @@ describe('TeammateThreadPopover', () => {
     testState.teammates = [teammate('running')];
     getTeammateTranscript.mockReset().mockResolvedValue([message('hello')]);
     sendMessageToTeammate.mockReset().mockResolvedValue({ success: true });
+    stopTeammate.mockReset().mockResolvedValue({ success: true });
     (window as unknown as { electronAPI: unknown }).electronAPI = {
       aiGetTeammateTranscript: getTeammateTranscript,
       aiSendMessageToTeammate: sendMessageToTeammate,
+      aiStopTeammate: stopTeammate,
     };
   });
 
@@ -181,5 +184,40 @@ describe('TeammateThreadPopover', () => {
 
     expect(input.value).toBe('status?');
     expect(baseElement.querySelector('.teammate-thread-popover-status')?.textContent).toContain('Failed');
+  });
+
+  it.each([
+    ['running', true],
+    ['blocked', true],
+    ['idle', false],
+    ['completed', false],
+    ['errored', false],
+  ] as [TeammateInfo['status'], boolean][])(
+    'shows the Stop button only for a %s teammate',
+    async (status, stopVisible) => {
+      testState.teammates = [teammate(status)];
+      const { baseElement } = await renderPopover();
+
+      expect(baseElement.querySelector('.teammate-thread-popover-stop') !== null).toBe(stopVisible);
+    },
+  );
+
+  it('stops the teammate and disables the button while the stop is in flight', async () => {
+    let resolveStop!: (value: { success: boolean }) => void;
+    stopTeammate.mockReturnValue(new Promise((resolve) => { resolveStop = resolve; }));
+    const { baseElement } = await renderPopover();
+
+    const stopButton = baseElement.querySelector('.teammate-thread-popover-stop') as HTMLButtonElement;
+    await act(async () => {
+      fireEvent.click(stopButton);
+    });
+
+    expect(stopTeammate).toHaveBeenCalledWith('lead-1', 'agent-scout', '/ws');
+    expect(stopButton.disabled).toBe(true);
+
+    await act(async () => {
+      resolveStop({ success: true });
+    });
+    expect(stopButton.disabled).toBe(false);
   });
 });

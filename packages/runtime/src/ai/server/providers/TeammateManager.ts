@@ -2038,6 +2038,48 @@ export class TeammateManager {
     }
   }
 
+  /**
+   * Stop a specific managed teammate by exact `agentId` -- addressed by the
+   * UI, which already has the exact id, unlike the lead model's own
+   * SendMessage tool which goes through `stop(name)`'s fuzzy matching.
+   *
+   * `leadSessionId` is threaded in explicitly rather than read from
+   * `this.lastUsedSessionId`, which is only set while a live lead query is
+   * streaming and is therefore unset for the first UI action after a
+   * restart -- the same gap `sendMessageFromHost`'s `leadSessionId`
+   * parameter exists to close. Without this, a post-restart stop would
+   * abort the subprocess but silently skip the status emit.
+   *
+   * Stopping a teammate that is already terminal (completed/errored) or
+   * unknown is a graceful no-op, not an error -- the UI may race a
+   * completion event that already cleared it from both maps.
+   */
+  stopByAgentId(agentId: string, leadSessionId: string | undefined): { stopped: boolean } {
+    const running = this.managedTeammates.get(agentId);
+    if (running) {
+      console.log(`[MANAGED-TEAMMATE] Stopping running teammate "${agentId}" (user requested)`);
+      running.abort.abort();
+      this.managedTeammates.delete(agentId);
+      this.clearPendingMessages(agentId);
+      this.scheduleEmitTeammateUpdate(leadSessionId, new Map([[agentId, 'errored']]));
+      return { stopped: true };
+    }
+
+    const idle = this.idleTeammates.get(agentId);
+    if (idle) {
+      console.log(`[MANAGED-TEAMMATE] Stopping idle teammate "${agentId}" (user requested)`);
+      this.idleTeammates.delete(agentId);
+      this.markCompleted(agentId);
+      this.clearPendingMessages(agentId);
+      void this.removeTeammateFromConfig(idle.teamName, agentId);
+      this.scheduleEmitTeammateUpdate(leadSessionId, new Map([[agentId, 'completed']]));
+      return { stopped: true };
+    }
+
+    console.log(`[MANAGED-TEAMMATE] Stop requested for "${agentId}" but it is not running or idle (already terminal)`);
+    return { stopped: false };
+  }
+
   stop(name: string): boolean {
     for (const [agentId, tm] of this.managedTeammates) {
       if (this.agentIdMatchesRecipient(agentId, name, this.currentTeamContext)) {

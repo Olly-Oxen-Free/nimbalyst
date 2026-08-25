@@ -498,6 +498,11 @@ interface ElectronAPI {
   ) => Promise<
     import('@nimbalyst/runtime/ai/server/transcript/TranscriptProjector').TranscriptViewMessage[]
   >;
+  aiStopTeammate: (
+    sessionId: string,
+    agentId: string,
+    workspacePath: string,
+  ) => Promise<{ success: boolean; error?: string }>;
   aiApplyEdit: (edit: any) => Promise<any>;
 
   // Flat-key settings -- single read-everything snapshot, single per-key write,

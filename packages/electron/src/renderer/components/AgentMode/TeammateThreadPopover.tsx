@@ -111,6 +111,19 @@ export const TeammateThreadPopover: React.FC<TeammateThreadPopoverProps> = ({
     return () => window.clearTimeout(debounceTimer);
   }, [fetchTranscript, transcriptSignal]);
 
+  const [stopping, setStopping] = useState(false);
+  const canStop = teammate?.status === 'running' || teammate?.status === 'blocked';
+
+  const handleStop = useCallback(async () => {
+    if (stopping) return;
+    setStopping(true);
+    try {
+      await window.electronAPI.aiStopTeammate(sessionId, agentId, workspacePath);
+    } finally {
+      setStopping(false);
+    }
+  }, [sessionId, agentId, workspacePath, stopping]);
+
   const [message, setMessage] = useState('');
   const [sendState, setSendState] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle');
 
@@ -154,20 +167,32 @@ export const TeammateThreadPopover: React.FC<TeammateThreadPopoverProps> = ({
         {...menu.getFloatingProps()}
         className="teammate-thread-popover flex flex-col gap-2 p-3 rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] shadow-lg z-50"
       >
-        <div className="teammate-thread-popover-header flex flex-col gap-0.5">
-          <div className="teammate-thread-popover-title text-[12px] font-medium text-[var(--nim-text)] truncate">
-            {teammate?.name ?? teammateName}
+        <div className="teammate-thread-popover-header flex items-start justify-between gap-2">
+          <div className="flex flex-col gap-0.5 min-w-0">
+            <div className="teammate-thread-popover-title text-[12px] font-medium text-[var(--nim-text)] truncate">
+              {teammate?.name ?? teammateName}
+            </div>
+            <div className="teammate-thread-popover-meta flex flex-wrap gap-x-2 text-[10px] text-[var(--nim-text-faint)]">
+              {teammate && <span>{STATUS_LABELS[mapTeammateStatus(teammate.status)]}</span>}
+              {teammate?.model && <span>{teammate.model}</span>}
+              {teammate?.startedAt !== undefined && (
+                <span>Started {new Date(teammate.startedAt).toLocaleTimeString()}</span>
+              )}
+              {teammate?.toolCallCount !== undefined && (
+                <span>{teammate.toolCallCount} tool calls</span>
+              )}
+            </div>
           </div>
-          <div className="teammate-thread-popover-meta flex flex-wrap gap-x-2 text-[10px] text-[var(--nim-text-faint)]">
-            {teammate && <span>{STATUS_LABELS[mapTeammateStatus(teammate.status)]}</span>}
-            {teammate?.model && <span>{teammate.model}</span>}
-            {teammate?.startedAt !== undefined && (
-              <span>Started {new Date(teammate.startedAt).toLocaleTimeString()}</span>
-            )}
-            {teammate?.toolCallCount !== undefined && (
-              <span>{teammate.toolCallCount} tool calls</span>
-            )}
-          </div>
+          {canStop && (
+            <button
+              type="button"
+              className="teammate-thread-popover-stop shrink-0 text-[11px] px-2 py-1 rounded border border-[var(--nim-border)] text-[var(--nim-text)] disabled:opacity-50"
+              onClick={handleStop}
+              disabled={stopping}
+            >
+              {stopping ? 'Stopping…' : 'Stop'}
+            </button>
+          )}
         </div>
 
         <div className="teammate-thread-popover-body flex-1 min-h-0 overflow-hidden rounded border border-[var(--nim-border)]">

@@ -2580,6 +2580,19 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   }
 
   /**
+   * Stop a specific managed teammate by exact agentId, addressed by the UI
+   * (not the lead model's fuzzy name matching). `leadSessionId` is passed in
+   * for the same reason `sendMessageToManagedTeammate` takes it explicitly:
+   * `this.currentSessionId` is unset for the first UI action after a restart.
+   */
+  public stopManagedTeammateById(
+    agentId: string,
+    leadSessionId: string,
+  ): { stopped: boolean } {
+    return this.teammateManager.stopByAgentId(agentId, leadSessionId);
+  }
+
+  /**
    * Deliver a UI-initiated message to a specific managed teammate, by agentId
    * (not the fuzzy name matching the lead model's own SendMessage tool uses --
    * the UI already has the exact agentId from TeammateInfo).
