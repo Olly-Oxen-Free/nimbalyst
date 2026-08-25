@@ -691,6 +691,50 @@ describe('projectTeammateRawMessages', () => {
     expect(vms.map((m) => m.text)).toEqual(['', 'Checking the tests now.']);
   });
 
+  it('re-projecting after one more logged chunk has no duplicate and no dropped turn (history/live seam)', async () => {
+    // Mirrors the popover's history-fetch-then-live-refetch flow (2a/2b): the
+    // teammate's raw log grows while the panel is open, and the panel
+    // re-projects the WHOLE log from scratch (no incremental diffing). A
+    // tool_use/tool_result pair is appended -- a distinct turn type, so this
+    // also guards against the projector's adjacent-assistant-text merging
+    // masking a real duplicate-or-drop regression.
+    const history: RawMessage[] = [assistantWithThinking(1)];
+    const beforeAppend = await projectTeammateRawMessages(history, AGENT);
+
+    const grown = [
+      ...history,
+      teammateChunk(2, {
+        type: 'assistant',
+        session_id: 'sdk-1',
+        message: {
+          id: 'msg_2',
+          role: 'assistant',
+          model: 'claude-opus-4',
+          content: [{ type: 'tool_use', id: 'toolu_seam', name: 'Read', input: { file_path: '/b.ts' } }],
+        },
+      }),
+      teammateChunk(3, {
+        type: 'user',
+        session_id: 'sdk-1',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_seam', content: 'export const b = 2;' }],
+        },
+      }),
+    ];
+    const afterAppend = await projectTeammateRawMessages(grown, AGENT);
+
+    // No dropped turn: every message from the first fetch still appears, in order.
+    expect(afterAppend.slice(0, beforeAppend.length)).toEqual(beforeAppend);
+    // No duplicate: exactly one new turn was added for the appended chunk pair.
+    expect(afterAppend).toHaveLength(beforeAppend.length + 1);
+    expect(afterAppend[afterAppend.length - 1].toolCall).toMatchObject({
+      toolName: 'Read',
+      status: 'completed',
+      result: 'export const b = 2;',
+    });
+  });
+
   it('leaves lead-transcript parsing of the same chunks unchanged', async () => {
     // The default (lead) projection must keep showing the injected message as a
     // status line and keep dropping the synthetic report -- the teammate view

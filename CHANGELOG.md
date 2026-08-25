@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The prompt sent when dispatching a tracker item into a session is now customizable, globally and per project, in Settings.
 - Chat with a local Ollama server as its own provider, and optionally bridge its models into OpenCode for coding sessions.
 - The project bar can now dock to the top of the window instead of the left edge, with the active project expanding into its full name in place; open projects can also be set to only show on hover.
-- Teammates and sub-agents you spawn now show up as a colored chip row above the chat input, with a distinct "blocked" color when one is waiting on a permission prompt; clicking a teammate's chip lets you message it directly, and a sub-agent that errors, crashes, hangs, or can't be reached now reliably notifies you instead of failing silently.
+- Teammates and sub-agents you spawn now show up as a colored chip row above the chat input, with a distinct "blocked" color when one is waiting on a permission prompt; clicking a teammate's chip opens its actual conversation — what it said, did, and thought — updating live while it works, surviving a restart, still reachable by message even if it's gone idle after one, with a Stop button for a runaway teammate, and a sub-agent that errors, crashes, hangs, or can't be reached now reliably notifies you instead of failing silently.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
