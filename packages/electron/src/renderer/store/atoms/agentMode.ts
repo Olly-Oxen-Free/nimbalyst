@@ -225,6 +225,21 @@ export const sessionTeammatesAtom = atomFamily((sessionId: string) =>
   })
 );
 
+/** Builds the compound key used by `teammateTranscriptSignalAtomFamily`. */
+export function teammateTranscriptSignalKey(sessionId: string, agentId: string): string {
+  return `${sessionId}:${agentId}`;
+}
+
+/**
+ * Per-(sessionId, agentId) live-update signal for a teammate's transcript.
+ * Bumped by teammateTranscriptListeners.ts whenever main forwards a
+ * `teammate:transcript-updated` event for this teammate. An open transcript
+ * popover (task 2b) subscribes via useAtomValue and debounces its own refetch.
+ */
+export const teammateTranscriptSignalAtomFamily = atomFamily((_key: string) =>
+  atom<number>(0)
+);
+
 /** Task info from SDK-native sub-agents (task_started/task_progress/task_notification) */
 export interface TaskInfo {
   taskId: string;

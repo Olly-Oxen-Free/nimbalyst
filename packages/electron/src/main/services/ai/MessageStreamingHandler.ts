@@ -1153,6 +1153,19 @@ export class MessageStreamingHandler {
     };
     this.installListener(provider, 'teammate:messageWhileIdle', onTeammateMessageWhileIdle);
 
+    // Live-update signal: forward each logged teammate chunk to the session's
+    // window so an open teammate transcript popover can refetch. Fire-and-forget
+    // -- no ack, no retry; a missed bump just means the next chunk's bump catches
+    // the popover up.
+    const onTeammateTranscriptUpdated = (data: { sessionId: string; agentId: string }) => {
+      if (!data.sessionId || !data.agentId) return;
+      const targetWindow = findWindowByWorkspace(effectiveWorkspacePath);
+      if (targetWindow && !targetWindow.isDestroyed()) {
+        targetWindow.webContents.send('teammate:transcript-updated', data);
+      }
+    };
+    this.installListener(provider, 'teammate:transcriptUpdated', onTeammateTranscriptUpdated);
+
     // Listen for all teammates completing. When the lead finished but teammates
     // were still active, endSession was deferred. Now that all teammates are
     // done, end the session and play the completion sound.

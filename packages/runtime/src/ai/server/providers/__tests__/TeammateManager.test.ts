@@ -32,7 +32,7 @@ type ManagerInternals = {
   idleTeammates: Map<string, unknown>;
   emitDebounceTimer: unknown;
   handleStreamCompletion(
-    sessionId: string,
+    sessionId: string | undefined,
     agentId: string,
     teamName: string,
     idleTemplate: unknown,
@@ -189,6 +189,52 @@ describe('TeammateManager batch outcome', () => {
  * These cover that late capture reaching persisted metadata, and surviving the
  * transition to idle.
  */
+/**
+ * The live-update signal (R5): every path that delivers a teammate message to
+ * the lead must also emit `teammate:transcriptUpdated` so an open transcript
+ * popover knows to refetch -- but only when a session id actually exists to
+ * key the popover off of (deliverMessageToLead's `if (sessionId)` guard).
+ */
+describe('TeammateManager live-update signal on message-to-lead', () => {
+  it('emits teammate:transcriptUpdated when a background agent delivers its result to the lead', async () => {
+    const emit = vi.fn();
+    const interruptWithMessage = vi.fn(async () => {});
+    const logNonBlocking = vi.fn();
+    const manager = new TeammateManager({ emit, interruptWithMessage, logNonBlocking } as unknown as TeammateManagerDeps);
+    internals(manager).managedTeammates.set('bot@team', {
+      name: 'bot', agentId: 'bot@team', teamName: 'team', agentType: 'general', isBackgroundAgent: true,
+    });
+
+    internals(manager).handleStreamCompletion('session-1', 'bot@team', 'team', idleTemplateFor('bot@team'), {
+      capturedSessionId: undefined,
+      approvedShutdown: false,
+      capturedResultText: 'done working',
+      sentMessageToLead: false,
+    });
+
+    expect(emit).toHaveBeenCalledWith('teammate:transcriptUpdated', { sessionId: 'session-1', agentId: 'bot@team' });
+  });
+
+  it('does not emit teammate:transcriptUpdated when sessionId is undefined', async () => {
+    const emit = vi.fn();
+    const interruptWithMessage = vi.fn(async () => {});
+    const logNonBlocking = vi.fn();
+    const manager = new TeammateManager({ emit, interruptWithMessage, logNonBlocking } as unknown as TeammateManagerDeps);
+    internals(manager).managedTeammates.set('bot@team', {
+      name: 'bot', agentId: 'bot@team', teamName: 'team', agentType: 'general', isBackgroundAgent: true,
+    });
+
+    internals(manager).handleStreamCompletion(undefined, 'bot@team', 'team', idleTemplateFor('bot@team'), {
+      capturedSessionId: undefined,
+      approvedShutdown: false,
+      capturedResultText: 'done working',
+      sentMessageToLead: false,
+    });
+
+    expect(emit).not.toHaveBeenCalledWith('teammate:transcriptUpdated', expect.anything());
+  });
+});
+
 describe('TeammateManager teammate session id persistence', () => {
   const sessionIdOf = (agentId: string) => storedTeammates.find(tm => tm.agentId === agentId)?.sessionId;
 

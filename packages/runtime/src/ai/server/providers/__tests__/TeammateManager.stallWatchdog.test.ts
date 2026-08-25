@@ -170,6 +170,16 @@ describe('TeammateManager stream stall watchdog', () => {
     const loggedTypes = (deps.logNonBlocking as unknown as ReturnType<typeof vi.fn>).mock.calls
       .map(([, , , , metadata]) => (metadata as { messageType: string }).messageType);
     expect(loggedTypes).toEqual(['teammate_output', 'teammate_output', 'teammate_completed']);
+    // Each logged chunk (2 output + 1 result) fires exactly one live-update
+    // signal for the popover (task 2b) to key its refetch off of.
+    const transcriptUpdatedPayloads = deps.emit.mock.calls
+      .filter(([event]) => event === 'teammate:transcriptUpdated')
+      .map(([, payload]) => payload);
+    expect(transcriptUpdatedPayloads).toEqual([
+      { sessionId: 'session-1', agentId: 'alice@team' },
+      { sessionId: 'session-1', agentId: 'alice@team' },
+      { sessionId: 'session-1', agentId: 'alice@team' },
+    ]);
   });
 
   it('does not reap a teammate that is silent because a tool is still running', async () => {

@@ -1109,6 +1109,7 @@ export class TeammateManager {
         JSON.stringify(teammateMessageChunk),
         { messageType: 'teammate_message_to_lead' }
       );
+      this.deps.emit('teammate:transcriptUpdated', { sessionId, agentId: teammateAgentId });
     }
 
     // Queue the message and interrupt the lead to process it
@@ -1869,6 +1870,7 @@ export class TeammateManager {
             JSON.stringify(taggedChunk),
             { messageType: 'teammate_output' }
           );
+          this.deps.emit('teammate:transcriptUpdated', { sessionId, agentId });
         }
 
         if (chunk.type === 'user' && Array.isArray(chunk.message?.content)) {
@@ -1931,6 +1933,7 @@ export class TeammateManager {
             JSON.stringify(completionChunk),
             { messageType: 'teammate_completed' }
           );
+          this.deps.emit('teammate:transcriptUpdated', { sessionId, agentId });
         }
       }
     }

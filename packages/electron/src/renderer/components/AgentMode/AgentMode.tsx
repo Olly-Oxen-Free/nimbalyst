@@ -55,6 +55,7 @@ import { initFileStateListeners } from '../../store/listeners/fileStateListeners
 import { initFileTreeListeners } from '../../store/listeners/fileTreeListeners';
 import { initSessionListListeners } from '../../store/listeners/sessionListListeners';
 import { initSessionTranscriptListeners } from '../../store/listeners/sessionTranscriptListeners';
+import { initTeammateTranscriptListeners } from '../../store/listeners/teammateTranscriptListeners';
 import { initTrayListeners, trayNewSessionRequestAtom } from '../../store/listeners/trayListeners';
 import { initDeepLinkListeners } from '../../store/listeners/deepLinkListeners';
 import {
@@ -257,6 +258,12 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   // Initialize session transcript listeners (global, runs once)
   useEffect(() => {
     const cleanup = initSessionTranscriptListeners();
+    return cleanup;
+  }, []);
+
+  // Initialize teammate transcript live-update listener (global, runs once)
+  useEffect(() => {
+    const cleanup = initTeammateTranscriptListeners();
     return cleanup;
   }, []);
 
