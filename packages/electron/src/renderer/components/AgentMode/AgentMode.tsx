@@ -57,6 +57,8 @@ import { initSessionListListeners } from '../../store/listeners/sessionListListe
 import { initSessionTranscriptListeners } from '../../store/listeners/sessionTranscriptListeners';
 import { initTeammateTranscriptListeners } from '../../store/listeners/teammateTranscriptListeners';
 import { initTaskTranscriptListeners } from '../../store/listeners/taskTranscriptListeners';
+import { setTranscriptToolWidgets } from '@nimbalyst/runtime/ui/AgentTranscript';
+import { TaskToolWidget, TASK_TOOL_WIDGET_SOURCE } from './TaskToolWidget';
 import { initTrayListeners, trayNewSessionRequestAtom } from '../../store/listeners/trayListeners';
 import { initDeepLinkListeners } from '../../store/listeners/deepLinkListeners';
 import {
@@ -272,6 +274,12 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   useEffect(() => {
     const cleanup = initTaskTranscriptListeners();
     return cleanup;
+  }, []);
+
+  // Register the inline-expand widget for Task sub-agent spawns (runs once)
+  useEffect(() => {
+    setTranscriptToolWidgets(TASK_TOOL_WIDGET_SOURCE, { Task: TaskToolWidget });
+    return () => setTranscriptToolWidgets(TASK_TOOL_WIDGET_SOURCE, undefined);
   }, []);
 
   // Initialize tray navigation listeners (global, runs once)

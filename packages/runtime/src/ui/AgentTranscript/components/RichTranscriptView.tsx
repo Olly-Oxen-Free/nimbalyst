@@ -1759,9 +1759,11 @@ export const RichTranscriptView = React.forwardRef<
       ? () => loadToolCallDiffs(tool.providerToolCallId!, toolMsg.createdAt?.getTime())
       : undefined;
 
-    // Check for custom widget first
+    // Check for custom widget first. Teammates are spawned through the same
+    // `Task` tool as plain sub-agents, so a `Task`-keyed widget would otherwise
+    // replace the teammate card below — they keep their existing rendering.
     const CustomWidget = tool.toolName ? getCustomToolWidget(tool.toolName) : undefined;
-    if (CustomWidget) {
+    if (CustomWidget && !(isSubAgent && isTeammate)) {
       return (
         <div
           key={toolRenderKey}
