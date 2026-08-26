@@ -240,6 +240,21 @@ export const teammateTranscriptSignalAtomFamily = atomFamily((_key: string) =>
   atom<number>(0)
 );
 
+/** Builds the compound key used by `taskTranscriptSignalAtomFamily`. */
+export function taskTranscriptSignalKey(sessionId: string, taskId: string): string {
+  return `${sessionId}:${taskId}`;
+}
+
+/**
+ * Per-(sessionId, taskId) live-update signal for a Task sub-agent's transcript.
+ * Bumped by taskTranscriptListeners.ts whenever main forwards a
+ * `task:transcript-updated` event for this task. An open Task transcript
+ * surface subscribes via useAtomValue and debounces its own refetch.
+ */
+export const taskTranscriptSignalAtomFamily = atomFamily((_key: string) =>
+  atom<number>(0)
+);
+
 /** Task info from SDK-native sub-agents (task_started/task_progress/task_notification) */
 export interface TaskInfo {
   taskId: string;

@@ -1317,6 +1317,29 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             const isSearchable = isSearchableAssistantChunk(chunk);
 
             this.logAgentMessageNonBlocking(sessionId, 'claude-code', 'output', rawChunkJson, undefined, hideMessages, providerMessageId, isSearchable);
+
+            // Live-update signal for Task sub-agent transcripts. Task 1a chose
+            // Option B -- forwarded sub-agent chunks are persisted by the generic
+            // call above rather than by a dedicated tagged write -- so this is the
+            // only place the signal can be raised, and it must be GATED: emitting
+            // for every persisted chunk would wake every open Task surface on the
+            // lead's own output. The gate is the same direct `parent_tool_use_id`
+            // -> `activeTasks[*].toolUseId` match documented in
+            // subagentTaskCorrelation.ts; a chunk that matches nothing (the lead's
+            // own output, or a teammate's -- teammates run their own SDK query, so
+            // their ids come from a different id space) simply does not emit.
+            // String chunks carry no `parent_tool_use_id` at all and are never
+            // sub-agent chunks under this provider's chunking, so they short out.
+            // Fire-and-forget, matching the teammate channel: the log above is
+            // non-blocking, so a consumer's refetch can race the write, and a
+            // missed bump is caught by the next chunk's bump.
+            if (typeof chunk !== 'string') {
+              const parentToolUseId: string | undefined = chunk.parent_tool_use_id;
+              const owningTask = this.findTaskForSubagentChunk(parentToolUseId);
+              if (owningTask) {
+                this.emit('task:transcriptUpdated', { sessionId, taskId: owningTask.taskId });
+              }
+            }
             // Drive incremental transcript transformation. Without this, the
             // canonical store only advances on the next aiLoadSession from
             // the renderer, which never fires when the user's active session

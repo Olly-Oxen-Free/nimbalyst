@@ -1182,6 +1182,19 @@ export class MessageStreamingHandler {
     };
     this.installListener(provider, 'teammate:transcriptUpdated', onTeammateTranscriptUpdated);
 
+    // Live-update signal: forward each logged Task sub-agent chunk to the
+    // session's window so an open Task transcript surface can refetch. Parallel
+    // to the teammate channel above, disjoint from it, and fire-and-forget on
+    // the same terms -- no ack, no retry.
+    const onTaskTranscriptUpdated = (data: { sessionId: string; taskId: string }) => {
+      if (!data.sessionId || !data.taskId) return;
+      const targetWindow = findWindowByWorkspace(effectiveWorkspacePath);
+      if (targetWindow && !targetWindow.isDestroyed()) {
+        targetWindow.webContents.send('task:transcript-updated', data);
+      }
+    };
+    this.installListener(provider, 'task:transcriptUpdated', onTaskTranscriptUpdated);
+
     // Listen for all teammates completing. When the lead finished but teammates
     // were still active, endSession was deferred. Now that all teammates are
     // done, end the session and play the completion sound.
