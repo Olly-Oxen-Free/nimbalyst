@@ -3224,6 +3224,21 @@ export class AIService {
         return { success: false, error: 'No active provider for session' };
       }
 
+      // Mark the session running the way a normal lead turn does, before the
+      // send: resuming an idle teammate can fail and wake the lead's own
+      // conversation, and that wake is dropped for a session the state manager
+      // is not tracking -- which is every session whose lead turn ended (or
+      // never ran) in this process. This is a deliberate user action, so
+      // starting the session here reflects what the user just did.
+      const stateManager = getSessionStateManager();
+      const wasActive = stateManager.isSessionActive(sessionId);
+      if (!wasActive) {
+        await stateManager.startSession({
+          sessionId,
+          workspacePath: session.workspacePath,
+        });
+      }
+
       // After a restart the provider has no live query, so the lead session id
       // and the lead's cwd/permission paths have to come from the session record.
       const { delivered, wasIdle } = await (provider as ClaudeCodeProvider).sendMessageToManagedTeammate(
@@ -3235,6 +3250,12 @@ export class AIService {
           permissionsPath: session.worktreeProjectPath || session.worktreePath || session.workspacePath,
         },
       );
+      if (!delivered && !wasActive) {
+        // Nothing was started, so nothing will ever end the session we just
+        // started. `delivered: true` is left alone: on the idle path the resume
+        // outcome arrives after this handler returns and needs it active.
+        await stateManager.endSession(sessionId);
+      }
       return { success: delivered, wasIdle };
     });
 

@@ -417,7 +417,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         return teammateHooks.createPostToolUseHook();
       },
       getAbortSignal: () => this.abortController?.signal,
-      interruptWithMessage: (message) => this.interruptWithMessage(message),
+      interruptWithMessage: (message, sessionId) => this.interruptWithMessage(message, sessionId),
       createCanUseToolHandler: (sessionId, workspacePath, permissionsPath, teammateName) =>
         this.createCanUseToolHandler(sessionId, workspacePath, permissionsPath, teammateName),
     });
@@ -2322,8 +2322,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    *   transport is already dead (turn finished but generator hasn't reached
    *   finally yet), interrupt() will fail gracefully and the message stays
    *   queued for the finally block to handle via resume.
+   *
+   * `sessionId` is the lead session the caller already knows. It is preferred
+   * over `lastUsedSessionId` on the idle path because the lead's own query may
+   * never have run in this process (post-restart), leaving that field unset.
    */
-  async interruptWithMessage(message: string): Promise<void> {
+  async interruptWithMessage(message: string, sessionId?: string): Promise<void> {
     // A real teammate message arrived — reset the continuation guard so
     // the lead can get another continuation if its next turn also ends
     // with active teammates.
@@ -2342,7 +2346,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       if (!pendingMessageBatch) return;
 
       console.log(`[CLAUDE-CODE] interruptWithMessage: lead is idle, triggering sendMessage for ${pendingMessageBatch.count} message(s): "${pendingMessageBatch.summaries}"`);
-      this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage);
+      this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage, sessionId);
       return;
     }
 
@@ -2546,12 +2550,34 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     };
   }
 
-  private emitTeammateMessageWhileIdle(message: string): void {
+  /**
+   * `sessionId` is only supplied by callers that were handed one (a teammate
+   * message delivered to a lead whose query never ran in this process). The
+   * post-lead-turn call sites have no such id and fall back to
+   * `lastUsedSessionId`, which their own just-finished turn populated.
+   */
+  private emitTeammateMessageWhileIdle(message: string, sessionId?: string): void {
     this.teammateIdleMessagePending = true;
     this.emit('teammate:messageWhileIdle', {
-      sessionId: this.teammateManager.lastUsedSessionId,
+      sessionId: sessionId ?? this.teammateManager.lastUsedSessionId,
       message,
     });
+  }
+
+  /**
+   * Undo the idle-wake latch when the host could not deliver the wake after all
+   * (its window is gone). `teammateIdleMessagePending` keeps `isLeadBusy()` true
+   * so the host defers ending the session until the woken lead turn finishes --
+   * a wake that never became a turn would leave that session running forever,
+   * because `teammates:allCompleted` already fired once and skipped the end.
+   *
+   * Returns true when no teammate is left either, i.e. the host's deferred
+   * `endSession` is now safe to run.
+   */
+  public releaseIdleWakeLatch(): boolean {
+    if (!this.teammateIdleMessagePending) return false;
+    this.teammateIdleMessagePending = false;
+    return !this.teammateManager.hasActiveTeammates();
   }
 
   /**

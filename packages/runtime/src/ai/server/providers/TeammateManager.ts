@@ -112,8 +112,16 @@ export interface TeammateManagerDeps {
   createPreToolUseHook(cwd: string, sessionId: string | undefined, permissionsPath: string | undefined, context: { isTeammateSession: boolean }): any;
   createPostToolUseHook(cwd: string, sessionId: string | undefined): any;
   getAbortSignal(): AbortSignal | undefined;
-  /** Interrupt the lead agent and deliver a teammate message */
-  interruptWithMessage(message: string): Promise<void>;
+  /**
+   * Interrupt the lead agent and deliver a teammate message.
+   *
+   * `sessionId` is threaded in explicitly rather than left to the provider's
+   * `lastUsedSessionId`, which is only set while a live lead query is streaming
+   * -- the same gap `stopByAgentId`'s `leadSessionId` parameter exists to close.
+   * Without it, a wake raised for a lead whose query never ran in this process
+   * emits an event with no session to deliver to.
+   */
+  interruptWithMessage(message: string, sessionId?: string): Promise<void>;
   /** Create a canUseTool handler that delegates to the lead's permission system */
   createCanUseToolHandler(
     sessionId: string | undefined,
@@ -1122,7 +1130,7 @@ export class TeammateManager {
     });
 
     const formattedMessage = `[Teammate message from "${teammateName}"]\n\n${content}`;
-    this.deps.interruptWithMessage(formattedMessage).catch(err => {
+    this.deps.interruptWithMessage(formattedMessage, sessionId).catch(err => {
       console.warn(`[MANAGED-TEAMMATE] Failed to interrupt lead with teammate message:`, err);
     });
 

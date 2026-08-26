@@ -1147,6 +1147,22 @@ export class MessageStreamingHandler {
             );
           },
         });
+
+        if (outcome !== 'delivered') {
+          // The wake never became a lead turn, so the provider's idle-message
+          // latch would keep isLeadBusy() true forever and the endSession
+          // teammates:allCompleted already deferred would never run. The user
+          // has been told why via notifyUndelivered above; end the session so it
+          // does not sit spinning.
+          const readyToEnd = typeof (provider as any).releaseIdleWakeLatch === 'function'
+            && (provider as any).releaseIdleWakeLatch();
+          if (readyToEnd && sessionStateManager.isSessionActive(data.sessionId)) {
+            logger.main.info(`[AIService] Teammate wake undelivered for ${data.sessionId}, ending the deferred session`);
+            await sessionStateManager.endSession(data.sessionId);
+            await this.svc.hooklessWatcher.stopForSession(data.sessionId);
+            codexEditWindowRegistry.clearSession(data.sessionId);
+          }
+        }
       } catch (error) {
         logger.main.error('[AIService] Failed to handle teammate message while idle:', error);
       }

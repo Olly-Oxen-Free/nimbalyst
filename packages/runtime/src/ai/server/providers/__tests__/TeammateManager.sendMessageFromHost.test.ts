@@ -109,6 +109,24 @@ describe('TeammateManager.sendMessageFromHost', () => {
     expect(resumeSpy).toHaveBeenCalledWith('lead-session', 'bob@team', idleTemplateFor('bob@team'), 'wake up bob');
   });
 
+  it('threads the lead session id into the wake a failed resume raises', async () => {
+    // The provider's own lastUsedSessionId is only set while a live lead query
+    // streams, so a wake raised in a process where the lead never ran has no
+    // session to reach unless this id is passed along with the message.
+    const interruptWithMessage = vi.fn(async (_message: string, _sessionId?: string) => {});
+    const manager = new TeammateManager({
+      emit: vi.fn(),
+      logNonBlocking: vi.fn(),
+      interruptWithMessage,
+    } as unknown as TeammateManagerDeps);
+    internals(manager).idleTeammates.set('bob@team', idleTemplateFor('bob@team'));
+
+    await manager.sendMessageFromHost('lead-session', 'bob@team', 'wake up bob');
+
+    await vi.waitFor(() => expect(interruptWithMessage).toHaveBeenCalled());
+    expect(interruptWithMessage.mock.calls[0][1]).toBe('lead-session');
+  });
+
   it('reports not-delivered for an agentId that is neither running nor idle', async () => {
     const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
 
