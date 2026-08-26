@@ -1,5 +1,58 @@
 {
   "slug": "task-subagent-visibility",
-  "status": "researched",
-  "created_at": "2026-08-26T00:00:00Z"
+  "status": "ready",
+  "created_at": "2026-08-26T00:00:00Z",
+  "execution_mode": "feature-branch",
+  "feature_branch": "feature/task-subagent-visibility",
+  "base_branch": "main",
+  "no_pull_requests": true,
+  "tasks": {
+    "1a": {
+      "status": "pending",
+      "wave": 1,
+      "complexity": 7,
+      "model": "opus"
+    },
+    "1b": {
+      "status": "pending",
+      "wave": 2,
+      "complexity": 4,
+      "model": "sonnet"
+    },
+    "1c": {
+      "status": "pending",
+      "wave": 3,
+      "complexity": 5,
+      "model": "opus"
+    },
+    "2a": {
+      "status": "pending",
+      "wave": 4,
+      "complexity": 5,
+      "model": "opus"
+    },
+    "2b": {
+      "status": "pending",
+      "wave": 4,
+      "complexity": 6,
+      "model": "opus"
+    },
+    "2c": {
+      "status": "pending",
+      "wave": 5,
+      "complexity": 9,
+      "model": "opus"
+    }
+  },
+  "gate": {
+    "after_wave": 3,
+    "status": "not_reached"
+  },
+  "verification": {
+    "typecheck": "PENDING",
+    "targeted_unit_tests": "PENDING",
+    "monorepo_test_prepush": "PENDING",
+    "manual_e2e": "PENDING -- required before wave 5 (2c) is considered done, per PRD 002's retrospective gap (its manual_e2e was left PENDING through merge)"
+  },
+  "approved_at": "2026-08-26T00:00:00Z"
 }

@@ -1,0 +1,50 @@
+prd_slug: "task-subagent-visibility"
+generated_at: "2026-08-26T00:00:00Z"
+
+# Backend chain (1a-1c) is fully sequential -- same-file overlaps
+# (preload/electron.d.ts shared by 1b/1c) sequenced rather than fought,
+# mirroring PRD 002's and PRD 003's own precedent. UI surfaces 2a/2b are
+# file-disjoint and run in the same wave; 2c is sequenced after 2a because
+# both add handlers (hover vs. click) to the same two components
+# (SubAgentChipRow.tsx, TeammatePanel.tsx). Corrected across two PRD review
+# passes (see PRD §6 Q5-Q7): 1a's correlation mechanism, 1a's persistence
+# approach (now an explicit implementation fork), and 2b's rendering
+# mechanism (a narrow RichTranscriptView.tsx exclusion, not "no runtime
+# changes" as first proposed) all changed; this plan reflects the final
+# file lists.
+
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    rationale: "No dependencies. Make Task sub-agent text retrievable and correctly correlated (via activeTasks[*].toolUseId match, not subagentToolCallOwners) -- resolves an implementation fork (new tagged write vs. projecting already-persisted raw rows) before 1b's projection logic is written."
+  - wave: 2
+    tasks: ["1b"]
+    rationale: "Depends on 1a's resolved approach. IPC fetch handler (keyable by taskId or toolUseId) + projection."
+  - wave: 3
+    tasks: ["1c"]
+    rationale: "Depends on 1b; also serializes preload/electron.d.ts, touched by both. Live-update signal channel; adds initTaskTranscriptListeners() call to AgentMode.tsx."
+  - wave: 4
+    tasks: ["2a", "2b"]
+    rationale: "Both depend on 1b (fetch) + 1c (signal). File-disjoint from each other (2a: SubAgentChipRow.tsx/TeammatePanel.tsx; 2b: RichTranscriptView.tsx narrow exclusion + new TaskToolWidget.tsx + AgentMode.tsx registration call) -- run together. 2b and 1c both touch AgentMode.tsx but are already ordered correctly by the 1c->2b dependency edge, not a same-wave conflict."
+  - wave: 5
+    tasks: ["2c"]
+    rationale: "Depends on 1b, 1c, and sequenced after 2a: both 2a and 2c add a new handler (hover vs. click) to SubAgentChipRow.tsx and TeammatePanel.tsx -- real file overlap, resolved by sequencing rather than parallelizing. Also introduces SessionTranscript.tsx and agentMode.ts (new openTaskTilesAtom) as its host/state files."
+
+longest_chain: ["1a", "1b", "1c", "2a", "2c"]
+
+file_overlap_notes:
+  - "ClaudeCodeTranscriptAdapter.ts (read/verify only) / ClaudeCodeProvider.ts: 1a only -- no overlap."
+  - "AIService.ts, projectRawMessages.ts: 1b only -- no overlap with 1a's files."
+  - "preload/electron.d.ts: touched by both 1b and 1c -- serialized via depends_on."
+  - "MessageStreamingHandler.ts, taskTranscriptListeners.ts: 1c only."
+  - "AgentMode.tsx: touched by 1c (initTaskTranscriptListeners call) and 2b (setTranscriptToolWidgets registration call) -- disjoint additions to the same file, already correctly ordered since 2b depends_on 1c."
+  - "store/atoms/agentMode.ts: touched by 1c (taskTranscriptSignalAtomFamily) and 2c (openTaskTilesAtom) -- disjoint additions, already ordered since 2c depends_on 1c."
+  - "SubAgentChipRow.tsx, TeammatePanel.tsx: 2a and 2c both touch these -- serialized (2c depends_on 2a). 2a removes TaskStatusPopover's local state; 2c wires the already-existing onTaskClick callback -- disjoint edits to the same handler, not a true conflict, but still sequenced for merge safety."
+  - "RichTranscriptView.tsx: 2b only, a narrow addition (gate the widget lookup on !(isSubAgent && isTeammate)) -- not touched by any other task in this PRD."
+  - "TaskToolWidget.tsx (new, electron): 2b only."
+  - "SessionTranscript.tsx: 2c only -- host for the new tiling layout, introduced fresh in wave 5."
+
+gate:
+  after_wave: 3
+  label: "Backend complete -- review before UI fan-out"
+  reason: "require_review auto-triggers (MessageStreamingHandler.ts and AIService.ts are both under packages/electron/src/main/**). Also the explicit human-verify checkpoint PRD 002's retrospective flagged as missing (its manual_e2e gate stayed PENDING through merge) -- verify backend retrieval/correlation/live-signal end to end before committing to the larger UI investment in waves 4-5."

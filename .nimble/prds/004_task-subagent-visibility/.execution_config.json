@@ -1,0 +1,74 @@
+{
+  "configured_at": "2026-08-26T00:00:00Z",
+  "orchestration_version": 2,
+  "branch_strategy": "feature-branch",
+  "feature_branch": "feature/task-subagent-visibility",
+  "base_branch": "main",
+  "note": "Repo standing constraint (confirmed via PRD 003's own status.json): no PR ever opened, including the final feature->main merge. Task/wave branches merge locally into the feature branch via git merge/fast-forward.",
+  "orchestration": {
+    "integration": {
+      "cadence": "wave",
+      "auto_merge_on_green": false,
+      "no_pull_requests": true,
+      "no_pr_reason": "Repo standing constraint: never open a PR for this repo. Task/wave branches merge locally into the feature branch via git merge/fast-forward. No gh pr create at any level, including the final feature->main merge."
+    },
+    "review": {
+      "trigger": "on-umbrella",
+      "scope": "cumulative",
+      "skip_if_diff_under": 0,
+      "on_findings": "halt",
+      "providers": {
+        "greptile": { "fire_at": [], "on_findings": "halt" },
+        "code-review": { "fire_at": [], "on_findings": "halt" }
+      },
+      "note": "review.enabled is false in .nimble/config.yaml (provider: null, none_behavior: manual) -- no automated review provider configured. Falls back to the manual final_merge_gate already enabled in project config."
+    },
+    "gates": {
+      "model": "pause",
+      "auto_place": false,
+      "placements": [
+        {
+          "after_wave": 3,
+          "label": "Backend complete -- review before UI fan-out",
+          "condition": "require_review (packages/electron/src/main/** touched by 1b/1c) + explicit human-verify checkpoint before waves 4-5's larger UI investment"
+        }
+      ],
+      "conditions": {
+        "require_tests_pass": true,
+        "require_build_pass": true,
+        "max_critical_findings": 0
+      }
+    }
+  },
+  "models": {
+    "default": "sonnet",
+    "complexity_threshold": 5,
+    "force_opus_tasks": [],
+    "force_sonnet_tasks": [],
+    "escalation": {
+      "after_failures": 1,
+      "triggers": ["architectural_issues", "type_system_issues"]
+    }
+  },
+  "max_revision_loops": 3,
+  "allow_bypass": {
+    "future_work_overlap": true,
+    "false_positive_factual": true
+  },
+  "usage_estimate": {
+    "pm_bootstrap_tokens": 60000,
+    "task_tokens": {
+      "1a": 95000,
+      "1b": 35000,
+      "1c": 75000,
+      "2a": 75000,
+      "2b": 85000,
+      "2c": 115000
+    },
+    "total_estimated_tokens": 540000,
+    "subscription_plan": "max-5x",
+    "capacity_per_5hr_window_tokens": 220000,
+    "percentage_of_capacity": 245,
+    "note": "Estimate exceeds one 5hr window (~245%) -- expect this PRD to span multiple windows across its 5 waves + gate. Approximate; actual usage varies."
+  }
+}
