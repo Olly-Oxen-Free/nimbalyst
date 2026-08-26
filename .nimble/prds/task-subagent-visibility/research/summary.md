@@ -54,13 +54,24 @@ the best-fit scope — smaller than teammates' persisted/interactive scope, suff
 the gap, and consistent with both external precedent and Nimbalyst's own already-persisted
 metadata pattern.
 
-## Design decision (pending user input)
+## Design decision (finalized 2026-08-26)
 
-Presentation surface (popover reuse / inline expand / tiling split-pane) is a separate,
-still-open UX decision — three mocked options were presented to the user directly (not part
-of this research artifact). Whichever is chosen determines PRD 002's `TeammateThreadPopover`
-reuse fraction: popover reuse is near-total reuse, inline expand and tiling both need new
-renderer layout work regardless of the backend piece being identical.
+All three presentation surfaces from the mockups are in scope, mapped to distinct triggers
+rather than picked as a single option:
+
+- **Hover** the chip (inline in transcript, or its row in the Sub-agents sidebar list) →
+  lightweight **popover** peek (dismisses on mouse-leave, no click).
+- **Click** the assistant message that spawned the sub-agent (a new, visually distinct
+  message-bubble class — not the chip) → **inline expand** directly under that message.
+- **Click** the chip itself (inline or in the sidebar list) → **tiling view**: a new pane
+  opens beside the main thread, main thread keeps full height.
+
+This is three real UI surfaces sharing one backend (the same live, taskId-correlated
+transcript feed), not a single pick. Backend scope (IPC handler, transcript
+projection/correlation, live-signal channel) is shared and built once; each presentation
+surface is separate renderer work. PRD 002's `TeammateThreadPopover` gives near-total reuse
+for the hover-popover surface only — inline expand and tiling both need new renderer layout
+work, though they consume the same transcript data once it's flowing.
 
 ## Research artifacts
 
