@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Teammates that failed after being resumed from idle now reliably wake your conversation with the failure, instead of silently going quiet, including after a Nimbalyst restart.
 
 ### Removed
 <!-- Removed features go here -->
