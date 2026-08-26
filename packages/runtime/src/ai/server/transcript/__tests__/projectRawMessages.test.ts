@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import {
   projectRawMessagesToViewMessages,
   projectTeammateRawMessages,
+  projectTaskSubagentRawMessages,
   rawMessagesToCanonicalEvents,
 } from '../projectRawMessages';
 import type { RawMessage } from '../TranscriptTransformer';
@@ -757,5 +758,68 @@ describe('projectTeammateRawMessages', () => {
     expect(vms).toHaveLength(1);
     expect(vms[0]).toMatchObject({ type: 'system_message' });
     expect(vms[0].text).toBe('[Message from team-lead]\n\ncheck the tests');
+  });
+});
+
+describe('projectTaskSubagentRawMessages', () => {
+  // forwardSubagentText relays a Task sub-agent's own assistant chunks through
+  // the LEAD's iterator, and the provider persists them like any other chunk.
+  // They must be readable per sub-agent, and invisible in the lead's own view.
+  function subagentChunk(id: number, parentToolUseId: string, text: string): RawMessage {
+    return raw({
+      id,
+      content: JSON.stringify({
+        type: 'assistant',
+        session_id: 'subagent-sdk-session',
+        parent_tool_use_id: parentToolUseId,
+        message: { id: `msg-${id}`, role: 'assistant', content: [{ type: 'text', text }] },
+      }),
+    });
+  }
+
+  const leadText = raw({
+    id: 1,
+    content: JSON.stringify({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'msg-lead', role: 'assistant', content: [{ type: 'text', text: 'lead speaking' }] },
+    }),
+  });
+
+  it("projects one sub-agent's text and keeps it out of the lead's transcript", async () => {
+    const messages = [leadText, subagentChunk(2, 'tool-outer', 'sub-agent speaking')];
+
+    const subagentView = await projectTaskSubagentRawMessages(messages, 'tool-outer');
+    expect(subagentView.map((m) => m.text)).toEqual(['sub-agent speaking']);
+
+    const leadView = await projectRawMessagesToViewMessages(messages, 'claude-code');
+    expect(leadView.map((m) => m.text)).toEqual(['lead speaking']);
+  });
+
+  it("correlates a depth-2 sub-agent to its OWN task, not its ancestor's", async () => {
+    const messages = [
+      subagentChunk(1, 'tool-outer', 'depth one speaking'),
+      subagentChunk(2, 'tool-inner', 'depth two speaking'),
+    ];
+
+    expect((await projectTaskSubagentRawMessages(messages, 'tool-outer')).map((m) => m.text))
+      .toEqual(['depth one speaking']);
+    expect((await projectTaskSubagentRawMessages(messages, 'tool-inner')).map((m) => m.text))
+      .toEqual(['depth two speaking']);
+  });
+
+  it('does not pick up a teammate chunk that carries a parent_tool_use_id', async () => {
+    const teammate = raw({
+      id: 2,
+      content: JSON.stringify({
+        type: 'assistant',
+        parent_tool_use_id: 'tool-outer',
+        _isTeammateOutput: true,
+        _teammateAgentId: 'reviewer@core',
+        message: { id: 'msg-tm', role: 'assistant', content: [{ type: 'text', text: 'teammate speaking' }] },
+      }),
+    });
+
+    expect(await projectTaskSubagentRawMessages([leadText, teammate], 'tool-outer')).toEqual([]);
   });
 });

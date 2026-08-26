@@ -25,6 +25,7 @@ import type { IRawMessageParser, ParseContext } from './parsers/IRawMessageParse
 import type { RawMessage } from './TranscriptTransformer';
 import type { TranscriptEvent } from './types';
 import { processDescriptor, selectRawParser } from './processDescriptor';
+import { isTaskSubagentRawChunk } from '../providers/claudeCode/subagentTaskCorrelation';
 
 export interface RawProjectionOptions {
   /**
@@ -33,6 +34,13 @@ export interface RawProjectionOptions {
    * projecting a lead session's transcript.
    */
   teammateProjection?: boolean;
+  /**
+   * Parse `parent_tool_use_id`-carrying chunks as ordinary assistant output,
+   * for one Task sub-agent's own transcript (see
+   * ClaudeCodeRawParser.setSubagentProjectionMode). Never set this when
+   * projecting a lead session's transcript.
+   */
+  subagentProjection?: boolean;
 }
 
 function createParser(provider: string, options?: RawProjectionOptions): IRawMessageParser {
@@ -49,6 +57,7 @@ function createParser(provider: string, options?: RawProjectionOptions): IRawMes
   if (kind === 'voice') return new VoiceRawParser();
   const claudeParser = new ClaudeCodeRawParser();
   if (options?.teammateProjection) claudeParser.setTeammateProjectionMode(true);
+  if (options?.subagentProjection) claudeParser.setSubagentProjectionMode(true);
   return claudeParser;
 }
 
@@ -148,5 +157,32 @@ export async function projectTeammateRawMessages(
 
   return projectRawMessagesToViewMessages(teammateMessages, 'claude-code', {
     teammateProjection: true,
+  });
+}
+
+/**
+ * Project one Task sub-agent's thread out of the LEAD session's raw log.
+ *
+ * `forwardSubagentText` relays a sub-agent's chunks through the lead's own
+ * iterator, and the provider persists them like any other chunk with
+ * `parent_tool_use_id` intact — so no separate write exists, and the rows are
+ * already durable. Filter the lead's log to one sub-agent, then run the same
+ * parser pipeline the rest of the app uses.
+ *
+ * @param leadRawMessages Every raw message of the lead session, in id order.
+ * @param toolUseId The tool_use id of the `Task` call that spawned the
+ *   sub-agent. Resolve it from a taskId via
+ *   `ClaudeCodeProvider.getTaskToolUseId` when only the taskId is known.
+ */
+export async function projectTaskSubagentRawMessages(
+  leadRawMessages: RawMessage[],
+  toolUseId: string,
+): Promise<TranscriptViewMessage[]> {
+  const subagentMessages = leadRawMessages.filter((msg) =>
+    isTaskSubagentRawChunk(msg.content, toolUseId),
+  );
+
+  return projectRawMessagesToViewMessages(subagentMessages, 'claude-code', {
+    subagentProjection: true,
   });
 }

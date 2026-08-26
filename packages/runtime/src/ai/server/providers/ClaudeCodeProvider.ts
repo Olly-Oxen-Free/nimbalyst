@@ -79,6 +79,7 @@ import {
   isTransientClaudeCodeChunk,
   slimClaudeCodeChunkForStorage,
 } from './claudeCode/toolChunkUtils';
+import { findTaskOwningSubagentChunk } from './claudeCode/subagentTaskCorrelation';
 import { capClaudeCodeChunkForStorage } from '../../../storage/toolOutputBudget';
 import {
   INTERNAL_MCP_TOOLS,
@@ -2768,6 +2769,30 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   /** True if any tracked SDK-native sub-agent task is still running. */
   private hasRunningTasks(): boolean {
     return computeHasRunningTasks(this.activeTasks.values());
+  }
+
+  /**
+   * The tool_use id of the `Task` call that spawned `taskId`, or `undefined`
+   * if that task is unknown to this provider instance.
+   *
+   * This is the durable handle for reading a sub-agent's transcript: forwarded
+   * sub-agent rows in `ai_agent_messages` carry it as `parent_tool_use_id`,
+   * whereas `task_id` appears only on `system`/`task_started` chunks, which are
+   * transient and never persisted. Callers holding a taskId resolve it here
+   * first; callers that already hold a toolUseId (a rendered `Task` tool call)
+   * can read the rows directly without going through the provider at all.
+   */
+  getTaskToolUseId(taskId: string): string | undefined {
+    return this.activeTasks.get(taskId)?.toolUseId;
+  }
+
+  /**
+   * The task that owns a forwarded sub-agent chunk, matched directly on
+   * `activeTasks[*].toolUseId`. See subagentTaskCorrelation.ts for why this
+   * must not be routed through `subagentToolCallOwners`.
+   */
+  findTaskForSubagentChunk(parentToolUseId: string | undefined): { taskId: string; toolUseId?: string } | undefined {
+    return findTaskOwningSubagentChunk(this.activeTasks.values(), parentToolUseId);
   }
 
   /**

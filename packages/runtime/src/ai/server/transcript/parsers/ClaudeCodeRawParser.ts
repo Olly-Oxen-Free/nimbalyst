@@ -70,6 +70,24 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
     this.teammateProjection = enabled;
   }
 
+  /**
+   * When true, assistant text/thinking carrying a `parent_tool_use_id` is
+   * parsed as ordinary assistant output — the mode used to project ONE Task
+   * sub-agent's own transcript out of the lead's raw log.
+   *
+   * Off by default, and while off that text is dropped entirely (see
+   * parseOutputMessage). `forwardSubagentText` relays a sub-agent's chunks
+   * through the lead's iterator, so without this guard they interleave into
+   * the lead's own transcript unattributed. The live streaming path already
+   * guards this in ClaudeCodeTranscriptAdapter; this is the same guard for the
+   * persisted reparse path, which is what desktop actually renders.
+   */
+  private subagentProjection = false;
+
+  setSubagentProjectionMode(enabled: boolean): void {
+    this.subagentProjection = enabled;
+  }
+
   async parseMessage(
     msg: RawMessage,
     context: ParseContext,
@@ -220,9 +238,18 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         const turnModel: string | undefined =
           typeof parsed.message.model === 'string' ? parsed.message.model : undefined;
 
+        // A forwarded Task sub-agent's own prose belongs to that sub-agent's
+        // transcript, not the lead's. Only text/thinking is dropped: `tool_use`
+        // blocks carrying a parent_tool_use_id are what the lead's Task card
+        // groups its sub-agent's tool calls under, and must keep flowing.
+        // Teammate mode is exempt so teammate thread views render as before.
+        const dropSubagentProse =
+          Boolean(parentToolUseId) && !this.teammateProjection && !this.subagentProjection;
+
         if (Array.isArray(parsed.message.content)) {
           for (const block of parsed.message.content) {
             if (block.type === 'text' && block.text) {
+              if (dropSubagentProse) continue;
               // Deduplicate text:
               // 1. If we've seen this message ID before, skip (repeated streaming chunk)
               // 2. If no message ID AND we've already processed text, skip (accumulated echo)
@@ -240,6 +267,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
                 ...(turnModel ? { model: turnModel } : {}),
               });
             } else if (block.type === 'thinking' && (block.thinking || block.text)) {
+              if (dropSubagentProse) continue;
               // Extended-thinking output. Persist as an assistant_message
               // with empty text and the thinking content on the side-channel
               // so we don't have to migrate the event_type CHECK constraint.
