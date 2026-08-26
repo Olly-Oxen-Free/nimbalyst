@@ -1,6 +1,46 @@
 {
   "slug": "teammate-resume-reliability",
-  "status": "ready",
+  "status": "ready-for-merge",
   "created_at": "2026-08-25T00:00:00Z",
-  "approved_at": "2026-08-25T00:00:00Z"
+  "approved_at": "2026-08-25T00:00:00Z",
+  "execution_mode": "feature-branch",
+  "feature_branch": "feature/teammate-resume-reliability",
+  "base_branch": "main",
+  "no_pull_requests": true,
+  "tasks": {
+    "1a": {
+      "status": "done",
+      "wave": 1,
+      "model": "sonnet",
+      "commit": "143064263"
+    },
+    "1b": {
+      "status": "done",
+      "wave": 2,
+      "model": "sonnet",
+      "commit": "4056d795b"
+    },
+    "1c": {
+      "status": "done",
+      "wave": 3,
+      "model": "opus",
+      "commit": "aa918c653",
+      "note": "Discloses an out-of-scope upstream gap: ProviderFactory does not recreate a claude-code provider post cold-restart before a lead turn runs, so the narrow post-restart wake path this task fixes is not reachable via a literal process-restart-then-click scenario today. Recommended as follow-up scope."
+    },
+    "2a": {
+      "status": "done",
+      "wave": 4,
+      "model": "sonnet",
+      "commits": ["46cf76f36", "0d66fe407"],
+      "note": "Door B's actual AIService.ts startSession mechanism is read-verified only, not executed by a unit test (no existing handler-capture harness for that file); disclosed in the test file's docblock and commit message."
+    }
+  },
+  "gates": {
+    "typecheck": "pass (all 23 workspaces, verified by PM after each task merge)",
+    "test_prepush": "pass (6 pre-existing unrelated jsdom/localStorage failures in AgentTranscriptPanel.listenerCleanup.test.tsx and MarkdownRenderer.rtl.test.tsx confirmed present on feature-branch baseline before any PRD work; excluded)"
+  },
+  "changelog_updated": true,
+  "changelog_commit": "2a0a4af95",
+  "merged_to_main": false,
+  "ready_for_merge_at": "2026-08-26T00:20:00Z"
 }
