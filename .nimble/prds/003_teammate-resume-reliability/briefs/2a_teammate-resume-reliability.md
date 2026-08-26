@@ -184,11 +184,18 @@ formatted message already embeds the teammate name (`` `[Teammate message from "
    this proves Door A (the sessionId-threading fix). Door B
    (`onTeammateMessageWhileIdle`'s `isSessionActive` bail, `MessageStreamingHandler.ts`) is in the
    `electron` package, not `runtime` — this file, scoped to `TeammateManager.ts`/`runtime`, can only
-   prove Door A directly. If a Door-B-level test is warranted, it belongs in an `electron` package
-   test file (e.g. near `MessageStreamingHandler.ts`'s existing test coverage, if any); check whether
-   one exists before deciding whether to add one — do not skip Door B's coverage silently if no such
-   file exists and Door B has no test anywhere. State explicitly in this file's docblock which door
-   this file covers and which (if any) is covered elsewhere.
+   prove Door A directly. Door B's coverage has a named home:
+   `packages/electron/src/main/services/ai/__tests__/teammateWakeDelivery.test.ts` already exists and
+   its docblock claims to cover `onTeammateMessageWhileIdle`'s drop cases, but its actual tests only
+   exercise `classifyTeammateWakeDelivery`/`announceTeammateWakeDelivery` (the classification
+   functions called *after* the `isSessionActive` gate) — the gate itself has zero coverage there
+   today. Extend `teammateWakeDelivery.test.ts` with a test that seeds `isSessionActive` false, fires
+   `'teammate:messageWhileIdle'`, and asserts the wake reaches `deliver()`/`sendMessage` after 1c's
+   Door B fix (Option B: `ai:sendMessageToTeammate` calling `startSession` before triggering the wake).
+   This is in-scope deliverable work for this task, not a deferred/optional item — see the Deliverables
+   table below. State explicitly in this file's docblock (the `runtime`-package
+   `TeammateManager.resumeReliability.test.ts` file) that Door A is covered here and Door B is covered
+   in `teammateWakeDelivery.test.ts`.
 6. **A fresh-spawn failure does NOT call the new wake path** (`wasResumed` marker distinguishes
    correctly). Spawn a teammate via the fresh-spawn path (not `resumeIdleTeammate`), fail its stream,
    and assert `deps.interruptWithMessage` was NOT called for that failure (separate from any other
@@ -235,8 +242,12 @@ Complete ALL criteria before marking task done:
       Requirements item 4, proving 1b's `deliverMessageToLead`-before-`emitAllCompleted` fix
 - [ ] Covers: resume-then-fail post-restart (session not active, `lastUsedSessionId` undefined)
       reaches the lead — proves 1c's Door A fix (sessionId threading) actually works, not just that
-      it compiles; Door B's coverage location is explicitly stated (covered elsewhere, or a
-      documented gap if no `electron`-package test exists for it)
+      it compiles
+- [ ] Door B (1c's `isSessionActive` gate fix) has test coverage added to
+      `packages/electron/src/main/services/ai/__tests__/teammateWakeDelivery.test.ts` — a test that
+      seeds `isSessionActive` false, fires `'teammate:messageWhileIdle'`, and asserts the wake reaches
+      `deliver()`/`sendMessage` after 1c's fix; this is a required deliverable of this task, not an
+      optional/deferred item
 - [ ] Covers: a fresh-spawn failure does NOT call the new wake path (`wasResumed` marker distinguishes
       correctly)
 - [ ] Covers: two concurrent resume failures each independently trigger their own
@@ -257,11 +268,13 @@ Complete ALL criteria before marking task done:
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts` | create | Dedicated test file covering all resume-delivery reliability behavior from tasks 1a/1b/1c |
+| `packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts` | create | Dedicated test file covering all resume-delivery reliability behavior from tasks 1a/1b/1c (Door A of 1c's post-restart fix) |
+| `packages/electron/src/main/services/ai/__tests__/teammateWakeDelivery.test.ts` | modify | Extend existing file with coverage for Door B (1c's `isSessionActive` gate fix) — currently only tests the classification layer, not the gate itself |
 
 ### File Ownership Notes
 
-None — this is a new file, no overlap with any other task in this PRD.
+`teammateWakeDelivery.test.ts` is an existing file, not created by this task — extend it rather than
+replacing it; do not touch its existing classification-layer tests beyond adding new ones.
 
 ---
 
@@ -304,13 +317,14 @@ No numeric coverage-percentage target is specified by this PRD's own success cri
 Success Metrics — the measurement is "unit test asserts X," not a percentage threshold) — this repo
 does not use `--coverageThreshold` flags for this kind of behavioral test task. Do not invent one.
 
-**Intentionally Uncovered Lines:**
+**Intentionally Uncovered Lines (within this file only):**
 
 - Task 1c's Door B fix (`MessageStreamingHandler.ts`'s `onTeammateMessageWhileIdle`,
-  `AIService.ts`'s `ai:sendMessageToTeammate`) is in the `electron` package and outside this file's
-  scope (`runtime` package, `TeammateManager.ts`-focused). See Requirements item 5 for what to do
-  about this — state explicitly whether it's covered elsewhere or genuinely uncovered; do not
-  silently skip mentioning it.
+  `AIService.ts`'s `ai:sendMessageToTeammate`) is in the `electron` package, outside
+  `TeammateManager.resumeReliability.test.ts`'s scope (`runtime` package, `TeammateManager.ts`-
+  focused) — it is not uncovered by this *task*, only by this one file. Door B coverage is required
+  as part of this task, added to `packages/electron/src/main/services/ai/__tests__/teammateWakeDelivery.test.ts`
+  (see Requirements item 5 and Files to Modify above).
 
 **Verification:**
 ```bash
@@ -336,15 +350,16 @@ PRD-specific boundaries for this task:
   `AIService.ts` themselves — this task is test-only. If you discover a genuine bug in 1a/1b/1c's
   implementation while writing these tests, do not fix it yourself; flag it clearly in your final
   report so it can be routed back to the relevant task/reviewer.
-- Do not write a Door-B (`electron` package) test unless you've confirmed via search that no
-  appropriate test file already exists to extend, per the scoping note in Requirements item 5 — do
-  not create a large new `electron`-package test file as a side effect of this `runtime`-package test
-  task without first checking whether this genuinely belongs here.
+- Door B coverage goes in the existing `electron`-package file
+  `packages/electron/src/main/services/ai/__tests__/teammateWakeDelivery.test.ts` — extend it, do not
+  create a new `electron`-package test file for this.
 
 ### Files Requiring Review
 
-The new test file is not itself in `.nimble/config.yaml`'s `require_review` list. This task does not
-trigger the PRD's human-review gate on its own.
+The new `runtime`-package test file is not itself in `.nimble/config.yaml`'s `require_review` list.
+The extension to `teammateWakeDelivery.test.ts`, however, is under `packages/electron/src/main/**`,
+which IS in `require_review` (per brief 1c's own file-ownership notes) — expect that edit to surface
+at the same end-of-work integration review as 1c's changes.
 
 ---
 
@@ -394,7 +409,8 @@ Types: feat, fix, refactor, test, docs, chore
 
 | Artifact | Path | Done when |
 |---|---|---|
-| Test file | `packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts` | Covers all 8 required coverage points from this brief's Requirements section, `npm run typecheck && npm run test:prepush` both green, and the Door-B coverage-location question (Requirements item 5) is explicitly answered in the file's docblock rather than left silent |
+| Test file | `packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts` | Covers all 8 required coverage points from this brief's Requirements section, `npm run typecheck && npm run test:prepush` both green, and the docblock states Door A is covered here / Door B is covered in `teammateWakeDelivery.test.ts` |
+| Extended test file | `packages/electron/src/main/services/ai/__tests__/teammateWakeDelivery.test.ts` | Adds a test proving Door B (1c's `isSessionActive` gate fix): seeds `isSessionActive` false, fires `'teammate:messageWhileIdle'`, asserts the wake reaches `deliver()`/`sendMessage` after the fix; `npm run typecheck && npm run test:prepush` both green |
 
 ---
 

@@ -172,17 +172,36 @@ never happens for a UI-initiated teammate send, so nothing marks the session act
 
 **Fix (pick one — either satisfies the requirement, as long as the wake actually reaches the
 user):**
-- **Option A (recommended, smaller blast radius):** In `onTeammateMessageWhileIdle`
-  (`MessageStreamingHandler.ts`), move the `sessionStateManager.startSession({...})` call
-  (currently at `:1112`, after the bail) to *before* the `isSessionActive` check, so the session is
-  marked active first and the check always passes for this handler's own flow. Confirm `startSession`
-  is idempotent (the existing code comment at `:1109-1111` already states it is: "sendMessageHandler
-  also calls startSession, but there can be a gap ... Re-calling startSession is safe (idempotent)")
-  — so moving it earlier is safe.
-- **Option B:** Have `ai:sendMessageToTeammate` (`AIService.ts:3208-3239`) call
+- **Option B (recommended):** Have `ai:sendMessageToTeammate` (`AIService.ts:3208-3239`) call
   `sessionStateManager.startSession(...)` itself before invoking
   `provider.sendMessageToManagedTeammate(...)`, mirroring what `sendMessageHandler` already does for
-  a normal lead turn.
+  a normal lead turn (`MessageStreamingHandler.ts:1282-1286`:
+  `await stateManager.startSession({ sessionId: session.id, workspacePath: session.workspacePath || effectiveWorkspacePath });`).
+  `ai:sendMessageToTeammate` already has `sessionId` in scope as a handler parameter and resolves the
+  session record (`AISessionsRepository.get(sessionId)`, `:3214`) for its `workspacePath`/`worktreePath`,
+  so the call site has everything `startSession` needs. This is the recommended fix because it is the
+  only one of the two options that scopes the activation to the actual post-restart-resume-wake
+  origin: `ai:sendMessageToTeammate` is itself the UI-initiated, user-triggered entry point that
+  originates this PRD's post-restart wake, so starting the session there is starting it because of a
+  deliberate user action, not as a side effect of an unrelated event handler firing.
+- **Option A (do not implement as a blanket reorder — narrow it or skip it):** Moving
+  `sessionStateManager.startSession({...})` (currently at `:1112`, after the bail) to *before* the
+  `isSessionActive` check inside `onTeammateMessageWhileIdle` was reviewed and rejected as written:
+  `onTeammateMessageWhileIdle` is the single handler for the `'teammate:messageWhileIdle'` event, which
+  has **four** emit sites in `ClaudeCodeProvider.ts` (this task's post-restart wake, plus the three
+  pre-existing call sites at `:2379`, `:2403`, `:2412`). The event payload
+  (`{ sessionId: string; message: string }`, `:1092-1095`) carries no origin information distinguishing
+  this task's wake from the other three, so a blanket reorder makes the `isSessionActive` check a
+  no-op for all four — including a case where the user has deliberately closed the session between the
+  resume failure and this handler running. `SessionStateManager.startSession` is unconditional (no
+  check for "was this ended on purpose"), so that bypass would resurrect a session the user closed. If
+  Option B turns out to be insufficient or inappropriate at implementation time, the only acceptable
+  fallback is a **scoped** variant of Option A: thread an explicit origin flag through the same
+  mechanism Door A already builds (the widened `interruptWithMessage`/`emitTeammateMessageWhileIdle`
+  signatures) so the emitted event payload carries something like `origin: 'postRestartResume'`, and
+  have `onTeammateMessageWhileIdle` only reorder `startSession` ahead of the guard when that flag is
+  present — leaving the guard fully intact for the three pre-existing call sites. Do not reorder
+  `startSession` unconditionally for the handler as a whole.
 
 Whichever you pick, the end state must be: a post-restart resume-failure wake, once
 `onTeammateMessageWhileIdle` receives it with a correct `sessionId` (Door A fixed), results in the
@@ -226,9 +245,11 @@ Fulfills PRD requirements **R2, R3, R4, R6** (post-restart specifically).
    `emitTeammateMessageWhileIdle`'s other three call sites (`:2379`, `:2403`, `:2412`), which have no
    explicit sessionId to thread and must keep working exactly as today.
 2. **Door B:** Fix `onTeammateMessageWhileIdle` (or its caller, `ai:sendMessageToTeammate`) so a
-   post-restart wake no longer silently bails on `!isSessionActive` — either the session gets
-   started/marked active as part of delivering the wake (Option A above, recommended), or the
-   `AIService.ts` handler starts the session itself before triggering the wake path (Option B).
+   post-restart wake no longer silently bails on `!isSessionActive` — the `AIService.ts` handler
+   (`ai:sendMessageToTeammate`) starts the session itself before triggering the wake path (Option B
+   above, recommended), rather than reordering `startSession` unconditionally inside
+   `onTeammateMessageWhileIdle` (Option A), which would bypass the "already-ended session" guard for
+   all four `emitTeammateMessageWhileIdle` call sites, not just this task's post-restart case.
 3. **Fallback requirement — read carefully, this is not optional:** if, after implementing both
    doors, some sub-case genuinely still cannot be fixed (should be rare given the fixes above), it
    MUST fall back to preserving today's pre-1b behavior for that sub-case specifically: the desktop
@@ -295,8 +316,8 @@ Complete ALL criteria before marking task done:
 |------|--------|---------|
 | `packages/runtime/src/ai/server/providers/TeammateManager.ts` | modify | Widen `TeammateManagerDeps.interruptWithMessage` to accept an optional `sessionId`; thread it through from `deliverMessageToLead`'s call at `:1124` |
 | `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts` | modify | Widen `interruptWithMessage`'s method signature and its constructor-site wiring (`:420`) to forward `sessionId`; widen `emitTeammateMessageWhileIdle` (`:2549-2555`) to accept and prefer an explicit `sessionId` over `lastUsedSessionId` |
-| `packages/electron/src/main/services/ai/MessageStreamingHandler.ts` | modify | Fix `onTeammateMessageWhileIdle` (`:1092-1154`) so a post-restart wake does not bail on `!isSessionActive` (Option A: reorder `startSession` before the check) |
-| `packages/electron/src/main/services/ai/AIService.ts` | modify (only if you choose Option B for Door B) | If reordering inside `MessageStreamingHandler.ts` is insufficient or inappropriate at implementation time, have `ai:sendMessageToTeammate` (`:3208-3239`) call `startSession` itself before triggering the wake path |
+| `packages/electron/src/main/services/ai/AIService.ts` | modify | Door B fix (Option B, recommended): have `ai:sendMessageToTeammate` (`:3208-3239`) call `startSession` itself before triggering the wake path |
+| `packages/electron/src/main/services/ai/MessageStreamingHandler.ts` | modify (only if Option B is insufficient/inappropriate at implementation time) | Fallback only: if Option B doesn't work, apply the scoped variant of Option A described in Door B's "Fix" section — thread an explicit origin flag through Door A's mechanism so `onTeammateMessageWhileIdle` (`:1092-1154`) only reorders `startSession` ahead of the `isSessionActive` check for this task's post-restart wake, not for the handler's other three call sites |
 
 ### File Ownership Notes
 
@@ -326,9 +347,14 @@ Complete ALL criteria before marking task done:
 - **`sendMessageFromHost`'s `leadSessionId` parameter** (`TeammateManager.ts:1191-1229`) is the same
   class of fix already applied to a sibling method — useful as a second reference for "thread it
   explicitly" if `stopByAgentId`'s docstring alone isn't enough context.
-- **`onTeammateMessageWhileIdle`'s existing idempotent-`startSession`-call comment**
-  (`MessageStreamingHandler.ts:1109-1111`) already documents that re-calling `startSession` is safe
-  — use this as the justification for reordering it earlier in the function.
+- **`sendMessageHandler`'s existing `startSession` call**
+  (`MessageStreamingHandler.ts:1282-1286`) is the exact call shape Option B mirrors — copy its
+  argument structure (`sessionId`, `workspacePath`) when adding the equivalent call to
+  `ai:sendMessageToTeammate`. Note: `onTeammateMessageWhileIdle`'s own idempotent-`startSession`-call
+  comment (`:1109-1111`) documents that re-calling `startSession` is safe, but that idempotency does
+  not make Option A's *unconditional guard bypass* safe — idempotency is about `startSession` being
+  called twice, not about whether the guard it's meant to satisfy should be skipped for all four call
+  sites.
 
 ### Code Style
 
@@ -347,9 +373,14 @@ throughout `TeammateManager.ts` and `ClaudeCodeProvider.ts` (e.g. `seedLeadConte
   as before — a regression here would break the "lead turn ends with active agents, continuation
   fires" flow, unrelated to this PRD but easy to break by accident while widening the signature.
 - **The session was already ended by the time the post-restart wake arrives** (e.g. user closed the
-  session in the UI between the resume failure and this wake being processed). `startSession` being
-  called again should not resurrect a session the user explicitly ended — confirm `startSession`'s
-  own semantics handle this gracefully (read its implementation if unsure; do not assume).
+  session in the UI between the resume failure and this wake being processed). This is exactly why
+  Option B is recommended over an unconditional Option A reorder: `ai:sendMessageToTeammate` only
+  fires from a live, user-initiated IPC call, so calling `startSession` there reflects a real,
+  current user action, not a resurrection of a stale event. `startSession`'s own semantics are still
+  unconditional (no "was this ended on purpose" check — read its implementation if unsure, do not
+  assume), so the three pre-existing `emitTeammateMessageWhileIdle` call sites must keep going
+  through `onTeammateMessageWhileIdle`'s existing `isSessionActive` guard unchanged; Option B does not
+  touch that guard for them.
 - **Two teammates both fail post-restart near-simultaneously.** Both should independently reach
   `onTeammateMessageWhileIdle` with the correct `sessionId` (same lead session for both, since they
   share a lead) — `startSession` being called twice for the same session must be idempotent (already
