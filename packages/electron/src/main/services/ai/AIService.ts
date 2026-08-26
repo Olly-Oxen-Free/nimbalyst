@@ -25,7 +25,10 @@ import {
 } from '@nimbalyst/runtime/ai/server';
 import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
-import { projectTeammateRawMessages } from '@nimbalyst/runtime/ai/server/transcript/projectRawMessages';
+import {
+  projectTeammateRawMessages,
+  projectTaskSubagentRawMessages,
+} from '@nimbalyst/runtime/ai/server/transcript/projectRawMessages';
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/transcript/TranscriptProjector';
 import { createRawMessageStoreAdapter } from '../TranscriptMigrationAdapters';
 import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
@@ -128,6 +131,7 @@ import {
   tagFileBeforeEdit,
   formatCodexTestError,
   categorizeAIError,
+  resolveTaskSubagentToolUseId,
 } from './aiServiceUtils';
 import { MessageStreamingHandler } from './MessageStreamingHandler';
 import { setSessionPendingPrompt } from './pendingPromptPersistence';
@@ -3325,6 +3329,47 @@ export class AIService {
 
       const rawMessages = await createRawMessageStoreAdapter().getMessages(sessionId);
       return projectTeammateRawMessages(rawMessages, agentId);
+    });
+
+    // A Task sub-agent has no session row of its own: `forwardSubagentText`
+    // relays its chunks through the LEAD session's own iterator, tagged with
+    // `parent_tool_use_id`, and they're persisted like any other raw row.
+    // Callers key by either `taskId` or `toolUseId` -- the inline-expand
+    // widget only ever has the latter (the spawning message's own tool_use
+    // id). A `taskId` is resolved to its `toolUseId` via
+    // `session.metadata.currentTasks`, the persisted mirror of the
+    // provider's in-memory `activeTasks`, so this works whether or not the
+    // session's provider instance is currently live.
+    safeHandle('ai:getTaskSubagentTranscript', async (
+      _event,
+      sessionId: string,
+      lookup: { taskId?: string; toolUseId?: string },
+      workspacePath: string,
+    ): Promise<TranscriptViewMessage[]> => {
+      if (!sessionId) throw new Error('sessionId is required');
+      if (!lookup?.taskId && !lookup?.toolUseId) {
+        throw new Error('taskId or toolUseId is required');
+      }
+      if (!workspacePath) throw new Error('workspacePath is required');
+
+      const session = await AISessionsRepository.get(sessionId);
+      if (!session) return [];
+
+      // Same ownership rule as ai:getTeammateTranscript: a worktree session
+      // is reachable from either its parent workspace or its worktree.
+      const ownsSession = session.workspacePath === workspacePath
+        || (!!session.worktreePath && session.worktreePath === workspacePath);
+      if (session.workspacePath && !ownsSession) {
+        throw new Error(
+          `Session ${sessionId} belongs to ${session.workspacePath}, not ${workspacePath}`,
+        );
+      }
+
+      const toolUseId = resolveTaskSubagentToolUseId(session.metadata, lookup);
+      if (!toolUseId) return [];
+
+      const rawMessages = await createRawMessageStoreAdapter().getMessages(sessionId);
+      return projectTaskSubagentRawMessages(rawMessages, toolUseId);
     });
 
     // Settings handlers

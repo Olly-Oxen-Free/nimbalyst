@@ -75,6 +75,7 @@ import {
   previewForLog,
   LOG_PREVIEW_LENGTH,
   extensionPromptRequiresConfiguredApiKey,
+  resolveTaskSubagentToolUseId,
 } from '../aiServiceUtils';
 
 describe('aiServiceUtils', () => {
@@ -437,6 +438,37 @@ describe('aiServiceUtils', () => {
 
     it('respects an explicit max', () => {
       expect(previewForLog('abcdefghij', 4)).toBe('abcd…');
+    });
+  });
+
+  describe('resolveTaskSubagentToolUseId', () => {
+    it('passes a bare toolUseId through unchanged, ignoring session metadata', () => {
+      expect(resolveTaskSubagentToolUseId(undefined, { toolUseId: 'tool-1' })).toBe('tool-1');
+    });
+
+    it('resolves a taskId via session.metadata.currentTasks', () => {
+      const metadata = {
+        currentTasks: [
+          { taskId: 'task-a', toolUseId: 'tool-a' },
+          { taskId: 'task-b', toolUseId: 'tool-b' },
+        ],
+      };
+      expect(resolveTaskSubagentToolUseId(metadata, { taskId: 'task-b' })).toBe('tool-b');
+    });
+
+    it('returns undefined for an unknown taskId', () => {
+      const metadata = { currentTasks: [{ taskId: 'task-a', toolUseId: 'tool-a' }] };
+      expect(resolveTaskSubagentToolUseId(metadata, { taskId: 'task-x' })).toBeUndefined();
+    });
+
+    it('returns undefined when the matched task has no toolUseId yet', () => {
+      const metadata = { currentTasks: [{ taskId: 'task-a' }] };
+      expect(resolveTaskSubagentToolUseId(metadata, { taskId: 'task-a' })).toBeUndefined();
+    });
+
+    it('returns undefined when neither key nor currentTasks is present', () => {
+      expect(resolveTaskSubagentToolUseId(undefined, {})).toBeUndefined();
+      expect(resolveTaskSubagentToolUseId({}, { taskId: 'task-a' })).toBeUndefined();
     });
   });
 });

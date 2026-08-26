@@ -503,6 +503,17 @@ interface ElectronAPI {
     agentId: string,
     workspacePath: string,
   ) => Promise<{ success: boolean; error?: string }>;
+  /**
+   * A Task sub-agent's own transcript, projected from the lead session's raw
+   * log. Keyable by `taskId` or `toolUseId` -- at least one is required.
+   */
+  aiGetTaskSubagentTranscript: (
+    sessionId: string,
+    lookup: { taskId?: string; toolUseId?: string },
+    workspacePath: string,
+  ) => Promise<
+    import('@nimbalyst/runtime/ai/server/transcript/TranscriptProjector').TranscriptViewMessage[]
+  >;
   aiApplyEdit: (edit: any) => Promise<any>;
 
   // Flat-key settings -- single read-everything snapshot, single per-key write,

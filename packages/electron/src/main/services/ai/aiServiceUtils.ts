@@ -25,6 +25,30 @@ import { historyManager } from '../../HistoryManager';
 
 export const LOG_PREVIEW_LENGTH = 400;
 
+/**
+ * Resolve the `toolUseId` a `ai:getTaskSubagentTranscript` lookup should use,
+ * given either key directly. A bare `toolUseId` passes through unchanged; a
+ * `taskId` is resolved via `session.metadata.currentTasks` -- the persisted
+ * mirror of `ClaudeCodeProvider`'s in-memory `activeTasks` -- so this works
+ * whether or not the session's provider instance is currently live. Returns
+ * `undefined` when nothing resolves (unknown taskId, or a matched task with
+ * no toolUseId yet), which the caller treats as "no transcript", not an error.
+ */
+export function resolveTaskSubagentToolUseId(
+  sessionMetadata: Record<string, unknown> | undefined,
+  lookup: { taskId?: string; toolUseId?: string },
+): string | undefined {
+  if (lookup.toolUseId) return lookup.toolUseId;
+  if (!lookup.taskId) return undefined;
+
+  const currentTasks = sessionMetadata?.currentTasks;
+  if (!Array.isArray(currentTasks)) return undefined;
+
+  const match = (currentTasks as Array<{ taskId?: string; toolUseId?: string }>)
+    .find((task) => task?.taskId === lookup.taskId);
+  return match?.toolUseId;
+}
+
 /** Read file content as UTF-8. Returns '' for missing files, null for other errors. */
 export async function readFileContentOrNull(filePath: string): Promise<string | null> {
   try {
