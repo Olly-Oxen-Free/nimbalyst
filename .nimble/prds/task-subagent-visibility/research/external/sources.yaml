@@ -1,0 +1,46 @@
+sources:
+  - title: "Feature request: Show agent/subagent task progress in terminal UI"
+    url: https://github.com/anthropics/claude-code/issues/48246
+    accessed: "2026-08-26"
+    relevance: high
+    note: >
+      First-party confirmation that the CLI's default interactive terminal shows only
+      agent name, elapsed time, and token count for a running sub-agent — no tool-call
+      detail, text, or thinking. Open request asking Anthropic to surface data already
+      tracked internally (TaskCreate/TaskUpdate). Used to calibrate "parity with native
+      CLI" scope for this PRD.
+  - title: "claude-agent-acp (Agent Client Protocol client for Claude Agent SDK)"
+    url: https://github.com/agentclientprotocol/claude-agent-acp
+    accessed: "2026-08-26"
+    relevance: high
+    note: >
+      Existing external consumer of the same forwardSubagentText data Nimbalyst enabled.
+      Correlates nested sub-agent updates to their parent Agent/Task call via
+      _meta.claudeCode.parentToolUseId, marks the spawning call with
+      _meta.claudeCode.subagent = true, and gates nested rendering behind a client
+      capability flag with a flattened fallback for clients that don't opt in. Validates
+      Nimbalyst's parentToolUseId correlation approach as the standard shape for this
+      feature, not a workaround.
+  - title: "Claude Code Subagents: A 2026 Practical Guide"
+    url: https://www.tembo.io/blog/claude-code-subagents
+    accessed: "2026-08-26"
+    relevance: medium
+    note: >
+      Corroborates that only a subagent's final summary reaches the parent/lead by
+      default; intermediate steps stay in the subagent's own transcript unless
+      explicitly forwarded.
+  - title: "Claude Code Cheat Sheet - Shortcuts, Commands, Tips [2026]"
+    url: https://computingforgeeks.com/claude-code-cheat-sheet/
+    accessed: "2026-08-26"
+    relevance: low
+    note: >
+      Documents Ctrl+T as the CLI's built-in task-list toggle (status only, not
+      transcript text); requires explicit user action, not inline/live.
+  - title: "Claude Agent SDK TypeScript CHANGELOG"
+    url: https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md
+    accessed: "2026-08-26"
+    relevance: medium
+    note: >
+      Confirms --forward-subagent-text is a stream-json-output-mode flag for
+      programmatic consumers, and that nested (depth-2+) sub-agents are now forwarded
+      too, each keyed by the tool_use id of the Agent call that spawned it.
