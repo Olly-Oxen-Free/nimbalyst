@@ -31,6 +31,7 @@ export interface ManagedTeammate {
   agentType: string;
   model?: string;
   isBackgroundAgent: boolean;  // true for fire-and-forget background sub-agents (no team, no idle)
+  wasResumed: boolean;         // true if this entry came from resumeIdleTeammate, not a fresh spawn
   startedAt: number;           // epoch ms when spawned
   lastActiveAt: number;        // epoch ms of most recent chunk
   toolCallCount: number;       // count of tool_use blocks observed
@@ -1534,7 +1535,10 @@ export class TeammateManager {
     teamName: string,
     err: Error,
   ): void {
-    const isBackground = this.managedTeammates.get(agentId)?.isBackgroundAgent ?? false;
+    const managed = this.managedTeammates.get(agentId);
+    const isBackground = managed?.isBackgroundAgent ?? false;
+    const wasResumed = managed?.wasResumed ?? false;
+    const teammateName = managed?.name ?? agentId;
 
     this.managedTeammates.delete(agentId);
     this.markCompleted(agentId);
@@ -1544,6 +1548,22 @@ export class TeammateManager {
     console.warn(`[MANAGED-TEAMMATE] "${agentId}" errored:`, err.message);
     this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'errored']]));
     this.recordBatchFailure('errored');
+
+    // Wake the lead's own conversation for a resumed teammate that died — the lead
+    // already believes it initiated a resume that will report back (see task 1a).
+    // Must run BEFORE the emitAllCompleted check below: deliverMessageToLead's
+    // interruptWithMessage() synchronously latches isLeadBusy() (mid-turn or
+    // teammateIdleMessagePending), which is what suppresses a duplicate desktop
+    // notification when this was also the last active teammate.
+    if (wasResumed) {
+      this.deliverMessageToLead(
+        sessionId,
+        agentId,
+        teammateName,
+        `Resuming teammate "${teammateName}" failed: ${err.message}`,
+        `${teammateName} resume failed`,
+      );
+    }
 
     // If no more active teammates remain, notify the host so the session can end
     if (!this.hasActiveTeammates()) {
@@ -1588,6 +1608,7 @@ export class TeammateManager {
       agentType,
       model,
       isBackgroundAgent: false,
+      wasResumed: false,
       startedAt: now,
       lastActiveAt: now,
       toolCallCount: 0,
@@ -1648,6 +1669,7 @@ export class TeammateManager {
       agentType,
       model,
       isBackgroundAgent: true,
+      wasResumed: false,
       startedAt: now,
       lastActiveAt: now,
       toolCallCount: 0,
@@ -1983,6 +2005,7 @@ export class TeammateManager {
       agentType: idleInfo.agentType,
       model: idleInfo.model,
       isBackgroundAgent: false,
+      wasResumed: true,
       startedAt: idleInfo.startedAt ?? now,
       lastActiveAt: now,
       toolCallCount: 0,

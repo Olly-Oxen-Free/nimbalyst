@@ -90,7 +90,16 @@ describe('TeammateManager.sendMessageFromHost', () => {
   });
 
   it('resumes an idle teammate and reports wasIdle', async () => {
-    const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
+    // Stub logNonBlocking/interruptWithMessage: resumeIdleTeammate's stream rejects
+    // (deps here don't implement the hooks streamTeammateOutput needs), which routes
+    // through handleStreamError -> deliverMessageToLead since the resumed teammate's
+    // wasResumed marker is true -- those two deps calls must exist to avoid an
+    // unhandled rejection, independent of this test's own assertions.
+    const manager = new TeammateManager({
+      emit: vi.fn(),
+      logNonBlocking: vi.fn(),
+      interruptWithMessage: vi.fn(async () => {}),
+    } as unknown as TeammateManagerDeps);
     const resumeSpy = vi.spyOn(internals(manager), 'resumeIdleTeammate');
     internals(manager).idleTeammates.set('bob@team', idleTemplateFor('bob@team'));
 
