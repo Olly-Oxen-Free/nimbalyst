@@ -255,6 +255,42 @@ export const taskTranscriptSignalAtomFamily = atomFamily((_key: string) =>
   atom<number>(0)
 );
 
+/**
+ * Per-session list of Task sub-agent ids whose transcript is open as a tile
+ * beside the main thread, in the order they were opened.
+ *
+ * Deliberately in-memory only: tile layout is not persisted across an app
+ * restart. It lives here rather than in the triggering component so a tile
+ * survives the remount of the chip row / sidebar row that opened it.
+ */
+export const openTaskTilesAtomFamily = atomFamily((_sessionId: string) =>
+  atom<string[]>([])
+);
+
+/** Write-only: opens the task's tile, or closes it if already open. Shared by
+ *  the inline chip row and the sidebar's Sub-agents list so both stay in sync. */
+export const toggleTaskTileAtom = atom(
+  null,
+  (get, set, { sessionId, taskId }: { sessionId: string; taskId: string }) => {
+    const open = get(openTaskTilesAtomFamily(sessionId));
+    set(
+      openTaskTilesAtomFamily(sessionId),
+      open.includes(taskId) ? open.filter(id => id !== taskId) : [...open, taskId],
+    );
+  }
+);
+
+/** Write-only: closes one tile, from the tile's own close control. */
+export const closeTaskTileAtom = atom(
+  null,
+  (get, set, { sessionId, taskId }: { sessionId: string; taskId: string }) => {
+    set(
+      openTaskTilesAtomFamily(sessionId),
+      get(openTaskTilesAtomFamily(sessionId)).filter(id => id !== taskId),
+    );
+  }
+);
+
 /** Task info from SDK-native sub-agents (task_started/task_progress/task_notification) */
 export interface TaskInfo {
   taskId: string;

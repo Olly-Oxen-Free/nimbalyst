@@ -14,7 +14,7 @@
  * `TaskInfo.status` strings.
  *
  * Teammate chips are click-to-thread; Task chips are hover-to-thread, wrapped in
- * `TaskThreadPopover`. A Task chip's click callback stays unconsumed here.
+ * `TaskThreadPopover`, and click-to-tile via `onTaskClick`.
  *
  * Terminal states are not auto-dismissed on a timer. A `complete`/`error` chip
  * stays until the entry leaves session metadata, matching `TeammatePanel`.
@@ -148,8 +148,8 @@ export interface SubAgentChipRowProps {
   sessionId: string;
   /** Opens the teammate's own thread, anchored to the clicked chip element. */
   onTeammateClick?: (agentId: string, anchorEl: HTMLElement) => void;
-  /** Fires on a Task chip click but is not consumed yet - a later task wires it
-   *  to opening the task's transcript tile. Hovering is what shows the thread. */
+  /** Toggles the task's transcript tile beside the main thread. Hovering the
+   *  same chip still shows the read-only popover. */
   onTaskClick?: (taskId: string) => void;
 }
 

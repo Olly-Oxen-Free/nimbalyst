@@ -114,7 +114,8 @@ import {
   MIN_CLI_TERMINAL_HEIGHT,
   MAX_CLI_TERMINAL_HEIGHT,
 } from '../../store/atoms/terminals';
-import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, sessionTeammatesAtom } from '../../store/atoms/agentMode';
+import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, sessionTeammatesAtom, toggleTaskTileAtom } from '../../store/atoms/agentMode';
+import { TaskTileRail } from '../AgentMode/TaskTileRail';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, defaultThinkingModeAtom, chatShowToolCallsAtom, developerModeAtom } from '../../store/atoms/appSettings';
 import { supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
@@ -2275,6 +2276,13 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     setOpenTeammateThread({ agentId, name: teammate?.name ?? agentId, anchorEl });
   }, [allTeammatesForThread]);
 
+  // Task chip click-to-tile (R7): toggles that task's transcript tile in the
+  // rail beside the main thread. Hovering the same chip still shows the popover.
+  const toggleTaskTile = useSetAtom(toggleTaskTileAtom);
+  const handleTaskChipClick = useCallback((taskId: string) => {
+    toggleTaskTile({ sessionId, taskId });
+  }, [toggleTaskTile, sessionId]);
+
   // Scroll-to-message: when PromptQuickOpen selects a prompt, scroll to the
   // matching user message by timestamp.
   const scrollToMessage = useAtomValue(scrollToMessageAtom);
@@ -2487,67 +2495,76 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
           below. */}
       {!collapseTranscript && (
         <div
+          className="session-transcript-tiling-row"
           style={{
             flex: 1,
+            display: 'flex',
+            flexDirection: 'row',
+            gap: 8,
             overflow: 'hidden',
             // NIM-824: when the CLI drawer is expanded below, keep a usable
             // transcript floor — the drawer's fixed-height band used to
             // flex-starve the transcript to ~0px in small Split-mode layouts.
+            // Lives on this row (not the transcript inside it) so the guard
+            // still applies now that the row is what flexes in the column.
             minHeight:
               provider === 'claude-code-cli' && cliSessionCommitted && cliTerminalExpanded
                 ? 120
                 : 0,
           }}
         >
-          <AgentTranscriptPanel
-            ref={transcriptPanelRef}
-            sessionId={sessionId}
-            sessionData={sessionData}
-            todos={todos}
-            isProcessing={isLoading}
-            hasPendingInteractivePrompt={hasPendingInteractivePrompt}
-            onFileClick={handleFileClick}
-            onOpenSession={handleOpenSession}
-            hideSidebar={hideSidebar || mode === 'chat'}
-            showFloatingActions={mode === 'agent'}
-            workspacePath={workspacePath}
-            initialSettings={{
-              showToolCalls: chatShowToolCalls,
-              compactMode: false,
-              collapseTools: false,
-              showThinking: true,
-              showSessionInit: false
-            }}
-            renderEmptyExtra={renderEmptyExtra}
-            hideEmptyHelp={hideEmptyHelp}
-            isArchived={isArchived}
-            onCloseAndArchive={handleCloseAndArchive}
-            onUnarchive={handleUnarchive}
-            readFile={readFile}
-            fileEdits={sessionFileEdits}
-            renderFilesHeader={mode === 'agent' ? () => (
-              <>
-                <WakeupBanner sessionId={sessionId} />
-                <PendingReviewBanner workspacePath={workspacePath} sessionId={sessionId} />
-              </>
-            ) : undefined}
-            pendingReviewFiles={pendingReviewFiles}
-            groupByDirectory={groupByDirectory}
-            onGroupByDirectoryChange={setGroupByDirectory}
-            onOpenInExternalEditor={hasExternalEditor ? handleOpenInExternalEditor : undefined}
-            externalEditorName={externalEditorName}
-            onCompact={compactionSupport === 'unsupported' ? undefined : handleCompact}
-            promptAdditions={showPromptAdditions ? promptAdditions : null}
-            currentTeammates={transcriptTeammates}
-            waitingForNoun={waitingForNoun}
-            appStartTime={appStartTime ?? undefined}
-            renderEmbeddedFile={renderEmbeddedFile}
-            canEmbedFile={canEmbedFile}
-            loadToolCallDiffs={loadToolCallDiffs}
-            currentPhase={currentPhase}
-            phaseColumns={SESSION_PHASE_COLUMNS}
-            onSetPhase={handleSetPhase}
-          />
+          <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+            <AgentTranscriptPanel
+              ref={transcriptPanelRef}
+              sessionId={sessionId}
+              sessionData={sessionData}
+              todos={todos}
+              isProcessing={isLoading}
+              hasPendingInteractivePrompt={hasPendingInteractivePrompt}
+              onFileClick={handleFileClick}
+              onOpenSession={handleOpenSession}
+              hideSidebar={hideSidebar || mode === 'chat'}
+              showFloatingActions={mode === 'agent'}
+              workspacePath={workspacePath}
+              initialSettings={{
+                showToolCalls: chatShowToolCalls,
+                compactMode: false,
+                collapseTools: false,
+                showThinking: true,
+                showSessionInit: false
+              }}
+              renderEmptyExtra={renderEmptyExtra}
+              hideEmptyHelp={hideEmptyHelp}
+              isArchived={isArchived}
+              onCloseAndArchive={handleCloseAndArchive}
+              onUnarchive={handleUnarchive}
+              readFile={readFile}
+              fileEdits={sessionFileEdits}
+              renderFilesHeader={mode === 'agent' ? () => (
+                <>
+                  <WakeupBanner sessionId={sessionId} />
+                  <PendingReviewBanner workspacePath={workspacePath} sessionId={sessionId} />
+                </>
+              ) : undefined}
+              pendingReviewFiles={pendingReviewFiles}
+              groupByDirectory={groupByDirectory}
+              onGroupByDirectoryChange={setGroupByDirectory}
+              onOpenInExternalEditor={hasExternalEditor ? handleOpenInExternalEditor : undefined}
+              externalEditorName={externalEditorName}
+              onCompact={compactionSupport === 'unsupported' ? undefined : handleCompact}
+              promptAdditions={showPromptAdditions ? promptAdditions : null}
+              currentTeammates={transcriptTeammates}
+              waitingForNoun={waitingForNoun}
+              appStartTime={appStartTime ?? undefined}
+              renderEmbeddedFile={renderEmbeddedFile}
+              canEmbedFile={canEmbedFile}
+              loadToolCallDiffs={loadToolCallDiffs}
+              currentPhase={currentPhase}
+              phaseColumns={SESSION_PHASE_COLUMNS}
+              onSetPhase={handleSetPhase}
+            />
+          </div>
+          <TaskTileRail sessionId={sessionId} />
         </div>
       )}
 
@@ -2693,7 +2710,11 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       />
 
       {/* Sub-agent status chips - renders nothing when the session has none */}
-      <SubAgentChipRow sessionId={sessionId} onTeammateClick={handleTeammateChipClick} />
+      <SubAgentChipRow
+        sessionId={sessionId}
+        onTeammateClick={handleTeammateChipClick}
+        onTaskClick={handleTaskChipClick}
+      />
       {openTeammateThread && (
         <TeammateThreadPopover
           sessionId={sessionId}

@@ -10,6 +10,7 @@
  * Collapse state is persisted at the project level.
  *
  * Clicking a teammate item scrolls the transcript to its spawn point via scrollToTeammateAtom.
+ * Clicking a sub-agent item toggles that task's transcript tile beside the main thread.
  */
 
 import React, { useCallback, useMemo, useState, useEffect } from 'react';
@@ -19,7 +20,7 @@ import {
   teammatePanelCollapsedAtom, toggleTeammatePanelCollapsedAtom,
   agentPanelCollapsedAtom, toggleAgentPanelCollapsedAtom,
   sessionTeammatesAtom, scrollToTeammateAtom,
-  sessionTasksAtom, type TaskInfo,
+  sessionTasksAtom, type TaskInfo, toggleTaskTileAtom,
 } from '../../store/atoms/agentMode';
 import { mapTaskStatus } from '../../store/atoms/subAgentStatus';
 import { TaskThreadPopover } from './TaskThreadPopover';
@@ -252,6 +253,13 @@ interface TaskItemProps {
 }
 
 const TaskItem: React.FC<TaskItemProps> = React.memo(({ task, sessionId }) => {
+  // Click-to-tile (R7). Reads the write-only atom directly rather than threading
+  // a callback through TaskSection/TeammatePanel, which take only a sessionId.
+  const toggleTaskTile = useSetAtom(toggleTaskTileAtom);
+  const handleClick = useCallback(() => {
+    toggleTaskTile({ sessionId, taskId: task.taskId });
+  }, [toggleTaskTile, sessionId, task.taskId]);
+
   const isRunning = task.status === 'running';
   const now = useNow(isRunning);
   const isDone = task.status === 'completed' || task.status === 'failed' || task.status === 'stopped';
@@ -279,7 +287,16 @@ const TaskItem: React.FC<TaskItemProps> = React.memo(({ task, sessionId }) => {
       lastToolName={task.lastToolName}
     >
     <div
-      className={`task-item flex items-start gap-2 py-1 px-1 rounded text-xs ${
+      role="button"
+      tabIndex={0}
+      onClick={handleClick}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          handleClick();
+        }
+      }}
+      className={`task-item flex items-start gap-2 py-1 px-1 rounded text-xs cursor-pointer ${
         isRunning ? 'bg-[var(--nim-bg-hover)]' : ''
       } ${isDone ? 'opacity-60' : ''}`}
       data-status={task.status}
