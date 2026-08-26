@@ -1,6 +1,6 @@
 {
   "slug": "task-subagent-visibility",
-  "status": "ready",
+  "status": "paused-at-gate",
   "created_at": "2026-08-26T00:00:00Z",
   "execution_mode": "feature-branch",
   "feature_branch": "feature/task-subagent-visibility",
@@ -8,22 +8,26 @@
   "no_pull_requests": true,
   "tasks": {
     "1a": {
-      "status": "pending",
+      "status": "done",
       "wave": 1,
       "complexity": 7,
-      "model": "opus"
+      "model": "opus",
+      "commit": "3598b7e41c5cfa5b590664b77e71b1b6b5d70aa7",
+      "option_chosen": "B"
     },
     "1b": {
-      "status": "pending",
+      "status": "done",
       "wave": 2,
       "complexity": 4,
-      "model": "sonnet"
+      "model": "sonnet",
+      "commit": "3cd65fec345022c0d3759e86fc8f441ec59bab61"
     },
     "1c": {
-      "status": "pending",
+      "status": "done",
       "wave": 3,
       "complexity": 5,
-      "model": "opus"
+      "model": "opus",
+      "commit": "0b187a28e6a38c7da242f69de27e2b2f1492c75a"
     },
     "2a": {
       "status": "pending",
@@ -46,12 +50,14 @@
   },
   "gate": {
     "after_wave": 3,
-    "status": "not_reached"
+    "status": "reached",
+    "reached_at": "2026-08-26T09:50:00Z",
+    "notes": "Waves 1-3 (1a/1b/1c) merged locally to feature/task-subagent-visibility via fast-forward. Typecheck 23/23 and test:prepush green (10716 passed / 6 failed -- the two pre-existing whitelisted failures only), verified independently by PM in the main repo after each merge. Gate reached, not passed -- awaiting human review of packages/electron/src/main/** and packages/runtime/src/ai/server/** diffs before waves 4-5 (2a/2b/2c UI fan-out) begin."
   },
   "verification": {
-    "typecheck": "PENDING",
-    "targeted_unit_tests": "PENDING",
-    "monorepo_test_prepush": "PENDING",
+    "typecheck": "PASS",
+    "targeted_unit_tests": "PASS",
+    "monorepo_test_prepush": "PASS (10716 passed / 6 failed, both pre-existing/whitelisted: AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx)",
     "manual_e2e": "PENDING -- required before wave 5 (2c) is considered done, per PRD 002's retrospective gap (its manual_e2e was left PENDING through merge)"
   },
   "approved_at": "2026-08-26T00:00:00Z"
