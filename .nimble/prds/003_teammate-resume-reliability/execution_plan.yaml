@@ -1,0 +1,22 @@
+prd_slug: "teammate-resume-reliability"
+generated_at: "2026-08-25T00:00:00Z"
+
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    rationale: "No dependencies."
+  - wave: 2
+    tasks: ["1b"]
+    rationale: "Depends on 1a (wording change) and shares TeammateManager.ts, so sequenced."
+  - wave: 3
+    tasks: ["1c"]
+    rationale: "Depends on 1b's wasResumed marker and call site existing first; also its own task since the fix spans packages/electron/src/main (require_review) unlike 1a/1b which stay in packages/runtime."
+  - wave: 4
+    tasks: ["2a"]
+    rationale: "End-of-work test task, gated on all three implementation tasks per repo convention."
+
+longest_chain: ["1a", "1b", "1c", "2a"]
+
+file_overlap_notes:
+  - "1a and 1b both touch packages/runtime/src/ai/server/providers/TeammateManager.ts -- resolved by sequencing (1b depends_on 1a), which is also the genuine feature dependency."
+  - "1c touches packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts and packages/electron/src/main/services/ai/{MessageStreamingHandler.ts,AIService.ts} -- disjoint from 1a/1b's TeammateManager.ts-only scope except for one shared file (TeammateManager.ts itself, if the sessionId-threading fix needs a small change there too); sequenced after 1b regardless since it depends on 1b's wasResumed marker and deliverMessageToLead call site existing."
