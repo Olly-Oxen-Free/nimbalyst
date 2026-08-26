@@ -231,6 +231,19 @@ describe('ClaudeCodeTranscriptAdapter', () => {
       expect(items!.find(i => i.kind === 'session_id')).toBeUndefined();
     });
 
+    it('does NOT emit text from a sub-agent assistant chunk (parent_tool_use_id set)', () => {
+      // With forwardSubagentText enabled, the SDK relays a sub-agent's own
+      // text/thinking blocks through the same iterator as the lead's. Without
+      // this guard they'd interleave into the lead's visible transcript
+      // unmarked, misattributing sub-agent narration to the lead.
+      const items = adapter.processChunk({
+        type: 'assistant',
+        parent_tool_use_id: 'tool-task-1',
+        message: { id: 'msg-subagent-1', content: [{ type: 'text', text: 'sub-agent thinking out loud' }] },
+      });
+      expect(items!.find(i => i.kind === 'text')).toBeUndefined();
+    });
+
     it('does NOT emit session_id from a result chunk', () => {
       // Result chunks may carry the sub-agent's session_id when a sub-agent
       // finishes. Only the system init frame is authoritative for the lead.

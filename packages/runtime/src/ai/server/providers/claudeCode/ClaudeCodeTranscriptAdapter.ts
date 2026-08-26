@@ -224,6 +224,14 @@ export class ClaudeCodeTranscriptAdapter {
     if (Array.isArray(content)) {
       for (const block of content) {
         if (block.type === 'text' && block.text) {
+          // Skip sub-agent text (parent_tool_use_id set): with forwardSubagentText
+          // enabled, the SDK relays a sub-agent's own text/thinking blocks through
+          // this same iterator. Without this guard they'd interleave into the
+          // lead's visible transcript unmarked -- same class of bug the session_id
+          // and usage guards above already exist to prevent. Sub-agent text has no
+          // consumer yet; it is dropped here rather than misattributed to the lead.
+          if (parentToolUseId) continue;
+
           // Dedup streaming chunks vs accumulated echoes
           if (messageId && this.processedTextMessageIds.has(messageId)) continue;
           if (!messageId && this.processedTextMessageIds.size > 0) continue;
