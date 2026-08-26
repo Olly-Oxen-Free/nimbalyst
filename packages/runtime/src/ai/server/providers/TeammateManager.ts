@@ -2386,7 +2386,7 @@ export class TeammateManager {
             toolInput,
             {
               success: true,
-              message: `Message delivered to idle teammate "${recipient}" via resume. Do not retry.`,
+              message: `Resume initiated for idle teammate "${recipient}"; message sent but not yet confirmed delivered.`,
               target: recipient,
             },
             'teammate_message'
@@ -2395,7 +2395,7 @@ export class TeammateManager {
           return {
             handled: true,
             result: this.denyPreToolUse(
-              `Message delivered to idle teammate "${recipient}" via resume. Do not retry.`
+              `Resume initiated for idle teammate "${recipient}"; message sent but not yet confirmed delivered.`
             ),
           };
         }
