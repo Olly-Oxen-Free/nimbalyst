@@ -13,32 +13,22 @@
  * (`store/atoms/subAgentStatus.ts`), never from the raw `TeammateInfo.status` /
  * `TaskInfo.status` strings.
  *
- * Display-only: chips carry an optional click callback so Teammate
- * click-to-thread and the Task status popover can be wired in without
- * restructuring, but nothing here implements either.
+ * Teammate chips are click-to-thread; Task chips are hover-to-thread, wrapped in
+ * `TaskThreadPopover`. A Task chip's click callback stays unconsumed here.
  *
  * Terminal states are not auto-dismissed on a timer. A `complete`/`error` chip
  * stays until the entry leaves session metadata, matching `TeammatePanel`.
  */
 
-import React, { useCallback, useLayoutEffect, useMemo, useState } from 'react';
+import React, { useCallback, useMemo } from 'react';
 import { useAtomValue } from 'jotai';
-import {
-  useFloating,
-  offset,
-  flip,
-  shift,
-  FloatingPortal,
-  useInteractions,
-  useDismiss,
-  useRole,
-} from '@floating-ui/react';
 import { sessionTeammatesAtom, sessionTasksAtom } from '../../store/atoms/agentMode';
 import {
   mapTaskStatus,
   mapTeammateStatus,
   type SubAgentStatus,
 } from '../../store/atoms/subAgentStatus';
+import { TaskThreadPopover } from './TaskThreadPopover';
 import './SubAgentChipRow.css';
 
 /**
@@ -127,7 +117,9 @@ const SubAgentChip: React.FC<SubAgentChipProps> = React.memo(({ label, status, k
       data-status={status}
       data-kind={kind}
       aria-label={`${label} — ${status}`}
-      title={`${label} — ${status}`}
+      // Task chips get a hover popover carrying the same facts; a native
+      // tooltip on top of it would just be noise.
+      title={kind === 'task' ? undefined : `${label} — ${status}`}
     >
       <span className="sub-agent-chip-icon inline-flex shrink-0 items-center justify-center w-3 h-3">
         {STATUS_ICONS[status]}
@@ -141,74 +133,14 @@ const SubAgentChip: React.FC<SubAgentChipProps> = React.memo(({ label, status, k
 
 SubAgentChip.displayName = 'SubAgentChip';
 
-const STATUS_LABELS: Record<SubAgentStatus, string> = {
-  working: 'Working',
-  waiting: 'Waiting',
-  blocked: 'Blocked',
-  complete: 'Complete',
-  error: 'Error',
-};
-
-interface TaskStatusPopoverProps {
-  label: string;
-  status: SubAgentStatus;
-  lastToolName: string | undefined;
-  anchorEl: HTMLElement;
-  onClose: () => void;
-}
-
-/**
- * Read-only status/tool-name popover for a Task sub-agent chip (R6). A
- * deliberate visibility ceiling, not a stepping stone toward a full thread
- * view — Task sub-agent turns stay hidden from the transcript by design
- * (`claudeCliSubAgentTracker.ts:20-22`). No buttons, no navigation.
- */
-const TaskStatusPopover: React.FC<TaskStatusPopoverProps> = ({ label, status, lastToolName, anchorEl, onClose }) => {
-  const { refs, floatingStyles, context } = useFloating({
-    placement: 'top',
-    open: true,
-    onOpenChange: (open) => { if (!open) onClose(); },
-    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 })],
-  });
-
-  useLayoutEffect(() => {
-    refs.setPositionReference(anchorEl);
-  }, [anchorEl, refs]);
-
-  const dismiss = useDismiss(context);
-  const role = useRole(context, { role: 'dialog' });
-  const { getFloatingProps } = useInteractions([dismiss, role]);
-
-  return (
-    <FloatingPortal>
-      <div
-        ref={refs.setFloating}
-        style={floatingStyles}
-        {...getFloatingProps()}
-        className="sub-agent-task-status-popover flex flex-col gap-1 p-2.5 rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] shadow-lg w-[200px] z-50 text-[11px]"
-      >
-        <div className="sub-agent-task-status-popover-title font-medium text-[var(--nim-text)] truncate">{label}</div>
-        <div className="flex items-center justify-between text-[var(--nim-text-faint)]">
-          <span>Status</span>
-          <span className="text-[var(--nim-text)]">{STATUS_LABELS[status]}</span>
-        </div>
-        <div className="flex items-center justify-between text-[var(--nim-text-faint)]">
-          <span>Active tool</span>
-          <span className="text-[var(--nim-text)] truncate max-w-[110px]">{lastToolName ?? '—'}</span>
-        </div>
-      </div>
-    </FloatingPortal>
-  );
-};
-
-TaskStatusPopover.displayName = 'TaskStatusPopover';
-
 interface SubAgentChipEntry {
   key: string;
   id: string;
   kind: 'teammate' | 'task';
   label: string;
   status: SubAgentStatus;
+  /** Task entries only - shown in the hover popover's header. */
+  lastToolName?: string;
 }
 
 export interface SubAgentChipRowProps {
@@ -216,7 +148,8 @@ export interface SubAgentChipRowProps {
   sessionId: string;
   /** Opens the teammate's own thread, anchored to the clicked chip element. */
   onTeammateClick?: (agentId: string, anchorEl: HTMLElement) => void;
-  /** Wired by a later task - opens the task's read-only status popover. */
+  /** Fires on a Task chip click but is not consumed yet - a later task wires it
+   *  to opening the task's transcript tile. Hovering is what shows the thread. */
   onTaskClick?: (taskId: string) => void;
 }
 
@@ -231,11 +164,6 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
 }) => {
   const allTeammates = useAtomValue(sessionTeammatesAtom(sessionId));
   const tasks = useAtomValue(sessionTasksAtom(sessionId));
-
-  // Task-chip read-only status popover (R6). A separate, purely local flow
-  // from the Teammate click-to-thread path below — does not touch it.
-  const [openTaskPopover, setOpenTaskPopover] = useState<{ taskId: string; anchorEl: HTMLElement } | null>(null);
-  const openTask = openTaskPopover ? tasks.find(t => t.taskId === openTaskPopover.taskId) ?? null : null;
 
   const entries = useMemo<SubAgentChipEntry[]>(() => [
     // Same filter as TeammatePanel: _background/_subagent entries are dead
@@ -255,6 +183,7 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
       kind: 'task',
       label: t.description,
       status: mapTaskStatus(t.status),
+      lastToolName: t.lastToolName,
     })),
   ], [allTeammates, tasks]);
 
@@ -263,7 +192,6 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
       onTeammateClick?.(entry.id, e.currentTarget);
     } else {
       onTaskClick?.(entry.id);
-      setOpenTaskPopover({ taskId: entry.id, anchorEl: e.currentTarget });
     }
   }, [onTeammateClick, onTaskClick]);
 
@@ -283,25 +211,33 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
         role="list"
         aria-label="Sub-agent status"
       >
-        {entries.map(entry => (
-          <SubAgentChip
-            key={entry.key}
-            label={entry.label}
-            status={entry.status}
-            kind={entry.kind}
-            onClick={hasClickHandler ? (e) => handleChipClick(entry, e) : undefined}
-          />
-        ))}
+        {entries.map(entry => {
+          const chip = (
+            <SubAgentChip
+              label={entry.label}
+              status={entry.status}
+              kind={entry.kind}
+              onClick={hasClickHandler ? (e) => handleChipClick(entry, e) : undefined}
+            />
+          );
+          if (entry.kind !== 'task') {
+            return <React.Fragment key={entry.key}>{chip}</React.Fragment>;
+          }
+          return (
+            <TaskThreadPopover
+              key={entry.key}
+              sessionId={sessionId}
+              taskId={entry.id}
+              label={entry.label}
+              status={entry.status}
+              lastToolName={entry.lastToolName}
+              triggerClassName="inline-flex shrink-0"
+            >
+              {chip}
+            </TaskThreadPopover>
+          );
+        })}
       </div>
-      {openTask && openTaskPopover && (
-        <TaskStatusPopover
-          label={openTask.description}
-          status={mapTaskStatus(openTask.status)}
-          lastToolName={openTask.lastToolName}
-          anchorEl={openTaskPopover.anchorEl}
-          onClose={() => setOpenTaskPopover(null)}
-        />
-      )}
     </div>
   );
 });

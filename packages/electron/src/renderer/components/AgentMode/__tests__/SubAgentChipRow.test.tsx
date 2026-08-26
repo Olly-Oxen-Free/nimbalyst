@@ -18,11 +18,23 @@ vi.mock('../../../store/atoms/agentMode', async () => {
   const { atom } = await import('jotai');
   const teammatesAtom = atom(() => testState.teammates);
   const tasksAtom = atom(() => testState.tasks);
+  const signalAtom = atom(0);
   return {
     sessionTeammatesAtom: () => teammatesAtom,
     sessionTasksAtom: () => tasksAtom,
+    taskTranscriptSignalKey: (sessionId: string, taskId: string) => `${sessionId}:${taskId}`,
+    taskTranscriptSignalAtomFamily: () => signalAtom,
   };
 });
+
+vi.mock('../../../store/atoms/sessions', async () => {
+  const { atom } = await import('jotai');
+  return { sessionListWorkspaceAtom: atom('/ws') };
+});
+
+vi.mock('@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView', () => ({
+  RichTranscriptView: () => <div data-testid="rich-transcript" />,
+}));
 
 function teammate(name: string, status: TeammateInfo['status'], teamName = 'squad'): TeammateInfo {
   return { name, agentId: `agent-${name}`, teamName, agentType: 'general', status };
@@ -114,69 +126,27 @@ describe('SubAgentChipRow', () => {
     expect(onTeammateClick).toHaveBeenCalledWith('agent-code-reviewer', chips()[0]);
   });
 
-  describe('Task-chip read-only status popover', () => {
-    it('opens on a Task chip click and shows status + active tool name', async () => {
-      testState.teammates = [teammate('code-reviewer', 'running')];
+  describe('Task chips', () => {
+    it('opens no popover on click - onTaskClick fires but stays unconsumed', async () => {
       testState.tasks = [task('db-migration', 'blocked', 'Bash')];
 
-      const onTeammateClick = vi.fn();
-      const { chips } = renderRow({ onTeammateClick });
-      const taskChip = chips().find(c => c.dataset.kind === 'task')!;
-      await act(async () => { taskChip.click(); });
-
-      const popover = document.querySelector('.sub-agent-task-status-popover');
-      expect(popover).not.toBeNull();
-      expect(popover!.textContent).toContain('db-migration');
-      expect(popover!.textContent).toContain('Blocked');
-      expect(popover!.textContent).toContain('Bash');
-    });
-
-    it('shows an explicit empty state when there is no active tool', async () => {
-      testState.tasks = [task('docs-update', 'running')];
-
-      const { chips } = renderRow({ onTeammateClick: vi.fn() });
+      const onTaskClick = vi.fn();
+      const { chips } = renderRow({ onTeammateClick: vi.fn(), onTaskClick });
       await act(async () => { chips()[0].click(); });
 
-      expect(document.querySelector('.sub-agent-task-status-popover')!.textContent).toContain('—');
+      expect(onTaskClick).toHaveBeenCalledWith('task-db-migration');
+      expect(document.querySelector('.sub-agent-task-status-popover')).toBeNull();
+      expect(document.querySelector('.task-thread-popover')).toBeNull();
     });
 
-    it('does not open for a Teammate chip click, and leaves onTeammateClick unaffected', async () => {
+    it('wraps each Task chip - and only Task chips - in a hover thread trigger', () => {
       testState.teammates = [teammate('code-reviewer', 'running')];
       testState.tasks = [task('db-migration', 'blocked')];
 
-      const onTeammateClick = vi.fn();
-      const { chips } = renderRow({ onTeammateClick });
-      const teammateChip = chips().find(c => c.dataset.kind === 'teammate')!;
-      await act(async () => { teammateChip.click(); });
-
-      expect(onTeammateClick).toHaveBeenCalledWith('agent-code-reviewer', teammateChip);
-      expect(document.querySelector('.sub-agent-task-status-popover')).toBeNull();
-    });
-
-    it('dismisses on outside click', async () => {
-      testState.tasks = [task('db-migration', 'blocked')];
-      const { chips } = renderRow({ onTeammateClick: vi.fn() });
-      await act(async () => { chips()[0].click(); });
-      expect(document.querySelector('.sub-agent-task-status-popover')).not.toBeNull();
-
-      await act(async () => {
-        fireEvent.pointerDown(document.body);
-      });
-
-      expect(document.querySelector('.sub-agent-task-status-popover')).toBeNull();
-    });
-
-    it('dismisses on Escape', async () => {
-      testState.tasks = [task('db-migration', 'blocked')];
-      const { chips } = renderRow({ onTeammateClick: vi.fn() });
-      await act(async () => { chips()[0].click(); });
-      expect(document.querySelector('.sub-agent-task-status-popover')).not.toBeNull();
-
-      await act(async () => {
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      });
-
-      expect(document.querySelector('.sub-agent-task-status-popover')).toBeNull();
+      const { container, chips } = renderRow({ onTeammateClick: vi.fn() });
+      const triggers = container.querySelectorAll('.task-thread-popover-trigger');
+      expect(triggers).toHaveLength(1);
+      expect(triggers[0].contains(chips().find(c => c.dataset.kind === 'task')!)).toBe(true);
     });
   });
 });

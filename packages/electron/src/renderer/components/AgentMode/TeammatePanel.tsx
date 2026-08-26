@@ -21,6 +21,8 @@ import {
   sessionTeammatesAtom, scrollToTeammateAtom,
   sessionTasksAtom, type TaskInfo,
 } from '../../store/atoms/agentMode';
+import { mapTaskStatus } from '../../store/atoms/subAgentStatus';
+import { TaskThreadPopover } from './TaskThreadPopover';
 
 export interface TeammateInfo {
   name: string;
@@ -92,6 +94,7 @@ export const TeammatePanel: React.FC<TeammatePanelProps> = React.memo(({
       {tasks.length > 0 && (
         <TaskSection
           tasks={tasks}
+          sessionId={sessionId}
           isCollapsed={isTasksCollapsed}
           onToggle={handleToggleTasks}
           className={teammates.length > 0 ? 'border-t border-[var(--nim-border)]' : undefined}
@@ -157,6 +160,7 @@ TeammateSection.displayName = 'TeammateSection';
 
 interface TaskSectionProps {
   tasks: TaskInfo[];
+  sessionId: string;
   isCollapsed: boolean;
   onToggle: () => void;
   className?: string;
@@ -164,6 +168,7 @@ interface TaskSectionProps {
 
 const TaskSection: React.FC<TaskSectionProps> = React.memo(({
   tasks,
+  sessionId,
   isCollapsed,
   onToggle,
   className,
@@ -192,7 +197,7 @@ const TaskSection: React.FC<TaskSectionProps> = React.memo(({
         <div className="px-3 pb-2 max-h-[200px] overflow-y-auto">
           <div className="flex flex-col gap-1">
             {tasks.map((task) => (
-              <TaskItem key={task.taskId} task={task} />
+              <TaskItem key={task.taskId} task={task} sessionId={sessionId} />
             ))}
           </div>
         </div>
@@ -243,9 +248,10 @@ function useNow(enabled: boolean): number {
 
 interface TaskItemProps {
   task: TaskInfo;
+  sessionId: string;
 }
 
-const TaskItem: React.FC<TaskItemProps> = React.memo(({ task }) => {
+const TaskItem: React.FC<TaskItemProps> = React.memo(({ task, sessionId }) => {
   const isRunning = task.status === 'running';
   const now = useNow(isRunning);
   const isDone = task.status === 'completed' || task.status === 'failed' || task.status === 'stopped';
@@ -265,6 +271,13 @@ const TaskItem: React.FC<TaskItemProps> = React.memo(({ task }) => {
   }
 
   return (
+    <TaskThreadPopover
+      sessionId={sessionId}
+      taskId={task.taskId}
+      label={task.description}
+      status={mapTaskStatus(task.status)}
+      lastToolName={task.lastToolName}
+    >
     <div
       className={`task-item flex items-start gap-2 py-1 px-1 rounded text-xs ${
         isRunning ? 'bg-[var(--nim-bg-hover)]' : ''
@@ -295,6 +308,7 @@ const TaskItem: React.FC<TaskItemProps> = React.memo(({ task }) => {
         )}
       </div>
     </div>
+    </TaskThreadPopover>
   );
 });
 
