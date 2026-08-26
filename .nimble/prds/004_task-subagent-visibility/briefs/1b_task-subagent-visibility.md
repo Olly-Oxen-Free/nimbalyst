@@ -115,6 +115,12 @@ matching/parsing logic depends on which option 1a resolved to:
   strategy, e.g. checking for `"parent_tool_use_id"` substring presence before parsing),
   then adapt/reuse `projectRawMessagesToViewMessages`. Coordinate directly with however 1a
   actually landed; this brief cannot specify the exact filter shape for Option B in advance.
+  Raw chunks only ever carry `parent_tool_use_id` (a `toolUseId`), never a bare `taskId` — so
+  when the caller supplies `taskId` instead of `toolUseId`, resolve it first by reading
+  `session.metadata.currentTasks` (the same array `activeTasks` persists into, per 1a) and
+  finding the entry whose `taskId` matches, then use *its* `toolUseId` for the raw-chunk
+  match. `TaskInfo.toolUseId` is typed optional there — handle the case where it's absent by
+  returning an empty array rather than throwing.
 
 **Preload + electron.d.ts sibling** (verified live):
 - `packages/electron/src/preload/index.ts:713`:

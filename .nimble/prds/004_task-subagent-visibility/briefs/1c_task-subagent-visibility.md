@@ -31,12 +31,15 @@ renderer over IPC → a centralized listener bumps a Jotai atom → open UI surf
 atom and debounce-refetch.
 
 This task is part of **Wave 3** — the last wave of the backend chain, and the wave that
-precedes the PRD's gate. **After this task lands, `require_review` triggers automatically**
-(this task's own files, `MessageStreamingHandler.ts`, are under
-`packages/electron/src/main/**`, as is `AIService.ts` from task 1b) — a real, human-verify
-checkpoint before any of the three UI surfaces (waves 4-5) begin. Do not assume this gate
-away; it is a deliberate design choice in this PRD, correcting a gap noted in PRD 002's own
-retrospective (its equivalent gate stayed `PENDING` through to merge).
+precedes the PRD's gate. **After this task lands, the wave-3 gate applies** (this task's own
+files, `MessageStreamingHandler.ts`, are under `packages/electron/src/main/**`, as is
+`AIService.ts` from task 1b, matching `.nimble/config.yaml`'s `require_review` boundary) —
+enforced explicitly via `.execution_config.json`'s `gates.placements` entry (`after_wave: 3`,
+`model: "pause"`), not by an automated reviewer (this repo's `.nimble/config.yaml` has
+`review.enabled: false` / no provider configured). It is still a real, human-verify checkpoint
+before any of the three UI surfaces (waves 4-5) begin. Do not assume this gate away; it is a
+deliberate design choice in this PRD, correcting a gap noted in PRD 002's own retrospective
+(its equivalent gate stayed `PENDING` through to merge).
 
 ---
 
