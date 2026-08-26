@@ -253,6 +253,11 @@ export async function buildSdkOptions(
           append: systemPrompt
         },
     settingSources,
+    // SDK default is false, which forwards only tool_use/tool_result blocks
+    // from subagents and teammates (enough for a heartbeat counter). Without
+    // this, a spawned teammate's own assistant text/thinking never leaves the
+    // CLI subprocess, so there is nothing for a thread-view UI to render.
+    forwardSubagentText: true,
     // NIM-1988: this is the provider-owned, first-build snapshot, not a live
     // config read. The SDK rebuilds the API tool prefix on resumed turns, so a
     // server appearing/disappearing here would force a tools_changed miss over

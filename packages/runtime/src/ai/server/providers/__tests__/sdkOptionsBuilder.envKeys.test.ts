@@ -196,6 +196,12 @@ describe('buildSdkOptions env-key hardening', () => {
     expect(options.thinking).toEqual({ type: 'disabled' });
   });
 
+  it('forwards subagent/teammate thinking and text blocks to the transcript', async () => {
+    const { options } = await buildSdkOptions(makeDeps(), makeParams());
+
+    expect(options.forwardSubagentText).toBe(true);
+  });
+
   it('omits the SDK thinking option when extended thinking is enabled', async () => {
     const { options } = await buildSdkOptions(
       makeDeps({ config: { thinkingMode: 'enabled' } }),
