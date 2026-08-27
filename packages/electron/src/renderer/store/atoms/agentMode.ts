@@ -318,6 +318,43 @@ export const setTaskInlineExpandAtom = atom(
   }
 );
 
+/**
+ * Per-session list of teammate agent ids whose transcript is open as a tile
+ * beside the main thread, in the order they were opened. Sibling of
+ * `openTaskTilesAtomFamily` for the teammate kind -- kept as a separate atom
+ * family rather than merged, matching how `TaskTileRail`/`TeammateTileRail`
+ * are two independent rails rather than one kind-branching component.
+ *
+ * Deliberately in-memory only: tile layout is not persisted across an app
+ * restart.
+ */
+export const openTeammateTilesAtomFamily = atomFamily((_sessionId: string) =>
+  atom<string[]>([])
+);
+
+/** Write-only: opens the teammate's tile, or closes it if already open. */
+export const toggleTeammateTileAtom = atom(
+  null,
+  (get, set, { sessionId, agentId }: { sessionId: string; agentId: string }) => {
+    const open = get(openTeammateTilesAtomFamily(sessionId));
+    set(
+      openTeammateTilesAtomFamily(sessionId),
+      open.includes(agentId) ? open.filter(id => id !== agentId) : [...open, agentId],
+    );
+  }
+);
+
+/** Write-only: closes one teammate tile, from the tile's own close control. */
+export const closeTeammateTileAtom = atom(
+  null,
+  (get, set, { sessionId, agentId }: { sessionId: string; agentId: string }) => {
+    set(
+      openTeammateTilesAtomFamily(sessionId),
+      get(openTeammateTilesAtomFamily(sessionId)).filter(id => id !== agentId),
+    );
+  }
+);
+
 /** Task info from SDK-native sub-agents (task_started/task_progress/task_notification) */
 export interface TaskInfo {
   taskId: string;

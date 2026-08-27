@@ -41,7 +41,6 @@ import { PendingReviewBanner } from '../AIChat/PendingReviewBanner';
 import { WakeupBanner } from '../AIChat/WakeupBanner';
 import { McpLockdownBanner } from '../AIChat/McpLockdownBanner';
 import { SubAgentChipRow } from '../AgentMode/SubAgentChipRow';
-import { TeammateThreadPopover } from '../AgentMode/TeammateThreadPopover';
 import type { AIMode } from './ModeTag';
 // Note: ExitPlanMode, AskUserQuestion, and ToolPermission use inline widgets via InteractiveWidgetHost (in runtime package)
 import { SlashCommandSuggestions } from './SlashCommandSuggestions';
@@ -114,8 +113,9 @@ import {
   MIN_CLI_TERMINAL_HEIGHT,
   MAX_CLI_TERMINAL_HEIGHT,
 } from '../../store/atoms/terminals';
-import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, sessionTeammatesAtom, toggleTaskTileAtom, openTaskTilesAtomFamily } from '../../store/atoms/agentMode';
+import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, toggleTaskTileAtom, openTaskTilesAtomFamily, toggleTeammateTileAtom, openTeammateTilesAtomFamily } from '../../store/atoms/agentMode';
 import { TaskTileRail } from '../AgentMode/TaskTileRail';
+import { TeammateTileRail } from '../AgentMode/TeammateTileRail';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, defaultThinkingModeAtom, chatShowToolCallsAtom, developerModeAtom } from '../../store/atoms/appSettings';
 import { supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
@@ -2262,19 +2262,15 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   }, [scrollToTeammate, setScrollToTeammate, sessionId, messages]);
 
   // Teammate chip click-to-thread (R5): a separate flow from the scroll-to-
-  // spawn-point behavior above, which stays exactly as-is — clicking a
-  // teammate's row in the vertical TeammatePanel still just scrolls; clicking
-  // its chip in the new horizontal SubAgentChipRow opens a compose popover.
-  const allTeammatesForThread = useAtomValue(sessionTeammatesAtom(sessionId));
-  const [openTeammateThread, setOpenTeammateThread] = useState<{
-    agentId: string;
-    name: string;
-    anchorEl: HTMLElement;
-  } | null>(null);
-  const handleTeammateChipClick = useCallback((agentId: string, anchorEl: HTMLElement) => {
-    const teammate = allTeammatesForThread.find(t => t.agentId === agentId);
-    setOpenTeammateThread({ agentId, name: teammate?.name ?? agentId, anchorEl });
-  }, [allTeammatesForThread]);
+  // Teammate chip click-to-tile: toggles that teammate's transcript tile in
+  // the rail beside the main thread, matching the Task chip's own
+  // click-to-tile behavior below (they used to diverge -- a teammate chip
+  // click opened a floating compose popover instead -- unified so both kinds
+  // behave the same way from the chip row and the sidebar list).
+  const toggleTeammateTile = useSetAtom(toggleTeammateTileAtom);
+  const handleTeammateChipClick = useCallback((agentId: string) => {
+    toggleTeammateTile({ sessionId, agentId });
+  }, [toggleTeammateTile, sessionId]);
 
   // Task chip click-to-tile (R7): toggles that task's transcript tile in the
   // rail beside the main thread. Hovering the same chip still shows the popover.
@@ -2283,11 +2279,13 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     toggleTaskTile({ sessionId, taskId });
   }, [toggleTaskTile, sessionId]);
 
-  // Whether any Task tile is open beside the main thread right now. Drives
-  // the main thread's own pane chrome below - when nothing is tiled, the
-  // layout stays exactly as it was before this feature (no border, no
-  // header), so a session that never uses tiling sees no difference at all.
-  const hasOpenTaskTiles = useAtomValue(openTaskTilesAtomFamily(sessionId)).length > 0;
+  // Whether any Task or teammate tile is open beside the main thread right
+  // now. Drives the main thread's own pane chrome below - when nothing is
+  // tiled, the layout stays exactly as it was before this feature (no
+  // border, no header), so a session that never uses tiling sees no
+  // difference at all.
+  const hasOpenTaskTiles = useAtomValue(openTaskTilesAtomFamily(sessionId)).length > 0
+    || useAtomValue(openTeammateTilesAtomFamily(sessionId)).length > 0;
 
   // Scroll-to-message: when PromptQuickOpen selects a prompt, scroll to the
   // matching user message by timestamp.
@@ -2593,6 +2591,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
               />
             </div>
           </div>
+          <TeammateTileRail sessionId={sessionId} />
           <TaskTileRail sessionId={sessionId} />
         </div>
       )}
@@ -2744,17 +2743,6 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         onTeammateClick={handleTeammateChipClick}
         onTaskClick={handleTaskChipClick}
       />
-      {openTeammateThread && (
-        <TeammateThreadPopover
-          sessionId={sessionId}
-          agentId={openTeammateThread.agentId}
-          teammateName={openTeammateThread.name}
-          workspacePath={workspacePath}
-          anchorEl={openTeammateThread.anchorEl}
-          onClose={() => setOpenTeammateThread(null)}
-        />
-      )}
-
       {/* Note: All interactive prompts (ToolPermission, ExitPlanMode, AskUserQuestion) use inline widgets in transcript */}
 
       {/* Input area — wrapped so the draftInput subscription doesn't

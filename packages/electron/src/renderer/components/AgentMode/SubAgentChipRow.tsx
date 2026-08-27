@@ -27,6 +27,7 @@ import {
   sessionTasksAtom,
   openTaskTilesAtomFamily,
   openTaskInlineExpandAtomFamily,
+  openTeammateTilesAtomFamily,
 } from '../../store/atoms/agentMode';
 import {
   mapTaskStatus,
@@ -209,6 +210,7 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
 
   const openTiles = useAtomValue(openTaskTilesAtomFamily(sessionId));
   const openInline = useAtomValue(openTaskInlineExpandAtomFamily(sessionId));
+  const openTeammateTiles = useAtomValue(openTeammateTilesAtomFamily(sessionId));
 
   const handleChipClick = useCallback((entry: SubAgentChipEntry, e: React.SyntheticEvent<HTMLDivElement>) => {
     if (entry.kind === 'teammate') {
@@ -235,10 +237,9 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
         aria-label="Sub-agent status"
       >
         {entries.map(entry => {
-          const isOpen = entry.kind === 'task' && (
-            openTiles.includes(entry.id)
-            || (entry.toolUseId != null && openInline.has(entry.toolUseId))
-          );
+          const isOpen = entry.kind === 'task'
+            ? openTiles.includes(entry.id) || (entry.toolUseId != null && openInline.has(entry.toolUseId))
+            : openTeammateTiles.includes(entry.id);
           const chip = (
             <SubAgentChip
               label={entry.label}

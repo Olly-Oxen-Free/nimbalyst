@@ -12,6 +12,7 @@ const testState = vi.hoisted(() => ({
   tasks: [] as TaskInfo[],
   openTiles: [] as string[],
   openInline: new Set<string>(),
+  openTeammateTiles: [] as string[],
 }));
 
 // Narrowest possible mock: only the source atom families. The normalized
@@ -23,11 +24,13 @@ vi.mock('../../../store/atoms/agentMode', async () => {
   const signalAtom = atom(0);
   const openTilesAtom = atom(() => testState.openTiles);
   const openInlineAtom = atom(() => testState.openInline);
+  const openTeammateTilesAtom = atom(() => testState.openTeammateTiles);
   return {
     sessionTeammatesAtom: () => teammatesAtom,
     sessionTasksAtom: () => tasksAtom,
     taskTranscriptSignalKey: (sessionId: string, taskId: string) => `${sessionId}:${taskId}`,
     taskTranscriptSignalAtomFamily: () => signalAtom,
+    openTeammateTilesAtomFamily: () => openTeammateTilesAtom,
     openTaskTilesAtomFamily: () => openTilesAtom,
     openTaskInlineExpandAtomFamily: () => openInlineAtom,
   };
@@ -78,6 +81,7 @@ describe('SubAgentChipRow', () => {
     testState.tasks = [];
     testState.openTiles = [];
     testState.openInline = new Set();
+    testState.openTeammateTiles = [];
   });
 
   afterEach(() => {
@@ -185,12 +189,21 @@ describe('SubAgentChipRow', () => {
       expect(chips()[0].querySelector('.sub-agent-chip-open-dot')).toBeNull();
     });
 
-    it('never shows the open-indicator on a teammate chip', () => {
+    it('does not read a teammate chip\'s open state from the task tile atoms (wrong id space)', () => {
       testState.teammates = [teammate('code-reviewer', 'running')];
-      testState.openTiles = ['agent-code-reviewer']; // wrong id space on purpose
+      testState.openTiles = ['agent-code-reviewer']; // task-tile atom, not teammate-tile
 
       const { chips } = renderRow({ onTeammateClick: vi.fn() });
       expect(chips()[0].dataset.open).toBeUndefined();
+    });
+
+    it('shows the open-indicator dot when a teammate is tiled', () => {
+      testState.teammates = [teammate('code-reviewer', 'running')];
+      testState.openTeammateTiles = ['agent-code-reviewer'];
+
+      const { chips } = renderRow({ onTeammateClick: vi.fn() });
+      expect(chips()[0].dataset.open).toBe('true');
+      expect(chips()[0].querySelector('.sub-agent-chip-open-dot')).not.toBeNull();
     });
   });
 });
