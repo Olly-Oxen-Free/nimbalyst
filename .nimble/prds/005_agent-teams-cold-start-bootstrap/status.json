@@ -1,28 +1,53 @@
 {
   "slug": "agent-teams-cold-start-bootstrap",
-  "status": "ready",
+  "status": "paused-at-gate",
   "created_at": "2026-08-27T00:00:00Z",
   "approved_at": "2026-08-27T00:00:00Z",
   "execution_mode": "feature-branch",
   "base_branch": "main",
   "no_pull_requests": true,
   "tasks": {
-    "1a": { "status": "pending", "wave": 1, "complexity": 7 },
-    "1b": { "status": "pending", "wave": 2, "complexity": 4 },
-    "2a": { "status": "pending", "wave": 2, "complexity": 3 },
+    "1a": {
+      "status": "done",
+      "wave": 1,
+      "complexity": 7,
+      "commit": "a4ad3ed6873267a9eb3734c34db2bfe4010798ba",
+      "notes": "Red-first regression test independently re-verified by PM (3 failed/11 passed pre-fix, matching worker's claim exactly, by reverting TeammateManager.ts in a scratch worktree against the new test file). Post-fix: 4 test files/39 tests green, independently re-run by PM."
+    },
+    "1b": {
+      "status": "done",
+      "wave": 2,
+      "complexity": 4,
+      "commit": "9aea2a3f7",
+      "notes": "Resume round-trip test added against a genuinely fresh TeammateManager instance; legacy comments added to sdkOptionsBuilder.ts and two TeammateManager.ts sites, no functional change."
+    },
+    "2a": {
+      "status": "done",
+      "wave": 2,
+      "complexity": 3,
+      "commit": "b7baf391e",
+      "notes": "TaskToolWidget registered for both 'Task' and 'Agent' keys in AgentMode.tsx. Audit found one additional site not fixed: packages/electron/src/main/services/ai/claudeCliSubAgentTracker.ts (TASK_TOOL_NAME = 'Task', main-process file) -- left unedited pending gate review since it's an unverified main-process behavioral question, not a confirmed no-op like ClaudeSettingsManager.ts."
+    },
     "2b": { "status": "pending", "wave": 3, "complexity": 3 },
     "3a": { "status": "pending", "wave": 4, "complexity": 3 }
   },
   "gate": {
     "after_wave": 2,
-    "status": "pending",
-    "notes": "Human review of 1a's gate/team-resolution diff plus any packages/electron/src/main/** touch from 2a's audit, before verification waves 3-4."
+    "status": "reached",
+    "reached_at": "2026-08-27T08:30:00Z",
+    "notes": "Human review of 1a's gate/team-resolution diff plus any packages/electron/src/main/** touch from 2a's audit, before verification waves 3-4.",
+    "open_items_for_human_review": [
+      "1a's team-resolution order and synthesis logic (TeammateManager.ts) -- the PRD's single most behavior-changing edit.",
+      "2a's audit finding: packages/electron/src/main/services/ai/claudeCliSubAgentTracker.ts:29/67 (TASK_TOOL_NAME = 'Task') was NOT touched -- unverified whether the CLI raw-proxy sub-agent tracker's wire protocol also renamed Task->Agent. No packages/electron/src/main/** file was modified in waves 1-2 (confirmed by PM diff check against dd5d0d468).",
+      "FIXED during gate review (not by a wave task): TeammateManager.enableAgentTeams (added by 1a) was never assigned anywhere -- ClaudeCodeProvider computed the equivalent value inline (line 834) but only passed it to buildSystemPrompt, never to teammateManager.enableAgentTeams. The gate's `legacyTeamName || this.enableAgentTeams` condition was permanently false for any fresh, name-only spawn -- the exact bug this PRD exists to fix was still live on the merged wave-2 branch. Fixed in commit a24626f1a: extracted syncAgentTeamsFlag(settingsEnv) so the wiring is directly unit-tested (ClaudeCodeProvider.agentTeamsFlag.test.ts, 3 tests) without invoking the full sendMessage generator. Caught by gate review, not by any task's own tests -- worth noting for future PRDs that a new cross-class property needs an explicit 'is it actually assigned' check, not just 'is it correctly read'."
+    ]
   },
   "verification": {
-    "typecheck": "PENDING",
-    "targeted_unit_tests": "PENDING",
-    "monorepo_test_prepush": "PENDING",
-    "manual_e2e": "PENDING (task 3a: cold-start named spawn -> managed teammate, chip/thread/SendMessage/stop, post-restart rehydration, un-named control case)"
+    "typecheck": "PASS (independently re-run by PM after merge, all 23 workspaces ok)",
+    "targeted_unit_tests": "PASS (all task-level targeted test files reported green by workers; PM independently re-derived 1a's red-to-green transition)",
+    "monorepo_test_prepush": "PASS with 2 known pre-existing exclusions (AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx -- jsdom localStorage undefined, unrelated to this PRD; 1342/1344 test files, 10749/10755 tests pass, 6 failures all within the 2 excluded files). Re-run independently by PM after merging waves 1-2 into feature/agent-teams-cold-start-bootstrap.",
+    "manual_e2e": "PENDING (task 3a: cold-start named spawn -> managed teammate, chip/thread/SendMessage/stop, post-restart rehydration, un-named control case) -- NOT RUN, waves 3-4 deferred pending human review of this gate"
   },
-  "approval_note": "Approved non-interactively per commissioning instruction (user absent; decisions recorded in PRD section 6). Do not execute (/nimble:run) without explicit user instruction."
+  "approval_note": "Approved non-interactively per commissioning instruction (user absent; decisions recorded in PRD section 6). Do not execute (/nimble:run) without explicit user instruction.",
+  "execution_note": "Waves 1-2 executed 2026-08-27 by PM agent per explicit user instruction limited to waves 1-2. Stopped at the after_wave:2 gate as designed. Waves 3-4 (2b, 3a) require a separate follow-on run after human review of the gate's open items."
 }
