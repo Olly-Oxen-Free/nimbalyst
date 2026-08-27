@@ -278,7 +278,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
 
   // Register the inline-expand widget for Task sub-agent spawns (runs once)
   useEffect(() => {
-    setTranscriptToolWidgets(TASK_TOOL_WIDGET_SOURCE, { Task: TaskToolWidget });
+    setTranscriptToolWidgets(TASK_TOOL_WIDGET_SOURCE, { Task: TaskToolWidget, Agent: TaskToolWidget });
     return () => setTranscriptToolWidgets(TASK_TOOL_WIDGET_SOURCE, undefined);
   }, []);
 
