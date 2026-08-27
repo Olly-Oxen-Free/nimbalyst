@@ -1547,6 +1547,27 @@ export class TeammateManager {
       });
       console.log(`[MANAGED-TEAMMATE] "${agentId}" idle (session=${result.capturedSessionId})`);
       this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'idle']]));
+
+      // Hand the finished turn back to the lead — a teammate that never called
+      // SendMessage would otherwise strand its answer here. The idle notice is
+      // unconditional; only the captured result body is gated on sentMessageToLead,
+      // so a teammate that already messaged the lead does not get it re-delivered.
+      // Must run BEFORE the all-completed check below: deliverMessageToLead's
+      // interruptWithMessage() synchronously latches isLeadBusy(), which suppresses a
+      // duplicate desktop notification when this was also the last active teammate.
+      const displayName = idleTemplate.name;
+      const resumeHint = 'Resume it with SendMessage, or shut it down if it is no longer needed.';
+      let content: string;
+      let summary = `${displayName} idle`;
+      if (!result.sentMessageToLead && result.capturedResultText) {
+        content = `Teammate "${displayName}" finished its turn and is now idle. Its final result:\n\n${result.capturedResultText}\n\n${resumeHint}`;
+      } else if (!result.sentMessageToLead) {
+        content = `Teammate "${displayName}" finished its turn without reporting a result, and is now idle. ${resumeHint}`;
+        summary = `${displayName} idle (no result)`;
+      } else {
+        content = `Teammate "${displayName}" finished its turn and is now idle. ${resumeHint}`;
+      }
+      this.deliverMessageToLead(sessionId, agentId, displayName, content, summary);
     } else {
       this.markCompleted(agentId);
       this.clearPendingMessages(agentId);

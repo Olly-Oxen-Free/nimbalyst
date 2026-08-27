@@ -169,13 +169,17 @@ describe('TeammateManager stream stall watchdog', () => {
     // The per-chunk body still runs: output logged, completion logged.
     const loggedTypes = (deps.logNonBlocking as unknown as ReturnType<typeof vi.fn>).mock.calls
       .map(([, , , , metadata]) => (metadata as { messageType: string }).messageType);
-    expect(loggedTypes).toEqual(['teammate_output', 'teammate_output', 'teammate_completed']);
+    // The trailing teammate_message_to_lead is the idle handoff: going idle
+    // without having SendMessage'd the lead now delivers the captured result.
+    expect(loggedTypes).toEqual(['teammate_output', 'teammate_output', 'teammate_completed', 'teammate_message_to_lead']);
     // Each logged chunk (2 output + 1 result) fires exactly one live-update
-    // signal for the popover (task 2b) to key its refetch off of.
+    // signal for the popover (task 2b) to key its refetch off of, plus one
+    // for the idle-handoff delivery.
     const transcriptUpdatedPayloads = deps.emit.mock.calls
       .filter(([event]) => event === 'teammate:transcriptUpdated')
       .map(([, payload]) => payload);
     expect(transcriptUpdatedPayloads).toEqual([
+      { sessionId: 'session-1', agentId: 'alice@team' },
       { sessionId: 'session-1', agentId: 'alice@team' },
       { sessionId: 'session-1', agentId: 'alice@team' },
       { sessionId: 'session-1', agentId: 'alice@team' },

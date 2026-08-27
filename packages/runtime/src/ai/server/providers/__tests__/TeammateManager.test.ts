@@ -45,7 +45,13 @@ const internals = (manager: TeammateManager) => manager as unknown as ManagerInt
 
 /** A manager holding the given `name@team` agent ids, already emitted as running. */
 async function managerWith(...agentIds: string[]) {
-  const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
+  const manager = new TeammateManager({
+    emit: vi.fn(),
+    // handleStreamCompletion's idle branch hands the finished turn to the
+    // lead (deliverMessageToLead), which needs both of these.
+    logNonBlocking: vi.fn(),
+    interruptWithMessage: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TeammateManagerDeps);
   for (const agentId of agentIds) {
     const [name, teamName] = agentId.split('@');
     internals(manager).managedTeammates.set(agentId, { name, agentId, teamName, agentType: 'general' });
