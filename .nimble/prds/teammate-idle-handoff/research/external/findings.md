@@ -1,0 +1,1 @@
+External research deliberately skipped: bugfix in internal teammate-lifecycle code with no library, framework, or API-surface decisions — nothing to evaluate externally. (Decision recorded by coordinator; user absent.)

@@ -1,0 +1,1 @@
+See findings.md. All fixes land in packages/runtime (TeammateManager.ts, ClaudeCodeProvider.ts); bug 3's display verification touches renderer read paths only if killAll's emission fix proves insufficient. Tests in packages/runtime/src/ai/server/providers/__tests__/.

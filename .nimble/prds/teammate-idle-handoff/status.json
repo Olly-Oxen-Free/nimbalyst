@@ -1,0 +1,6 @@
+{
+  "slug": "teammate-idle-handoff",
+  "phase": "research",
+  "created": "2026-08-27",
+  "notes": "Coordinator running autonomously (user absent): asset-prompt skipped (no assets for a lifecycle bugfix); research is internal-only by deliberate decision (no library/external questions). Covers three live bugs from session c29787e7 (weatherman teammate): lead duplicating teammate work via continuation prompt wording; idle-handoff race leaving session stuck; killAll blanket-errored status + lost toolCallCount in UI."
+}
