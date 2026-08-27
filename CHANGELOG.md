@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 <!-- Bug fixes go here -->
 - Teammates that failed after being resumed from idle now reliably wake your conversation with the failure, instead of silently going quiet, including after a Nimbalyst restart.
+- A teammate that finishes its work now hands its answer back to your conversation the moment it goes idle — even if it never sent a message — instead of the session silently stalling, and the lead is told to wait for its teammates rather than redoing their work itself.
+- A finished teammate now shows as Completed with its real tool-call count after you stop the session, instead of a false Error with zero tools, and the Teammates panel shows each teammate's model.
 - Asking Claude to spawn a named agent now correctly creates an addressable teammate you can message directly, instead of silently falling back to an anonymous one-shot sub-agent.
 
 ### Removed

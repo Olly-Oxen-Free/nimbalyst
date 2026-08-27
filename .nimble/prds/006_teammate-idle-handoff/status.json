@@ -1,10 +1,64 @@
 {
   "slug": "teammate-idle-handoff",
-  "phase": "ready",
+  "phase": "ready-for-merge",
   "created": "2026-08-27",
-  "notes": "Coordinator running autonomously (user absent): asset-prompt skipped (no assets for a lifecycle bugfix); research is internal-only by deliberate decision (no library/external questions). Covers three live bugs from session c29787e7 (weatherman teammate): lead duplicating teammate work via continuation prompt wording; idle-handoff race leaving session stuck; killAll blanket-errored status + lost toolCallCount in UI. | Plan phase: interview conducted autonomously; decisions D1-D6 recorded in PRD. Reviewer pass pending. | PRD reviewed (opus reviewer): approve-with-corrections; all 8 corrections applied (C1 counter sourcing + emitTeammateUpdate map branch + naming, M1 D3 citation, M2 resolved as D7 option-a, M3 interrupt semantics documented, m1 optional IdleTeammate fields, m2 PersistedTeammateRow persistence folded into 2a).",
-  "status": "ready",
+  "notes": "Coordinator running autonomously (user absent): asset-prompt skipped (no assets for a lifecycle bugfix); research is internal-only by deliberate decision (no library/external questions). Covers three live bugs from session c29787e7 (weatherman teammate): lead duplicating teammate work via continuation prompt wording; idle-handoff race leaving session stuck; killAll blanket-errored status + lost toolCallCount in UI. | Plan phase: interview conducted autonomously; decisions D1-D6 recorded in PRD. Reviewer pass pending. | PRD reviewed (opus reviewer): approve-with-corrections; all 8 corrections applied (C1 counter sourcing + emitTeammateUpdate map branch + naming, M1 D3 citation, M2 resolved as D7 option-a, M3 interrupt semantics documented, m1 optional IdleTeammate fields, m2 PersistedTeammateRow persistence folded into 2a). | Execution complete: 5 tasks, 3 waves, all committed on feature/teammate-idle-handoff (1dfcd758e, c1d602ed4, a619370f5, 42f6c9d12, f8331dda2). Stopped at ready-for-merge per standing constraint: NO PRs, user performs the feature->main merge. Live end-to-end verification prepared as live_verification_script (not executable by agents - no chat-prompt-submission mechanism).",
+  "status": "ready-for-merge",
   "prd_number": "006",
   "tasks_total": 5,
-  "waves": 3
+  "waves": 3,
+  "execution_mode": "feature-branch",
+  "feature_branch": "feature/teammate-idle-handoff",
+  "bead": "nby-e0l",
+  "tasks": {
+    "1a": {
+      "state": "done",
+      "commit": "1dfcd758e"
+    },
+    "1b": {
+      "state": "done",
+      "commit": "c1d602ed4"
+    },
+    "1c": {
+      "state": "done",
+      "commit": "a619370f5"
+    },
+    "2a": {
+      "state": "done",
+      "commit": "42f6c9d12"
+    },
+    "3a": {
+      "state": "done",
+      "commit": "f8331dda2"
+    }
+  },
+  "gates_run": [
+    {
+      "after": "wave1",
+      "typecheck": "pass",
+      "test_prepush": "pass excluding 2 known pre-existing failures (AgentTranscriptPanel.listenerCleanup, MarkdownRenderer.rtl); 2 new TeammateManager failures were legitimate fixture updates shipped with 1b"
+    },
+    {
+      "after": "2a",
+      "typecheck": "pass",
+      "test_prepush": "pass excluding the 2 known pre-existing failures"
+    },
+    {
+      "after": "3a (final)",
+      "typecheck": "pass",
+      "test_prepush": "pass excluding the 2 known pre-existing failures (AgentTranscriptPanel.listenerCleanup, MarkdownRenderer.rtl - jsdom localStorage); all gates run by the coordinator in the main checkout, not trusted from worker reports"
+    }
+  ],
+  "live_verification_script": {
+    "purpose": "Manual end-to-end verification the coordinator could not execute (no chat-prompt-submission mechanism, same limitation as PRD 005 task 3a). Unit tests cover every code path; this script verifies the live experience.",
+    "steps": [
+      "1. Start dev (npm run dev in packages/electron), open an Agent Mode session.",
+      "2. Prompt the lead: 'Spawn a teammate named weatherman (model haiku) to fetch current Miami weather and report back via message when done.'",
+      "3. Watch the lead's transcript during the teammate's run: the lead must NOT run its own WebSearch/WebFetch/ToolSearch for the weather (bug 1). Continuation system messages, if any, should show the new wait/no-duplication wording.",
+      "4. When weatherman goes idle (even if it never calls SendMessage), the lead's conversation must receive a message containing weatherman's final answer within seconds (bug 2). The session must not sit deferred/stuck.",
+      "5. Open weatherman's thread popover: header shows a real tool-call count (>0) matching the transcript body, model shown, status idle.",
+      "6. Abort/stop the session (or switch away triggering provider abort). Re-open the popover / Teammates panel: weatherman shows Completed (not Error), tool-call count preserved; panel row shows 'general-purpose - haiku' style type+model (bug 3).",
+      "7. Optional resume check: before aborting, SendMessage weatherman a follow-up; after it replies and re-idles, its tool-call count must accumulate, not reset."
+    ]
+  }
 }
