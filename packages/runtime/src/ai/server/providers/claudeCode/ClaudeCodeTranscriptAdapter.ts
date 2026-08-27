@@ -42,7 +42,7 @@ export type ParsedItem =
   | { kind: 'summary'; text: string; isAuthError: boolean; chunk: any }
   | { kind: 'auth_status'; chunk: any }
   | { kind: 'rate_limit'; chunk: any }
-  | { kind: 'tool_progress' }
+  | { kind: 'tool_progress'; chunk?: any }
   | { kind: 'tool_use_summary' }
   | { kind: 'unknown'; chunk: any; extractedText?: string };
 
@@ -103,7 +103,7 @@ export class ClaudeCodeTranscriptAdapter {
       case 'summary': return this.parseSummaryChunk(chunk);
       case 'auth_status': return [{ kind: 'auth_status', chunk }];
       case 'rate_limit_event': return [{ kind: 'rate_limit', chunk }];
-      case 'tool_progress': return [{ kind: 'tool_progress' }];
+      case 'tool_progress': return [{ kind: 'tool_progress', chunk }];
       case 'tool_use_summary': return [{ kind: 'tool_use_summary' }];
       default: return [this.parseUnknownChunk(chunk)];
     }

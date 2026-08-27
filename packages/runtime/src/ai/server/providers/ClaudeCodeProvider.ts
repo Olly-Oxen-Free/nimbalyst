@@ -79,7 +79,7 @@ import {
   isTransientClaudeCodeChunk,
   slimClaudeCodeChunkForStorage,
 } from './claudeCode/toolChunkUtils';
-import { findTaskOwningSubagentChunk } from './claudeCode/subagentTaskCorrelation';
+import { findTaskOwningSubagentChunk, resolveTaskToolUseIdFromProgress } from './claudeCode/subagentTaskCorrelation';
 import { capClaudeCodeChunkForStorage } from '../../../storage/toolOutputBudget';
 import {
   INTERNAL_MCP_TOOLS,
@@ -1673,6 +1673,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
               }
 
               case 'tool_progress':
+                if (this.backfillTaskToolUseIdFromProgress(item.chunk)) {
+                  // Persist the resolved id: a taskId-only lookup (the
+                  // popover/tile) reads session.metadata.currentTasks, not
+                  // this in-memory map, so the backfill is invisible to it
+                  // until this fires.
+                  this.emitTaskUpdate(sessionId).catch(() => {});
+                }
+                break;
+
               case 'tool_use_summary':
                 // Informational only -- handled visually through transcript
                 break;
@@ -2934,6 +2943,22 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       console.log(`[CLAUDE-CODE] SUBAGENT_DRAIN: drain settled (cause=${this.drainExitCause}); releasing deferred session end for ${sessionId}`);
       this.emit('subagents:drainSettled', { sessionId });
     }
+  }
+
+  /**
+   * Backfill `activeTasks[taskId].toolUseId` from a `tool_progress` chunk,
+   * when `task_started` didn't carry one. See
+   * `resolveTaskToolUseIdFromProgress` in subagentTaskCorrelation.ts for why
+   * this is needed. Returns true when it actually filled one, so the caller
+   * knows to persist the change (see the `tool_progress` case above).
+   */
+  private backfillTaskToolUseIdFromProgress(chunk: any): boolean {
+    if (!chunk || typeof chunk !== 'object' || typeof chunk.task_id !== 'string') return false;
+    const task = this.activeTasks.get(chunk.task_id);
+    const resolved = resolveTaskToolUseIdFromProgress(task, chunk);
+    if (!resolved) return false;
+    task!.toolUseId = resolved;
+    return true;
   }
 
   /** Handle system task chunks (task_started, task_progress, task_notification) */

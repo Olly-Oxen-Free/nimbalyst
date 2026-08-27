@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   findTaskOwningSubagentChunk,
   isTaskSubagentRawChunk,
+  resolveTaskToolUseIdFromProgress,
 } from '../subagentTaskCorrelation';
 import {
   isTransientClaudeCodeChunk,
@@ -98,5 +99,37 @@ describe('forwarded sub-agent chunks survive the storage path', () => {
       parent_tool_use_id?: string;
     };
     expect(stored.parent_tool_use_id).toBe('tool-outer');
+  });
+});
+
+describe('resolveTaskToolUseIdFromProgress', () => {
+  // SDKTaskStartedMessage.tool_use_id is optional and comes back undefined
+  // for type=local_agent tasks; task_updated's patch never carries it either.
+  // tool_progress is the only other chunk carrying both task_id and
+  // parent_tool_use_id together, so it's the sole backfill source.
+  it('fills toolUseId from a matching tool_progress chunk when the task has none', () => {
+    const task = { taskId: 'task-1', toolUseId: undefined };
+    const progressChunk = { task_id: 'task-1', parent_tool_use_id: 'tool-outer' };
+    expect(resolveTaskToolUseIdFromProgress(task, progressChunk)).toBe('tool-outer');
+  });
+
+  it('never overwrites a toolUseId task_started already set', () => {
+    const task = { taskId: 'task-1', toolUseId: 'tool-from-task-started' };
+    const progressChunk = { task_id: 'task-1', parent_tool_use_id: 'tool-outer' };
+    expect(resolveTaskToolUseIdFromProgress(task, progressChunk)).toBeUndefined();
+  });
+
+  it('does not backfill from a different task\'s progress chunk', () => {
+    const task = { taskId: 'task-1', toolUseId: undefined };
+    const progressChunk = { task_id: 'task-2', parent_tool_use_id: 'tool-outer' };
+    expect(resolveTaskToolUseIdFromProgress(task, progressChunk)).toBeUndefined();
+  });
+
+  it('returns undefined for an unknown task or a malformed chunk', () => {
+    expect(resolveTaskToolUseIdFromProgress(undefined, { task_id: 'task-1', parent_tool_use_id: 'tool-outer' })).toBeUndefined();
+    const task = { taskId: 'task-1', toolUseId: undefined };
+    expect(resolveTaskToolUseIdFromProgress(task, {})).toBeUndefined();
+    expect(resolveTaskToolUseIdFromProgress(task, null)).toBeUndefined();
+    expect(resolveTaskToolUseIdFromProgress(task, { task_id: 'task-1' })).toBeUndefined();
   });
 });

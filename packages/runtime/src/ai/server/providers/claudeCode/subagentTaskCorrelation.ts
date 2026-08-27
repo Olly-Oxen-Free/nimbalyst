@@ -39,6 +39,38 @@ export interface SubagentTaskOwner {
  *   teammate (teammates run their own SDK query, so their ids are from a
  *   different id space and must not be force-fit onto a task).
  */
+/**
+ * Resolve the `toolUseId` a `tool_progress` chunk implies for its owning
+ * task, when that task doesn't have one yet.
+ *
+ * `SDKTaskStartedMessage.tool_use_id` is optional and comes back `undefined`
+ * for `type=local_agent` (background-dispatched) tasks -- `task_updated`'s
+ * `patch` never carries it either, so without this, `findTaskOwningSubagentChunk`
+ * can never match those tasks' forwarded chunks: it's matching against
+ * `undefined` forever, and the task's transcript stays empty even after it
+ * completes. `tool_progress` chunks carry both `task_id` and
+ * `parent_tool_use_id` on the same frame, giving a reliable second source.
+ *
+ * @param task The `activeTasks` entry the chunk's `task_id` names, or
+ *   `undefined` if unknown.
+ * @param chunk A raw `tool_progress` chunk.
+ * @returns The id to set, or `undefined` when there's nothing to backfill
+ *   (task unknown, chunk missing either id, or the task already has one --
+ *   this never overwrites an id `task_started` already set).
+ */
+export function resolveTaskToolUseIdFromProgress(
+  task: SubagentTaskOwner | undefined,
+  chunk: { task_id?: unknown; parent_tool_use_id?: unknown } | null | undefined,
+): string | undefined {
+  if (!task || task.toolUseId) return undefined;
+  if (!chunk || typeof chunk !== 'object') return undefined;
+  const taskId = chunk.task_id;
+  const parentToolUseId = chunk.parent_tool_use_id;
+  if (typeof taskId !== 'string' || typeof parentToolUseId !== 'string') return undefined;
+  if (taskId !== task.taskId) return undefined;
+  return parentToolUseId;
+}
+
 export function findTaskOwningSubagentChunk<T extends SubagentTaskOwner>(
   tasks: Iterable<T>,
   parentToolUseId: string | undefined,
