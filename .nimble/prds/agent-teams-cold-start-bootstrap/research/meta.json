@@ -1,0 +1,9 @@
+{
+  "mode": "feature-init",
+  "slug": "agent-teams-cold-start-bootstrap",
+  "date": "2026-08-27",
+  "phases_completed": ["internal", "external", "summary"],
+  "researcher": "nimble-researcher (sonnet) + orchestrator verification",
+  "sdk_version_pinned": "@anthropic-ai/claude-agent-sdk@0.3.221",
+  "notes": "Root cause empirically confirmed against live-test transcript; assets step skipped (user not present)."
+}
