@@ -400,7 +400,7 @@ const TeammateItem: React.FC<TeammateItemProps> = React.memo(({ teammate, onClic
           {teammate.name}
         </div>
         <div className="text-[10px] text-[var(--nim-text-faint)] truncate">
-          {teammate.agentType}{teammate.status === 'idle' ? ' (idle)' : ''}
+          {teammate.agentType}{teammate.model ? ` · ${teammate.model}` : ''}{teammate.status === 'idle' ? ' (idle)' : ''}
         </div>
         {stats.length > 0 && (
           <div className="text-[10px] text-[var(--nim-text-faint)] truncate font-mono">
