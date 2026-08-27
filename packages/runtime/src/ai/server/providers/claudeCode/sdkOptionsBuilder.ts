@@ -494,6 +494,9 @@ export async function buildSdkOptions(
     ? await teammateManager.resolveTeamContext(sessionId)
     : undefined;
 
+  // legacy (explicit-team protocol, SDK <0.3.x): only fires when a team context
+  // already exists (resumed old-protocol or post-spawn sessions); the SDK ignores
+  // these deprecated vars otherwise.
   if (effectiveTeamContext) {
     env.CLAUDE_CODE_TEAM_NAME = effectiveTeamContext;
     env.CLAUDE_CODE_TASK_LIST_ID = effectiveTeamContext;

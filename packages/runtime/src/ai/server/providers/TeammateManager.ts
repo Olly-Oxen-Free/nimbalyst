@@ -580,6 +580,8 @@ export class TeammateManager {
 
   // ─── Team context from tool results ─────────────────────────────────────
 
+  // legacy (explicit-team protocol, SDK <0.3.x): parses TeamCreate tool
+  // results; no TeamCreate tool exists in SDK 0.3.221's tool surface.
   /**
    * Extract team name from TeamCreate tool result content.
    */
@@ -1774,6 +1776,8 @@ export class TeammateManager {
       settingSources: [],
       cwd,
       abortController,
+      // legacy (explicit-team protocol, SDK <0.3.x): team-scoped extraArgs/env
+      // vars for the teammate subprocess.
       extraArgs: {
         'agent-id': agentId,
         'agent-name': name,

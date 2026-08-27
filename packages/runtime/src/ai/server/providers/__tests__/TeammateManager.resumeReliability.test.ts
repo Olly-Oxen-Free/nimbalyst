@@ -376,6 +376,85 @@ describe('spawn gate: implicit-team protocol (PRD agent-teams-cold-start-bootstr
   });
 });
 
+describe('resume round-trip: synthesized team name survives a manager restart (PRD agent-teams-cold-start-bootstrap, task 1b, R4)', () => {
+  /** IDs of the manager's currently-managed teammates, read off a live instance. */
+  const managedIds = (manager: TeammateManager) =>
+    [...(manager as unknown as { managedTeammates: Map<string, { sessionId?: string }> }).managedTeammates.keys()];
+  const managedSessionId = (manager: TeammateManager, agentId: string) =>
+    (manager as unknown as { managedTeammates: Map<string, { sessionId?: string }> }).managedTeammates.get(agentId)?.sessionId;
+
+  /** Yields one chunk carrying session_id (so the manager captures it), then wedges. */
+  function oneChunkThenWedge(sdkSessionId: string) {
+    let yielded = false;
+    return {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      next: async (): Promise<IteratorResult<unknown>> => {
+        if (!yielded) {
+          yielded = true;
+          return { done: false, value: { session_id: sdkSessionId } };
+        }
+        return new Promise<never>(() => {});
+      },
+    };
+  }
+
+  it('a fresh manager rehydrates the same synthesized team name and resumes the same teammate, not a re-synthesized one', async () => {
+    claudeConfigDir = path.join(os.tmpdir(), `nimbalyst-resume-roundtrip-${Math.random().toString(36).slice(2)}`);
+    queryMock.mockReturnValue(oneChunkThenWedge(SDK_SESSION));
+
+    // 1. Spawn via 1a's name-only path -- no team_name, so the gate synthesizes one.
+    const manager = new TeammateManager(makeDeps());
+    manager.enableAgentTeams = true;
+    const expectedTeamName = `team-${LEAD_SESSION.slice(0, 8)}`;
+    const agentId = `git-scout@${expectedTeamName}`;
+
+    const spawnResult = await manager.handlePreToolUse(
+      'Agent',
+      { name: 'git-scout', prompt: 'work' },
+      'tool-1',
+      LEAD_SESSION,
+    );
+    expect(spawnResult.handled).toBe(true);
+    expect(managedIds(manager)).toEqual([agentId]);
+
+    // 2. emitTeammateUpdate persists the currentTeammates[] row -- wait for the
+    // spawn-triggered emit, then the stream's captured SDK session id, then
+    // persist that session id the way a later production emit would.
+    await vi.waitFor(() => expect(storedTeammates.some(tm => tm.agentId === agentId)).toBe(true));
+    await vi.waitFor(() => expect(managedSessionId(manager, agentId)).toBe(SDK_SESSION));
+    await manager.emitTeammateUpdate(LEAD_SESSION);
+
+    const persistedRow = storedTeammates.find(tm => tm.agentId === agentId) as unknown as
+      { teamName?: string; sessionId?: string; status?: string } | undefined;
+    expect(persistedRow?.status).toBe('running');
+    expect(persistedRow?.teamName).toBe(expectedTeamName);
+    expect(persistedRow?.sessionId).toBe(SDK_SESSION);
+
+    // 3. Construct a genuinely fresh TeammateManager instance -- simulates a
+    // manager restart: empty in-memory maps, only the persisted row survives.
+    const restarted = new TeammateManager(makeDeps());
+    expect(managedIds(restarted)).toEqual([]);
+
+    // 4. A fresh instance's resolveTeamContext must find the SAME synthesized
+    // name via the metadata cascade, not regenerate a new one.
+    const rehydratedTeamName = await restarted.resolveTeamContext(LEAD_SESSION);
+    expect(rehydratedTeamName).toBe(expectedTeamName);
+
+    // 5. The resume entry point accepts the rehydrated team and resumes the
+    // teammate under the exact same agentId (git-scout@<same synthesized team>).
+    queryMock.mockReturnValue(oneChunkThenWedge(SDK_SESSION));
+    const sendResult = await restarted.sendMessageFromHost(LEAD_SESSION, agentId, 'status?');
+    expect(sendResult).toEqual({ delivered: true, wasIdle: true });
+    expect(managedIds(restarted)).toEqual([agentId]);
+
+    const resumeCallOptions = queryMock.mock.calls[queryMock.mock.calls.length - 1][0].options;
+    expect(resumeCallOptions.resume).toBe(SDK_SESSION);
+    expect(resumeCallOptions.extraArgs['team-name']).toBe(expectedTeamName);
+  });
+});
+
 describe('shutdown-request handshake wording is unaffected (task 1a "confirm unchanged")', () => {
   it('still says sent/awaiting approval, never delivered/do not retry', async () => {
     queryMock.mockReturnValue(wedgedQuery());
