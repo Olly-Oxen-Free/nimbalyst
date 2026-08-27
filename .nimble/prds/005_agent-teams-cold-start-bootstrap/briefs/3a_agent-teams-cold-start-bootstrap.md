@@ -45,7 +45,14 @@ None — this is a live-verification task, not a code-pattern task. The "pattern
 
 ### Recommended Approach
 
-Execute this exact five-step scenario, agent teams enabled, in a **fresh session** with **no prior team history**:
+**Mechanism check first, before attempting step 1.** This scenario requires submitting a live chat prompt into the running Electron app and observing the model's actual tool call. Confirm you have a real way to do that (an available MCP tool that submits a chat prompt to a running Nimbalyst session — check your own tool list; `submitChatPrompt` is documented in `docs/E2E_TESTING.md:538` as a Playwright E2E helper only, not something callable ad hoc). `get_main_process_logs`/`get_renderer_debug_logs`/`database_query`/`renderer_eval` let you *observe* state but do not *drive* the UI or originate a prompt.
+
+**If no such mechanism is available to you:** do not attempt to fake or skip this step. Instead:
+1. Write the five-step scenario below into `status.json`'s `verification.manual_e2e` field as a ready-to-follow script (prompt text, exact log lines to check for, exact pass/fail criteria per step) rather than executed evidence.
+2. Set `verification.manual_e2e` to `"AWAITING_USER_EXECUTION"` (not `PENDING`, not a fabricated pass) and note explicitly which step blocked automated execution and why.
+3. This is a legitimate, complete way to finish this task — per `.claude/rules/end-to-end-verification.md`, a bug found via manual testing needs observed red→green evidence before "fixed" is declared, and if you cannot personally observe it, saying so plainly is the correct behavior, not a task failure. Do not mark this task `done` implying the live verification happened if it didn't — mark it done as "verification script prepared, execution pending the user."
+
+**If you do have a way to submit a chat prompt**, execute this exact five-step scenario, agent teams enabled, in a **fresh session** with **no prior team history**:
 
 1. **Cold-start named spawn:** Prompt: *"spawn an agent named git-scout to get the most recent git commit"*. Pull `main.log` via `get_main_process_logs` and confirm it shows the teammate spawn path — look for `TEAM-CONTEXT` / `MANAGED-TEAMMATE` log lines (these are the bracketed tags used throughout `TeammateManager.ts`, confirmed live) — and explicitly confirm it does **NOT** show `'SUBAGENT_TASK started: type=local_agent'` (the old failure signature).
 2. **UI surfaces:** Confirm the teammate chip appears; open the thread view and confirm it shows a live transcript (PRD 002 surface).
