@@ -205,6 +205,10 @@ export interface ScheduleWakeupRequest {
   reason: string;
 }
 
+// Sibling of the private static MAX_CONTINUATIONS field below (can't export a
+// private class field, so this lives at module scope instead). Injected as a
+// system message when the lead's turn ends while teammates are still active.
+export const TEAMMATE_CONTINUATION_MESSAGE = '[System: Your previous turn ended but you still have active agents. Wait for their results — do not perform or duplicate the work you assigned to them. You may message, stop, or shut down a teammate, or reply to the user directly if you can already do so without their results.]';
 
 export class ClaudeCodeProvider extends BaseAgentProvider {
   private currentMode?: 'planning' | 'agent' | 'auto'; // Track session mode for prompt customization and tool filtering
@@ -2462,7 +2466,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         // continuation turns keep ending without resolving agents.
         console.log(`[CLAUDE-CODE] Lead turn ended with active agents, triggering continuation (${this.continuationCount + 1}/${ClaudeCodeProvider.MAX_CONTINUATIONS})`);
         this.continuationCount++;
-        this.emitTeammateMessageWhileIdle('[System: Your previous turn ended but you still have active agents. Wait for their results, or take other actions as needed.]');
+        this.emitTeammateMessageWhileIdle(TEAMMATE_CONTINUATION_MESSAGE);
       } else {
         // Max continuations exhausted and the lead still didn't resolve teammates.
         // Abandon idle teammates to unstick the session.
