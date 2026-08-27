@@ -57,14 +57,19 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: (args: unknown) => queryMock(args),
 }));
 
-// Keep the team-config writes out of the real ~/.claude.
+// Keep the team-config writes out of the real ~/.claude. Mutable so the spawn-gate
+// tests can point each case at an empty dir: team-context resolution falls back to
+// scanning <configDir>/teams, and one leftover dir there would mask synthesis.
+let claudeConfigDir = path.join(os.tmpdir(), 'nimbalyst-teammate-resume-reliability-test');
 vi.mock('../claudeCode/claudeConfigDir', () => ({
-  resolveClaudeConfigDir: () => path.join(os.tmpdir(), 'nimbalyst-teammate-resume-reliability-test'),
+  resolveClaudeConfigDir: () => claudeConfigDir,
 }));
 
 import { TeammateManager, type IdleTeammate, type TeammateManagerDeps } from '../TeammateManager';
 
 const SDK_SESSION = 'sdk-session-1';
+/** Lead session id; its first 8 chars are what a synthesized team name is built from. */
+const LEAD_SESSION = '0d5f2a91-7c3e-4b1a-9f22-1e2d3c4b5a6f';
 
 /** A query whose first `next()` never resolves -- fine for ack-only assertions that never await the stream. */
 function wedgedQuery() {
@@ -273,6 +278,101 @@ describe('concurrent resume failures (task 1b)', () => {
     const messages = deps.interruptWithMessage.mock.calls.map(([message]) => message as string);
     expect(messages.some(message => /alice/.test(message))).toBe(true);
     expect(messages.some(message => /bob/.test(message))).toBe(true);
+  });
+});
+
+describe('spawn gate: implicit-team protocol (PRD agent-teams-cold-start-bootstrap, task 1a)', () => {
+  /** Spawn through the PreToolUse gate, the way the SDK hook actually reaches it. */
+  const spawnViaGate = (
+    manager: TeammateManager,
+    toolName: string,
+    toolInput: Record<string, unknown>,
+    sessionId: string | undefined = LEAD_SESSION,
+  ) => manager.handlePreToolUse(toolName, toolInput, 'tool-1', sessionId);
+
+  /** agentId of the teammate the manager actually registered, or undefined if it never spawned. */
+  const spawnedAgentId = (manager: TeammateManager) =>
+    [...(manager as unknown as { managedTeammates: Map<string, unknown> }).managedTeammates.keys()][0];
+
+  beforeEach(() => {
+    claudeConfigDir = path.join(os.tmpdir(), `nimbalyst-spawn-gate-${Math.random().toString(36).slice(2)}`);
+    queryMock.mockReturnValue(wedgedQuery());
+  });
+
+  it('spawns a managed teammate for a name-only Agent call, synthesizing a session-scoped team it stays addressable under', async () => {
+    const manager = new TeammateManager(makeDeps());
+    manager.enableAgentTeams = true;
+
+    const result = await spawnViaGate(manager, 'Agent', {
+      name: 'git-scout',
+      description: 'Scout the git history',
+      prompt: 'Find the commit that introduced the regression.',
+      subagent_type: 'general-purpose',
+    });
+
+    expect(result.handled).toBe(true);
+    expect(spawnedAgentId(manager)).toBe(`git-scout@team-${LEAD_SESSION.slice(0, 8)}`);
+
+    // The whole point of pinning currentTeamContext to the synthesized name:
+    // SendMessage's bare-name routing has to keep finding the teammate.
+    const send = await manager.handlePreToolUse(
+      'SendMessage',
+      { recipient: 'git-scout', type: 'message', content: 'status?' },
+      'tool-2',
+      LEAD_SESSION,
+    );
+    expect(send.handled).toBe(true);
+  });
+
+  it('honors a legacy Task + team_name spawn without agent teams being enabled', async () => {
+    const manager = new TeammateManager(makeDeps());
+
+    const result = await spawnViaGate(manager, 'Task', { team_name: 'team', name: 'alice', prompt: 'work' });
+
+    expect(result.handled).toBe(true);
+    expect(spawnedAgentId(manager)).toBe('alice@team');
+  });
+
+  it.each([
+    ['a nameless Agent call', true, { description: 'do a thing', prompt: 'work' }],
+    ['a name-only Agent call while agent teams are disabled', false, { name: 'git-scout', prompt: 'work' }],
+  ])('does not intercept %s', async (_label, enabled, toolInput) => {
+    const manager = new TeammateManager(makeDeps());
+    manager.enableAgentTeams = enabled;
+
+    expect(await spawnViaGate(manager, 'Agent', toolInput)).toEqual({ handled: false });
+    expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  // The D10/C2 regression guard. A resumed session already has a real team, and
+  // SendMessage routing keys on `name@team` matching exactly
+  // (agentIdMatchesRecipient's preferredTeam branch). Synthesizing over that
+  // team would make every already-spawned teammate permanently unreachable.
+  it('spawns into a resumed session\'s existing team rather than synthesizing over it', async () => {
+    const manager = new TeammateManager(makeDeps());
+    manager.enableAgentTeams = true;
+    // How a resumed session presents itself: idle teammates rehydrated from
+    // persisted metadata, carrying the real team name, before any spawn.
+    internals(manager).idleTeammates.set('alice@real-team', idleTeammate('alice', SDK_SESSION));
+
+    await spawnViaGate(manager, 'Agent', { name: 'git-scout', prompt: 'work' });
+
+    expect(spawnedAgentId(manager)).toBe('git-scout@real-team');
+    // And the resumed teammate stays addressable by bare name under that team.
+    expect(manager.agentIdMatchesRecipient('alice@real-team', 'alice', 'real-team')).toBe(true);
+  });
+
+  it('denies a duplicate spawn keyed on the synthesized team', async () => {
+    const manager = new TeammateManager(makeDeps());
+    manager.enableAgentTeams = true;
+    const toolInput = { name: 'git-scout', prompt: 'work' };
+
+    await spawnViaGate(manager, 'Agent', toolInput);
+    const second = await spawnViaGate(manager, 'Agent', toolInput);
+
+    if (!second.handled) throw new Error('expected handled: true');
+    expect(second.result.hookSpecificOutput.permissionDecisionReason).toMatch(/ALREADY running/);
+    expect(queryMock).toHaveBeenCalledTimes(1);
   });
 });
 

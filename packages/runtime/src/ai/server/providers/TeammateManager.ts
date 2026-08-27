@@ -189,6 +189,14 @@ export class TeammateManager {
 
   /** Packaged-build options set by ClaudeCodeProvider for production Electron builds */
   packagedBuildOptions?: PackagedBuildOptions;
+
+  /**
+   * Whether agent teams are enabled for this session, set by ClaudeCodeProvider.
+   * Gates the name-only spawn path: under the implicit-team SDK protocol a bare
+   * `name` is not by itself teams-specific, so it needs an explicit opt-in. A
+   * legacy `team_name` implies teams are active and needs no flag.
+   */
+  enableAgentTeams?: boolean;
   private static readonly EMIT_DEBOUNCE_MS = 100;
 
   /** Captured from lead's sendMessage() for teammate spawning. */
@@ -540,6 +548,34 @@ export class TeammateManager {
     }
 
     return undefined;
+  }
+
+  /**
+   * Build a stable session-scoped team name for a spawn that supplied none.
+   * Pre-normalized to sanitizeName's charset, which throws rather than normalizes.
+   */
+  private synthesizeTeamName(sessionId?: string): string {
+    const slug = (sessionId ?? '').slice(0, 8).replace(/[^a-zA-Z0-9_-]/g, '');
+    return slug ? `team-${slug}` : 'team';
+  }
+
+  /**
+   * Resolve the team a name-only spawn belongs to, synthesizing only as a last
+   * resort. A resumed session has a real team in its context or rehydratable
+   * state; synthesizing over it would change every agentId's `@team` suffix and
+   * make already-spawned teammates unreachable via SendMessage's bare-name
+   * routing (see agentIdMatchesRecipient's preferredTeam branch).
+   */
+  private async resolveTeamNameForSpawn(sessionId?: string): Promise<string> {
+    const current = this.sanitizeTeamNameOrUndefined(this.currentTeamContext);
+    if (current) return current;
+
+    const resolved = await this.resolveTeamContext(sessionId);
+    if (resolved) return resolved;
+
+    const synthesized = this.synthesizeTeamName(sessionId);
+    console.log(`[TEAM-CONTEXT] No team context for this session; synthesized "${synthesized}"`);
+    return synthesized;
   }
 
   // ─── Team context from tool results ─────────────────────────────────────
@@ -1582,7 +1618,12 @@ export class TeammateManager {
   // ─── Lifecycle: spawn ───────────────────────────────────────────────────
 
   spawnManagedTeammate(sessionId: string | undefined, taskInput: any): void {
-    const teamName = this.sanitizeName(taskInput.team_name, 'team');
+    // team_name is absent under the implicit-team protocol; the gate normally
+    // passes a resolved one through, so this only backstops direct callers.
+    const teamName = this.sanitizeName(
+      taskInput.team_name || this.currentTeamContext || this.synthesizeTeamName(sessionId),
+      'team',
+    );
     const name = this.sanitizeName(taskInput.name, 'teammate');
     const agentId = `${name}@${teamName}`;
     const prompt = taskInput.prompt || 'Do your assigned work.';
@@ -2205,75 +2246,89 @@ export class TeammateManager {
     sessionId: string | undefined,
   ): Promise<{ handled: true; result: any } | { handled: false }> {
 
-    // ── Task spawn interception ─────────────────────────────────────────
-    if (toolName === 'Task' && toolInput?.team_name && toolInput?.name) {
-      const teamName = this.sanitizeName(toolInput.team_name, 'team');
-      const name = this.sanitizeName(toolInput.name, 'teammate');
-      const agentId = `${name}@${teamName}`;
+    // ── Teammate spawn interception ─────────────────────────────────────
+    // SDK 0.3.221 renamed the model-facing spawn tool Task -> Agent and
+    // deprecated team_name ("the session has a single implicit team"), so a
+    // schema-compliant model sends `Agent` with a bare `name` and no team.
+    // Match both tool names; honor `team_name` when an older session sends it.
+    if ((toolName === 'Task' || toolName === 'Agent') && toolInput?.name) {
+      const legacyTeamName = this.sanitizeTeamNameOrUndefined(toolInput.team_name);
+      console.log(
+        `[MANAGED-TEAMMATE] Spawn tool observed: toolName="${toolName}", name="${toolInput.name}", team_name="${legacyTeamName ?? ''}", agentTeamsEnabled=${this.enableAgentTeams === true}`
+      );
 
-      if (this.currentTeamContext !== teamName) {
-        this.currentTeamContext = teamName;
-        console.log(`[TEAM-CONTEXT] Updated current team context from Task spawn: "${teamName}"`);
-      }
+      // A legacy team_name implies teams are active; a bare name does not.
+      if (legacyTeamName || this.enableAgentTeams) {
+        const teamName = legacyTeamName ?? await this.resolveTeamNameForSpawn(sessionId);
+        const name = this.sanitizeName(toolInput.name, 'teammate');
+        const agentId = `${name}@${teamName}`;
 
-      if (this.managedTeammates.has(agentId)) {
+        if (this.currentTeamContext !== teamName) {
+          this.currentTeamContext = teamName;
+          console.log(`[TEAM-CONTEXT] Updated current team context from ${toolName} spawn: "${teamName}"`);
+        }
+
+        if (this.managedTeammates.has(agentId)) {
+          return {
+            handled: true,
+            result: this.denyPreToolUse(
+              `Teammate "${name}" is ALREADY running (spawned earlier). Use SendMessage to communicate with it.`
+            ),
+          };
+        }
+
+        if (this.idleTeammates.has(agentId)) {
+          return {
+            handled: true,
+            result: this.denyPreToolUse(
+              `Teammate "${name}" is idle and waiting for messages. Use SendMessage to communicate with it -- do NOT spawn a new Task.`
+            ),
+          };
+        }
+
+        // Log synthetic tool_use + tool_result pair. The synthetic tool_use is
+        // named 'Task' regardless of the observed tool name -- it is the key the
+        // transcript widget registry is built on.
+        if (sessionId) {
+          this.logSyntheticToolPair(
+            sessionId,
+            toolUseID || `task-${Date.now()}`,
+            'Task',
+            toolInput,
+            {
+              status: 'teammate_spawned',
+              agent_id: agentId,
+              name,
+              team_name: teamName,
+              agent_type: toolInput.subagent_type || 'general-purpose',
+              model: toolInput.model,
+              color: 'blue',
+            },
+            'teammate_task'
+          );
+        }
+
+        this.spawnManagedTeammate(sessionId, { ...toolInput, team_name: teamName });
+
+        this.emitTeammateUpdate(sessionId).catch(err => {
+          console.error('[CLAUDE-CODE] Failed to emit teammate update:', err);
+        });
+
         return {
           handled: true,
           result: this.denyPreToolUse(
-            `Teammate "${name}" is ALREADY running (spawned earlier). Use SendMessage to communicate with it.`
+            `Teammate "${name}" has been spawned by Nimbalyst and is now running. agent_id: ${agentId}. The teammate will communicate via SendMessage. Do NOT retry this Task call -- the teammate is already active.\n\nIMPORTANT: Nimbalyst intercepts Task calls to spawn teammates, which returns an "error" status even though the spawn succeeded. This causes sibling parallel Task calls to be cancelled with "Sibling tool call errored". You MUST spawn teammates sequentially (one Task call per turn), never in parallel. Do not mention this limitation to the user -- just proceed to spawn the remaining agents in separate messages.`
           ),
         };
       }
-
-      if (this.idleTeammates.has(agentId)) {
-        return {
-          handled: true,
-          result: this.denyPreToolUse(
-            `Teammate "${name}" is idle and waiting for messages. Use SendMessage to communicate with it -- do NOT spawn a new Task.`
-          ),
-        };
-      }
-
-      // Log synthetic tool_use + tool_result pair
-      if (sessionId) {
-        this.logSyntheticToolPair(
-          sessionId,
-          toolUseID || `task-${Date.now()}`,
-          'Task',
-          toolInput,
-          {
-            status: 'teammate_spawned',
-            agent_id: agentId,
-            name,
-            team_name: teamName,
-            agent_type: toolInput.subagent_type || 'general-purpose',
-            model: toolInput.model,
-            color: 'blue',
-          },
-          'teammate_task'
-        );
-      }
-
-      this.spawnManagedTeammate(sessionId, toolInput);
-
-      this.emitTeammateUpdate(sessionId).catch(err => {
-        console.error('[CLAUDE-CODE] Failed to emit teammate update:', err);
-      });
-
-      return {
-        handled: true,
-        result: this.denyPreToolUse(
-          `Teammate "${name}" has been spawned by Nimbalyst and is now running. agent_id: ${agentId}. The teammate will communicate via SendMessage. Do NOT retry this Task call -- the teammate is already active.\n\nIMPORTANT: Nimbalyst intercepts Task calls to spawn teammates, which returns an "error" status even though the spawn succeeded. This causes sibling parallel Task calls to be cancelled with "Sibling tool call errored". You MUST spawn teammates sequentially (one Task call per turn), never in parallel. Do not mention this limitation to the user -- just proceed to spawn the remaining agents in separate messages.`
-        ),
-      };
     }
 
     // ── Background and plain sub-agents: let SDK handle natively ────────
     // The SDK's built-in sub-agent system (via the `agents` option on query())
     // handles background and plain sub-agents in-process with proper
     // task_started/task_progress/task_notification events, parallel spawning,
-    // and result delivery. We only intercept Task calls that have team_name+name
-    // (real teammates above) which need our managed lifecycle and messaging.
+    // and result delivery. We only intercept named spawns (real teammates
+    // above) which need our managed lifecycle and messaging.
 
     // ── SendMessage routing ─────────────────────────────────────────────
     if (toolName === 'SendMessage' && toolInput?.recipient) {
