@@ -77,7 +77,11 @@ describe('RichTranscriptView Task widget gate', () => {
       callback(0);
       return 1;
     });
-    setTranscriptToolWidgets(SOURCE, { Task: StubWidget, some_other_tool: StubWidget });
+    setTranscriptToolWidgets(SOURCE, {
+      Task: StubWidget,
+      Agent: StubWidget,
+      some_other_tool: StubWidget,
+    });
   });
 
   afterEach(() => {
@@ -94,6 +98,30 @@ describe('RichTranscriptView Task widget gate', () => {
   it('leaves a teammate spawn on its existing teammate card', () => {
     const { container } = renderTranscript(
       makeTaskMessage({ teammateName: 'Ada', teamName: 'core', teammateMode: 'implementer' } as any),
+    );
+
+    expect(container.querySelector('[data-testid="stub-task-widget"]')).toBeNull();
+    expect(container.querySelector('.rich-transcript-tool-card.teammate')).not.toBeNull();
+  });
+
+  // The live SDK calls the spawn tool `Agent`, not `Task` — this is the real
+  // shape a name-less delegation arrives in, distinct from the synthetic
+  // 'Task'-named teammate pair kept by task 1a.
+  it('routes a plain Agent sub-agent spawn (no name arg) to the registered widget', () => {
+    const { container } = renderTranscript(
+      makeTaskMessage({ agentType: 'general-purpose' } as any, 'Agent'),
+    );
+
+    expect(container.querySelector('[data-testid="stub-task-widget"]')).not.toBeNull();
+    expect(container.querySelector('.rich-transcript-tool-card.sub-agent')).toBeNull();
+  });
+
+  it('leaves a name-carrying Agent spawn on its teammate card, not the widget', () => {
+    const { container } = renderTranscript(
+      makeTaskMessage(
+        { teammateName: 'Ada', teamName: 'core', teammateMode: 'implementer' } as any,
+        'Agent',
+      ),
     );
 
     expect(container.querySelector('[data-testid="stub-task-widget"]')).toBeNull();
