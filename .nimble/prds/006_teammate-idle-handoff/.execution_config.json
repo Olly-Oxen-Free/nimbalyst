@@ -1,0 +1,23 @@
+{
+  "configured_at": "2026-08-27T00:00:00Z",
+  "orchestration_version": 2,
+  "configured_by": "coordinator (user absent; decisions recorded)",
+  "orchestration": {
+    "integration": {
+      "cadence": "worktree-free-local",
+      "note": "NO GitHub PRs ever (standing repo constraint). Workers edit disjoint files in the main checkout on the feature branch; coordinator reviews diff, runs gates, commits per task. Stop at ready-for-merge; user merges feature->main."
+    },
+    "review": {
+      "trigger": "per-task",
+      "provider": "none-manual",
+      "note": "Coordinator runs npm run typecheck && npm run test:prepush per task, excluding two known pre-existing failures (AgentTranscriptPanel.listenerCleanup, MarkdownRenderer.rtl - jsdom localStorage)."
+    },
+    "gates": { "model": "skip-on-pass", "placements": [], "note": "5 tasks / 3 waves - below gate threshold" }
+  },
+  "models": {
+    "default": "sonnet",
+    "assignments": { "1a": "sonnet", "1b": "opus", "1c": "haiku", "2a": "sonnet", "3a": "opus" },
+    "escalation": { "after_failures": 1 }
+  },
+  "max_revision_loops": 3
+}
