@@ -1,0 +1,10 @@
+{
+  "slug": "teammate-idle-handoff",
+  "phase": "ready",
+  "created": "2026-08-27",
+  "notes": "Coordinator running autonomously (user absent): asset-prompt skipped (no assets for a lifecycle bugfix); research is internal-only by deliberate decision (no library/external questions). Covers three live bugs from session c29787e7 (weatherman teammate): lead duplicating teammate work via continuation prompt wording; idle-handoff race leaving session stuck; killAll blanket-errored status + lost toolCallCount in UI. | Plan phase: interview conducted autonomously; decisions D1-D6 recorded in PRD. Reviewer pass pending. | PRD reviewed (opus reviewer): approve-with-corrections; all 8 corrections applied (C1 counter sourcing + emitTeammateUpdate map branch + naming, M1 D3 citation, M2 resolved as D7 option-a, M3 interrupt semantics documented, m1 optional IdleTeammate fields, m2 PersistedTeammateRow persistence folded into 2a).",
+  "status": "ready",
+  "prd_number": "006",
+  "tasks_total": 5,
+  "waves": 3
+}

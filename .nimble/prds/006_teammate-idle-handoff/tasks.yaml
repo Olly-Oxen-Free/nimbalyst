@@ -1,0 +1,244 @@
+# ============================================================
+# NIMBLE TASK DEFINITIONS
+# ============================================================
+
+metadata:
+  prd_slug: "teammate-idle-handoff"
+  created_at: "2026-08-27T00:00:00Z"
+  total_complexity: 17
+  task_count: 5
+
+tasks:
+  - id: "1a"
+    title: "Continuation prompt: wait, don't duplicate teammate work"
+    description: |
+      Reword the continuation system message injected at
+      ClaudeCodeProvider.ts:2465 (currently '[System: Your previous turn
+      ended but you still have active agents. Wait for their results, or
+      take other actions as needed.]'). Live-observed failure: the lead
+      read "or take other actions as needed" as license to redo the
+      teammate's own task itself (same web queries, once per continuation,
+      3x). New wording must: (1) instruct the lead to WAIT for its
+      teammates' results; (2) explicitly forbid performing or duplicating
+      the work the teammates are already doing; (3) still permit teammate
+      management actions (SendMessage to a teammate, stopping or shutting
+      one down) and answering the user. Keep the '[System: ...]' framing.
+
+      Extract the message to an exported constant (e.g.
+      TEAMMATE_CONTINUATION_MESSAGE) near MAX_CONTINUATIONS so 3a can
+      assert its content without a full provider harness — PRD 003's R1
+      established the model-facing-string test precedent.
+
+      Verified during research (target 8): there is no hide mechanism for
+      this message — it becomes a real prompt via
+      emitTeammateMessageWhileIdle -> sendMessageHandler. Wording-only is
+      the correct fix shape; do not attempt to hide or suppress it.
+
+      Fulfills R3.
+    depends_on: []
+    complexity: 2
+    priority: "must"
+    success_criteria:
+      - "The continuation message no longer contains open-ended 'take other actions' language; it instructs waiting and explicitly forbids duplicating the teammates' assigned work, while permitting teammate management and user-facing replies"
+      - "Message text lives in an exported constant used by handlePostLeadTurnTeammateState; no other behavior of the continuation branch changes (count, reset, abandon call sites untouched)"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts"
+    agent_context: |
+      Wording + constant extraction only. Do not touch the
+      continuation-count logic, abandonIdleTeammates calls, or anything
+      in the teammate idle branch (task 1b's territory, different file).
+
+  - id: "1b"
+    title: "Idle handoff: deliver the teammate's captured result to the lead"
+    description: |
+      In TeammateManager.handleStreamCompletion's idle branch
+      (TeammateManager.ts:1542-1549), after the teammate is moved to
+      idleTeammates and the UI emit is scheduled, deliver the handoff to
+      the lead: for EVERY !isBackground idle transition, call
+      this.deliverMessageToLead(sessionId, agentId, displayName, content,
+      summary) mirroring the background-branch calling convention at
+      :1562-1569. displayName is idleTemplate.name (the display name, not
+      the agentId). Per PRD decision D7 the notice is unconditional; only
+      the result body is gated: include result.capturedResultText ONLY
+      when !result.sentMessageToLead (a teammate that already messaged
+      the lead does not get its result re-delivered).
+
+      Content: identify the teammate, state that it finished its turn and
+      is now idle (can be resumed via SendMessage or shut down). With
+      !sentMessageToLead and captured text: include the text. With
+      !sentMessageToLead and no text: explicitly say it reported no
+      result — never skip delivery silently. With sentMessageToLead: a
+      bare idle notice only. Summary shape: '{displayName} idle' /
+      '{displayName} idle (no result)'.
+
+      Verified by research — rely on these, do not re-litigate:
+      - capturedResultText/sentMessageToLead are populated by
+        streamTeammateOutput for ALL paths (spawn, resume, background);
+        no new tracking needed (target 1).
+      - The live-process delivery chain works end-to-end from this exact
+        call site: session stays deferred after continuation exhaustion,
+        isSessionActive passes, interruptWithMessage handles both
+        mid-turn and idle lead (target 2).
+      - Latch safety: 4th deliverMessageToLead call site uses the same
+        audited machinery incl. releaseIdleWakeLatch(); add no new
+        suppression or queueing (targets 3-4).
+
+      The approved-shutdown and background branches are untouched.
+      Reviewer-verified: double delivery is impossible (sentMessageToLead
+      is a per-stream local declared at :1828, set at :1982; queued
+      teammate messages merge into one drained batch at
+      :2394/:2429/:2452, they do not duplicate).
+
+      Fulfills R1, R2.
+    depends_on: []
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "Idle completion with !sentMessageToLead and non-empty capturedResultText calls deliverMessageToLead with the display name and a content string containing the captured text"
+      - "Idle completion with !sentMessageToLead and no capturedResultText calls deliverMessageToLead with an explicit no-result idle notice (never silent)"
+      - "Idle completion with sentMessageToLead === true delivers a bare idle notice and does NOT include capturedResultText (D7: notice unconditional, result body gated)"
+      - "Background-agent and approved-shutdown branches byte-identical in behavior; no new suppression/queueing code anywhere"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+    agent_context: |
+      Read the background-result call at TeammateManager.ts:1562-1569 and
+      PRD 003's wake call at :1604-1612 for the calling convention. Do
+      not touch ClaudeCodeProvider.ts or MessageStreamingHandler.ts —
+      research confirmed the delivery chain needs no changes for the
+      live-process case. Do not modify abandonIdleTeammates (PRD decision
+      D3: the exhaustion race is made moot by this task). Mid-turn, this
+      delivery interrupts the lead's active turn
+      (ClaudeCodeProvider.ts:2406-2421) exactly as a teammate SendMessage
+      does — accepted behavior, add no batching/debounce. sessionId may
+      be undefined at this call site; deliverMessageToLead tolerates it
+      (:1144 gates logging, :1163/:1171 tolerate undefined) — add no
+      redundant guard. Place the call BEFORE the hasActiveTeammates()
+      check at :1573, matching the load-bearing ordering documented at
+      :1600-1603.
+
+  - id: "1c"
+    title: "Teammates panel row: show model"
+    description: |
+      TeammatePanel.tsx's row currently shows agentType (e.g.
+      "general-purpose") with the model unused despite being present on
+      the teammate object. Show the model alongside the type when
+      present (e.g. "general-purpose - haiku"), matching the panel's
+      existing text styling. Visual-only change; per repo testing rules
+      (no presentation-only tests) this task ships no unit test.
+      Fulfills R7.
+    depends_on: []
+    complexity: 1
+    priority: "should"
+    success_criteria:
+      - "Panel row displays the model string when the teammate object carries one; layout unchanged when model is absent"
+      - "No changes outside TeammatePanel.tsx; no new tests"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+    agent_context: |
+      This is the TEAMMATE panel (PRD 002 surface), not the Task-subagent
+      tile/popover from PRD 004 — do not touch anything under the
+      sub-agent task UI.
+
+  - id: "2a"
+    title: "Truthful abort status and tool-count continuity"
+    description: |
+      Two metadata fixes in TeammateManager.ts (sequenced after 1b, same
+      file):
+
+      (1) killAll (:2078-2115) currently emits a blanket 'errored'
+      override for ALL cleared agents (:2108-2113). Split it: agents
+      cleared from managedTeammates (actually aborted mid-run) stay
+      'errored'; agents cleared from idleTeammates (finished their turn)
+      emit 'completed' — matching stopByAgentId (:2144-2152) and
+      stop(name) (:2172-2184) precedent. PRD decision D4: reuse
+      'completed', do not invent a new wire/display status.
+
+      (2) Tool-count continuity, four coordinated pieces:
+      - IdleTeammate gains OPTIONAL fields (toolCallCount?: number;
+        lastActiveAt?: number) — the type is exported (:40) and
+        constructed as bare literals in stallWatchdog.test.ts:105 and
+        resumeReliability.test.ts:119; required fields would break
+        typecheck in files this task does not own.
+      - In handleStreamCompletion's idle branch, populate them from the
+        `managed` entry captured at :1531 (BEFORE the delete at :1534):
+        toolCallCount: managed?.toolCallCount ?? 0, lastActiveAt:
+        managed?.lastActiveAt. Do NOT source from idleTemplate — it is a
+        spawn-time literal (:1674, :1735) and on the resume path it is
+        the PREVIOUS idle record (:2068).
+      - Both idle-entry paths in emitTeammateUpdate must carry the
+        fields: the push loop (:1488-1501, fires only for agents with no
+        persisted row) AND the existingTeammates.map idle branch
+        (:1461-1466, fires whenever a row already exists — e.g. after a
+        resume's running emit) — the map branch currently spreads the
+        stale previous row.
+      - resumeIdleTeammate (:2064) seeds toolCallCount from
+        idleInfo.toolCallCount ?? 0 instead of 0, so the count
+        accumulates across resume cycles; PersistedTeammateRow (:57-66)
+        and rehydrateIdleTeammate (:1323-1333) gain the count so a
+        post-restart host-send resume (sendMessageFromHost third branch,
+        :1266) does not reset to 0.
+
+      Fulfills R4, R5.
+    depends_on: ["1b"]
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "killAll with one running and one idle teammate emits 'errored' for the running one and 'completed' for the idle one"
+      - "Idle metadata entries in emitTeammateUpdate include toolCallCount and lastActiveAt with the values from the teammate's run, in BOTH the push loop and the existingTeammates.map idle branch"
+      - "A resume->re-idle cycle emits the accumulated count (row already present in currentTeammates), not the pre-resume value"
+      - "resumeIdleTeammate registers the resumed teammate with the accumulated prior toolCallCount, not 0; the count survives a restart via PersistedTeammateRow/rehydrateIdleTeammate"
+      - "IdleTeammate type changes are confined to TeammateManager.ts (or its types module); no wire-protocol/renderer changes needed"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+    agent_context: |
+      Renderer needs no changes for these fixes (verified, target 6): the
+      popover header and panel stat read the emitted status/toolCallCount
+      directly, and the '> 0' guard at TeammatePanel.tsx:365 renders the
+      stat once the field exists (popover renders on !== undefined, so a
+      zero-tool teammate reading '0 tool calls' there is truthful, not a
+      regression). killAll split: collect running vs idle ids into one
+      Map<string,'errored'|'completed'> for the existing single
+      emitTeammateUpdate call at :2111 (widen the 'as const' at :2109);
+      lastUsedSessionId-undefined still gates the whole emit at :2108 —
+      unchanged.
+
+  - id: "3a"
+    title: "Tests for idle handoff, abort status, and continuation wording"
+    description: |
+      End-of-work test task. New file
+      TeammateManager.idleHandoff.test.ts (topic-suffixed convention)
+      following TeammateManager.stallWatchdog.test.ts's exact mocking
+      pattern; killAll emission tests may extend the existing
+      abandonIdleTeammates/stopByAgentId describe blocks in
+      TeammateManager.test.ts where that is cheaper than re-mocking.
+      Continuation-wording assertions import 1a's exported constant.
+
+      Red-first (PRD 003 task 2a precedent): write each test, temporarily
+      revert the specific change it covers, confirm it fails, restore,
+      confirm green. npm run typecheck && npm run test:prepush green
+      before handoff (two known pre-existing failures excluded:
+      AgentTranscriptPanel.listenerCleanup.test.tsx,
+      MarkdownRenderer.rtl.test.tsx - jsdom localStorage).
+
+      Fulfills R6.
+    depends_on: ["1a", "1b", "2a"]
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "Covers: idle with result text and !sentMessageToLead -> deliverMessageToLead called with display name and captured text (assert arguments, not just invocation)"
+      - "Covers: idle with NO result text -> explicit no-result notice delivered"
+      - "Covers: idle with sentMessageToLead === true -> bare idle notice delivered, capturedResultText NOT included (D7)"
+      - "Covers: background-agent completion path unchanged (still delivers via its own branch, no double delivery)"
+      - "Covers: killAll emits 'errored' for running, 'completed' for idle teammates"
+      - "Covers: idle metadata entry carries toolCallCount/lastActiveAt in both emitTeammateUpdate paths (push loop and map branch, i.e. resume->re-idle keeps the accumulated count); resume seeds accumulated toolCallCount"
+      - "Covers: continuation message constant contains the wait/no-duplication instruction and no open-ended 'other actions' invitation"
+      - "@vitest-environment node first line; narrow vi.mock of @anthropic-ai/claude-agent-sdk, AISessionsRepository, claudeConfigDir; no @nimbalyst/runtime barrel mock"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.idleHandoff.test.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.test.ts"
+    agent_context: |
+      Assert observable behavior (deliverMessageToLead call arguments,
+      emitted status overrides, registered toolCallCount), never
+      component source text. If a source import specifier changed in
+      1a/1b/2a, grep the test tree for stale vi.mock specifiers in the
+      same commit (NIM mock-drift lesson).

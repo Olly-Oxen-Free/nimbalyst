@@ -1,0 +1,14 @@
+prd_slug: "teammate-idle-handoff"
+waves:
+  - wave: 1
+    tasks: ["1a", "1b", "1c"]
+    note: "Independent files: ClaudeCodeProvider.ts (1a), TeammateManager.ts (1b), TeammatePanel.tsx (1c)"
+  - wave: 2
+    tasks: ["2a"]
+    note: "Same file as 1b (TeammateManager.ts), sequenced to avoid conflicts"
+  - wave: 3
+    tasks: ["3a"]
+    note: "End-of-work tests, gated on all runtime changes"
+longest_chain: ["1b", "2a", "3a"]
+total_complexity: 17
+max_parallel: 3
