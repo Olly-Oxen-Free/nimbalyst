@@ -676,7 +676,23 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     return resolveClaudeCodeModelVariant(this.config.model, CLAUDE_CODE_SAFE_FALLBACK_MODEL);
   }
 
-
+  /**
+   * Read the agent-teams flag from settings.json's env block and wire it into
+   * TeammateManager, which gates its name-only spawn interception on it (see
+   * TeammateManager.enableAgentTeams's own doc comment). Read per-turn, not
+   * cached at construction, since settingsEnv is itself read fresh each turn
+   * (settings.json can change between turns without a restart).
+   *
+   * Extracted to its own method specifically so this wiring is directly unit
+   * testable without invoking the whole sendMessage generator: the flag was
+   * computed inline here once already and never reached TeammateManager,
+   * silently leaving its spawn-gate fix inert.
+   */
+  private syncAgentTeamsFlag(settingsEnv: Record<string, string>): boolean {
+    const enableAgentTeams = settingsEnv.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
+    this.teammateManager.enableAgentTeams = enableAgentTeams;
+    return enableAgentTeams;
+  }
 
   async *sendMessage(
     message: string,
@@ -831,7 +847,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       const promptBuildStart = Date.now();
       // console.log('[CLAUDE-CODE] sendMessage - documentContext keys:', documentContext ? Object.keys(documentContext) : 'undefined');
       // console.log('[CLAUDE-CODE] sendMessage - documentContext.sessionType:', (documentContext as any)?.sessionType);
-      const enableAgentTeams = settingsEnv.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
+      const enableAgentTeams = this.syncAgentTeamsFlag(settingsEnv);
       const agentRole = await this.getAgentRole(sessionId);
       const isMetaAgent = agentRole === 'meta-agent';
       const workflowPreset = isMetaAgent ? await this.getWorkflowPreset(sessionId) : 'default';
