@@ -1,0 +1,39 @@
+prd_slug: "agent-teams-cold-start-bootstrap"
+generated_at: "2026-08-27T00:00:00Z"
+
+# Core fix (1a) first and alone -- every other task depends on its landed
+# shape (team-resolution order, synthetic tool-pair shape, flag plumbing).
+# 1b and 2a are file-disjoint and parallelize in wave 2. 2b's rendering
+# verification depends on 2a's widget-registration fix (the live-'Agent'
+# shape test) as well as 1a's spawn shape. 3a is the live cold-start E2E
+# that closes the PRD. Reviewer pass (PRD section 6 D10) corrected 2a's
+# scope (renderer registration, not the ClaudeSettingsManager no-op) and
+# 1a's team-resolution ordering before this plan was finalized.
+
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    rationale: "No dependencies. Red-first regression test, then the gate change (Task|Agent, name-only, teams-enablement plumbing, team-resolution order ending in session-derived synthesis). Defines the shapes 1b/2b consume."
+  - wave: 2
+    tasks: ["1b", "2a"]
+    rationale: "Both depend only on 1a. File-disjoint: 1b touches TeammateManager.ts (same file as 1a, sequenced after it via depends_on, never same-wave) + sdkOptionsBuilder.ts; 2a touches AgentMode.tsx (renderer widget registration, the primary fix) and audits electron for 'Task'-only hardcodes (ClaudeSettingsManager case is a documented no-op)."
+  - wave: 3
+    tasks: ["2b"]
+    rationale: "Depends on 1a (spawn/args shape) and 2a (widget registered for 'Agent'). Pure test-extension task in existing runtime-side renderer test files; explicitly barred from packages/electron/src/main/** (boundary stays behind the gate)."
+  - wave: 4
+    tasks: ["3a"]
+    rationale: "Depends on everything. Live cold-start E2E in the dev app; restart step requires explicit user permission per repo rules; records evidence in status.json."
+
+longest_chain: ["1a", "2a", "2b", "3a"]
+
+file_overlap_notes:
+  - "TeammateManager.ts: 1a and 1b both touch it -- serialized via depends_on (1b after 1a), never same-wave."
+  - "sdkOptionsBuilder.ts: 1b only."
+  - "AgentMode.tsx, ClaudeSettingsManager.ts (audit/optional): 2a only."
+  - "Runtime renderer test files: 2b only; no source files expected to change in 2b (a needed source fix routes back to 1a). 2b must not touch packages/electron/src/main/** (see gate note)."
+  - "status.json: 3a only (evidence)."
+
+gate:
+  after_wave: 2
+  label: "Core fix + electron changes -- human review before verification fan-out"
+  reason: "require_review triggers if 2a's audit touches packages/electron/src/main/** (its optional ClaudeSettingsManager clarity case sits there). Also the natural checkpoint to eyeball 1a's gate/team-resolution diff -- the single most behavior-changing edit in the PRD -- before the verification waves invest against its landed shape. Post-gate tasks are barred from the require_review boundary (2b explicitly); anything needing a boundary file after the gate is deferred to the final merge gate via findings.md."

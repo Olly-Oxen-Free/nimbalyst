@@ -1,0 +1,46 @@
+sources:
+  - id: sdk-tools-typedefs
+    title: "@anthropic-ai/claude-agent-sdk 0.3.221 sdk-tools.d.ts (AgentInput)"
+    location: "node_modules/@anthropic-ai/claude-agent-sdk/sdk-tools.d.ts:484-515"
+    type: primary
+    accessed: "2026-08-27"
+  - id: sdk-typedefs
+    title: "@anthropic-ai/claude-agent-sdk 0.3.221 sdk.d.ts (hooks, teammateMode)"
+    location: "node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:2248-2253,6619-6621,6836-6942"
+    type: primary
+    accessed: "2026-08-27"
+  - id: gh-48160
+    title: "anthropics/claude-code#48160 — Spawned subagents cannot originate SendMessage despite name= parameter"
+    url: "https://github.com/anthropics/claude-code/issues/48160"
+    type: issue-tracker
+    accessed: "2026-08-27"
+  - id: gh-32721
+    title: "anthropics/claude-code#32721 — Teammates receive 'Claude Agent SDK' identity"
+    url: "https://github.com/anthropics/claude-code/issues/32721"
+    type: issue-tracker
+    accessed: "2026-08-27"
+  - id: ultimate-guide
+    title: "claude-code-ultimate-guide — agent-teams.md"
+    url: "https://github.com/FlorianBruniaux/claude-code-ultimate-guide/blob/main/guide/workflows/agent-teams.md"
+    type: community
+    accessed: "2026-08-27"
+  - id: sdk-changelog
+    title: "claude-agent-sdk-typescript CHANGELOG.md"
+    url: "https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md"
+    type: primary
+    accessed: "2026-08-27"
+  - id: getclaudeskills
+    title: "Claude Code Agent Teams Explained (2026)"
+    url: "https://www.getclaudeskills.com/blog/claude-code-agent-teams"
+    type: community
+    accessed: "2026-08-27"
+  - id: aifreeapi
+    title: "Claude Code Agent Teams: Complete Guide (2026)"
+    url: "https://www.aifreeapi.com/en/posts/claude-code-agent-teams"
+    type: community
+    accessed: "2026-08-27"
+  - id: live-transcript
+    title: "Live-test session transcript (empirical Agent tool_use inputs)"
+    location: "~/.claude/projects/-home-jayden-eppcohen-Documents-Projects-Software-nimbalyst/5aa68ce2-5e6b-4483-b3de-5070527a7c3a.jsonl"
+    type: primary
+    accessed: "2026-08-27"

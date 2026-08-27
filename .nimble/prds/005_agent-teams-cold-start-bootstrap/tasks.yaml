@@ -1,0 +1,321 @@
+# ============================================================
+# NIMBLE TASK DEFINITIONS
+# Parsed by the orchestrator for execution planning.
+# ============================================================
+
+metadata:
+  prd_slug: "agent-teams-cold-start-bootstrap"
+  created_at: "2026-08-27T00:00:00Z"
+  total_complexity: 20
+  task_count: 5
+
+tasks:
+  - id: "1a"
+    title: "Adapt the teammate spawn gate to the implicit-team protocol"
+    description: |
+      RED FIRST (repo end-to-end-verification rule): before any fix, add a
+      regression test calling handlePreToolUse('Agent', {name: 'git-scout',
+      description: '...', prompt: '...', subagent_type: 'general-purpose'},
+      toolUseId, sessionId) -- the exact empirical live-test shape -- and
+      assert it spawns a managed teammate. Run it; confirm it fails
+      (today it returns { handled: false }). Only then fix.
+
+      STEP 0 (R7): add a one-line debug log of the observed toolName at the
+      top of the spawn-interception branch. The SDK types
+      PreToolUseHookInput.tool_name as bare string (sdk.d.ts:2248-2253);
+      "the hook sees 'Agent'" is inferred from the assistant-message
+      tool_use name plus the hook wiring (ClaudeCodeProvider.ts:505-531),
+      not doc-confirmed. The log stays in (it is cheap and diagnostic);
+      match on BOTH 'Task' and 'Agent' regardless so the fix is correct
+      under either observation.
+
+      GATE CHANGE (TeammateManager.ts:2209): intercept on
+      (toolName === 'Task' || toolName === 'Agent') && toolInput?.name,
+      additionally conditioned on agent teams being enabled for the
+      session. TeammateManager does not currently know enableAgentTeams --
+      the old gate free-rode on team_name only appearing when teams were
+      active. Plumb the flag in (a settable property or a deps accessor,
+      matching how packagedBuildOptions is already injected) rather than
+      re-reading process.env inside the manager. team_name, when present,
+      is still honored exactly as today (legacy input, old sessions).
+
+      TEAM NAME RESOLUTION ORDER (R2 -- ordering corrected during PRD
+      review, see section 6 D10/C2): when toolInput.team_name is absent,
+      resolve the team in this order, and ONLY synthesize as the last
+      resort:
+        1. toolInput.team_name (legacy, honored as today);
+        2. this.currentTeamContext if already set;
+        3. await this.resolveTeamContext(sessionId) (a resumed
+           old-protocol session has a real team here -- overwriting it
+           with a synthesized name would break agentIdMatchesRecipient's
+           exact-team match at TeammateManager.ts:390-395 and make
+           existing teammates like alice@team unreachable);
+        4. synthesize a stable session-scoped name: 'team-' + first 8
+           chars of the lead sessionId, PRE-NORMALIZED to
+           ^[a-zA-Z0-9_-]+$ BEFORE it reaches sanitizeName (sanitizeName
+           throws on non-conforming input rather than normalizing,
+           :326-348); fallback 'team' when sessionId is undefined --
+           mirror the existing fallback at TeammateManager.ts:1286.
+      Set this.currentTeamContext to the resolved value so SendMessage
+      routing (agentIdMatchesRecipient sites: 2116, 2128, 2151, 2166,
+      2285, 2366, 2437), duplicate-spawn denial (managedTeammates/
+      idleTeammates keyed by name@team), and updateTeamConfig/inbox paths
+      (~/.claude/teams/<team>/, line 977) all see one consistent value.
+      spawnManagedTeammate currently throws on a missing team_name
+      (sanitizeName(undefined) throws, line 1585) -- pass the resolved
+      name through (widen spawnManagedTeammate's input or resolve before
+      the call; keep the change surgical).
+
+      SYNTHETIC PAIR (logSyntheticToolPair, ~2239-2254): keep passing
+      'Task' as the synthetic tool_use name (switching it to the observed
+      'Agent' would shift the widget-registry key -- see 2a); include the
+      resolved team_name in the result payload for log fidelity. Note the
+      renderer's isTeammate discriminator derives from the tool_use ARGS
+      (ClaudeCodeRawParser.ts:510-511, args.name || args.team_name), not
+      the result payload -- a name-only spawn is isTeammate: true from
+      args.name alone, so no renderer change is needed for the
+      discriminator (verified during PRD review).
+
+      NAME-LESS PASSTHROUGH (R6): no name => { handled: false }, exactly as
+      today. run_in_background on a name-carrying call does NOT change the
+      decision: a named agent is a teammate (interview decision D3, PRD
+      section 6) -- the managed pipeline already runs teammates without
+      blocking the lead.
+
+      TEST UPDATES: existing tests hardcode the old protocol
+      (resumeReliability.test.ts:255 and stallWatchdog.test.ts:124 pass
+      {team_name:'team', name:'alice'} spawn inputs; resumeReliability
+      :145/:286 are SendMessage tests coupled to the same team) -- they
+      must stay green (legacy input still honored). Add name-only +
+      'Agent'-toolName variants alongside, including one asserting a
+      resumed session's EXISTING team context is reused rather than
+      overwritten by synthesis. Audit TeammateManager.test.ts and
+      sendMessageFromHost.test.ts for team_name coupling while there.
+
+      Fulfills R1, R2, R3 (partially -- resume half is 1b), R6 (gate
+      half), R7.
+    depends_on: []
+    complexity: 7
+    priority: "must"
+    success_criteria:
+      - "Regression test written FIRST and observed failing before the fix (state red-run evidence in the commit message)"
+      - "handlePreToolUse('Agent', {name, no team_name}) spawns a managed teammate with agentId name@<synthesized-team> when agent teams are enabled"
+      - "handlePreToolUse('Task', {name, team_name}) behaves exactly as today (legacy input honored); existing resumeReliability/stallWatchdog tests untouched and green"
+      - "handlePreToolUse('Agent', {no name}) returns { handled: false }; agent-teams-disabled sessions never intercept"
+      - "Team resolution order honored: legacy team_name > existing currentTeamContext > resolveTeamContext(sessionId) > synthesis -- a resumed session with a real team context spawns into THAT team, never a synthesized one (explicit test)"
+      - "Synthesized team name is stable within a session, pre-normalized so sanitizeName cannot throw, and set as currentTeamContext; duplicate-spawn denial and SendMessage routing tests pass against it"
+      - "spawnManagedTeammate no longer throws on name-only input"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/ (existing TeammateManager test files, extended)"
+    deliverables:
+      - artifact: "Implicit-team spawn gate + session-derived team synthesis"
+        path: "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+        done_when: "Red-first regression test flips green; all success_criteria covered by unit tests in existing TeammateManager test files"
+
+  - id: "1b"
+    title: "Resume/rehydration with synthesized teams; mark legacy explicit-team surface"
+    description: |
+      RESUME (R4): PRD 003's resume flow must work for teammates spawned
+      under a synthesized team name. resolveTeamContext
+      (TeammateManager.ts:515-543) already rehydrates from persisted
+      currentTeammates[].teamName rows (written by emitTeammateUpdate,
+      1373-1479) -- verify the synthesized name round-trips: spawn (1a's
+      new path) -> metadata persisted -> fresh manager instance ->
+      resolveTeamContext returns the synthesized team ->
+      rebuildIdleTeammateFromMetadata / resume path works. Unit test with
+      a mocked AISessionsRepository, mirroring the existing
+      resumeReliability test setup. Note emitTeammateUpdate never writes
+      metadata.currentTeamContext (only currentTeammates rows) -- the
+      teammates-array branch of the rehydration cascade is the one that
+      must carry this; do not add a new metadata field unless the test
+      proves the existing cascade insufficient.
+
+      LEAD ENV BLOCK (R8, decision D5): sdkOptionsBuilder.ts:489-503 --
+      keep CLAUDE_CODE_ENABLE_TASKS=1 (undocumented whether still
+      load-bearing in 0.3.x; at worst a no-op -- do not remove without
+      evidence). Keep the resolveTeamContext call and the conditional env
+      block (it only fires when a team context exists, i.e. resumed
+      old-protocol or post-spawn sessions; the SDK ignores the deprecated
+      vars). Add the short legacy comment to the env block, to the
+      teammate-subprocess env/extraArgs block (TeammateManager.ts:
+      1736-1752), and to the TeamCreate/TeamDelete tool-result handling
+      (extractTeamNameFromToolResult and its call sites, ~550-660) --
+      marked, not removed, per surgical-change rules. No behavior change
+      in this half of the task; test coverage is the resume test above.
+
+      Do NOT remove the enableAgentTeams declaration on
+      ClaudeCodePromptOptions (prompt.ts:110). It is unread inside
+      prompt.ts but ASSIGNED at ClaudeCodeProvider.ts:4194,
+      OpenAICodexProvider.ts:1902, OpenAICodexACPProvider.ts:518, and
+      CopilotCLIProvider.ts:437 -- removal breaks typecheck in four files
+      (found during PRD review, section 6 D10/W2).
+
+      Fulfills R4, R8, and the resume half of R3.
+    depends_on: ["1a"]
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Unit test: teammate spawned via the name-only path persists rows whose teamName is the synthesized team; a fresh manager's resolveTeamContext returns it; the resume path accepts it"
+      - "CLAUDE_CODE_ENABLE_TASKS still set when agent teams enabled; no env var removed"
+      - "Legacy comments present on the three explicit-team surfaces; no functional change to them"
+      - "npm run typecheck green; no existing sdkOptionsBuilder/TeammateManager test regresses"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/claudeCode/sdkOptionsBuilder.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/ (resume test extension)"
+    deliverables:
+      - artifact: "Synthesized-team resume round-trip test + legacy markers"
+        path: "packages/runtime/src/ai/server/providers/__tests__/"
+        done_when: "Resume round-trip test green in the existing resumeReliability (or sibling) test file"
+
+  - id: "2a"
+    title: "Recognize 'Agent' alongside 'Task' in electron tool-name-keyed surfaces"
+    description: |
+      PRIMARY FIX (found during PRD review, section 6 D10/C1):
+      AgentMode.tsx:281 registers PRD 004's inline-expand widget under the
+      'Task' key only:
+        setTranscriptToolWidgets(TASK_TOOL_WIDGET_SOURCE,
+                                 { Task: TaskToolWidget });
+      The live SDK spawn tool is 'Agent', so 004's TaskToolWidget is
+      ALREADY unreachable for real name-less dispatches today -- they fall
+      through to the generic sub-agent card. Register the widget for both
+      names ({ Task: TaskToolWidget, Agent: TaskToolWidget }), and add a
+      LIVE-SHAPE test: a tool_use named 'Agent' with no name arg renders
+      TaskToolWidget (extend 004's existing widget test file; do not add a
+      new file). This is a real user-facing regression fix that 004's
+      'Task'-keyed fixtures could not catch.
+
+      AUDIT: sweep packages/electron/src (main AND renderer) for other
+      'Task'-only tool-name hardcodes; align or document each in the
+      commit message. Known finding, already reviewed:
+      ClaudeSettingsManager.ts:381's bare `case 'Task':` is a behavioral
+      NO-OP -- its default: branch returns toolName for unknown names
+      anyway (:343-393). Adding `case 'Agent':` there is optional clarity;
+      do NOT write a test for it (it would assert an identity, contrary to
+      repo testing rules -- section 6 D10/W1).
+
+      Renderer file => fast-track; if the audit ends up touching any file
+      under packages/electron/src/main/**, the require_review boundary
+      applies (gate after wave 2 covers it).
+
+      Small task by design -- every changed line must be a
+      'Task'-vs-'Agent' recognition fix.
+
+      Fulfills R5.
+    depends_on: ["1a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "TaskToolWidget registered for both 'Task' and 'Agent' keys; live-shape test (tool named 'Agent', no name arg) renders it"
+      - "A name-carrying 'Agent' tool_use still renders the teammate card, not TaskToolWidget (isTeammate gate from args.name -- regression guard)"
+      - "Audit result across packages/electron/src (sites found/aligned/no-op-documented) stated in the commit message"
+      - "No identity-asserting test added for the ClaudeSettingsManager no-op"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/AgentMode.tsx"
+      - "packages/electron/src/main/services/ClaudeSettingsManager.ts (optional clarity case, audit)"
+    deliverables:
+      - artifact: "'Agent' recognized in widget registration + audit"
+        path: "packages/electron/src/renderer/components/AgentMode/AgentMode.tsx"
+        done_when: "Live-shape widget test green; audit documented"
+
+  - id: "2b"
+    title: "Rendering and downstream regression verification for name-only spawns"
+    description: |
+      A name-only spawn now produces the synthetic teammate_task tool pair
+      (from 1a, tool name kept as 'Task'). Verify the rendering
+      discriminators built in PRDs 002/004 hold for the LIVE shapes:
+
+      1. The teammate-spawn message renders the existing teammate card in
+         RichTranscriptView.tsx -- NOT PRD 004's TaskToolWidget. The
+         isTeammate signal derives from the tool_use ARGS
+         (ClaudeCodeRawParser.ts:510-511, args.name || args.team_name) --
+         a name-only spawn is isTeammate: true from args.name alone
+         (verified during PRD review; the synthetic result payload is not
+         the discriminator). Extend the existing RichTranscriptView /
+         TaskToolWidget test coverage with the name-only spawn fixture --
+         prefer extending 004's regression test file over creating a new
+         one.
+      2. A name-LESS dispatch renders through 004's TaskToolWidget path
+         under BOTH tool names -- 2a adds the 'Agent'-shape test; here
+         confirm the 'Task'-keyed fixtures also still pass (green-suite
+         confirmation only for the 'Task' half).
+      3. Teammate chip + NotificationService agent-notification behavior
+         for the new spawn shape: runtime-side verification only. Do NOT
+         touch packages/electron/src/main/** test files in this task --
+         that crosses the require_review boundary post-gate (section 6
+         D10/W3). If the spawn shape reaches NotificationService
+         differently and its test needs extending, flag it in findings.md
+         for the final merge gate instead of editing it here.
+
+      Pure verification/extension task -- if a discriminator breaks, the
+      fix belongs in 1a's payload/args shape (coordinate back), not in
+      new renderer branching.
+
+      Fulfills R6 (rendering half).
+    depends_on: ["1a", "2a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "Name-only spawn fixture renders the teammate card, not TaskToolWidget (isTeammate true from args.name)"
+      - "Name-less dispatch rendering verified under both tool names (2a's 'Agent' test + existing 'Task' fixtures green)"
+      - "Existing teammate test suites green; all extensions land in existing runtime-side files; no packages/electron/src/main/** file touched"
+    files_affected:
+      - "packages/runtime/src/ui/AgentTranscript/components/__tests__/ (existing files, extended)"
+    deliverables:
+      - artifact: "Name-only spawn rendering regression coverage"
+        path: "packages/runtime/src/ui/AgentTranscript/components/__tests__/"
+        done_when: "New fixture green in existing test files; no renderer source change (or, if one was needed, it landed in 1a and is noted)"
+
+  - id: "3a"
+    title: "Live cold-start end-to-end verification"
+    description: |
+      Reproduce the exact scenario that exposed the bug, in the running
+      dev app (agent teams enabled, fresh session, NO prior team history
+      -- verify ~/.claude/teams/ state beforehand; a leftover single team
+      dir would mask the cold-start path via resolveTeamContext's
+      directory fallback):
+
+      1. "spawn an agent named git-scout to get the most recent git
+         commit" -> main.log shows the teammate spawn path (TEAM-CONTEXT /
+         MANAGED-TEAMMATE log lines), NOT 'SUBAGENT_TASK started:
+         type=local_agent'.
+      2. Teammate chip appears; thread view opens with live transcript
+         (PRD 002 surface).
+      3. SendMessage round-trip: message the teammate from the lead,
+         observe delivery; observe the teammate's reply reaching the lead
+         (if the upstream asymmetric-SendMessage limitation,
+         anthropics/claude-code#48160, manifests under the managed
+         pipeline, document the observed behavior in the PRD's Open
+         Questions rather than failing the gate -- Nimbalyst-side routing
+         is what this PRD owns).
+      4. Stop control works; restart the app; teammate resumes/rehydrates
+         (PRD 003 surface) under the synthesized team name.
+      5. Control: an un-named delegation request still produces the plain
+         local_agent path and PRD 004's chip/popover surfaces.
+
+      Record evidence (log excerpts, redacted per repo rules) in
+      status.json verification.manual_e2e. Path note: the deliverable
+      path assumes the folder is renamed to 005_ at PRD approval (next
+      free number after 004_); if numbering differs at save time, the
+      actual folder wins. The agent runs its own
+      observation commands (get_main_process_logs etc.) -- never asks the
+      user to paste logs. Restart requires explicit user permission per
+      repo rules.
+
+      Fulfills the end-to-end half of R1-R4; closes the PRD gate.
+    depends_on: ["1b", "2a", "2b"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "Cold-start named spawn produces a managed teammate (log-evidenced), not local_agent"
+      - "Chip, thread view, SendMessage, stop all function on the spawned teammate"
+      - "Post-restart rehydration works under the synthesized team name"
+      - "Un-named delegation control case unchanged (local_agent + 004 surfaces)"
+      - "Evidence recorded in status.json verification.manual_e2e"
+    files_affected:
+      - ".nimble/prds/005_agent-teams-cold-start-bootstrap/status.json (evidence only)"
+    deliverables:
+      - artifact: "Cold-start E2E evidence"
+        path: ".nimble/prds/005_agent-teams-cold-start-bootstrap/status.json"
+        done_when: "All five scenario steps evidenced; any upstream-limitation observation filed in section 6"

@@ -1,0 +1,28 @@
+{
+  "slug": "agent-teams-cold-start-bootstrap",
+  "status": "ready",
+  "created_at": "2026-08-27T00:00:00Z",
+  "approved_at": "2026-08-27T00:00:00Z",
+  "execution_mode": "feature-branch",
+  "base_branch": "main",
+  "no_pull_requests": true,
+  "tasks": {
+    "1a": { "status": "pending", "wave": 1, "complexity": 7 },
+    "1b": { "status": "pending", "wave": 2, "complexity": 4 },
+    "2a": { "status": "pending", "wave": 2, "complexity": 3 },
+    "2b": { "status": "pending", "wave": 3, "complexity": 3 },
+    "3a": { "status": "pending", "wave": 4, "complexity": 3 }
+  },
+  "gate": {
+    "after_wave": 2,
+    "status": "pending",
+    "notes": "Human review of 1a's gate/team-resolution diff plus any packages/electron/src/main/** touch from 2a's audit, before verification waves 3-4."
+  },
+  "verification": {
+    "typecheck": "PENDING",
+    "targeted_unit_tests": "PENDING",
+    "monorepo_test_prepush": "PENDING",
+    "manual_e2e": "PENDING (task 3a: cold-start named spawn -> managed teammate, chip/thread/SendMessage/stop, post-restart rehydration, un-named control case)"
+  },
+  "approval_note": "Approved non-interactively per commissioning instruction (user absent; decisions recorded in PRD section 6). Do not execute (/nimble:run) without explicit user instruction."
+}
