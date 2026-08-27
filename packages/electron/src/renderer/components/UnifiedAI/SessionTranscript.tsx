@@ -2521,20 +2521,17 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         >
           <div
             className="session-transcript-main-pane"
-            style={
-              hasOpenTaskTiles
-                ? {
-                    flex: 1,
-                    minWidth: 0,
-                    minHeight: 0,
-                    overflow: 'hidden',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    border: '1px solid var(--nim-border)',
-                    borderRadius: 6,
-                  }
-                : { flex: 1, minWidth: 0, overflow: 'hidden' }
-            }
+            style={{
+              flex: 1,
+              minWidth: 0,
+              minHeight: 0,
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              ...(hasOpenTaskTiles
+                ? { border: '1px solid var(--nim-border)', borderRadius: 6 }
+                : {}),
+            }}
           >
             {hasOpenTaskTiles && (
               // Matches TaskTileRail's own tile-header chrome, so a tiled
