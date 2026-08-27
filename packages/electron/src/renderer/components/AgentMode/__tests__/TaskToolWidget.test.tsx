@@ -1,8 +1,10 @@
 import React from 'react';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { getDefaultStore } from 'jotai';
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
 import { TaskToolWidget } from '../TaskToolWidget';
+import { openTaskInlineExpandAtomFamily } from '../../../store/atoms/agentMode';
 
 vi.mock('@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView', () => ({
   RichTranscriptView: ({ messages }: { messages: TranscriptViewMessage[] }) => (
@@ -97,5 +99,29 @@ describe('TaskToolWidget', () => {
     await waitFor(() =>
       expect(screen.getByText('No activity yet from this sub-agent.')).toBeDefined(),
     );
+  });
+
+  it('syncs its expand state into openTaskInlineExpandAtomFamily, keyed by toolUseId, for the chip row to read', () => {
+    const inlineExpandAtom = openTaskInlineExpandAtomFamily('session-1');
+    const store = getDefaultStore();
+
+    const { unmount, rerender } = renderWidget(false);
+    expect(store.get(inlineExpandAtom).has('toolu_task_1')).toBe(false);
+
+    rerender(
+      <TaskToolWidget
+        message={makeMessage()}
+        isExpanded={true}
+        onToggle={() => {}}
+        workspacePath="/workspace"
+        sessionId="session-1"
+      />,
+    );
+    expect(store.get(inlineExpandAtom).has('toolu_task_1')).toBe(true);
+
+    // Cleared on unmount too, so a message scrolled out of a virtualized list
+    // doesn't leave a stale dot lit on the chip.
+    unmount();
+    expect(store.get(inlineExpandAtom).has('toolu_task_1')).toBe(false);
   });
 });

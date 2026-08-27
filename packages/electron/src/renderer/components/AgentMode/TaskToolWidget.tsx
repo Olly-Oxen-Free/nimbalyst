@@ -11,12 +11,13 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useAtomValue } from 'jotai';
+import { useAtomValue, useSetAtom } from 'jotai';
 import { RichTranscriptView } from '@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView';
 import type { CustomToolWidgetProps } from '@nimbalyst/runtime/ui/AgentTranscript/components/CustomToolWidgets';
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
 import {
   sessionTasksAtom,
+  setTaskInlineExpandAtom,
   taskTranscriptSignalAtomFamily,
   taskTranscriptSignalKey,
 } from '../../store/atoms/agentMode';
@@ -80,6 +81,16 @@ export const TaskToolWidget: React.FC<CustomToolWidgetProps> = ({
       fetchGenerationRef.current += 1;
     };
   }, [fetchTranscript, isExpanded]);
+
+  // Lets the chip row's open-indicator dot reflect this widget's own expand
+  // state. Cleared on unmount too, so a message scrolled out of a virtualized
+  // list doesn't leave a stale dot lit.
+  const setInlineExpand = useSetAtom(setTaskInlineExpandAtom);
+  useEffect(() => {
+    if (!toolUseId) return;
+    setInlineExpand({ sessionId, toolUseId, expanded: isExpanded });
+    return () => setInlineExpand({ sessionId, toolUseId, expanded: false });
+  }, [setInlineExpand, sessionId, toolUseId, isExpanded]);
 
   // Live follow while expanded. The signal is keyed by taskId, which only the
   // session's task list maps back to this widget's toolUseId.

@@ -10,20 +10,26 @@ import { SubAgentChipRow, type SubAgentChipRowProps } from '../SubAgentChipRow';
 const testState = vi.hoisted(() => ({
   teammates: [] as TeammateInfo[],
   tasks: [] as TaskInfo[],
+  openTiles: [] as string[],
+  openInline: new Set<string>(),
 }));
 
-// Narrowest possible mock: only the two source atom families. The normalized
+// Narrowest possible mock: only the source atom families. The normalized
 // status mapping under test (subAgentStatus.ts) stays real.
 vi.mock('../../../store/atoms/agentMode', async () => {
   const { atom } = await import('jotai');
   const teammatesAtom = atom(() => testState.teammates);
   const tasksAtom = atom(() => testState.tasks);
   const signalAtom = atom(0);
+  const openTilesAtom = atom(() => testState.openTiles);
+  const openInlineAtom = atom(() => testState.openInline);
   return {
     sessionTeammatesAtom: () => teammatesAtom,
     sessionTasksAtom: () => tasksAtom,
     taskTranscriptSignalKey: (sessionId: string, taskId: string) => `${sessionId}:${taskId}`,
     taskTranscriptSignalAtomFamily: () => signalAtom,
+    openTaskTilesAtomFamily: () => openTilesAtom,
+    openTaskInlineExpandAtomFamily: () => openInlineAtom,
   };
 });
 
@@ -40,7 +46,7 @@ function teammate(name: string, status: TeammateInfo['status'], teamName = 'squa
   return { name, agentId: `agent-${name}`, teamName, agentType: 'general', status };
 }
 
-function task(description: string, status: TaskInfo['status'], lastToolName?: string): TaskInfo {
+function task(description: string, status: TaskInfo['status'], lastToolName?: string, toolUseId?: string): TaskInfo {
   return {
     taskId: `task-${description}`,
     description,
@@ -50,6 +56,7 @@ function task(description: string, status: TaskInfo['status'], lastToolName?: st
     tokenCount: 0,
     durationMs: 0,
     lastToolName,
+    toolUseId,
   };
 }
 
@@ -69,6 +76,8 @@ describe('SubAgentChipRow', () => {
   beforeEach(() => {
     testState.teammates = [];
     testState.tasks = [];
+    testState.openTiles = [];
+    testState.openInline = new Set();
   });
 
   afterEach(() => {
@@ -147,6 +156,41 @@ describe('SubAgentChipRow', () => {
       const triggers = container.querySelectorAll('.task-thread-popover-trigger');
       expect(triggers).toHaveLength(1);
       expect(triggers[0].contains(chips().find(c => c.dataset.kind === 'task')!)).toBe(true);
+    });
+
+    it('shows the open-indicator dot when the task is tiled', () => {
+      testState.tasks = [task('db-migration', 'blocked')];
+      testState.openTiles = ['task-db-migration'];
+
+      const { chips } = renderRow();
+      expect(chips()[0].dataset.open).toBe('true');
+      expect(chips()[0].querySelector('.sub-agent-chip-open-dot')).not.toBeNull();
+    });
+
+    it('shows the open-indicator dot when the task is inline-expanded, joined via toolUseId', () => {
+      testState.tasks = [task('db-migration', 'blocked', undefined, 'tool-abc')];
+      testState.openInline = new Set(['tool-abc']);
+
+      const { chips } = renderRow();
+      expect(chips()[0].dataset.open).toBe('true');
+    });
+
+    it('shows no open-indicator when neither surface has the task open', () => {
+      testState.tasks = [task('db-migration', 'blocked', undefined, 'tool-abc')];
+      testState.openTiles = ['task-some-other-task'];
+      testState.openInline = new Set(['tool-unrelated']);
+
+      const { chips } = renderRow();
+      expect(chips()[0].dataset.open).toBeUndefined();
+      expect(chips()[0].querySelector('.sub-agent-chip-open-dot')).toBeNull();
+    });
+
+    it('never shows the open-indicator on a teammate chip', () => {
+      testState.teammates = [teammate('code-reviewer', 'running')];
+      testState.openTiles = ['agent-code-reviewer']; // wrong id space on purpose
+
+      const { chips } = renderRow({ onTeammateClick: vi.fn() });
+      expect(chips()[0].dataset.open).toBeUndefined();
     });
   });
 });

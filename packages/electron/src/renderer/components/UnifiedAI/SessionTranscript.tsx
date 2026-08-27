@@ -114,7 +114,7 @@ import {
   MIN_CLI_TERMINAL_HEIGHT,
   MAX_CLI_TERMINAL_HEIGHT,
 } from '../../store/atoms/terminals';
-import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, sessionTeammatesAtom, toggleTaskTileAtom } from '../../store/atoms/agentMode';
+import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, sessionTeammatesAtom, toggleTaskTileAtom, openTaskTilesAtomFamily } from '../../store/atoms/agentMode';
 import { TaskTileRail } from '../AgentMode/TaskTileRail';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, defaultThinkingModeAtom, chatShowToolCallsAtom, developerModeAtom } from '../../store/atoms/appSettings';
@@ -2283,6 +2283,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     toggleTaskTile({ sessionId, taskId });
   }, [toggleTaskTile, sessionId]);
 
+  // Whether any Task tile is open beside the main thread right now. Drives
+  // the main thread's own pane chrome below - when nothing is tiled, the
+  // layout stays exactly as it was before this feature (no border, no
+  // header), so a session that never uses tiling sees no difference at all.
+  const hasOpenTaskTiles = useAtomValue(openTaskTilesAtomFamily(sessionId)).length > 0;
+
   // Scroll-to-message: when PromptQuickOpen selects a prompt, scroll to the
   // matching user message by timestamp.
   const scrollToMessage = useAtomValue(scrollToMessageAtom);
@@ -2513,9 +2519,34 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
                 : 0,
           }}
         >
-          <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
-            <AgentTranscriptPanel
-              ref={transcriptPanelRef}
+          <div
+            className="session-transcript-main-pane"
+            style={
+              hasOpenTaskTiles
+                ? {
+                    flex: 1,
+                    minWidth: 0,
+                    minHeight: 0,
+                    overflow: 'hidden',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    border: '1px solid var(--nim-border)',
+                    borderRadius: 6,
+                  }
+                : { flex: 1, minWidth: 0, overflow: 'hidden' }
+            }
+          >
+            {hasOpenTaskTiles && (
+              // Matches TaskTileRail's own tile-header chrome, so a tiled
+              // view reads as two threads open side by side rather than
+              // "the main thread got smaller and a box appeared next to it."
+              <div className="session-transcript-main-pane-header flex items-center h-[30px] shrink-0 px-2.5 border-b border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[11px] text-[var(--nim-text-faint)]">
+                Main thread
+              </div>
+            )}
+            <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+              <AgentTranscriptPanel
+                ref={transcriptPanelRef}
               sessionId={sessionId}
               sessionData={sessionData}
               todos={todos}
@@ -2562,7 +2593,8 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
               currentPhase={currentPhase}
               phaseColumns={SESSION_PHASE_COLUMNS}
               onSetPhase={handleSetPhase}
-            />
+              />
+            </div>
           </div>
           <TaskTileRail sessionId={sessionId} />
         </div>

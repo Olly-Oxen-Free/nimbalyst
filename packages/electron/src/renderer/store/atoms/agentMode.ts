@@ -291,6 +291,33 @@ export const closeTaskTileAtom = atom(
   }
 );
 
+/**
+ * Per-session set of `toolUseId`s whose inline-expand widget (`TaskToolWidget`,
+ * rendered inside the spawning message, not the chip row) is currently open.
+ *
+ * Keyed by `toolUseId` rather than `taskId`: `TaskToolWidget` lives inside
+ * `RichTranscriptView`'s tool-card rendering, where a Task tool_use block's own
+ * id is naturally at hand but the correlated `taskId` isn't. The chip row
+ * already has both (via `sessionTasksAtom`'s `TaskInfo.toolUseId`), so it can
+ * join on this id space instead of a second one.
+ */
+export const openTaskInlineExpandAtomFamily = atomFamily((_sessionId: string) =>
+  atom<ReadonlySet<string>>(new Set<string>())
+);
+
+/** Write-only: `TaskToolWidget` calls this as its own `isExpanded` prop
+ *  changes, so the chip row's open-indicator dot can reflect it. */
+export const setTaskInlineExpandAtom = atom(
+  null,
+  (get, set, { sessionId, toolUseId, expanded }: { sessionId: string; toolUseId: string; expanded: boolean }) => {
+    const current = get(openTaskInlineExpandAtomFamily(sessionId));
+    if (expanded === current.has(toolUseId)) return;
+    const next = new Set(current);
+    if (expanded) next.add(toolUseId); else next.delete(toolUseId);
+    set(openTaskInlineExpandAtomFamily(sessionId), next);
+  }
+);
+
 /** Task info from SDK-native sub-agents (task_started/task_progress/task_notification) */
 export interface TaskInfo {
   taskId: string;

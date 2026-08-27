@@ -22,7 +22,12 @@
 
 import React, { useCallback, useMemo } from 'react';
 import { useAtomValue } from 'jotai';
-import { sessionTeammatesAtom, sessionTasksAtom } from '../../store/atoms/agentMode';
+import {
+  sessionTeammatesAtom,
+  sessionTasksAtom,
+  openTaskTilesAtomFamily,
+  openTaskInlineExpandAtomFamily,
+} from '../../store/atoms/agentMode';
 import {
   mapTaskStatus,
   mapTeammateStatus,
@@ -96,9 +101,13 @@ interface SubAgentChipProps {
    *  `e.currentTarget` regardless of whether the click came from a pointer or
    *  a keyboard activation. */
   onClick?: (e: React.SyntheticEvent<HTMLDivElement>) => void;
+  /** True when this task's transcript is currently open somewhere persistent
+   *  (a tile, or the inline-expand widget) - not the transient hover popover,
+   *  which is already its own visual affordance while it's showing. */
+  isOpen?: boolean;
 }
 
-const SubAgentChip: React.FC<SubAgentChipProps> = React.memo(({ label, status, kind, onClick }) => {
+const SubAgentChip: React.FC<SubAgentChipProps> = React.memo(({ label, status, kind, onClick, isOpen }) => {
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     if (onClick && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
@@ -113,14 +122,21 @@ const SubAgentChip: React.FC<SubAgentChipProps> = React.memo(({ label, status, k
   return (
     <div
       {...interactive}
-      className={`sub-agent-chip inline-flex items-center gap-[5px] h-[25px] shrink-0 px-2 rounded-[5px] border text-[11px] font-medium leading-none whitespace-nowrap ${STATUS_CLASSES[status]} ${onClick ? 'cursor-pointer' : ''}`}
+      className={`sub-agent-chip relative inline-flex items-center gap-[5px] h-[25px] shrink-0 px-2 rounded-[5px] border text-[11px] font-medium leading-none whitespace-nowrap ${STATUS_CLASSES[status]} ${onClick ? 'cursor-pointer' : ''}`}
       data-status={status}
       data-kind={kind}
-      aria-label={`${label} — ${status}`}
+      data-open={isOpen ? 'true' : undefined}
+      aria-label={isOpen ? `${label} — ${status} — thread open` : `${label} — ${status}`}
       // Task chips get a hover popover carrying the same facts; a native
       // tooltip on top of it would just be noise.
       title={kind === 'task' ? undefined : `${label} — ${status}`}
     >
+      {isOpen && (
+        <span
+          className="sub-agent-chip-open-dot absolute -top-[3px] -right-[3px] w-[7px] h-[7px] rounded-full bg-[var(--nim-primary)] border border-[var(--nim-bg)]"
+          aria-hidden="true"
+        />
+      )}
       <span className="sub-agent-chip-icon inline-flex shrink-0 items-center justify-center w-3 h-3">
         {STATUS_ICONS[status]}
       </span>
@@ -141,6 +157,9 @@ interface SubAgentChipEntry {
   status: SubAgentStatus;
   /** Task entries only - shown in the hover popover's header. */
   lastToolName?: string;
+  /** Task entries only - joins tile-open state to inline-expand-open state
+   *  (see openTaskInlineExpandAtomFamily's doc comment for why). */
+  toolUseId?: string;
 }
 
 export interface SubAgentChipRowProps {
@@ -184,8 +203,12 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
       label: t.description,
       status: mapTaskStatus(t.status),
       lastToolName: t.lastToolName,
+      toolUseId: t.toolUseId,
     })),
   ], [allTeammates, tasks]);
+
+  const openTiles = useAtomValue(openTaskTilesAtomFamily(sessionId));
+  const openInline = useAtomValue(openTaskInlineExpandAtomFamily(sessionId));
 
   const handleChipClick = useCallback((entry: SubAgentChipEntry, e: React.SyntheticEvent<HTMLDivElement>) => {
     if (entry.kind === 'teammate') {
@@ -212,12 +235,17 @@ export const SubAgentChipRow: React.FC<SubAgentChipRowProps> = React.memo(({
         aria-label="Sub-agent status"
       >
         {entries.map(entry => {
+          const isOpen = entry.kind === 'task' && (
+            openTiles.includes(entry.id)
+            || (entry.toolUseId != null && openInline.has(entry.toolUseId))
+          );
           const chip = (
             <SubAgentChip
               label={entry.label}
               status={entry.status}
               kind={entry.kind}
               onClick={hasClickHandler ? (e) => handleChipClick(entry, e) : undefined}
+              isOpen={isOpen}
             />
           );
           if (entry.kind !== 'task') {
