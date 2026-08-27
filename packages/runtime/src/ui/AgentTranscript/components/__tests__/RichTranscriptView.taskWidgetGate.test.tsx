@@ -104,6 +104,19 @@ describe('RichTranscriptView Task widget gate', () => {
     expect(container.querySelector('.rich-transcript-tool-card.teammate')).not.toBeNull();
   });
 
+  // Task 1a's synthetic tool-pair for a name-only spawn: tool_use name stays
+  // 'Task', args carry `name` but no `team_name`. isTeammate must still key off
+  // `teammateName` alone (RichTranscriptView.tsx:1756's `||`), so this must not
+  // fall through to the registered Task widget.
+  it('routes a name-only spawn (no team_name) to the teammate card, not the widget', () => {
+    const { container } = renderTranscript(
+      makeTaskMessage({ teammateName: 'Ada', teammateMode: 'implementer' } as any),
+    );
+
+    expect(container.querySelector('[data-testid="stub-task-widget"]')).toBeNull();
+    expect(container.querySelector('.rich-transcript-tool-card.teammate')).not.toBeNull();
+  });
+
   // The live SDK calls the spawn tool `Agent`, not `Task` — this is the real
   // shape a name-less delegation arrives in, distinct from the synthetic
   // 'Task'-named teammate pair kept by task 1a.
