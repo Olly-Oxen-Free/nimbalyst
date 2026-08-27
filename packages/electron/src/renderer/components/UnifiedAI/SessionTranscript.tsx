@@ -2284,8 +2284,13 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   // tiled, the layout stays exactly as it was before this feature (no
   // border, no header), so a session that never uses tiling sees no
   // difference at all.
-  const hasOpenTaskTiles = useAtomValue(openTaskTilesAtomFamily(sessionId)).length > 0
-    || useAtomValue(openTeammateTilesAtomFamily(sessionId)).length > 0;
+  // Both useAtomValue calls must run every render, unconditionally -- `||`
+  // short-circuits, so folding them into one expression made the second call
+  // conditional on the first's truthiness and violated the Rules of Hooks
+  // (crashed with "Should have a queue" whenever open-tile count crossed zero).
+  const hasOpenTasks = useAtomValue(openTaskTilesAtomFamily(sessionId)).length > 0;
+  const hasOpenTeammates = useAtomValue(openTeammateTilesAtomFamily(sessionId)).length > 0;
+  const hasOpenTaskTiles = hasOpenTasks || hasOpenTeammates;
 
   // Scroll-to-message: when PromptQuickOpen selects a prompt, scroll to the
   // matching user message by timestamp.
