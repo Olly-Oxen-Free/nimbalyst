@@ -47,6 +47,8 @@ export interface IdleTeammate {
   cwd: string;
   prompt: string;        // original prompt
   startedAt?: number;    // epoch ms when originally spawned (preserved across idle)
+  toolCallCount?: number; // count of tool_use blocks observed during the run that just finished
+  lastActiveAt?: number;  // epoch ms of most recent chunk during that run
 }
 
 /**
@@ -63,6 +65,7 @@ interface PersistedTeammateRow {
   model?: string;
   startedAt?: number;
   sessionId?: string;
+  toolCallCount?: number;
 }
 
 /**
@@ -1330,6 +1333,7 @@ export class TeammateManager {
       cwd: this.lastUsedCwd || process.cwd(),
       prompt: '',
       startedAt: entry.startedAt,
+      toolCallCount: entry.toolCallCount,
     };
   }
 
@@ -1459,9 +1463,12 @@ export class TeammateManager {
           // is still open.
           return { ...tm, ...activityFields, status: this.statusForManaged(tm.agentId) };
         } else if (this.idleTeammates.has(tm.agentId)) {
+          const idleInfo = this.idleTeammates.get(tm.agentId);
           return {
             ...tm,
-            sessionId: this.idleTeammates.get(tm.agentId)?.sessionId ?? tm.sessionId,
+            sessionId: idleInfo?.sessionId ?? tm.sessionId,
+            toolCallCount: idleInfo?.toolCallCount,
+            lastActiveAt: idleInfo?.lastActiveAt,
             status: 'idle' as const,
           };
         }
@@ -1495,6 +1502,8 @@ export class TeammateManager {
             status: statusOverrides?.has(agentId) ? statusOverrides.get(agentId)! : 'idle',
             model: tm.model,
             startedAt: tm.startedAt,
+            toolCallCount: tm.toolCallCount,
+            lastActiveAt: tm.lastActiveAt,
             sessionId: tm.sessionId,
           });
         }
@@ -1544,6 +1553,8 @@ export class TeammateManager {
       this.idleTeammates.set(agentId, {
         ...idleTemplate,
         sessionId: result.capturedSessionId,
+        toolCallCount: managed?.toolCallCount ?? 0,
+        lastActiveAt: managed?.lastActiveAt,
       });
       console.log(`[MANAGED-TEAMMATE] "${agentId}" idle (session=${result.capturedSessionId})`);
       this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'idle']]));
@@ -2082,7 +2093,7 @@ export class TeammateManager {
       wasResumed: true,
       startedAt: idleInfo.startedAt ?? now,
       lastActiveAt: now,
-      toolCallCount: 0,
+      toolCallCount: idleInfo.toolCallCount ?? 0,
     });
 
     streamPromise.then((result) => {
@@ -2098,7 +2109,7 @@ export class TeammateManager {
 
   killAll(): void {
     this.flushPendingEmit();
-    const allAgentIds: string[] = [];
+    const overrides = new Map<string, 'errored' | 'completed'>();
 
     if (this.managedTeammates.size > 0) {
       console.log(`[MANAGED-TEAMMATE] Killing ${this.managedTeammates.size} running teammate(s)`);
@@ -2106,7 +2117,7 @@ export class TeammateManager {
         console.log(`[MANAGED-TEAMMATE] Aborting "${agentId}"`);
         tm.abort.abort();
         if (!tm.isBackgroundAgent) void this.removeTeammateFromConfig(tm.teamName, agentId);
-        allAgentIds.push(agentId);
+        overrides.set(agentId, 'errored');
       }
       this.managedTeammates.clear();
     }
@@ -2116,7 +2127,7 @@ export class TeammateManager {
       for (const [agentId, idleInfo] of this.idleTeammates.entries()) {
         console.log(`[MANAGED-TEAMMATE] Removing idle teammate "${agentId}"`);
         void this.removeTeammateFromConfig(idleInfo.teamName, agentId);
-        allAgentIds.push(agentId);
+        overrides.set(agentId, 'completed');
       }
       this.idleTeammates.clear();
     }
@@ -2126,8 +2137,7 @@ export class TeammateManager {
     this.completedTeammates.clear();
     this.handledShutdownToolUseIds.clear();
 
-    if (allAgentIds.length > 0 && this.lastUsedSessionId) {
-      const overrides = new Map(allAgentIds.map(id => [id, 'errored' as const]));
+    if (overrides.size > 0 && this.lastUsedSessionId) {
       // Immediate emit for killAll - no debounce since we're tearing down
       this.emitTeammateUpdate(this.lastUsedSessionId, overrides).catch(err => {
         console.error('[CLAUDE-CODE] Failed to emit teammate kill update:', err);
