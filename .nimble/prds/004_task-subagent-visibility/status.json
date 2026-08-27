@@ -1,6 +1,6 @@
 {
   "slug": "task-subagent-visibility",
-  "status": "ready-for-merge",
+  "status": "merged",
   "created_at": "2026-08-26T00:00:00Z",
   "execution_mode": "feature-branch",
   "feature_branch": "feature/task-subagent-visibility",
@@ -64,7 +64,7 @@
     "typecheck": "PASS (23/23 workspaces, verified by PM in main repo after each of the three wave-4/5 merges)",
     "targeted_unit_tests": "PASS",
     "monorepo_test_prepush": "PASS (10731 passed / 6 failed, both pre-existing/whitelisted: AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx -- verified by PM directly on the merged feature branch at 3748e5197, not from worker self-reports)",
-    "manual_e2e": "PENDING -- tiling pane (2c) layout has not been visually verified against the approved mockup in a running app; automated tests (TaskTileRail.test.tsx) cover structure/state only (open, multi-tile-concurrent, main-thread-priority-cap, stay-open-on-completion), not visual rendering. Required before this PRD is considered fully done, per PRD 002's retrospective gap."
+    "manual_e2e": "FOUND_BUG_FIXED -- local_agent tasks never populated toolUseId at task_started; backfilled from tool_progress in a7c48f409"
   },
   "approved_at": "2026-08-26T00:00:00Z",
   "ready_for_merge_at": "2026-08-26T17:25:04Z"
