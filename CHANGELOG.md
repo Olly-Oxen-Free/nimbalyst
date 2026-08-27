@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 <!-- Bug fixes go here -->
 - Teammates that failed after being resumed from idle now reliably wake your conversation with the failure, instead of silently going quiet, including after a Nimbalyst restart.
+- Asking Claude to spawn a named agent now correctly creates an addressable teammate you can message directly, instead of silently falling back to an anonymous one-shot sub-agent.
 
 ### Removed
 <!-- Removed features go here -->

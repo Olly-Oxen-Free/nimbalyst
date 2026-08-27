@@ -1,6 +1,6 @@
 {
   "slug": "agent-teams-cold-start-bootstrap",
-  "status": "paused-at-gate",
+  "status": "ready-for-merge",
   "created_at": "2026-08-27T00:00:00Z",
   "approved_at": "2026-08-27T00:00:00Z",
   "execution_mode": "feature-branch",
@@ -28,26 +28,84 @@
       "commit": "b7baf391e",
       "notes": "TaskToolWidget registered for both 'Task' and 'Agent' keys in AgentMode.tsx. Audit found one additional site not fixed: packages/electron/src/main/services/ai/claudeCliSubAgentTracker.ts (TASK_TOOL_NAME = 'Task', main-process file) -- left unedited pending gate review since it's an unverified main-process behavioral question, not a confirmed no-op like ClaudeSettingsManager.ts."
     },
-    "2b": { "status": "pending", "wave": 3, "complexity": 3 },
-    "3a": { "status": "pending", "wave": 4, "complexity": 3 }
+    "2b": {
+      "status": "done",
+      "wave": 3,
+      "complexity": 3,
+      "commit": "7c689332b",
+      "merge_commit": "38ca6acea",
+      "notes": "Added a name-only spawn fixture (tool_use name 'Task', args.name present, no team_name) to the existing RichTranscriptView.taskWidgetGate.test.tsx, asserting it renders the teammate card and not TaskToolWidget. Confirmed the 'Agent'-keyed name-less/name-carrying fixtures already added by 2a were present and green (no new fixture needed for that half). Diff scoped to exactly one file under packages/runtime/src/ui/AgentTranscript/components/__tests__/; no packages/electron/src/main/** file touched (boundary respected, confirmed by PM diff check against feature branch before merge). No renderer source change was needed -- the discriminator held as expected. PM independently re-ran typecheck (23/23 workspaces pass) and test:prepush (6 failed / 10753 passed / 26 skipped) after merging into feature/agent-teams-cold-start-bootstrap; failures are exactly the 2 known pre-existing exclusions, nothing new."
+    },
+    "3a": {
+      "status": "done",
+      "wave": 4,
+      "complexity": 3,
+      "notes": "Completed in the brief's honest fallback mode: verification script prepared, execution AWAITING_USER_EXECUTION -- not live-executed. Mechanism check (per brief's 'Mechanism check first' section): the PM's own tool list for this run contains no MCP tool capable of originating/submitting a live chat prompt into the running Nimbalyst app (no get_main_process_logs/get_renderer_debug_logs/database_query/renderer_eval-equivalent prompt-submission tool, and no nimbalyst-extension-dev MCP server tools at all were present this session); submitChatPrompt is documented as a Playwright E2E helper only, not ad-hoc callable. NIMBLE worker agent types (nimble-implementer/tester/documenter) are scoped to Read/Write/Edit/Bash/Glob/Grep only -- strictly less tool access than the PM, so delegating to a worker would not have produced a real mechanism either. Per the brief's explicit instruction, this is a legitimate complete outcome, not a failure: the five-step scenario was written into verification.manual_e2e as a ready-to-follow script rather than executed evidence."
+    }
   },
   "gate": {
     "after_wave": 2,
     "status": "reached",
     "reached_at": "2026-08-27T08:30:00Z",
-    "notes": "Human review of 1a's gate/team-resolution diff plus any packages/electron/src/main/** touch from 2a's audit, before verification waves 3-4.",
+    "cleared_by_user_at": "2026-08-27T09:00:00Z",
+    "notes": "Human review of 1a's gate/team-resolution diff plus any packages/electron/src/main/** touch from 2a's audit, before verification waves 3-4. User approved continuing into waves 3-4 after review, noting the additional post-gate fix in commit a24626f1a (syncAgentTeamsFlag wiring) as the current true state of the spawn-gate fix.",
     "open_items_for_human_review": [
       "1a's team-resolution order and synthesis logic (TeammateManager.ts) -- the PRD's single most behavior-changing edit.",
-      "2a's audit finding: packages/electron/src/main/services/ai/claudeCliSubAgentTracker.ts:29/67 (TASK_TOOL_NAME = 'Task') was NOT touched -- unverified whether the CLI raw-proxy sub-agent tracker's wire protocol also renamed Task->Agent. No packages/electron/src/main/** file was modified in waves 1-2 (confirmed by PM diff check against dd5d0d468).",
+      "2a's audit finding: packages/electron/src/main/services/ai/claudeCliSubAgentTracker.ts:29/67 (TASK_TOOL_NAME = 'Task') was NOT touched -- unverified whether the CLI raw-proxy sub-agent tracker's wire protocol also renamed Task->Agent. No packages/electron/src/main/** file was modified in waves 1-2 (confirmed by PM diff check against dd5d0d468). Still open/unresolved as of the end of wave 4 -- not in this PRD's scope, carried forward as a follow-up candidate.",
       "FIXED during gate review (not by a wave task): TeammateManager.enableAgentTeams (added by 1a) was never assigned anywhere -- ClaudeCodeProvider computed the equivalent value inline (line 834) but only passed it to buildSystemPrompt, never to teammateManager.enableAgentTeams. The gate's `legacyTeamName || this.enableAgentTeams` condition was permanently false for any fresh, name-only spawn -- the exact bug this PRD exists to fix was still live on the merged wave-2 branch. Fixed in commit a24626f1a: extracted syncAgentTeamsFlag(settingsEnv) so the wiring is directly unit-tested (ClaudeCodeProvider.agentTeamsFlag.test.ts, 3 tests) without invoking the full sendMessage generator. Caught by gate review, not by any task's own tests -- worth noting for future PRDs that a new cross-class property needs an explicit 'is it actually assigned' check, not just 'is it correctly read'."
     ]
   },
   "verification": {
-    "typecheck": "PASS (independently re-run by PM after merge, all 23 workspaces ok)",
-    "targeted_unit_tests": "PASS (all task-level targeted test files reported green by workers; PM independently re-derived 1a's red-to-green transition)",
-    "monorepo_test_prepush": "PASS with 2 known pre-existing exclusions (AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx -- jsdom localStorage undefined, unrelated to this PRD; 1342/1344 test files, 10749/10755 tests pass, 6 failures all within the 2 excluded files). Re-run independently by PM after merging waves 1-2 into feature/agent-teams-cold-start-bootstrap.",
-    "manual_e2e": "PENDING (task 3a: cold-start named spawn -> managed teammate, chip/thread/SendMessage/stop, post-restart rehydration, un-named control case) -- NOT RUN, waves 3-4 deferred pending human review of this gate"
+    "typecheck": "PASS (independently re-run by PM after merging wave 3/task 2b into feature/agent-teams-cold-start-bootstrap at commit 38ca6acea; all 23 workspaces ok)",
+    "targeted_unit_tests": "PASS (all task-level targeted test files reported green by workers; PM independently re-derived 1a's red-to-green transition; 2b's new fixture independently confirmed present and passing as part of the full suite run below)",
+    "monorepo_test_prepush": "PASS with 2 known pre-existing exclusions (AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx -- jsdom localStorage undefined, unrelated to this PRD). Latest run (after merging task 2b, feature branch commit 38ca6acea): 1343 test files passed / 2 failed (1352 total, 7 skipped); 10753 tests passed / 6 failed / 26 skipped (10785 total). All 6 failures are within the 2 excluded files, nothing new. Re-run independently by PM.",
+    "manual_e2e": {
+      "status": "AWAITING_USER_EXECUTION",
+      "prepared_by": "PM agent, 2026-08-27",
+      "mechanism_check": "FAILED (no automated mechanism available): the PM has no tool capable of submitting/originating a live chat prompt into the running Nimbalyst app this session -- only observation tools would exist if present (main-process/renderer log access, database query, renderer eval), and none of those, nor any chat-prompt-submission tool, were available in this session's tool list. submitChatPrompt is a Playwright E2E helper only (docs/E2E_TESTING.md:538), not ad-hoc callable. NIMBLE worker agent types have strictly less tool access than the PM (Read/Write/Edit/Bash/Glob/Grep only), so delegating would not help. Per this task's brief, this is the correct, complete outcome: script prepared, not executed.",
+      "pre_check_observation": "~/.claude/teams/ was checked on 2026-08-27 and contains 3 existing session directories (session-23bec2b3, session-483d64a8, session-a40e18de) -- NOT exactly one, so TeammateManager's directory-fallback rehydration branch (resolveTeamContextFromClaudeDirectories, fires only when exactly one directory exists) would not currently mask a cold-start test. This state is dynamic -- re-check at execution time, since prior/concurrent sessions may add or remove directories before the user runs this script. Do not delete any of these directories automatically; they may contain real session state (repo destructive-data-paths rule).",
+      "script": [
+        {
+          "step": 1,
+          "name": "Cold-start named spawn",
+          "action": "In a FRESH session with no prior team history, submit the prompt: \"spawn an agent named git-scout to get the most recent git commit\"",
+          "verify": "Pull main.log via get_main_process_logs. Confirm it shows TEAM-CONTEXT / MANAGED-TEAMMATE bracketed log lines from TeammateManager.ts. Confirm it does NOT show 'SUBAGENT_TASK started: type=local_agent' (the old failure signature).",
+          "pass_if": "TEAM-CONTEXT/MANAGED-TEAMMATE lines present AND no 'SUBAGENT_TASK started: type=local_agent' line for this spawn.",
+          "fail_if_reached": "If this step fails (still shows local_agent path), STOP -- do not proceed to steps 2-5. Record the failure and flag that 1a's landed fix is broken in a way its own unit tests didn't catch. This would be a genuine PRD-blocking finding."
+        },
+        {
+          "step": 2,
+          "name": "UI surfaces",
+          "action": "After step 1's spawn, look at the running app UI.",
+          "verify": "Confirm a teammate chip appears. Open the thread view and confirm it shows a live transcript (PRD 002 surface), not a plain sub-agent inline-expand.",
+          "pass_if": "Chip present, thread view opens and shows live transcript content."
+        },
+        {
+          "step": 3,
+          "name": "SendMessage round-trip",
+          "action": "Message the spawned teammate ('git-scout') from the lead session.",
+          "verify": "Observe delivery in logs/UI. Observe whether the teammate's reply reaches the lead.",
+          "pass_if": "Message delivered to the teammate.",
+          "note": "If the teammate's reply does not reach the lead due to the upstream asymmetric-SendMessage limitation (anthropics/claude-code#48160, Q2 in the PRD), document the observed behavior but do NOT fail this step on it -- that limitation is outside Nimbalyst's control. Only fail this step if Nimbalyst's own delivery-to-teammate routing does not work."
+        },
+        {
+          "step": 4,
+          "name": "Stop + resume",
+          "action": "Use the stop control on the teammate; confirm it works. ASK THE USER FOR EXPLICIT PERMISSION before calling restart_nimbalyst or any equivalent restart action -- do not restart unilaterally. After restart (once permitted), observe whether the teammate resumes/rehydrates.",
+          "verify": "Stop control functions. Post-restart, teammate rehydrates under the SAME synthesized team name it used before restart (this is what task 1b's unit test proved in isolation -- this step proves it live).",
+          "pass_if": "Stop works; post-restart rehydration occurs under the same synthesized team name."
+        },
+        {
+          "step": 5,
+          "name": "Control case -- un-named delegation",
+          "action": "Issue an UN-NAMED delegation request (no name in the prompt), e.g. \"look up the most recent git commit\" with no agent name specified.",
+          "verify": "Confirm it still produces the plain local_agent path and PRD 004's chip/popover surfaces -- i.e. confirm nothing in this PRD broke the existing, correct anonymous-dispatch behavior.",
+          "pass_if": "local_agent path used, PRD 004 chip/popover surfaces render, no teammate card/thread view for this dispatch."
+        }
+      ],
+      "recording_instructions": "When the user (or a future session with real prompt-submission access) executes this script, record redacted log excerpts and explicit pass/fail per step back into this same manual_e2e field, and update this field's top-level status from AWAITING_USER_EXECUTION to PASS or FAIL accordingly."
+    }
   },
   "approval_note": "Approved non-interactively per commissioning instruction (user absent; decisions recorded in PRD section 6). Do not execute (/nimble:run) without explicit user instruction.",
-  "execution_note": "Waves 1-2 executed 2026-08-27 by PM agent per explicit user instruction limited to waves 1-2. Stopped at the after_wave:2 gate as designed. Waves 3-4 (2b, 3a) require a separate follow-on run after human review of the gate's open items."
+  "execution_note": "Waves 1-2 executed 2026-08-27 by PM agent per explicit user instruction limited to waves 1-2, stopping at the after_wave:2 gate as designed. User reviewed the gate and approved continuing into waves 3-4 (this same day), noting the additional a24626f1a spawn-gate wiring fix landed during gate review. Waves 3-4 (2b, 3a) executed 2026-08-27 by PM agent: 2b's rendering-discriminator regression coverage merged into feature/agent-teams-cold-start-bootstrap and independently re-verified (typecheck + full test:prepush) by the PM after merge. 3a's live E2E could not be executed live (no prompt-submission mechanism available to the PM or any spawnable worker this session) -- per the brief's explicit fallback instructions, a ready-to-follow five-step verification script was prepared into verification.manual_e2e with status AWAITING_USER_EXECUTION instead of faking or skipping it. PRD status set to ready-for-merge on the feature branch; no PR created and no merge to main performed by the PM, per repo/PRD standing constraints -- final merge-to-main decision left to the user."
 }
