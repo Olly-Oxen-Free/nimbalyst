@@ -1,0 +1,21 @@
+prd_slug: "teammate-wake-transcript-integration"
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    note: "Root fix: thread teammate-origin marker through the canonical transcript pipeline (Bug A+B foundation)"
+  - wave: 2
+    tasks: ["1b"]
+    note: "Bug C revival grounding -- independent of 1a logically, sequenced after it for TeammateManager.ts file-conflict safety in the shared checkout"
+  - wave: 3
+    tasks: ["2a"]
+    note: "Bug A: stop labeling teammate wake turns as 'You', depends on 1a's marker"
+  - wave: 4
+    tasks: ["2b"]
+    note: "Bug B: condense wake message + shutdown-handshake plumbing into one card, depends on 1a's marker, sequenced after 2a for RichTranscriptView.tsx file-conflict safety"
+  - wave: 5
+    tasks: ["3a"]
+    note: "CHANGELOG bullet, after all behavior changes land"
+longest_chain: ["1a", "2a", "2b", "3a"]
+total_complexity: 20
+max_parallel: 1
+note: "worktree-free-local cadence (no PRs, no git worktrees): all tasks edit the main checkout on feature/teammate-wake-transcript-integration sequentially, one at a time, coordinator commits per task. No true parallel waves in this PRD -- every wave is single-task, sequenced for logical dependency and/or file-conflict safety."

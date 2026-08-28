@@ -1,0 +1,19 @@
+{
+  "slug": "teammate-wake-transcript-integration",
+  "phase": "planned",
+  "created": "2026-08-28",
+  "status": "executing",
+  "notes": "Coordinator running autonomously (user pre-approved all gates this session; interview conducted from the user's own confirmed root-cause brief -- no interactive Q&A possible in this harness). Research internal-only, done via nimble-researcher (agent a162213d76755cd12) plus direct coordinator verification of one unresolved architectural question: which transcript pipeline feeds the desktop mainline RichTranscriptView. Resolved: SessionManager.loadSession uses the canonical ai_transcript_events/ClaudeCodeRawParser pipeline; SessionManager.transformAgentMessagesToUI (the regex-tagging isTeammateMessage path RichTranscriptView's existing collapse checks) is iOS-only and dead on desktop. This resolution is recorded in the PRD's Research section and threaded into every task brief so no task fixes the wrong pipeline. Execution rule: NO PRs ever; worktree-free-local cadence (PRD 006/007/008 precedent); coordinator runs typecheck+test:prepush itself per task with visible output (never trusts a worker's claim -- known stall pattern this session); final git merge --ff-only to main per explicit session instruction (not stopping at ready-for-merge for user action, unlike PRD 006-008).",
+  "prd_number": "009",
+  "tasks_total": 5,
+  "waves": 5,
+  "execution_mode": "feature-branch",
+  "feature_branch": "feature/teammate-wake-transcript-integration",
+  "tasks": {
+    "1a": { "state": "pending" },
+    "1b": { "state": "pending" },
+    "2a": { "state": "pending" },
+    "2b": { "state": "pending" },
+    "3a": { "state": "pending" }
+  }
+}

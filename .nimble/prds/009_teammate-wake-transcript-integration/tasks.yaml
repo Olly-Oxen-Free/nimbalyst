@@ -1,0 +1,199 @@
+metadata:
+  prd_slug: "teammate-wake-transcript-integration"
+  created_at: "2026-08-28T00:00:00Z"
+  total_complexity: 20
+  task_count: 5
+
+tasks:
+  - id: "1a"
+    title: "Thread a teammate-origin marker through the canonical transcript pipeline"
+    description: |
+      Root fix for Bug A/B. The desktop mainline is fed by SessionManager.loadSession ->
+      loadCanonicalTranscript -> ai_transcript_events, parsed by ClaudeCodeRawParser /
+      TranscriptTransformer -- NOT by the iOS-only SessionManager.transformAgentMessagesToUI
+      (confirmed dead on desktop by loadSession's own comment at :1056-1058). Do not touch the
+      iOS-only path.
+
+      Thread a new, explicit origin marker (do not derive it by regex-sniffing message content
+      downstream) from the two call sites that inject a teammate wake message while the lead is
+      idle -- TeammateManager.deliverMessageToLead (:1202-1244) and deliverRevivalFailure
+      (:1263-1309), both via interruptWithMessage -> ClaudeCodeProvider.emitTeammateMessageWhileIdle
+      -> MessageStreamingHandler.ts onTeammateMessageWhileIdle (:1092-1170), which currently calls
+      sendMessageHandler!(mockEvent, data.message, {} as any, data.sessionId, effectiveWorkspacePath)
+      -- through sendMessageHandler (signature at AIService.ts:219; documentContext is a typed
+      object, add a new optional parameter rather than overloading it), down to wherever the raw
+      ai_agent_messages row gets written, and forward it into the canonical
+      ClaudeCodeRawParser/TranscriptTransformer event so the resulting message carries a
+      machine-checkable marker (e.g. metadata.teammateOrigin: {agentId, teammateName, kind:
+      'wake-message' | 'revival-failed'}) distinct for deliverMessageToLead vs deliverRevivalFailure.
+
+      Handle batching: emitTeammateMessageWhileIdle / drainAndFormatPendingTeammateMessages may
+      coalesce multiple queued teammate messages into one delivered string before it reaches
+      sendMessageHandler -- read that code path and ensure the marker survives or applies correctly
+      whether one or several teammate messages are coalesced into a single delivered turn.
+
+      Nearest prior art: messageType: 'teammate_message_injected' at ClaudeCodeProvider.ts:956 and
+      :1870 -- a different (active-lead mid-turn) call path, but the closest existing precedent for
+      how origin metadata is threaded into a written message today; read both sites before design.
+
+      Do NOT modify SessionManager.transformAgentMessagesToUI, its isTeammateMessage regex tagging,
+      or RichTranscriptView's existing :2107-2148 collapse gating in this task -- those are iOS-only
+      / consumed by tasks 2a/2b respectively.
+
+      Tests: red-first, unit-level, covering MessageStreamingHandler's onTeammateMessageWhileIdle
+      listener (no existing test file touches it -- MessageStreamingHandler.opencodeModel.test.ts is
+      the only current test for this file and does not cover this listener) and the marker surviving
+      into a canonical transcript event for both deliverMessageToLead and deliverRevivalFailure
+      shapes, plus a batched-multi-message case. Mirror the vi.mock pattern from
+      TeammateManager.stallWatchdog.test.ts / TeammateManager.resumeReliability.test.ts (mocks
+      AISessionsRepository, @anthropic-ai/claude-agent-sdk, claudeConfigDir) for any TeammateManager-
+      side coverage. Do not barrel-mock @nimbalyst/runtime.
+    depends_on: []
+    complexity: 6
+    priority: "must"
+    success_criteria:
+      - "A canonical transcript event for a teammate wake message or revival-failed notice carries a distinct, typed origin marker distinguishing it from real user input"
+      - "The marker survives batched (multi-message) delivery, not just the single-message case"
+      - "No change to the iOS-only transformAgentMessagesToUI path"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/electron/src/main/services/ai/MessageStreamingHandler.ts"
+      - "packages/electron/src/main/services/ai/AIService.ts"
+      - "packages/runtime/src/ai/server/transcript/parsers/ClaudeCodeRawParser.ts"
+      - "packages/electron/src/main/services/ai/__tests__/MessageStreamingHandler.opencodeModel.test.ts (or a new sibling test file for the idle-wake listener)"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.stallWatchdog.test.ts"
+
+  - id: "1b"
+    title: "Ground revival with a fresh-context message before resuming a shutdown-ended teammate"
+    description: |
+      Bug C. rehydrateIdleTeammate (TeammateManager.ts:1437-1487) -> resumeIdleTeammate (:2269-2274)
+      -> query({prompt, options:{resume:resumeSessionId}}) (:2050-2058). The resume call always
+      carries the real new prompt (never blank) -- the bug is missing grounding: the SDK replays the
+      prior approved shutdown handshake as history and the model's next turn reacts to that stale
+      context instead of the real new instruction.
+
+      IdleTeammate.revivedFromTerminal (:1485) and the equivalent ManagedTeammate flag (:2306) are
+      already threaded but currently unused for grounding -- use this as the gate for "inject
+      grounding only when reviving from a terminal/shutdown-ended state," not on every resume.
+
+      Implementation choice (make it and document it in the commit, this is a routine SDK-capability
+      check, not a product decision -- see PRD decision D4): first check whether the installed
+      @anthropic-ai/claude-agent-sdk's query() prompt parameter accepts an AsyncIterable (same shape
+      already produced by the in-file createInjectedUserMessageStream(content):
+      AsyncIterable<SDKUserMessage> at :366-380, currently only used for streamInput into an
+      already-running query). If the SDK's types/runtime support it, seed query() with a two-message
+      iterable: a synthetic grounding message ("You have been revived by the user after a prior
+      shutdown; the previous shutdown request is no longer active.") followed by the real prompt. If
+      the SDK does not support an AsyncIterable prompt, fall back to issuing a streamInput-shaped
+      grounding call immediately after query() starts and before the real prompt is delivered. Either
+      mechanism is acceptable; pick one, do not build both.
+
+      This task touches TeammateManager.ts in a different region than task 1a (revival/resume logic
+      vs. deliverMessageToLead/deliverRevivalFailure) but the same file -- sequenced after 1a to
+      avoid stacking edits in the shared checkout, not because of a logical dependency.
+
+      Tests: red-first. Extend TeammateManager.resumeReliability.test.ts, mirroring the existing
+      'restart-path revival: a lead-abandoned teammate resumes through the widened gate (PRD 008,
+      tasks 2a+3b)' describe block (line 657) for structure. Assert the grounding message/call
+      actually happens on a revival following an approved user-shutdown end, and does NOT happen on
+      an ordinary (non-terminal) resume.
+    depends_on: []
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "Reviving a teammate whose last end was an approved user-shutdown handshake injects a grounding message before/alongside the real prompt"
+      - "Ordinary resumes (not from a terminal/shutdown-ended state) are unaffected -- no grounding message added"
+      - "SDK-capability choice (AsyncIterable prompt vs streamInput fallback) documented in the commit message"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts"
+
+  - id: "2a"
+    title: "Stop rendering teammate wake messages under the \"You\" header"
+    description: |
+      Bug A. Depends on task 1a's canonical-path origin marker (metadata.teammateOrigin or
+      equivalent) actually being present on the message object RichTranscriptView receives via its
+      messages prop (AgentTranscriptPanel.tsx:322 <- sessionData.messages <-
+      SessionManager.loadSession's loadCanonicalTranscript). Do NOT key off
+      message.metadata?.isTeammateMessage -- that flag is only ever set by the iOS-only
+      transformAgentMessagesToUI path and is dead on desktop (see PRD Research / task 1a).
+
+      Header logic is at RichTranscriptView.tsx:2243: isUser ? 'You' : (agentName ??
+      getProviderDisplayName(provider)). When the new marker from task 1a is present on a
+      user-role turn, render the teammate's name (from the marker) instead of 'You', consistent with
+      how a real agent turn is labeled.
+
+      Rules of Hooks: if this requires reading two atoms/hooks to compute the label, call both
+      unconditionally and combine the results afterward -- never `||`/`&&` short-circuit between two
+      hook calls (see this repo's CLAUDE.md, real crash in commit 3fa68d3c0).
+
+      Tests: red-first, render-level. Follow the RichTranscriptView.taskWidgetGate.test.tsx harness
+      pattern (render tests), not RichTranscriptView.test.ts (pure-helpers only, no render coverage).
+      No readFileSync+toContain source-text assertions. No presentation-only assertions beyond what's
+      needed to prove the header text/attribution is correct for a marked vs. unmarked turn.
+    depends_on: ["1a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "A mainline turn carrying task 1a's origin marker renders the teammate's name, never 'You'"
+      - "An ordinary real user turn is unaffected"
+    files_affected:
+      - "packages/runtime/src/ui/AgentTranscript/components/RichTranscriptView.tsx"
+      - "packages/runtime/src/ui/AgentTranscript/components/__tests__/RichTranscriptView.taskWidgetGate.test.tsx (or a new sibling render-test file)"
+
+  - id: "2b"
+    title: "Condense teammate wake messages and shutdown-handshake plumbing into a collapsed mainline card"
+    description: |
+      Bug B. Depends on task 1a's marker. Sequenced after 2a (same file, RichTranscriptView.tsx --
+      avoid stacking edits).
+
+      The existing in-list collapse at RichTranscriptView.tsx:2107-2148 (<details>/<summary>, label
+      `Received message from agent ${teammateName}`, 100-char truncated preview, native uncontrolled
+      expand, MarkdownRenderer isUser={false} for full content) is gated on
+      message.metadata?.isTeammateMessage -- dead on desktop (iOS-only flag, see task 1a notes).
+      Re-gate this pattern (or a close variant of it) on task 1a's new canonical-path marker so it
+      actually fires on the desktop mainline.
+
+      Extend it to also swallow adjacent SendMessage / shutdown_response tool calls and their results
+      that belong to the same teammate exchange, so shutdown-handshake plumbing collapses into the
+      same card rather than appearing as separate mainline turns -- this is the specific gap the user
+      called out ("a lot of the shutdown messages or other things from the inter-communication").
+      Content is already resident in the messages array (per PRD decision D3) -- do not build a
+      second-fetch widget, and do not touch TaskToolWidget.tsx's deliberate teammate-spawn exclusion.
+
+      Companion suppression logic at RichTranscriptView.tsx:2040-2052 (hides empty processing turns
+      right after a teammate notification) should be reviewed and extended if it no longer covers the
+      widened collapse range.
+
+      Tests: red-first, render-level, same harness as 2a (RichTranscriptView.taskWidgetGate.test.tsx
+      pattern). Cover: wake message alone collapses; wake message + adjacent SendMessage/
+      shutdown_response calls collapse into one card; a real user turn adjacent to a collapsed card is
+      unaffected and still renders normally.
+    depends_on: ["1a", "2a"]
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "Teammate wake messages collapse into a single expandable card in the lead's mainline, matching the existing condensation pattern"
+      - "Adjacent SendMessage/shutdown_response tool calls and results for the same teammate exchange collapse into the same card"
+      - "Real user turns adjacent to a collapsed card are unaffected"
+    files_affected:
+      - "packages/runtime/src/ui/AgentTranscript/components/RichTranscriptView.tsx"
+      - "packages/runtime/src/ui/AgentTranscript/components/__tests__/RichTranscriptView.taskWidgetGate.test.tsx (or a new sibling render-test file)"
+
+  - id: "3a"
+    title: "CHANGELOG entry"
+    description: |
+      Add one CHANGELOG.md [Unreleased] bullet covering the whole PRD (all three bugs are one
+      user-facing improvement: teammate messages/handshakes no longer clutter or mislabel the lead's
+      mainline transcript, and reviving a teammate no longer confuses it with stale shutdown context).
+      One sentence, no internal scaffolding, no symbol/file names, matching the existing voice in
+      [Unreleased] and recent `git log --oneline`. If an existing bullet already covers
+      teammate/agent-thread UI from this session's other merged PRDs (006/007/008), edit it rather
+      than appending a new one -- check [Unreleased] first.
+    depends_on: ["1a", "1b", "2a", "2b"]
+    complexity: 1
+    priority: "must"
+    success_criteria:
+      - "Exactly one bullet (new or edited) in CHANGELOG.md [Unreleased] describing the user-facing fix, no internal scaffolding"
+    files_affected:
+      - "CHANGELOG.md"
