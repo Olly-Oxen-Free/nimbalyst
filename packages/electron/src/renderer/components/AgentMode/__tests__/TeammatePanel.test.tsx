@@ -1,11 +1,15 @@
 // @vitest-environment jsdom
 import React from 'react';
-import { cleanup, render } from '@testing-library/react';
+import { cleanup, fireEvent, render } from '@testing-library/react';
 import { Provider, createStore, atom } from 'jotai';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { TeammateInfo } from '../TeammatePanel';
 
 const testState = vi.hoisted(() => ({ teammates: [] as TeammateInfo[] }));
+const spies = vi.hoisted(() => ({
+  setScrollTarget: vi.fn(),
+  toggleTeammateTile: vi.fn(),
+}));
 
 // Narrowest mocks: the atoms the panel reads plus the icon module (its deep
 // path keeps the runtime barrel out of the graph).
@@ -15,6 +19,12 @@ vi.mock('../../../store/atoms/agentMode', async () => {
   const tasks = makeAtom(() => [] as unknown[]);
   const collapsed = makeAtom(false);
   const noop = makeAtom(null, () => {});
+  const scrollToTeammateAtom = makeAtom(null, (_get, _set, arg: unknown) => {
+    spies.setScrollTarget(arg);
+  });
+  const toggleTeammateTileAtom = makeAtom(null, (_get, _set, arg: unknown) => {
+    spies.toggleTeammateTile(arg);
+  });
   return {
     sessionTeammatesAtom: () => teammates,
     sessionTasksAtom: () => tasks,
@@ -22,7 +32,8 @@ vi.mock('../../../store/atoms/agentMode', async () => {
     agentPanelCollapsedAtom: collapsed,
     toggleTeammatePanelCollapsedAtom: noop,
     toggleAgentPanelCollapsedAtom: noop,
-    scrollToTeammateAtom: noop,
+    scrollToTeammateAtom,
+    toggleTeammateTileAtom,
     toggleTaskTileAtom: noop,
   };
 });
@@ -68,5 +79,26 @@ describe('TeammatePanel teammate ordering', () => {
     ];
 
     expect(renderPanel()).toEqual(['dated', 'undated']);
+  });
+});
+
+describe('TeammatePanel teammate click', () => {
+  afterEach(cleanup);
+
+  it('scrolls to the spawn point and toggles the tile when a teammate row is clicked', () => {
+    testState.teammates = [row('runner', 'running')];
+    spies.setScrollTarget.mockClear();
+    spies.toggleTeammateTile.mockClear();
+
+    const result = render(
+      <Provider store={createStore()}>
+        <TeammatePanel sessionId="lead-1" />
+      </Provider>,
+    );
+    const item = result.container.querySelector('.teammate-item');
+    fireEvent.click(item as Element);
+
+    expect(spies.setScrollTarget).toHaveBeenCalledWith({ sessionId: 'lead-1', agentId: 'runner' });
+    expect(spies.toggleTeammateTile).toHaveBeenCalledWith({ sessionId: 'lead-1', agentId: 'runner' });
   });
 });

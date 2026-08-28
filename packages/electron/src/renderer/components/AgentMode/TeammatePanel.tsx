@@ -9,7 +9,8 @@
  * Each section is independently collapsible. Sections only render when they have entries.
  * Collapse state is persisted at the project level.
  *
- * Clicking a teammate item scrolls the transcript to its spawn point via scrollToTeammateAtom.
+ * Clicking a teammate item scrolls the transcript to its spawn point via scrollToTeammateAtom
+ * and toggles that teammate's tile via toggleTeammateTileAtom.
  * Clicking a sub-agent item toggles that task's transcript tile beside the main thread.
  */
 
@@ -20,7 +21,7 @@ import type { TeammateEndReason } from '@nimbalyst/runtime/ai/server/providers/T
 import {
   teammatePanelCollapsedAtom, toggleTeammatePanelCollapsedAtom,
   agentPanelCollapsedAtom, toggleAgentPanelCollapsedAtom,
-  sessionTeammatesAtom, scrollToTeammateAtom,
+  sessionTeammatesAtom, scrollToTeammateAtom, toggleTeammateTileAtom,
   sessionTasksAtom, type TaskInfo, toggleTaskTileAtom,
 } from '../../store/atoms/agentMode';
 import { mapTaskStatus } from '../../store/atoms/subAgentStatus';
@@ -66,6 +67,7 @@ export const TeammatePanel: React.FC<TeammatePanelProps> = React.memo(({
   const allEntries = useAtomValue(sessionTeammatesAtom(sessionId));
   const tasks = useAtomValue(sessionTasksAtom(sessionId));
   const setScrollTarget = useSetAtom(scrollToTeammateAtom);
+  const toggleTeammateTile = useSetAtom(toggleTeammateTileAtom);
 
   const handleToggleTeammates = useCallback(() => {
     toggleTeammatesCollapsed();
@@ -77,7 +79,8 @@ export const TeammatePanel: React.FC<TeammatePanelProps> = React.memo(({
 
   const handleTeammateClick = useCallback((agentId: string) => {
     setScrollTarget({ sessionId, agentId });
-  }, [sessionId, setScrollTarget]);
+    toggleTeammateTile({ sessionId, agentId });
+  }, [sessionId, setScrollTarget, toggleTeammateTile]);
 
   // Filter out _background/_subagent entries from teammates -- those are dead
   // after switching to SDK-native sub-agents. Only real team members remain.
