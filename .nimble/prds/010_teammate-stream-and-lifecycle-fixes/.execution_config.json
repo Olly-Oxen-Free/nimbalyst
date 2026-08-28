@@ -1,0 +1,28 @@
+{
+  "configured_at": "2026-08-28T00:00:00Z",
+  "orchestration_version": 2,
+  "configured_by": "coordinator (user pre-approved all gates this session; explicit no-PR, no-gh, ff-only-merge-to-main instruction)",
+  "orchestration": {
+    "integration": {
+      "cadence": "worktree-free-local",
+      "note": "NO GitHub PRs, no gh usage, ever, per explicit session instruction. Workers edit the main checkout directly on feature/teammate-stream-and-lifecycle-fixes, one task at a time (no true parallel waves). Coordinator reviews diff, runs typecheck+test:prepush itself with visible output, commits per task."
+    },
+    "review": {
+      "trigger": "per-task",
+      "provider": "none-manual",
+      "note": "Coordinator runs npm run typecheck && npm run test:prepush per task, excluding known pre-existing failures (AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx - jsdom localStorage) and rerunning BodyDocCache.remountPaint.test.ts isolated before treating it as real. Never trust a worker's own claim that tests passed."
+    },
+    "gates": {
+      "model": "skip-on-pass",
+      "placements": [],
+      "note": "5 tasks / 5 waves, all single-task, below the gate threshold -- user pre-approved gates for this session, proceed through wave boundaries unless a genuine blocking decision arises."
+    }
+  },
+  "models": {
+    "default": "sonnet",
+    "complexity_threshold": 5,
+    "assignments": { "1a": "sonnet", "2a": "opus", "3a": "sonnet", "4a": "opus", "5a": "sonnet" },
+    "escalation": { "after_failures": 1 }
+  },
+  "max_revision_loops": 3
+}

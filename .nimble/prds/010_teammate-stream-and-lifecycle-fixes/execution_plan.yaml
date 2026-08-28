@@ -1,0 +1,21 @@
+prd_slug: "teammate-stream-and-lifecycle-fixes"
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    note: "Task 2 (menu-click tile-open): trivial, independent, cheap early win"
+  - wave: 2
+    tasks: ["2a"]
+    note: "Task 1 (teammate forwarded-stream leak): the hard task, independent of others logically"
+  - wave: 3
+    tasks: ["3a"]
+    note: "Task 3 (sessionId/revival gap) -- touches TeammateManager.ts, sequenced after 2a for file-conflict safety in the shared checkout"
+  - wave: 4
+    tasks: ["4a"]
+    note: "Task 4 (grace-period delay) -- also touches TeammateManager.ts, sequenced after 3a"
+  - wave: 5
+    tasks: ["5a"]
+    note: "CHANGELOG edit, after all behavior changes land"
+longest_chain: ["1a", "2a", "3a", "4a", "5a"]
+total_complexity: 19
+max_parallel: 1
+note: "worktree-free-local cadence (no PRs, no git worktrees, no gh): all tasks edit the main checkout on feature/teammate-stream-and-lifecycle-fixes sequentially, one at a time, coordinator commits per task. No true parallel waves -- every wave is single-task, sequenced for file-conflict safety (3a/4a share TeammateManager.ts) and logical ordering (CHANGELOG last)."

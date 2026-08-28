@@ -1,0 +1,298 @@
+metadata:
+  prd_slug: "teammate-stream-and-lifecycle-fixes"
+  created_at: "2026-08-28T00:00:00Z"
+  total_complexity: 19
+  task_count: 5
+
+tasks:
+  - id: "1a"
+    title: "Open teammate tile from the Teammates-menu click, not just the chip"
+    description: |
+      `TeammatePanel.tsx`'s `handleTeammateClick` (packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx:78)
+      currently only calls `setScrollTarget({ sessionId, agentId })` (scrollToTeammateAtom) — it
+      never opens a tile. Per this session's trigger-map spec (confirmed during PRD 004 planning):
+      hover chip -> popover; click the message that spawned it -> inline-expand; click the chip OR
+      click the agent in the Teammates/sub-agents menu -> tiling view.
+
+      The sibling `TaskItem` component in the same file (~line 275) already wires this correctly:
+      `const toggleTaskTile = useSetAtom(toggleTaskTileAtom); const handleClick = useCallback(() =>
+      toggleTaskTile({ sessionId, taskId: task.taskId }), [...]);`. `toggleTeammateTileAtom`
+      (packages/electron/src/renderer/store/atoms/agentMode.ts:336) already exists with the same
+      shape (`{ sessionId, agentId }`) and is currently unused anywhere in `TeammatePanel.tsx`.
+
+      Fix: in `TeammateItem` (wherever `handleTeammateClick` is invoked from — trace the JSX that
+      wires the click handler for a teammate row, mirroring `TaskItem`'s structure), add
+      `useSetAtom(toggleTeammateTileAtom)` and call it alongside `setScrollTarget` in the click
+      handler, so clicking a teammate in the menu both scrolls to the spawn point AND opens/closes
+      its tile — matching `TaskItem`'s pattern exactly (`toggleTaskTile({ sessionId, taskId })` ->
+      `toggleTeammateTile({ sessionId, agentId })`).
+
+      Tests: extend or add a render test for `TeammatePanel.tsx` (check for an existing
+      `TeammatePanel.test.tsx` first, extend it rather than creating a new file) asserting that
+      clicking a teammate row calls both the scroll-target write and the tile-toggle write with the
+      correct `{ sessionId, agentId }`. Do not assert on CSS/classNames; assert on atom state or a
+      mocked write-atom call. No `readFileSync`+`toContain` source assertions.
+    depends_on: []
+    complexity: 2
+    priority: "must"
+    success_criteria:
+      - "Clicking a teammate row in the Teammates panel menu opens/closes that teammate's tile (toggleTeammateTileAtom), not just scrolling"
+      - "Existing scroll-to-spawn-point behavior on click is preserved"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/__tests__/TeammatePanel.test.tsx (or new sibling test file if none exists)"
+
+  - id: "2a"
+    title: "Fold a teammate's own forwarded thinking/tool-call stream into the existing collapsed card, instead of leaking into the lead's bare mainline"
+    description: |
+      Root cause (confirmed via Explore investigation, not the `forwardSubagentText`/Task-sub-agent
+      path the bug's initial framing assumed): teammates run their OWN independent SDK `query()`
+      (`TeammateManager.streamTeammateOutput`, packages/runtime/src/ai/server/providers/TeammateManager.ts:2099`),
+      wholly separate from the lead's iterator. Their output chunks are captured from that separate
+      query and manually persisted onto the LEAD's session via `this.deps.logNonBlocking(sessionId,
+      'claude-code', 'output', JSON.stringify(taggedChunk), ...)` (TeammateManager.ts:2226-2233),
+      tagged `_isTeammateOutput: true, _teammateAgentId: agentId` (TeammateManager.ts:2220-2224). A
+      teammate's own TOP-LEVEL turns carry `parent_tool_use_id: null` (they are not sub-agent chunks
+      in the `forwardSubagentText` sense at all) — so the existing `parentToolUseId`-keyed guards
+      (`ClaudeCodeRawParser.ts:251-252`'s `dropSubagentProse`, and
+      `ClaudeCodeTranscriptAdapter.ts:233`'s equivalent) never fire for them, because those guards are
+      keyed EXCLUSIVELY on `Boolean(parentToolUseId)` and never check `_isTeammateOutput`/
+      `_teammateAgentId`.
+
+      Concretely, in `ClaudeCodeRawParser.ts`'s `parseOutputMessage`:
+      - The `assistant` branch (`:231-308`) emits a teammate's text/thinking blocks as ordinary
+        `assistant_message` descriptors (uncollapsed, unattributed) because `dropSubagentProse`
+        evaluates false for them. `tool_use` blocks (`:296-303`) are NEVER gated by
+        `dropSubagentProse` at all (by design, for the real Task-sub-agent case, so a Task card's
+        child tool calls keep flowing) — for a teammate they render as bare, un-nested tool calls
+        because the lead's `emittedSubagents`/Task-card correlation (`:305-306`,
+        `parentToolUseId && this.emittedSubagents.has(parentToolUseId)`) never registered a
+        teammate's id space (teammates run their own query, no `parent_tool_use_id` link back to the
+        spawning Task call the way real forwarded sub-agents have).
+      - The `user` string-content branch (`:423-450`) has exactly ONE `_isTeammateOutput` check
+        anywhere in the file, at `:436` — `if (this.teammateProjection && parsed._isTeammateOutput)`
+        — but it only fires when `teammateProjection` is already true (i.e. only inside a teammate's
+        OWN dedicated thread projection view, never the lead's mainline, where `teammateProjection`
+        is always false). In the mainline this falls to the `else` branch (`:442-449`) and renders as
+        a bare, unlabeled `system_message`. This is also why a forwarded SYSTEM REMINDER renders
+        unlabeled/uncollapsed: the reminder-classification logic (`isSystemReminderContent`/
+        `reminderKind`, which would route it through the collapsible `SystemReminderCard`) exists
+        ONLY in `parseInputMessage` (`:129,134,170,175,191,196`), never in the output-side `user`
+        branch a teammate's forwarded turn goes through (teammate output is always logged with
+        `direction: 'output'`, TeammateManager.ts:2227).
+
+      PRD 009's existing teammate collapsed card (RichTranscriptView.tsx:1455-1469, :2090-2138,
+      `teammateExchanges.absorbedIndices`) only folds the wake-notification tool call + trailing
+      empty lead-processing turns around a `teammateOrigin`-tagged `user_message` — it is NOT a
+      generic sub-agent-activity card. The card that DOES group child tool activity under one widget
+      by correlation is the Task/Teammate tool-call card at RichTranscriptView.tsx:1812-2030
+      (`isSubAgent`, `isTeammate`, `toolMsg.subagent?.childEvents`), keyed by `subagentId` derived
+      from parser-side `parentToolUseId && emittedSubagents.has(parentToolUseId)` correlation.
+
+      Required fix (fold into the card, per the user's explicit ask — suppression alone is
+      insufficient and will be rejected):
+      1. Establish a stable correlation from a teammate's `agentId`/`_teammateAgentId` to the
+         spawning `Task`/teammate-spawn tool_use id — the natural join key is the
+         `args.name`/`args.team_name` already captured at spawn time
+         (`ClaudeCodeRawParser.ts:538-539`, `ClaudeCodeTranscriptAdapter.ts:283-284`), since there is
+         no `parent_tool_use_id` link for a teammate's own query.
+      2. In `parseOutputMessage`'s `assistant` branch and `user` string-content branch, consult
+         `parsed._isTeammateOutput`/`parsed._teammateAgentId` UNCONDITIONALLY (not gated behind
+         `this.teammateProjection`) when parsing for the lead's own mainline, and route matched
+         chunks (text, thinking, tool_use, tool_result, and system-reminder-classified user content)
+         into the SAME `subagent.childEvents`-style collapsible structure the Task/Teammate tool-call
+         card already renders (RichTranscriptView.tsx:1812-2030), keyed by the correlation from step 1,
+         instead of letting them fall through as bare top-level descriptors.
+      3. Extend SYSTEM REMINDER classification (`isSystemReminderContent`/`extractReminderKind`) to
+         also apply on the output-side `user` branch when `_isTeammateOutput` is set, so a forwarded
+         reminder renders through the existing collapsible reminder UI rather than an unlabeled status
+         line, wherever it ends up (inside the folded card, per step 2).
+      4. Do NOT touch the `teammateProjection`-gated branch itself (`:436`) — that is the correct,
+         working behavior for a teammate's own dedicated thread/tile view (task 1a's tile-open fix
+         depends on that view rendering correctly) and must be left as-is.
+      5. Do NOT touch the real Task-sub-agent (`forwardSubagentText`) path or its
+         `parentToolUseId`-keyed guards — those are working correctly for genuine sub-agents and are
+         out of scope.
+
+      Rules of Hooks: if any renderer-side change needs two atom/hook reads to decide the folded
+      card's contents, call both unconditionally and combine afterward — never `||`/`&&`
+      short-circuit between two hook calls (this repo's CLAUDE.md, real crash in commit 3fa68d3c0).
+
+      Tests: red-first. Cover, at the parser level (extend
+      `packages/runtime/src/ai/server/transcript/__tests__/projectRawMessages.test.ts`, which already
+      has `subagentChunk`-shaped fixtures at line ~765-774 to mirror): a teammate's own text/thinking
+      chunk (`_isTeammateOutput: true, _teammateAgentId`, `parent_tool_use_id: null`) parsed for the
+      LEAD's mainline (not teammateProjection) must NOT produce a bare top-level `assistant_message`
+      descriptor — it must be attributable/correlated to the teammate's spawn id. A teammate's
+      forwarded tool_use/tool_result must not appear as an un-nested mainline tool card. A forwarded
+      system-reminder must be classified with a `reminderKind`, not a bare status line. Also extend
+      `ClaudeCodeTranscriptAdapter.test.ts` (line ~235 already documents `forwardSubagentText`
+      relaying) for the live-adapter path if teammate output is ever live-streamed there. Do not
+      barrel-mock `@nimbalyst/runtime`.
+    depends_on: []
+    complexity: 8
+    priority: "must"
+    success_criteria:
+      - "A teammate's own forwarded thinking, SYSTEM REMINDER, and tool-call/tool-result turns no longer render as bare, uncollapsed turns in the lead's mainline transcript"
+      - "That content is reachable inside the same expandable card pattern PRD 009 built, not merely suppressed"
+      - "The teammate's own dedicated thread/tile view (teammateProjection mode) is unaffected"
+      - "The real Task-sub-agent (forwardSubagentText) path is unaffected"
+    files_affected:
+      - "packages/runtime/src/ai/server/transcript/parsers/ClaudeCodeRawParser.ts"
+      - "packages/runtime/src/ai/server/providers/claudeCode/ClaudeCodeTranscriptAdapter.ts"
+      - "packages/runtime/src/ui/AgentTranscript/components/RichTranscriptView.tsx"
+      - "packages/runtime/src/ai/server/transcript/__tests__/projectRawMessages.test.ts"
+      - "packages/runtime/src/ai/server/transcript/__tests__/ClaudeCodeTranscriptAdapter.test.ts"
+
+  - id: "3a"
+    title: "Fix missing sessionId on a normally-completed teammate so revival compose is offered"
+    description: |
+      Root cause (confirmed): `teammateComposeMode` (packages/electron/src/renderer/components/AgentMode/TeammateTileRail.tsx:75-86)
+      gates on `sessionId` BEFORE the `endReason` check the bug describes:
+      ```
+      if (!teammate.sessionId) return 'inactive';                      // line 81 -- fires first
+      if (endedAt window exceeded) return 'inactive';
+      if (teammate.endReason !== 'user-shutdown') return 'compose';    // line 84 -- never reached
+      ```
+      `composeMode === 'inactive'` renders "This teammate is no longer active" (:280-283) — no
+      textbox, no revive button; this is an absent affordance, not a silent-fail send.
+
+      `TeammateManager.handleStreamCompletion` (packages/runtime/src/ai/server/providers/TeammateManager.ts:1771-1846)
+      has three branches: approved-shutdown (endReason 'user-shutdown', :1788); goes-idle when
+      `result.capturedSessionId && !isBackground` (:1791-1798); ELSE (:1820-1826) —
+      `status: 'completed', endReason: 'finished'` — hit whenever `!result.capturedSessionId` (the
+      SDK stream ended before ever emitting a `session_id` chunk) or the teammate `isBackground`.
+      `ManagedTeammate.sessionId` starts `undefined` at spawn (:1933, :1995) and is only ever set at
+      `:2202` when the FIRST SDK `session_id` chunk arrives. `this.managedTeammates.delete(agentId)`
+      runs at `:1781`, BEFORE the debounced `scheduleEmitTeammateUpdate` fires — so by the time
+      `emitTeammateUpdate`'s merge (`:1690`, `sessionId: managed.sessionId ?? tm.sessionId`) runs,
+      there is no live entry to pull a fresh sessionId from, and it inherits whatever `tm.sessionId`
+      was already persisted (never set, for a teammate whose stream ended before its first
+      `session_id` chunk).
+
+      NOT caused by PRD 009 commit 541dd3c02 (that commit is scoped entirely to
+      `IdleTeammate.revivedFromShutdown`/`createGroundedRevivalPromptStream`; it never touches
+      `handleStreamCompletion`, `markCompleted`, or `emitTeammateUpdate`).
+
+      Fix: ensure a teammate that completes via the "finished, no captured session ID" branch
+      (:1820-1826) still persists a usable `sessionId`. The SDK's session id is knowable earlier than
+      the streamed `session_id` chunk in the common case — the query was started/resumed with a known
+      session id (fresh spawn: the SDK assigns one at query start even if no chunk echoing it back is
+      ever observed before the stream ends; resume: the `resumeSessionId` passed into `query({...,
+      options: { resume: resumeSessionId }})` is already known). Investigate the SDK's `query()`
+      return/init shape for the earliest point a session id is obtainable (e.g. an init/system message
+      emitted before any assistant chunk) and capture it there instead of solely at the later
+      `session_id`-chunk callback at `:2202`; alternatively, if truly no session id is ever obtainable
+      for a given stream (a genuine edge case, not the common "no chunk yet" case this bug reports),
+      leave `sessionId` unset and leave `composeMode` returning `'inactive'` for that specific case —
+      do not fabricate an unusable id.
+
+      Tests: red-first. Extend `TeammateManager.resumeReliability.test.ts` or the nearest existing
+      completion-path test file (search for `handleStreamCompletion` coverage first) — assert that a
+      teammate whose SDK stream ends before a `session_id` chunk streams still persists a non-empty
+      `sessionId` on its `completed`/`finished` row, and that `teammateComposeMode` (component-level
+      test in `TeammateTileRail.test.tsx` if one exists, else a new sibling) returns `'compose'` for
+      that row's shape (status completed, endReason finished, sessionId present, endedAt recent).
+    depends_on: []
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "A teammate that completes normally (endReason 'finished', not 'user-shutdown') persists a usable sessionId even if its stream ended before a session_id chunk arrived"
+      - "teammateComposeMode returns 'compose' (not 'inactive') for such a row within the 24h revival window"
+      - "A teammate genuinely reviving from a user-shutdown end is unaffected (still gated by the revive-confirm flow)"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts"
+      - "packages/electron/src/renderer/components/AgentMode/__tests__/TeammateTileRail.test.tsx (if it exists; else a new sibling)"
+
+  - id: "4a"
+    title: "Configurable grace-period delay before an idle-completed teammate's shutdown executes"
+    description: |
+      New feature, not a bug. Confirmed via Explore investigation: shutdown is LEAD-INITIATED (the
+      SDK-native `SendMessage` tool, `type: "shutdown_request"`, called by the lead's own model) —
+      there is NO autonomous idle-timeout/watchdog in `TeammateManager.ts`. Going idle
+      (`handleStreamCompletion`, TeammateManager.ts:1791-1798, `this.idleTeammates.set(agentId,
+      {...})`) is a pure state transition with no timer attached; nothing schedules a later forced
+      shutdown. Shutdown only happens via `handlePreToolUse` routing:
+      - Running teammate: TeammateManager.ts:2651-2696 — `queueLeadMessage` (:2658) then an
+        IMMEDIATE `await flushPendingMessages` (:2667).
+      - Idle teammate: TeammateManager.ts:2735-2764 — an IMMEDIATE `resumeIdleTeammate` (:2740).
+      - Already-completed: :2804-2806 intercepts redundant requests.
+      No grace-period/cooldown/delay mechanism exists anywhere in the file today (checked
+      setTimeout/delay/grace/cooldown/watchdog near shutdown code — only unrelated debounce/retry/
+      stall-watchdog timers exist, e.g. `emitDebounceTimer` at :271/:1600, `raceNextChunkWithStallWatchdog`
+      at :2148, both unrelated to shutdown timing).
+
+      Product decision (already made, do not re-litigate): default delay = 0 seconds (current
+      immediate behavior unchanged by default) — this is opt-in, not a default behavior change.
+      Setting lives in workspace-settings (IPC-routed, never `localStorage` per this repo's rule),
+      configurable per-workspace, in seconds.
+
+      Implementation shape: the request (tool call, denied with a confirmation message today at
+      :2691-2696 / :2753-2764) and the execution (the actual `flushPendingMessages`/
+      `resumeIdleTeammate` call, plus the later teardown in `handleStreamCompletion`/
+      `handleShutdownResult`) are already two logically distinct steps that merely run back-to-back.
+      Add a grace-period hold at the two entry points:
+      - `TeammateManager.ts:2651-2671` (running-teammate path) and `:2735-2741` (idle-teammate path):
+        instead of calling `flushPendingMessages`/`resumeIdleTeammate` inline, if the configured delay
+        for this workspace is > 0, schedule a `setTimeout` keyed by `agentId` in a new
+        `private pendingShutdowns: Map<string, ReturnType<typeof setTimeout>>` (alongside the existing
+        `idleTeammates`/`managedTeammates` maps declared near :228), and only invoke the actual
+        flush/resume when it fires. If the configured delay is 0 (the default), execute exactly as
+        today — no behavior change.
+      - Cancellation: every other inbound message to a teammate already funnels through the same
+        `handlePreToolUse`/`SendMessage` routing block (:2642 onward) keyed by `agentId`/`recipient`
+        matching. A new message arriving for an `agentId` with a pending shutdown timer should
+        `clearTimeout` and delete the pending-shutdown entry before proceeding with normal delivery
+        (`resumeIdleTeammate` at :2773-2774, or `queueLeadMessage`/`flushPendingMessages` at
+        :2709-2717) — this is what makes the grace period useful ("a window during which the user
+        could message the teammate again before it actually shuts down").
+      - No change needed to the SDK's `SendMessage`/`shutdown_request` contract or schema.
+      - Reading the configured delay: read it the same way other workspace-settings values are read
+        into `TeammateManager` today (find the existing pattern — search for how TeammateManager or
+        its constructor/deps already receive workspace-settings-backed config, do not invent a new
+        plumbing mechanism). Add the setting to the workspace-settings store/IPC surface with a
+        `createDefault*()` default of 0, per this repo's state-persistence rules (missing field on old
+        data must default to 0, never undefined/crash).
+
+      Tests: red-first. Add coverage (extend `TeammateManager.stallWatchdog.test.ts` or the nearest
+      relevant existing test file — mirror its `vi.mock` pattern for
+      AISessionsRepository/@anthropic-ai/claude-agent-sdk/claudeConfigDir) asserting: with delay=0,
+      shutdown executes immediately (current behavior, unchanged); with delay>0, the shutdown
+      execution is held for the configured duration and a new inbound message before it fires cancels
+      the pending shutdown (teammate stays alive, no teardown); after the delay elapses with no
+      cancelling message, shutdown executes. Use fake timers, not real `setTimeout` waits.
+    depends_on: []
+    complexity: 5
+    priority: "must"
+    success_criteria:
+      - "A configurable per-workspace delay (seconds, default 0) exists between a shutdown_request and its actual execution"
+      - "Default behavior (delay=0) is unchanged from today -- immediate execution"
+      - "A new message to the teammate before the delay elapses cancels the pending shutdown"
+      - "Setting is read via workspace-settings IPC, never localStorage"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.stallWatchdog.test.ts"
+      - "workspace-settings store/IPC surface (find existing file via grep for an existing similar per-workspace numeric setting)"
+
+  - id: "5a"
+    title: "CHANGELOG entry"
+    description: |
+      Do NOT append a new bullet. Edit the existing bullet in CHANGELOG.md's `[Unreleased] ###
+      Fixed` section (added by PRD 009, currently reading: "A teammate's wake-up message and
+      shutdown handling no longer show as "You" or clutter your mainline conversation with plumbing
+      — they collapse into one expandable card, and reviving a teammate that had shut down cleanly
+      no longer leaves it confused about being asked to shut down again.") to also cover: the
+      teammate's own live thread now folds into that same card (task 1a... wait, task 2a in this
+      PRD's ids), clicking a teammate in the menu now opens its tile, and a normally-completed
+      teammate can be revived again. If task 4a's grace-period delay is a distinct enough
+      user-facing capability, add it as a SEPARATE new bullet under `### Added` (it is a new
+      feature, not a fix to the existing bullet's territory) — one sentence, no internal
+      scaffolding, no symbol/file/setting names, matching the existing voice in `[Unreleased]` and
+      recent `git log --oneline`.
+    depends_on: ["1a", "2a", "3a", "4a"]
+    complexity: 1
+    priority: "must"
+    success_criteria:
+      - "The existing PRD-009 Fixed bullet is edited (not duplicated) to also cover this PRD's fixes"
+      - "If included, the grace-period delay gets its own one-sentence Added bullet, no internal scaffolding"
