@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Teammates and sub-agents you spawn now show up as a colored chip row above the chat input, with a distinct "blocked" color when one is waiting on a permission prompt; clicking a teammate's chip pops its actual conversation out into its own pane beside the main thread — what it said, did, and thought — updating live while it works, surviving a restart, still reachable by message even if it's gone idle after one, with a Stop button for a runaway teammate, and a sub-agent that errors, crashes, hangs, or can't be reached now reliably notifies you instead of failing silently. An agent's conversation is headed by its own name and model — "weatherman [haiku]" — instead of a generic agent label.
 - Task sub-agents (the model's automatic parallel dispatch) now show their live output too — hover a chip for a quick peek, click the message that spawned it to expand its transcript inline, or click the chip to pop it out into its own pane beside the main conversation. The spawn card in the transcript stays a compact one-line summary — showing the agent's type, model, and live status like a teammate's card — until you click it, instead of dumping its full output inline.
 - A teammate that recently finished, failed, or was abandoned when Nimbalyst closed can now be revived and messaged again, picking up where it left off — a teammate you stopped yourself needs an explicit confirmation first.
+- A workspace can now hold an idle teammate open for a configurable grace period before it shuts down, so a follow-up message sent right after it finishes reaches it instead of a fresh revival.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
@@ -35,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A teammate that finishes its work now hands its answer back to your conversation the moment it goes idle — even if it never sent a message — instead of the session silently stalling, and the lead is told to wait for its teammates rather than redoing their work itself.
 - A finished teammate now shows as Completed with its real tool-call count after you stop the session, instead of a false Error with zero tools, and the Teammates panel shows each teammate's model.
 - Asking Claude to spawn a named agent now correctly creates an addressable teammate you can message directly, instead of silently falling back to an anonymous one-shot sub-agent.
-- A teammate's wake-up message and shutdown handling no longer show as "You" or clutter your mainline conversation with plumbing — they collapse into one expandable card, and reviving a teammate that had shut down cleanly no longer leaves it confused about being asked to shut down again.
+- A teammate's wake-up message, shutdown handling, and its own live thinking and tool calls no longer show as "You" or clutter your mainline conversation — they collapse into one expandable card you can open from the Teammates menu as well as the chip, reviving a teammate that had shut down cleanly no longer leaves it confused about being asked to shut down again, and a teammate that simply finished its work can now be revived and messaged again too.
 
 ### Removed
 <!-- Removed features go here -->
