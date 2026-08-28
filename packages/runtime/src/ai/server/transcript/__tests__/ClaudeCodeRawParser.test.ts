@@ -1144,4 +1144,52 @@ describe('ClaudeCodeRawParser', () => {
       expect(await parser.parseMessage(blank, makeContext())).toHaveLength(0);
     });
   });
+
+  describe('teammate output correlated across batches', () => {
+    // The desktop incremental path parses each batch with a fresh parser, so
+    // the spawning Task call is usually in an EARLIER batch: the in-batch map
+    // is empty and only the store lookup can fold the teammate's turn under
+    // its card.
+    const teammateTurn = makeRawMessage({
+      content: JSON.stringify({
+        type: 'assistant',
+        parent_tool_use_id: null,
+        _isTeammateOutput: true,
+        _teammateAgentId: 'Scout@core',
+        message: {
+          id: 'msg-tm',
+          role: 'assistant',
+          model: 'claude-opus-4',
+          content: [
+            { type: 'text', text: 'Tests look green.' },
+            { type: 'tool_use', id: 'toolu_read', name: 'Read', input: { file_path: '/a.ts' } },
+          ],
+        },
+      }),
+    });
+
+    it('resolves the spawn id from the store when the spawn is not in this batch', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const descriptors = await parser.parseMessage(
+        teammateTurn,
+        makeContext({ findTeammateSpawnToolUseId: async (id) => (id === 'Scout@core' ? 'toolu_spawn' : null) }),
+      );
+
+      expect(descriptors).toEqual([
+        expect.objectContaining({ type: 'assistant_message', subagentId: 'toolu_spawn' }),
+        expect.objectContaining({ type: 'tool_call_started', subagentId: 'toolu_spawn' }),
+      ]);
+    });
+
+    it('keeps top-level rendering when no spawn card exists for the teammate', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const descriptors = await parser.parseMessage(
+        teammateTurn,
+        makeContext({ findTeammateSpawnToolUseId: async () => null }),
+      );
+
+      expect(descriptors.map((d) => (d as { subagentId?: string | null }).subagentId))
+        .toEqual([undefined, null]);
+    });
+  });
 });

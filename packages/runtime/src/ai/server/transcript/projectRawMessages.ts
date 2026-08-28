@@ -24,7 +24,7 @@ import { VoiceRawParser } from './parsers/VoiceRawParser';
 import type { IRawMessageParser, ParseContext } from './parsers/IRawMessageParser';
 import type { RawMessage } from './TranscriptTransformer';
 import type { TranscriptEvent } from './types';
-import { processDescriptor, selectRawParser } from './processDescriptor';
+import { processDescriptor, selectRawParser, findTeammateSpawnToolUseId } from './processDescriptor';
 import { isTaskSubagentRawChunk } from '../providers/claudeCode/subagentTaskCorrelation';
 
 export interface RawProjectionOptions {
@@ -89,6 +89,8 @@ export async function rawMessagesToCanonicalEvents(
       store.findByProviderToolCallId(id, sessionId),
     findActiveToolCallByRawProviderId: (rawId: string) =>
       store.findActiveToolCallByRawProviderId(rawId, sessionId),
+    findTeammateSpawnToolUseId: (agentId: string) =>
+      findTeammateSpawnToolUseId(store, sessionId, agentId),
   };
 
   for (const msg of rawMessages) {

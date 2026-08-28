@@ -823,3 +823,132 @@ describe('projectTaskSubagentRawMessages', () => {
     expect(await projectTaskSubagentRawMessages([leadText, teammate], 'tool-outer')).toEqual([]);
   });
 });
+
+describe("a teammate's own stream in the LEAD's mainline", () => {
+  // A teammate runs its OWN SDK query (TeammateManager.streamTeammateOutput), so
+  // its chunks carry `parent_tool_use_id: null` and are persisted onto the lead's
+  // session tagged `_isTeammateOutput`. Without correlation back to the spawning
+  // Task call they render as bare, unattributed lead turns.
+  const AGENT = 'Scout@core';
+
+  const spawn = raw({
+    id: 1,
+    content: JSON.stringify({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        id: 'msg-spawn',
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_spawn',
+          name: 'Task',
+          input: { name: 'Scout', team_name: 'core', prompt: 'review the tests' },
+        }],
+      },
+    }),
+  });
+
+  const teammateChunk = (id: number, chunk: Record<string, unknown>): RawMessage =>
+    raw({
+      id,
+      content: JSON.stringify({ ...chunk, parent_tool_use_id: null, _isTeammateOutput: true, _teammateAgentId: AGENT }),
+    });
+
+  const cardFor = (vms: Awaited<ReturnType<typeof projectRawMessagesToViewMessages>>) =>
+    vms.find((m) => m.type === 'subagent');
+
+  it("folds a teammate's text and thinking under its spawn card instead of the mainline", async () => {
+    const vms = await projectRawMessagesToViewMessages([
+      spawn,
+      teammateChunk(2, {
+        type: 'assistant',
+        message: {
+          id: 'msg-tm',
+          role: 'assistant',
+          model: 'claude-opus-4',
+          content: [
+            { type: 'thinking', thinking: 'Reading the suite first.', signature: 'sig' },
+            { type: 'text', text: 'Tests look green.' },
+          ],
+        },
+      }),
+    ], 'claude-code');
+
+    expect(vms.filter((m) => m.type === 'assistant_message')).toEqual([]);
+    const children = cardFor(vms)?.subagent?.childEvents ?? [];
+    expect(children.map((c) => c.thinking ?? c.text)).toEqual(['Reading the suite first.', 'Tests look green.']);
+  });
+
+  it("nests a teammate's tool_use/tool_result under the spawn card, not the mainline", async () => {
+    const vms = await projectRawMessagesToViewMessages([
+      spawn,
+      teammateChunk(2, {
+        type: 'assistant',
+        message: {
+          id: 'msg-tm-tool',
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_read', name: 'Read', input: { file_path: '/a.ts' } }],
+        },
+      }),
+      teammateChunk(3, {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_read', content: 'export const a = 1;' }],
+        },
+      }),
+    ], 'claude-code');
+
+    expect(vms.filter((m) => m.type === 'tool_call')).toEqual([]);
+    const children = cardFor(vms)?.subagent?.childEvents ?? [];
+    expect(children).toHaveLength(1);
+    expect(children[0].toolCall).toMatchObject({ toolName: 'Read', status: 'completed', result: 'export const a = 1;' });
+  });
+
+  it('classifies a forwarded SYSTEM REMINDER instead of leaving a bare status line', async () => {
+    const vms = await projectRawMessagesToViewMessages([
+      spawn,
+      teammateChunk(2, {
+        type: 'user',
+        message: { role: 'user', content: '<SYSTEM_REMINDER>Keep the plan updated.</SYSTEM_REMINDER>' },
+      }),
+    ], 'claude-code');
+
+    expect(vms.filter((m) => m.type === 'system_message')).toEqual([]);
+    const children = cardFor(vms)?.subagent?.childEvents ?? [];
+    expect(children).toHaveLength(1);
+    expect(children[0].systemMessage).toMatchObject({ systemType: 'status', reminderKind: 'teammate_forwarded' });
+  });
+
+  it("never merges a teammate's text into the lead's own assistant bubble", async () => {
+    // appendAssistantMessage coalesces adjacent assistant events; without a
+    // subagent-scope check the teammate's text lands inside the lead's turn.
+    const leadSays = (id: number, text: string) =>
+      raw({
+        id,
+        content: JSON.stringify({
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: { id: `msg-lead-${id}`, role: 'assistant', content: [{ type: 'text', text }] },
+        }),
+      });
+
+    const vms = await projectRawMessagesToViewMessages([
+      spawn,
+      leadSays(2, 'Dispatching Scout.'),
+      teammateChunk(3, {
+        type: 'assistant',
+        message: { id: 'msg-tm', role: 'assistant', content: [{ type: 'text', text: 'On it.' }] },
+      }),
+      leadSays(4, 'Thanks.'),
+    ], 'claude-code');
+
+    // The lead's own two turns still coalesce (they are adjacent once the
+    // teammate's turn is folded out); what must never happen is the teammate's
+    // words landing inside them.
+    const leadText = vms.filter((m) => m.type === 'assistant_message').map((m) => m.text).join('');
+    expect(leadText).not.toContain('On it.');
+    expect((cardFor(vms)?.subagent?.childEvents ?? []).map((c) => c.text)).toEqual(['On it.']);
+  });
+});

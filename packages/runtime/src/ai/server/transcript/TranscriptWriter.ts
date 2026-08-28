@@ -83,9 +83,11 @@ export class TranscriptWriter {
       thinking?: string;
       thinkingSignature?: string;
       model?: string;
+      subagentId?: string | null;
     },
   ): Promise<TranscriptEvent> {
     const mode = options?.mode ?? 'agent';
+    const subagentId = options?.subagentId ?? null;
     const hasExtras =
       options?.thinking !== undefined ||
       options?.thinkingSignature !== undefined ||
@@ -104,7 +106,10 @@ export class TranscriptWriter {
     if (
       last &&
       last.eventType === 'assistant_message' &&
-      last.subagentId === null &&
+      // Same scope only: a teammate's forwarded text carries the spawning
+      // Task's subagentId, and merging it into the lead's adjacent bubble
+      // would attribute the teammate's words to the lead.
+      last.subagentId === subagentId &&
       last.mode === mode
     ) {
       const mergedText = (last.searchableText ?? '') + text;
@@ -128,6 +133,7 @@ export class TranscriptWriter {
       searchableText: text,
       searchable: true,
       payload: payload as unknown as Record<string, unknown>,
+      subagentId,
       createdAt: options?.createdAt,
     });
   }
@@ -151,6 +157,7 @@ export class TranscriptWriter {
       attachmentDenyRule?: string;
       attachmentDetection?: 'reactive' | 'preflight';
       searchable?: boolean;
+      subagentId?: string | null;
       createdAt?: Date;
     },
   ): Promise<TranscriptEvent> {
@@ -176,6 +183,7 @@ export class TranscriptWriter {
       searchableText: text,
       searchable: options?.searchable ?? true,
       payload: payload as unknown as Record<string, unknown>,
+      subagentId: options?.subagentId ?? null,
       createdAt: options?.createdAt,
     });
   }

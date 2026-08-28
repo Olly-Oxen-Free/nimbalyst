@@ -30,7 +30,7 @@ import type {
   ParseContext,
   CanonicalEventDescriptor,
 } from './parsers/IRawMessageParser';
-import { processDescriptor as processDescriptorShared } from './processDescriptor';
+import { processDescriptor as processDescriptorShared, findTeammateSpawnToolUseId } from './processDescriptor';
 
 // ---------------------------------------------------------------------------
 // Dependencies (injected via interfaces)
@@ -282,6 +282,8 @@ export class TranscriptTransformer {
         this.transcriptStore.findByProviderToolCallId(id, sessionId),
       findActiveToolCallByRawProviderId: (rawId: string) =>
         this.transcriptStore.findActiveToolCallByRawProviderId(rawId, sessionId),
+      findTeammateSpawnToolUseId: (agentId: string) =>
+        findTeammateSpawnToolUseId(this.transcriptStore, sessionId, agentId),
     };
 
     let lastRawMessageId = afterId;
@@ -532,6 +534,8 @@ export class TranscriptTransformer {
         targetStore.findByProviderToolCallId(id, sessionId),
       findActiveToolCallByRawProviderId: (rawId: string) =>
         targetStore.findActiveToolCallByRawProviderId(rawId, sessionId),
+      findTeammateSpawnToolUseId: (agentId: string) =>
+        findTeammateSpawnToolUseId(targetStore, sessionId, agentId),
     };
 
     for (const msg of messages) {

@@ -40,6 +40,33 @@ function isSyntheticCodexLookupId(id: string): boolean {
   return id.startsWith('nimtc|');
 }
 
+/**
+ * Resolve a managed teammate's agent id (`"<name>@<team>"`) to the tool_use id
+ * of the `Task` call that spawned it, from subagent events already written for
+ * the session. Latest spawn wins so a re-spawned teammate folds under its
+ * current card. See `ClaudeCodeRawParser.resolveTeammateSubagentId`.
+ */
+export async function findTeammateSpawnToolUseId(
+  store: Pick<ITranscriptEventStore, 'getSessionEvents'>,
+  sessionId: string,
+  agentId: string,
+): Promise<string | null> {
+  const spawns = await store.getSessionEvents(sessionId, { eventTypes: ['subagent'] });
+  let match: string | null = null;
+  for (const event of spawns) {
+    const payload = event.payload as { teammateName?: string | null; teamName?: string | null };
+    if (
+      payload.teammateName
+      && payload.teamName
+      && `${payload.teammateName}@${payload.teamName}` === agentId
+      && event.subagentId
+    ) {
+      match = event.subagentId;
+    }
+  }
+  return match;
+}
+
 export async function processDescriptor(
   writer: TranscriptWriter,
   store: ITranscriptEventStore,
@@ -65,6 +92,7 @@ export async function processDescriptor(
         thinking: desc.thinking,
         thinkingSignature: desc.thinkingSignature,
         model: desc.model,
+        subagentId: desc.subagentId,
       });
     }
 
@@ -85,6 +113,7 @@ export async function processDescriptor(
         attachmentStagingMode: desc.attachmentStagingMode,
         attachmentDenyRule: desc.attachmentDenyRule,
         attachmentDetection: desc.attachmentDetection,
+        subagentId: desc.subagentId,
       });
     }
 

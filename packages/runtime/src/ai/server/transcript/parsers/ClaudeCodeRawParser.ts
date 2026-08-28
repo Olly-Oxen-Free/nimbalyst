@@ -89,6 +89,15 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
     this.subagentProjection = enabled;
   }
 
+  /**
+   * Managed-teammate agent id (`"<name>@<team>"`, TeammateManager) -> tool_use
+   * id of the `Task` call that spawned it. Populated from spawn args seen in
+   * this batch; misses fall back to a store lookup via ParseContext.
+   */
+  private readonly teammateSpawnIds = new Map<string, string>();
+  /** Agent ids already looked up in the store and not found. */
+  private readonly teammateSpawnMisses = new Set<string>();
+
   async parseMessage(
     msg: RawMessage,
     context: ParseContext,
@@ -251,6 +260,10 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         const dropSubagentProse =
           Boolean(parentToolUseId) && !this.teammateProjection && !this.subagentProjection;
 
+        // A managed teammate's own turn: fold it under the spawn card rather
+        // than letting it land unattributed in the lead's mainline.
+        const teammateSubagentId = await this.resolveTeammateSubagentId(parsed, context);
+
         if (Array.isArray(parsed.message.content)) {
           for (const block of parsed.message.content) {
             if (block.type === 'text' && block.text) {
@@ -270,6 +283,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
                 text: block.text,
                 createdAt: msg.createdAt,
                 ...(turnModel ? { model: turnModel } : {}),
+                ...(teammateSubagentId ? { subagentId: teammateSubagentId } : {}),
               });
             } else if (block.type === 'thinking' && (block.thinking || block.text)) {
               if (dropSubagentProse) continue;
@@ -291,6 +305,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
                 thinking: thinkingText,
                 ...(thinkingSignature ? { thinkingSignature } : {}),
                 ...(turnModel ? { model: turnModel } : {}),
+                ...(teammateSubagentId ? { subagentId: teammateSubagentId } : {}),
                 createdAt: msg.createdAt,
               });
             } else if (block.type === 'tool_use') {
@@ -299,6 +314,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
                 block,
                 context,
                 parentToolUseId,
+                teammateSubagentId,
               );
               descriptors.push(...toolDescriptors);
             } else if (block.type === 'tool_result') {
@@ -440,10 +456,22 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
               createdAt: msg.createdAt,
             });
           } else {
+            // In the LEAD's mainline the same chunk is the teammate's, not the
+            // lead's. Fold it under the spawn card, and run the SYSTEM REMINDER
+            // classification that until now only existed on the input side --
+            // teammate output is always logged with direction 'output'.
+            const teammateSubagentId = await this.resolveTeammateSubagentId(parsed, context);
+            const isReminder =
+              parsed._isTeammateOutput === true
+              && this.isSystemReminderContent(parsed.message.content, msg.metadata);
             descriptors.push({
               type: 'system_message',
               text: parsed.message.content,
               systemType: 'status',
+              ...(isReminder
+                ? { reminderKind: this.extractReminderKind(msg.metadata) ?? 'teammate_forwarded' }
+                : {}),
+              ...(teammateSubagentId ? { subagentId: teammateSubagentId } : {}),
               createdAt: msg.createdAt,
             });
           }
@@ -523,6 +551,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
     block: any,
     context: ParseContext,
     parentToolUseId?: string,
+    teammateSubagentId?: string,
   ): Promise<CanonicalEventDescriptor[]> {
     const descriptors: CanonicalEventDescriptor[] = [];
     const toolName = block.name ?? 'unknown';
@@ -546,6 +575,13 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         typeof args.subagent_type === 'string' && args.subagent_type
           ? args.subagent_type
           : toolName;
+
+      // Join key for this teammate's own forwarded chunks, which carry no
+      // parent_tool_use_id (see resolveTeammateSubagentId).
+      if (teammateName && teamName) {
+        this.teammateSpawnIds.set(`${teammateName}@${teamName}`, toolId);
+        this.teammateSpawnMisses.clear();
+      }
 
       descriptors.push({
         type: 'subagent_started',
@@ -586,9 +622,12 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
       if (existing) return [];
     }
 
-    // Resolve parent subagent for nested tool calls
+    // Resolve parent subagent for nested tool calls. A teammate-correlated id
+    // bypasses hasSubagent: it was already validated against the spawn args or
+    // the store, and the in-batch map is empty when the spawn landed earlier.
     const resolvedParent = parentToolUseId ?? block.parent_tool_use_id;
-    const subagentId = resolvedParent && context.hasSubagent(resolvedParent) ? resolvedParent : undefined;
+    const subagentId = teammateSubagentId
+      ?? (resolvedParent && context.hasSubagent(resolvedParent) ? resolvedParent : undefined);
 
     descriptors.push({
       type: 'tool_call_started',
@@ -799,6 +838,40 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
   private extractReminderKind(metadata?: Record<string, unknown>): string | undefined {
     const kind = metadata?.reminderKind;
     return typeof kind === 'string' ? kind : undefined;
+  }
+
+  /**
+   * Resolve the sub-agent card a `_isTeammateOutput`-tagged chunk belongs to.
+   *
+   * Managed teammates run their own SDK query, so their chunks carry no
+   * `parent_tool_use_id` — the join key is the agent id TeammateManager builds
+   * as `"<name>@<team>"`, compared against the same string composed from the
+   * spawning `Task` call's `name`/`team_name` args. Returns undefined in
+   * teammate-projection mode (the teammate's own thread view renders these as
+   * ordinary top-level turns) and when no spawn card exists for this session,
+   * in which case the caller keeps the pre-existing top-level rendering rather
+   * than dropping the turn.
+   */
+  private async resolveTeammateSubagentId(
+    parsed: any,
+    context: ParseContext,
+  ): Promise<string | undefined> {
+    if (this.teammateProjection) return undefined;
+    if (parsed?._isTeammateOutput !== true) return undefined;
+    const agentId = typeof parsed._teammateAgentId === 'string' ? parsed._teammateAgentId : '';
+    if (!agentId) return undefined;
+
+    const inBatch = this.teammateSpawnIds.get(agentId);
+    if (inBatch) return inBatch;
+    if (this.teammateSpawnMisses.has(agentId)) return undefined;
+
+    const resolved = (await context.findTeammateSpawnToolUseId?.(agentId)) ?? null;
+    if (resolved) {
+      this.teammateSpawnIds.set(agentId, resolved);
+      return resolved;
+    }
+    this.teammateSpawnMisses.add(agentId);
+    return undefined;
   }
 }
 

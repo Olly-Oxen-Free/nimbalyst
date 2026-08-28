@@ -39,6 +39,18 @@ export interface ParseContext {
    * processed in an earlier batch.
    */
   findActiveToolCallByRawProviderId(rawId: string): Promise<TranscriptEvent | null>;
+  /**
+   * Resolve a managed teammate's agent id (`"<name>@<team>"`) back to the
+   * `Task` tool_use id that spawned it, from subagent events already written
+   * for this session.
+   *
+   * A teammate runs its own SDK query, so its chunks carry no
+   * `parent_tool_use_id` and the parser's in-batch spawn map is empty whenever
+   * the spawn landed in an earlier incremental batch. Optional so the parser
+   * unit tests' hand-built contexts keep compiling; the real contexts
+   * (TranscriptTransformer, projectRawMessages) always provide it.
+   */
+  findTeammateSpawnToolUseId?(agentId: string): Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +84,8 @@ export interface AssistantMessageDescriptor {
   thinkingSignature?: string;
   /** Per-turn model id (e.g. "claude-opus-4-7"). New in Claude Code 2.1.x. */
   model?: string;
+  /** Owning sub-agent/teammate card, so the projector folds this under it. */
+  subagentId?: string | null;
 }
 
 export interface SystemMessageDescriptor {
@@ -101,6 +115,8 @@ export interface SystemMessageDescriptor {
   attachmentStagingMode?: 'temp' | 'workspace' | 'custom';
   attachmentDenyRule?: string;
   attachmentDetection?: 'reactive' | 'preflight';
+  /** Owning sub-agent/teammate card, so the projector folds this under it. */
+  subagentId?: string | null;
 }
 
 export interface ToolCallStartedDescriptor {

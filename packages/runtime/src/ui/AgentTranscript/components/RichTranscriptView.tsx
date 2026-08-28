@@ -373,6 +373,7 @@ const PromptAdditionsInline: React.FC<{
 const REMINDER_KIND_LABELS: Record<string, string> = {
   session_naming: 'Session metadata reminder',
   wakeup_resume: 'Resumed from scheduled wakeup',
+  teammate_forwarded: 'Teammate system reminder',
 };
 
 // Keyed by the known PermissionDeniedReasonType values from the SDK. Typed
@@ -466,6 +467,41 @@ const SystemReminderCard: React.FC<{
         <p className="m-0 mt-2 text-[0.875rem] leading-relaxed text-[var(--nim-text-muted)] whitespace-normal break-words">
           {content}
         </p>
+      )}
+    </div>
+  );
+};
+
+/**
+ * A sub-agent's or teammate's own prose, rendered inside its collapsed card.
+ * The mainline message renderer is index/ref-bound and can't be reused here,
+ * and `renderToolCard` drops anything without a `toolCall` -- so without this
+ * a folded teammate turn would be suppressed rather than merely collapsed.
+ */
+const SubagentProseCard: React.FC<{
+  message: TranscriptViewMessage;
+}> = ({ message }) => {
+  const thinking = message.thinking?.trim();
+  const text = message.text?.trim();
+  if (!thinking && !text) return null;
+
+  return (
+    <div className="rich-transcript-subagent-prose flex flex-col gap-1">
+      {thinking && (
+        <details className="rich-transcript-thinking rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)]">
+          <summary className="flex items-center gap-1.5 px-2 py-1 text-xs text-[var(--nim-text-muted)] cursor-pointer select-none">
+            <MaterialSymbol icon="psychology" size={14} />
+            <span>Thinking</span>
+          </summary>
+          <div className="px-2 pb-2 pt-1 text-xs text-[var(--nim-text-muted)] whitespace-pre-wrap">
+            {thinking}
+          </div>
+        </details>
+      )}
+      {text && (
+        <div className="text-xs text-[var(--nim-text-muted)] whitespace-pre-wrap select-text">
+          {text}
+        </div>
       )}
     </div>
   );
@@ -2026,9 +2062,15 @@ export const RichTranscriptView = React.forwardRef<
                     {isTeammate ? 'Teammate' : 'Sub-agent'} Actions ({(toolMsg.subagent?.childEvents ?? []).length}):
                   </div>
                   <div className="rich-transcript-subagent-children flex flex-col gap-1 mt-2">
-                    {(toolMsg.subagent?.childEvents ?? []).map((childMsg: TranscriptViewMessage, childIdx: number) =>
-                      renderToolCard(childMsg, childIdx, depth + 1)
-                    )}
+                    {(toolMsg.subagent?.childEvents ?? []).map((childMsg: TranscriptViewMessage, childIdx: number) => {
+                      if (childMsg.type === 'assistant_message') {
+                        return <SubagentProseCard key={`prose-${childMsg.id}`} message={childMsg} />;
+                      }
+                      if (childMsg.type === 'system_message') {
+                        return <SystemReminderCard key={`reminder-${childMsg.id}`} message={childMsg} />;
+                      }
+                      return renderToolCard(childMsg, childIdx, depth + 1);
+                    })}
                   </div>
                 </div>
               )}
