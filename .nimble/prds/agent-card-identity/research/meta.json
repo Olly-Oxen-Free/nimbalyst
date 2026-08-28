@@ -1,0 +1,36 @@
+{
+  "feature_slug": "agent-card-identity",
+  "mode": "feature-init",
+  "research_type": "internal-only",
+  "external_research_skipped": true,
+  "external_skip_reason": "Repo-internal UI consistency fix; no external library/API question in scope.",
+  "created": "2026-08-28",
+  "phases_completed": ["internal"],
+  "phase_2_status": "skipped-by-design",
+  "artifacts": {
+    "internal": [
+      "internal/patterns.md",
+      "internal/errors.md",
+      "internal/dependencies.md",
+      "internal/structure.md",
+      "internal/findings.md"
+    ],
+    "external": [
+      "external/findings.md",
+      "external/sources.yaml"
+    ],
+    "summary": "summary.md"
+  },
+  "bugs_researched": ["A1: inline spawn card auto-expand + header anatomy divergence", "A2: generic provider label instead of agent name+model"],
+  "confirmed_root_causes": {
+    "A1": "RichTranscriptView.tsx:1626-1642 auto-expand useEffect, keyed off same id as card expand-state lookup",
+    "A2": "RichTranscriptView.tsx:2298-2300 getProviderDisplayName(provider), single prop per view, never overridden at embed sites"
+  },
+  "prds_referenced": [
+    "004_task-subagent-visibility",
+    "006_teammate-idle-handoff"
+  ],
+  "research_gaps": [
+    "TaskThreadPopover.tsx, TaskTileRail.tsx, TeammateTileRail.tsx RichTranscriptView call sites not read in full — identity data availability unconfirmed"
+  ]
+}
