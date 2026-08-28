@@ -1,8 +1,8 @@
 {
   "slug": "teammate-stream-and-lifecycle-fixes",
-  "phase": "executing",
+  "phase": "ready-for-merge",
   "created": "2026-08-28",
-  "status": "running",
+  "status": "ready-for-merge",
   "notes": "Coordinator running autonomously (user pre-approved all gates this session; interview conducted from the user's own confirmed root-cause brief -- no interactive Q&A possible in this harness). Research internal-only via three parallel Explore forks, each producing high-confidence file:line root causes folded directly into tasks.yaml briefs. Execution rule: NO PRs ever, no gh; worktree-free-local cadence (PRD 006-009 precedent); coordinator runs typecheck+test:prepush itself per task with visible output; final git merge --ff-only to main per explicit session instruction.",
   "prd_number": "010",
   "tasks_total": 5,
@@ -15,6 +15,6 @@
     "2a": { "state": "done", "commit": "5a5129547+d8e7ab2b5" },
     "3a": { "state": "done", "commit": "8f9fa5d1b" },
     "4a": { "state": "done", "commit": "d1e8f21ef+4c65449b5" },
-    "5a": { "state": "pending" }
+    "5a": { "state": "done", "commit": "47831ce13" }
   }
 }
