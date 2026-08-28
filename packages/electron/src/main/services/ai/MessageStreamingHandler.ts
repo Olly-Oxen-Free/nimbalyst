@@ -114,6 +114,7 @@ import {
   getDefaultEffortLevel,
   getDefaultThinkingMode,
   getAppSetting,
+  getTeammateShutdownGraceSeconds,
 } from '../../utils/store';
 import {
   safeSend,
@@ -1629,6 +1630,14 @@ export class MessageStreamingHandler {
                 modelDisplayName: resolveExtensionModelDisplayName(session.provider, session.model),
               })
             : undefined;
+
+      // Per-workspace teammate shutdown grace period. Read per-turn (the store
+      // can change between turns) and pushed into the provider, which owns the
+      // TeammateManager the setting actually governs.
+      const graceCapableProvider = provider as { setTeammateShutdownGraceSeconds?: (seconds: number) => void };
+      if (effectiveWorkspacePath && typeof graceCapableProvider.setTeammateShutdownGraceSeconds === 'function') {
+        graceCapableProvider.setTeammateShutdownGraceSeconds(getTeammateShutdownGraceSeconds(effectiveWorkspacePath));
+      }
 
       for await (const chunk of provider.sendMessage(messageToSend, contextWithSession, session.id, sessionMessages, effectiveWorkspacePath, attachments, extensionAgentTools, extensionAgentSystemPrompt)) {
         if (!chunk) continue;

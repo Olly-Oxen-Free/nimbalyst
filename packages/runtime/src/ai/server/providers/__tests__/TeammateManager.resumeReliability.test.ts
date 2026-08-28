@@ -35,7 +35,7 @@
  *   `packages/electron/src/main/services/ai/__tests__/teammateWakeDelivery.test.ts`.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import os from 'os';
 import path from 'path';
 
@@ -528,6 +528,106 @@ describe('shutdown-request handshake wording is unaffected (task 1a "confirm unc
     expect(ackText).toMatch(/awaiting approval/i);
     expect(ackText).not.toMatch(/delivered/i);
     expect(ackText).not.toMatch(/do not retry/i);
+  });
+});
+
+/**
+ * Shutdown grace period (PRD teammate-stream-and-lifecycle-fixes, task 4a).
+ *
+ * `shutdownGraceMs` splits the shutdown *request* (which still acks the lead
+ * immediately) from its *execution*. The default of 0 must stay byte-identical
+ * to the pre-grace behavior, so the first case here is a regression guard, not
+ * a feature test. Delivery is observed through `queryMock`: the idle branch
+ * executes by resuming the teammate's session.
+ */
+describe('shutdown grace period (task 4a)', () => {
+  type GraceInternals = { pendingShutdowns: Map<string, unknown> };
+  const pendingShutdowns = (manager: TeammateManager) =>
+    (manager as unknown as GraceInternals).pendingShutdowns;
+
+  const requestShutdown = (manager: TeammateManager) =>
+    manager.handlePreToolUse(
+      'SendMessage',
+      { recipient: 'alice', type: 'shutdown_request', content: 'please stop' },
+      'tool-1',
+      'session-1',
+    );
+
+  /** True if any resume so far carried the shutdown handshake prompt. */
+  const shutdownWasDelivered = () =>
+    queryMock.mock.calls.some(([args]) =>
+      typeof (args as { prompt?: unknown }).prompt === 'string' &&
+      ((args as { prompt: string }).prompt).includes('shutdown request'));
+
+  const idleManagerWithGrace = (graceMs: number) => {
+    const manager = new TeammateManager(makeDeps());
+    manager.shutdownGraceMs = graceMs;
+    internals(manager).idleTeammates.set('alice@team', idleAlice);
+    return manager;
+  };
+
+  beforeEach(() => {
+    queryMock.mockReturnValue(wedgedQuery());
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('executes immediately at the default grace of 0', async () => {
+    const manager = idleManagerWithGrace(0);
+
+    await requestShutdown(manager);
+
+    expect(shutdownWasDelivered()).toBe(true);
+    expect(pendingShutdowns(manager).size).toBe(0);
+  });
+
+  it('holds the shutdown for the configured delay, then executes it', async () => {
+    const manager = idleManagerWithGrace(5000);
+
+    await requestShutdown(manager);
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(pendingShutdowns(manager).has('alice@team')).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(shutdownWasDelivered()).toBe(true);
+    expect(pendingShutdowns(manager).size).toBe(0);
+  });
+
+  it('cancels the pending shutdown when a new message arrives inside the window', async () => {
+    const manager = idleManagerWithGrace(5000);
+
+    await requestShutdown(manager);
+    await manager.handlePreToolUse(
+      'SendMessage',
+      { recipient: 'alice', type: 'message', content: 'actually, keep going' },
+      'tool-2',
+      'session-1',
+    );
+
+    expect(pendingShutdowns(manager).size).toBe(0);
+    // The teammate was resumed for the new message, never for the shutdown
+    // handshake -- and nothing fires once the original delay would have passed.
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    expect(shutdownWasDelivered()).toBe(false);
+  });
+
+  it('cancels the pending shutdown when the user messages the teammate directly', async () => {
+    const manager = idleManagerWithGrace(5000);
+
+    await requestShutdown(manager);
+    await manager.sendMessageFromHost('session-1', 'alice@team', 'actually, keep going');
+
+    expect(pendingShutdowns(manager).size).toBe(0);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    expect(shutdownWasDelivered()).toBe(false);
   });
 });
 

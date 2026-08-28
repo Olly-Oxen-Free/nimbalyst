@@ -543,6 +543,9 @@ export interface WorkspaceState {
   workstreamStates?: Record<string, unknown>;
   // Agent mode file scope mode (shared across all sessions in workspace)
   agentFileScopeMode?: AgentFileScopeMode;
+  // Seconds to hold a teammate shutdown_request before it executes, giving the
+  // user a window to message the teammate again and cancel it. 0 = immediate.
+  teammateShutdownGraceSeconds?: number;
   // Collab mode tree state.
   collabTree?: {
     expandedFolders: string[];
@@ -791,6 +794,7 @@ function createDefaultWorkspaceState(workspacePath: string): WorkspaceState {
     extensionConfiguration: undefined,
     agentPermissions: undefined,
     agentWorktreeSessionModes: undefined,
+    teammateShutdownGraceSeconds: 0,
     diffTreeGroupByDirectory: undefined,
     fileGutterCollapsed: undefined,
     workstreamStates: undefined,
@@ -1316,6 +1320,22 @@ export function getAgentFileScopeMode(workspacePath: string): AgentFileScopeMode
 export function saveAgentFileScopeMode(workspacePath: string, mode: AgentFileScopeMode): void {
   updateWorkspaceState(workspacePath, workspace => {
     workspace.agentFileScopeMode = mode;
+  });
+}
+
+// Teammate Shutdown Grace Period Management
+/**
+ * Seconds to wait between a teammate `shutdown_request` and its execution.
+ * Defaults to 0 (execute immediately) so existing workspaces are unchanged.
+ */
+export function getTeammateShutdownGraceSeconds(workspacePath: string): number {
+  const seconds = getWorkspaceState(workspacePath).teammateShutdownGraceSeconds;
+  return typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
+export function saveTeammateShutdownGraceSeconds(workspacePath: string, seconds: number): void {
+  updateWorkspaceState(workspacePath, workspace => {
+    workspace.teammateShutdownGraceSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
   });
 }
 

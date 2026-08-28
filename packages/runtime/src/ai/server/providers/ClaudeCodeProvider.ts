@@ -693,6 +693,17 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    * computed inline here once already and never reached TeammateManager,
    * silently leaving its spawn-gate fix inert.
    */
+  /**
+   * Push the per-workspace teammate shutdown grace period into TeammateManager.
+   * The value lives in electron's workspace-settings store, which the runtime
+   * cannot read, so the host sets it per-turn (the store is editable between
+   * turns without a restart).
+   */
+  public setTeammateShutdownGraceSeconds(seconds: number): void {
+    this.teammateManager.shutdownGraceMs =
+      Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+  }
+
   private syncAgentTeamsFlag(settingsEnv: Record<string, string>): boolean {
     const enableAgentTeams = settingsEnv.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
     this.teammateManager.enableAgentTeams = enableAgentTeams;

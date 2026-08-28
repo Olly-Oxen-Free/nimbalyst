@@ -254,6 +254,11 @@ export class TeammateManager {
   private pendingLeadMessages: Map<string, PendingMessage[]> = new Map();
   private pendingLeadMessageFlushes: Set<string> = new Set();
 
+  // agentId -> timer holding an approved shutdown_request during its grace
+  // period. Only populated when `shutdownGraceMs` > 0; a new message for the
+  // same agentId clears the timer so the teammate stays alive.
+  private pendingShutdowns: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
   // tool_use_ids of shutdown_request SendMessage calls already handled by handlePreToolUse
   // (resumed idle teammate for approval handshake). processTeammateToolResult must skip these.
   private handledShutdownToolUseIds: Set<string> = new Set();
@@ -290,6 +295,13 @@ export class TeammateManager {
    * legacy `team_name` implies teams are active and needs no flag.
    */
   enableAgentTeams?: boolean;
+
+  /**
+   * How long a `shutdown_request` is held before it is actually delivered, set
+   * per-turn by ClaudeCodeProvider from the per-workspace setting. 0 (the
+   * default) executes immediately, exactly as before the grace period existed.
+   */
+  shutdownGraceMs: number = 0;
   private static readonly EMIT_DEBOUNCE_MS = 100;
 
   /** Captured from lead's sendMessage() for teammate spawning. */
@@ -425,6 +437,8 @@ export class TeammateManager {
   }
 
   private markCompleted(agentId: string): void {
+    // A teammate that reached a terminal state has nothing left to shut down.
+    this.cancelPendingShutdown(agentId);
     this.completedTeammates.add(agentId);
     while (this.completedTeammates.size > TeammateManager.MAX_COMPLETED_TEAMMATES) {
       const oldest = this.completedTeammates.values().next().value;
@@ -1109,6 +1123,85 @@ export class TeammateManager {
     this.pendingLeadMessageFlushes.delete(agentId);
   }
 
+  /**
+   * Drop a shutdown still inside its grace period. Called from every path that
+   * delivers a fresh message to a teammate -- that is the whole point of the
+   * grace period: talking to a teammate again calls its shutdown off.
+   *
+   * Returns whether a pending shutdown was actually cancelled.
+   */
+  private cancelPendingShutdown(agentId: string): boolean {
+    const timer = this.pendingShutdowns.get(agentId);
+    if (!timer) return false;
+    clearTimeout(timer);
+    this.pendingShutdowns.delete(agentId);
+    console.log(`[MANAGED-TEAMMATE] Cancelled pending shutdown for "${agentId}" -- a new message arrived during the grace period`);
+    return true;
+  }
+
+  /**
+   * Deliver an approved shutdown prompt to whichever state the teammate is in
+   * *now*. State is re-resolved here rather than captured when the request came
+   * in, because a running teammate can finish its turn and go idle (or be torn
+   * down entirely) while the grace period is still counting down.
+   */
+  private async executeShutdown(
+    agentId: string,
+    recipient: string,
+    shutdownPrompt: string,
+    leadSessionId: string | undefined,
+  ): Promise<void> {
+    const running = this.managedTeammates.get(agentId);
+    if (running) {
+      const queueDepth = this.queueLeadMessage(agentId, recipient, shutdownPrompt, 'Shutdown request from lead');
+      console.log(`[MANAGED-TEAMMATE] Queued shutdown request for running teammate "${recipient}" (agentId: ${agentId}, queueDepth=${queueDepth})`);
+      try {
+        await this.flushPendingMessages(agentId, running.query);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn(`[MANAGED-TEAMMATE] Failed to flush shutdown request to "${recipient}":`, reason);
+      }
+      return;
+    }
+
+    const idle = this.idleTeammates.get(agentId);
+    if (idle) {
+      console.log(`[MANAGED-TEAMMATE] Shutdown request for idle teammate "${recipient}" - resuming for approval handshake`);
+      this.resumeIdleTeammate(leadSessionId, agentId, idle, shutdownPrompt);
+      return;
+    }
+
+    console.log(`[MANAGED-TEAMMATE] Shutdown for "${agentId}" is no longer deliverable - the teammate is neither running nor idle`);
+  }
+
+  /**
+   * Run a shutdown now, or hold it for the configured grace period first.
+   * With the default `shutdownGraceMs` of 0 this is the original inline call.
+   */
+  private async scheduleShutdown(
+    agentId: string,
+    recipient: string,
+    shutdownPrompt: string,
+    leadSessionId: string | undefined,
+  ): Promise<void> {
+    if (this.shutdownGraceMs <= 0) {
+      await this.executeShutdown(agentId, recipient, shutdownPrompt, leadSessionId);
+      return;
+    }
+
+    if (this.pendingShutdowns.has(agentId)) {
+      console.log(`[MANAGED-TEAMMATE] Shutdown for "${agentId}" is already inside its grace period - not stacking another`);
+      return;
+    }
+
+    console.log(`[MANAGED-TEAMMATE] Holding shutdown for "${agentId}" for ${this.shutdownGraceMs}ms before it executes`);
+    const timer = setTimeout(() => {
+      this.pendingShutdowns.delete(agentId);
+      void this.executeShutdown(agentId, recipient, shutdownPrompt, leadSessionId);
+    }, this.shutdownGraceMs);
+    this.pendingShutdowns.set(agentId, timer);
+  }
+
   private async appendToInbox(
     agentId: string,
     message: { content: string; summary: string; queuedAt: number },
@@ -1418,6 +1511,10 @@ export class TeammateManager {
     content: string,
     resumeContext?: TeammateResumeContext,
   ): Promise<{ delivered: boolean; wasIdle: boolean }> {
+    // The user talking to a teammate during its shutdown grace period calls the
+    // shutdown off -- that window exists precisely for this.
+    this.cancelPendingShutdown(agentId);
+
     const running = this.managedTeammates.get(agentId);
     if (running) {
       this.queueLeadMessage(agentId, running.name, content, 'Message from architect');
@@ -2684,26 +2781,12 @@ export class TeammateManager {
       });
 
       if (matchingRunning && messageType === 'shutdown_request') {
-        const [agentId, teammate] = matchingRunning;
+        const [agentId] = matchingRunning;
         const requestId = `shutdown-${Date.now()}@${recipient}`;
         const shutdownMessage = toolInput.content || toolInput.message || '';
         const shutdownPrompt = this.buildShutdownRequestPrompt(requestId, shutdownMessage);
-        const teammateQuery = teammate.query;
 
-        const queueDepth = this.queueLeadMessage(
-          agentId,
-          recipient,
-          shutdownPrompt,
-          'Shutdown request from lead',
-        );
-        console.log(`[MANAGED-TEAMMATE] Queued shutdown request for running teammate "${recipient}" (agentId: ${agentId}, queueDepth=${queueDepth})`);
-
-        try {
-          await this.flushPendingMessages(agentId, teammateQuery);
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          console.warn(`[MANAGED-TEAMMATE] Failed to flush shutdown request to "${recipient}":`, reason);
-        }
+        await this.scheduleShutdown(agentId, recipient, shutdownPrompt, sessionId);
 
         // Track that this shutdown was handled via preToolUse so processTeammateToolResult
         // does not redundantly call handleShutdownResult when the denied tool_result arrives.
@@ -2735,6 +2818,7 @@ export class TeammateManager {
         const [agentId, teammate] = matchingRunning;
         const messageContent = toolInput.content || toolInput.message || '';
         const messageSummary = toolInput.summary || 'Message from lead';
+        this.cancelPendingShutdown(agentId);
 
         const teammateQuery = teammate.query;
         if (!teammateQuery || typeof teammateQuery.streamInput !== 'function') {
@@ -2771,8 +2855,7 @@ export class TeammateManager {
           const requestId = `shutdown-${Date.now()}@${recipient}`;
           const shutdownMessage = toolInput.content || toolInput.message || '';
           const shutdownPrompt = this.buildShutdownRequestPrompt(requestId, shutdownMessage);
-          console.log(`[MANAGED-TEAMMATE] Shutdown request for idle teammate "${recipient}" - resuming for approval handshake`);
-          this.resumeIdleTeammate(sessionId, agentId, idleInfo, shutdownPrompt);
+          await this.scheduleShutdown(agentId, recipient, shutdownPrompt, sessionId);
 
           // Track that this shutdown was handled via preToolUse so processTeammateToolResult
           // does not redundantly call handleShutdownResult when the denied tool_result arrives.
@@ -2805,6 +2888,7 @@ export class TeammateManager {
           // Fall through to SDK handling
         } else {
           const messageContent = toolInput.content || toolInput.message || '';
+          this.cancelPendingShutdown(agentId);
           console.log(`[MANAGED-TEAMMATE] Resuming idle teammate "${recipient}" (session=${idleInfo.sessionId}) with message`);
           this.resumeIdleTeammate(sessionId, agentId, idleInfo, messageContent);
 
