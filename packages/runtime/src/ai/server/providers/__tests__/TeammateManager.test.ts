@@ -11,7 +11,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-type StoredTeammate = { agentId: string; status: string; sessionId?: string };
+type StoredTeammate = { agentId: string; status: string; sessionId?: string; endReason?: string; endedAt?: number };
 
 let storedTeammates: StoredTeammate[] = [];
 
@@ -117,7 +117,7 @@ describe('TeammateManager permission blocking', () => {
 
     // Any other teammate's activity re-emits the whole roster; without the
     // blocked set that pass would reset alice to 'running' mid-prompt.
-    await manager.emitTeammateUpdate('session-1', new Map([['bob@team', 'running']]));
+    await manager.emitTeammateUpdate('session-1', new Map([['bob@team', { status: 'running' }]]));
 
     expect(statusOf('alice@team')).toBe('blocked');
   });
@@ -129,7 +129,7 @@ describe('TeammateManager permission blocking', () => {
 
     // What handleStreamCompletion does when the teammate shuts down mid-prompt.
     internals(manager).managedTeammates.delete('alice@team');
-    await manager.emitTeammateUpdate('session-1', new Map([['alice@team', 'completed']]));
+    await manager.emitTeammateUpdate('session-1', new Map([['alice@team', { status: 'completed' }]]));
 
     manager.markTeammatePermissionResolved('session-1', 'req-a');
     await settled({ 'alice@team': 'completed' });
@@ -312,5 +312,121 @@ describe('TeammateManager.stopByAgentId', () => {
 
     expect(() => manager.stopByAgentId('ghost@team', 'session-explicit')).not.toThrow();
     expect(manager.stopByAgentId('ghost@team', 'session-explicit')).toEqual({ stopped: false });
+  });
+});
+
+/**
+ * endReason/endedAt taxonomy (task 1a, PRD agent-revival-persistence).
+ *
+ * Every place a teammate goes terminal must stamp why, so a later gate (2a)
+ * can tell a clean finish, a deliberate user shutdown, and an involuntary
+ * lead-abandonment apart instead of collapsing them all into `completed`.
+ * One test per write site; `stop`/`stopByAgentId`/`killAll`'s idle-teammate
+ * loop write 'user-shutdown' rather than 'finished', per the settled Known
+ * Issues decision in the task brief -- a UI Stop click is exactly the
+ * "deliberately shut down" case the revival gate must never resurface.
+ */
+describe('TeammateManager endReason/endedAt taxonomy', () => {
+  const endReasonOf = (agentId: string) => storedTeammates.find(tm => tm.agentId === agentId)?.endReason;
+  const endedAtOf = (agentId: string) => storedTeammates.find(tm => tm.agentId === agentId)?.endedAt;
+
+  const withAbort = (manager: TeammateManager, agentId: string) => {
+    const abort = { abort: vi.fn() };
+    Object.assign(internals(manager).managedTeammates.get(agentId) as object, { abort });
+    return abort;
+  };
+
+  it('abandonIdleTeammates writes lead-abandoned', async () => {
+    const manager = await managerWith();
+    internals(manager).idleTeammates.set('alice@team', idleTemplateFor('alice@team'));
+    // abandonIdleTeammates persists via scheduleEmitTeammateUpdate against a
+    // roster that must already know about alice@team for the override to land.
+    await manager.emitTeammateUpdate('session-1', new Map([['alice@team', { status: 'idle' }]]));
+
+    manager.abandonIdleTeammates('session-1');
+
+    await settled({ 'alice@team': 'completed' });
+    expect(endReasonOf('alice@team')).toBe('lead-abandoned');
+    expect(endedAtOf('alice@team')).toEqual(expect.any(Number));
+  });
+
+  it('handleStreamCompletion writes user-shutdown for an approved shutdown', async () => {
+    const manager = await managerWith('alice@team');
+
+    internals(manager).handleStreamCompletion('session-1', 'alice@team', 'team', idleTemplateFor('alice@team'), {
+      capturedSessionId: undefined,
+      approvedShutdown: true,
+      capturedResultText: undefined,
+      sentMessageToLead: false,
+    });
+
+    await settled({ 'alice@team': 'completed' });
+    expect(endReasonOf('alice@team')).toBe('user-shutdown');
+    expect(endedAtOf('alice@team')).toEqual(expect.any(Number));
+  });
+
+  it('handleStreamCompletion writes finished for a clean/no-session-id completion', async () => {
+    const manager = await managerWith('alice@team');
+
+    internals(manager).handleStreamCompletion('session-1', 'alice@team', 'team', idleTemplateFor('alice@team'), FINISHED);
+
+    await settled({ 'alice@team': 'completed' });
+    expect(endReasonOf('alice@team')).toBe('finished');
+    expect(endedAtOf('alice@team')).toEqual(expect.any(Number));
+  });
+
+  it('handleStreamError writes errored', async () => {
+    const manager = await managerWith('alice@team');
+
+    internals(manager).handleStreamError('session-1', 'alice@team', 'team', new Error('transport closed'));
+
+    await settled({ 'alice@team': 'errored' });
+    expect(endReasonOf('alice@team')).toBe('errored');
+    expect(endedAtOf('alice@team')).toEqual(expect.any(Number));
+  });
+
+  it('killAll writes errored for running teammates and user-shutdown for idle ones', async () => {
+    const manager = await managerWith('alice@team');
+    withAbort(manager, 'alice@team');
+    internals(manager).idleTeammates.set('bob@team', idleTemplateFor('bob@team'));
+    await manager.emitTeammateUpdate('session-1', new Map([['bob@team', { status: 'idle' }]]));
+    // killAll emits immediately against lastUsedSessionId, not the sessionId
+    // threaded through managerWith/emitTeammateUpdate above.
+    (manager as unknown as { lastUsedSessionId: string }).lastUsedSessionId = 'session-1';
+
+    manager.killAll();
+
+    await settled({ 'alice@team': 'errored', 'bob@team': 'completed' });
+    expect(endReasonOf('alice@team')).toBe('errored');
+    expect(endReasonOf('bob@team')).toBe('user-shutdown');
+  });
+
+  it('stop/stopByAgentId write user-shutdown for both the running and idle branches', async () => {
+    const manager = await managerWith('alice@team');
+    withAbort(manager, 'alice@team');
+    internals(manager).idleTeammates.set('bob@team', idleTemplateFor('bob@team'));
+    await manager.emitTeammateUpdate('session-1', new Map([['bob@team', { status: 'idle' }]]));
+
+    manager.stopByAgentId('alice@team', 'session-1');
+    manager.stopByAgentId('bob@team', 'session-1');
+
+    await settled({ 'alice@team': 'errored', 'bob@team': 'completed' });
+    expect(endReasonOf('alice@team')).toBe('user-shutdown');
+    expect(endReasonOf('bob@team')).toBe('user-shutdown');
+  });
+
+  it('handleShutdownResult (SDK-mediated shutdown_request) writes user-shutdown for the idle branch', async () => {
+    // Discovered via the brief's Edge Cases grep: a sixth scheduleEmitTeammateUpdate
+    // call site that sets 'completed', not one of the five named write sites.
+    // Same deliberate shutdown handshake as handleStreamCompletion's
+    // approvedShutdown branch, so it gets the same reason.
+    const manager = await managerWith();
+    internals(manager).idleTeammates.set('alice@team', idleTemplateFor('alice@team'));
+    await manager.emitTeammateUpdate('session-1', new Map([['alice@team', { status: 'idle' }]]));
+
+    manager.handleShutdownResult('session-1', 'alice');
+
+    await settled({ 'alice@team': 'completed' });
+    expect(endReasonOf('alice@team')).toBe('user-shutdown');
   });
 });
