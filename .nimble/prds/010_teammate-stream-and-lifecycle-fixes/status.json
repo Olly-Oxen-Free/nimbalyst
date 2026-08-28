@@ -11,7 +11,7 @@
   "feature_branch": "feature/teammate-stream-and-lifecycle-fixes",
   "beads": { "tier": "cli" },
   "tasks": {
-    "1a": { "state": "pending" },
+    "1a": { "state": "done", "commit": "1ddbb89bb" },
     "2a": { "state": "pending" },
     "3a": { "state": "pending" },
     "4a": { "state": "pending" },
