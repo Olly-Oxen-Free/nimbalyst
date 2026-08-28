@@ -65,7 +65,7 @@ vi.mock('../claudeCode/claudeConfigDir', () => ({
   resolveClaudeConfigDir: () => claudeConfigDir,
 }));
 
-import { TeammateManager, type IdleTeammate, type TeammateManagerDeps } from '../TeammateManager';
+import { TeammateManager, TeammateCwdMissingError, type IdleTeammate, type TeammateManagerDeps } from '../TeammateManager';
 
 const SDK_SESSION = 'sdk-session-1';
 /** Lead session id; its first 8 chars are what a synthesized team name is built from. */
@@ -427,10 +427,14 @@ describe('resume round-trip: synthesized team name survives a manager restart (P
     await manager.emitTeammateUpdate(LEAD_SESSION);
 
     const persistedRow = storedTeammates.find(tm => tm.agentId === agentId) as unknown as
-      { teamName?: string; sessionId?: string; status?: string } | undefined;
+      { teamName?: string; sessionId?: string; status?: string; cwd?: string } | undefined;
     expect(persistedRow?.status).toBe('running');
     expect(persistedRow?.teamName).toBe(expectedTeamName);
     expect(persistedRow?.sessionId).toBe(SDK_SESSION);
+    // Spawn-time cwd (this manager's lastUsedCwd is unset, so process.cwd())
+    // lands on the persisted row via the updateMetadata payload, not just the
+    // in-memory ManagedTeammate.
+    expect(persistedRow?.cwd).toBe(process.cwd());
 
     // 3. Construct a genuinely fresh TeammateManager instance -- simulates a
     // manager restart: empty in-memory maps, only the persisted row survives.
@@ -475,5 +479,83 @@ describe('shutdown-request handshake wording is unaffected (task 1a "confirm unc
     expect(ackText).toMatch(/awaiting approval/i);
     expect(ackText).not.toMatch(/delivered/i);
     expect(ackText).not.toMatch(/do not retry/i);
+  });
+});
+
+/**
+ * Spawn cwd persists per teammate row and is preferred over lastUsedCwd on
+ * rehydration (PRD agent-revival-persistence, task 1b). Covers the
+ * post-restart path (`rehydrateIdleTeammate`, reached via
+ * `sendMessageFromHost` when neither in-memory map holds the teammate).
+ */
+describe('spawn cwd persists per teammate row (task 1b)', () => {
+  const persistedRow = (overrides: Record<string, unknown> = {}) => ({
+    name: 'bob',
+    agentId: 'bob@team',
+    teamName: 'team',
+    agentType: 'general-purpose',
+    status: 'idle',
+    sessionId: 'sdk-session-9',
+    startedAt: 111,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    storedTeammates = [];
+    queryMock.mockReset();
+  });
+
+  it('prefers the persisted row\'s own cwd over lastUsedCwd/resumeContext.cwd on rehydration', async () => {
+    const manager = new TeammateManager(makeDeps());
+    // lastUsedCwd is normally unset in a process where the lead never ran
+    // (post-restart) -- set it explicitly here to prove the row's own cwd
+    // wins even when a lastUsedCwd IS present, not just when it's absent.
+    manager.lastUsedCwd = '/some/other/lastUsedCwd/that/would/be/wrong';
+    const resumeSpy = vi
+      .spyOn(internals(manager) as unknown as { resumeIdleTeammate: (...args: unknown[]) => void }, 'resumeIdleTeammate')
+      .mockImplementation(() => {});
+    storedTeammates = [persistedRow({ cwd: os.tmpdir() })] as unknown as StoredTeammate[];
+
+    const result = await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'still there?');
+
+    expect(result).toEqual({ delivered: true, wasIdle: true });
+    expect(resumeSpy).toHaveBeenCalledWith(
+      LEAD_SESSION,
+      'bob@team',
+      expect.objectContaining({ cwd: os.tmpdir() }),
+      'still there?',
+    );
+  });
+
+  it('falls back to lastUsedCwd/process.cwd() without throwing for a legacy row with no cwd field', async () => {
+    const manager = new TeammateManager(makeDeps());
+    const resumeSpy = vi
+      .spyOn(internals(manager) as unknown as { resumeIdleTeammate: (...args: unknown[]) => void }, 'resumeIdleTeammate')
+      .mockImplementation(() => {});
+    storedTeammates = [persistedRow()] as unknown as StoredTeammate[];
+
+    const result = await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'still there?');
+
+    expect(result).toEqual({ delivered: true, wasIdle: true });
+    expect(resumeSpy).toHaveBeenCalledWith(
+      LEAD_SESSION,
+      'bob@team',
+      expect.objectContaining({ cwd: process.cwd() }),
+      'still there?',
+    );
+  });
+
+  it('surfaces a typed, catchable TeammateCwdMissingError when the persisted cwd no longer exists', async () => {
+    const manager = new TeammateManager(makeDeps());
+    const missingCwd = path.join(os.tmpdir(), `nimbalyst-teammate-cwd-missing-${Math.random().toString(36).slice(2)}`);
+    storedTeammates = [persistedRow({ cwd: missingCwd })] as unknown as StoredTeammate[];
+
+    const sendPromise = manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'still there?');
+    await expect(sendPromise).rejects.toThrow(TeammateCwdMissingError);
+    await sendPromise.catch((err: unknown) => {
+      expect(err).toBeInstanceOf(TeammateCwdMissingError);
+      expect((err as TeammateCwdMissingError).agentId).toBe('bob@team');
+      expect((err as TeammateCwdMissingError).cwd).toBe(missingCwd);
+    });
   });
 });
