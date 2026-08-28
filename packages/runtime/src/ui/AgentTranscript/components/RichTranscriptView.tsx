@@ -534,6 +534,10 @@ interface RichTranscriptViewProps {
    * don't stomp the main transcript's scroll-follow state.
    */
   persistScrollState?: boolean;
+  /** Optional: identity override for the assistant group header, e.g. a sub-agent's display name */
+  agentName?: string;
+  /** Optional: model label shown alongside agentName in the assistant group header, e.g. 'haiku' */
+  agentModel?: string;
   // Note: Interactive widgets read their host from interactiveWidgetHostAtom(sessionId)
 }
 
@@ -1161,7 +1165,7 @@ export const extractEditsFromToolMessage = (message: TranscriptViewMessage): any
 export const RichTranscriptView = React.forwardRef<
   { scrollToMessage: (index: number) => void; scrollToTop: () => void },
   RichTranscriptViewProps
->(({ sessionId, sessionStatus, isProcessing, hasPendingInteractivePrompt, messages, provider, settings: propsSettings, onSettingsChange, showSettings, documentContext, workspacePath, renderEmptyExtra, hideEmptyHelp, readFile, onOpenFile, onOpenSession, onCompact, promptAdditions, currentTeammates, waitingForNoun, appStartTime, renderEmbeddedFile, canEmbedFile, loadToolCallDiffs, onSearchBarVisibilityChange, persistScrollState = true }, ref) => {
+>(({ sessionId, sessionStatus, isProcessing, hasPendingInteractivePrompt, messages, provider, settings: propsSettings, onSettingsChange, showSettings, documentContext, workspacePath, renderEmptyExtra, hideEmptyHelp, readFile, onOpenFile, onOpenSession, onCompact, promptAdditions, currentTeammates, waitingForNoun, appStartTime, renderEmbeddedFile, canEmbedFile, loadToolCallDiffs, onSearchBarVisibilityChange, persistScrollState = true, agentName, agentModel }, ref) => {
   const [collapsedMessages, setCollapsedMessages] = useState<Set<number>>(new Set());
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
   const scrollButtonRef = useRef<HTMLDivElement>(null);
@@ -2278,7 +2282,12 @@ export const RichTranscriptView = React.forwardRef<
             </div>
             <div className="rich-transcript-message-meta flex-1 flex items-baseline gap-2">
               <span className="rich-transcript-message-sender font-medium text-[var(--nim-text)] text-sm">
-                {isUser ? 'You' : getProviderDisplayName(provider)}
+                {isUser ? 'You' : (agentName ?? getProviderDisplayName(provider))}
+                {!isUser && agentName && agentModel && (
+                  <span className="rich-transcript-message-sender-model text-[var(--nim-text-muted)] font-normal">
+                    {` [${agentModel}]`}
+                  </span>
+                )}
               </span>
               {isUser && message.mode === 'planning' && (
                 <span

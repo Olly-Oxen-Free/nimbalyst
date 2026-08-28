@@ -81,6 +81,17 @@ function renderTranscript(message: TranscriptViewMessage) {
   );
 }
 
+function makeAssistantMessage(): TranscriptViewMessage {
+  return {
+    id: 1,
+    sequence: 1,
+    createdAt: new Date(1_784_648_445_000),
+    type: 'assistant_message',
+    text: 'Hello there',
+    subagentId: null,
+  } as TranscriptViewMessage;
+}
+
 // A `Task`-keyed custom widget must take over plain sub-agent spawns WITHOUT
 // swallowing teammate spawns: teammates go through the same `Task` tool and the
 // same registry lookup, so an ungated lookup silently blanks their card.
@@ -218,5 +229,56 @@ describe('RichTranscriptView Task widget gate', () => {
     } as TranscriptViewMessage);
 
     expect(container.querySelector('[data-testid="stub-task-widget"]')).not.toBeNull();
+  });
+});
+
+describe('RichTranscriptView assistant header identity override', () => {
+  beforeEach(() => {
+    vi.stubGlobal('CSS', { highlights: { delete: vi.fn(), set: vi.fn() } });
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0);
+      return 1;
+    });
+  });
+
+  it('renders agentName and agentModel in the assistant group header when provided', () => {
+    const { container } = render(
+      <RichTranscriptView
+        sessionId="gate-1"
+        sessionStatus="idle"
+        messages={[makeAssistantMessage()]}
+        workspacePath="/workspace"
+        persistScrollState={false}
+        settings={{ compactMode: true } as any}
+        agentName="weatherman"
+        agentModel="haiku"
+      />,
+    );
+
+    const sender = container.querySelector('.rich-transcript-message-sender');
+    expect(sender).not.toBeNull();
+    expect(sender?.textContent).toContain('weatherman');
+
+    const modelSpan = container.querySelector('.rich-transcript-message-sender-model');
+    expect(modelSpan).not.toBeNull();
+    expect(modelSpan?.textContent).toContain('haiku');
+  });
+
+  it('falls back to the provider display name when agentName is not provided', () => {
+    const { container } = render(
+      <RichTranscriptView
+        sessionId="gate-1"
+        sessionStatus="idle"
+        messages={[makeAssistantMessage()]}
+        workspacePath="/workspace"
+        persistScrollState={false}
+        settings={{ compactMode: true } as any}
+      />,
+    );
+
+    const sender = container.querySelector('.rich-transcript-message-sender');
+    expect(sender).not.toBeNull();
+    expect(sender?.textContent).toContain('Agent');
+    expect(container.querySelector('.rich-transcript-message-sender-model')).toBeNull();
   });
 });
