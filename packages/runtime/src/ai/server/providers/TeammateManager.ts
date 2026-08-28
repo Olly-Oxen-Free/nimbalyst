@@ -35,6 +35,7 @@ export interface ManagedTeammate {
   startedAt: number;           // epoch ms when spawned
   lastActiveAt: number;        // epoch ms of most recent chunk
   toolCallCount: number;       // count of tool_use blocks observed
+  cwd: string;                 // the directory this teammate actually spawned into
 }
 
 export interface IdleTeammate {
@@ -59,6 +60,22 @@ export interface IdleTeammate {
 export type TeammateEndReason = 'finished' | 'user-shutdown' | 'lead-abandoned' | 'errored';
 
 /**
+ * Thrown by `rehydrateIdleTeammate` when the cwd it would resume a teammate
+ * into (the row's own persisted `cwd`, or the legacy `lastUsedCwd`/`process.cwd()`
+ * fallback for rows written before that field existed) no longer exists on
+ * disk -- e.g. a worktree cleaned up after the teammate went idle. Distinct
+ * from `rehydrateIdleTeammate` returning `undefined`, which means "nothing to
+ * resume" (no row, no session id, or a terminal status), not "found it, but
+ * its directory is gone". Consumed by 2b's no-live-lead delivery path.
+ */
+export class TeammateCwdMissingError extends Error {
+  constructor(public readonly agentId: string, public readonly cwd: string) {
+    super(`Teammate "${agentId}"'s working directory no longer exists: ${cwd}`);
+    this.name = 'TeammateCwdMissingError';
+  }
+}
+
+/**
  * A teammate row as it sits in the lead session's `currentTeammates` metadata.
  * Every field is optional: rows written before a field existed keep their old
  * shape, and nothing validates them on the way back in.
@@ -75,6 +92,12 @@ interface PersistedTeammateRow {
   toolCallCount?: number;
   endReason?: TeammateEndReason;
   endedAt?: number;
+  /**
+   * The directory this teammate actually spawned into. Absent on rows written
+   * before this field existed -- read sites (rehydrateIdleTeammate) must fall
+   * back to the pre-existing lastUsedCwd/process.cwd() chain for those rows.
+   */
+  cwd?: string;
 }
 
 /**
@@ -1344,6 +1367,17 @@ export class TeammateManager {
     // are terminal and must not be brought back.
     if (!entry.status || !TeammateManager.RESUMABLE_PERSISTED_STATUSES.has(entry.status)) return undefined;
 
+    // The row's own cwd is the most authoritative source -- it's what this
+    // teammate actually ran in, which may differ from the current process's
+    // own cwd (e.g. the team spawned into its own git worktree). Only legacy
+    // rows written before this field existed fall back to lastUsedCwd/process.cwd().
+    const cwd = entry.cwd ?? this.lastUsedCwd ?? process.cwd();
+    try {
+      await fsp.access(cwd);
+    } catch {
+      throw new TeammateCwdMissingError(agentId, cwd);
+    }
+
     const [fallbackName, fallbackTeam] = agentId.split('@');
     return {
       teamName: entry.teamName ?? fallbackTeam ?? 'team',
@@ -1352,7 +1386,7 @@ export class TeammateManager {
       agentType: entry.agentType ?? 'general-purpose',
       model: entry.model,
       color: TeammateManager.colorForAgentId(agentId),
-      cwd: this.lastUsedCwd || process.cwd(),
+      cwd,
       prompt: '',
       startedAt: entry.startedAt,
       toolCallCount: entry.toolCallCount,
@@ -1465,6 +1499,7 @@ export class TeammateManager {
         sessionId?: string;
         endReason?: TeammateEndReason;
         endedAt?: number;
+        cwd?: string;
       }> = Array.isArray(currentMetadata.currentTeammates) ? currentMetadata.currentTeammates as any[] : [];
 
       const seenAgentIds = new Set<string>();
@@ -1478,6 +1513,7 @@ export class TeammateManager {
           // Captured mid-stream, well after the teammate was first emitted, so
           // it has to be re-read on every emit rather than written once at spawn.
           sessionId: managed.sessionId ?? tm.sessionId,
+          cwd: managed.cwd,
         } : {};
         if (statusOverrides?.has(tm.agentId)) {
           const override = statusOverrides.get(tm.agentId)!;
@@ -1501,6 +1537,7 @@ export class TeammateManager {
             sessionId: idleInfo?.sessionId ?? tm.sessionId,
             toolCallCount: idleInfo?.toolCallCount,
             lastActiveAt: idleInfo?.lastActiveAt,
+            cwd: idleInfo?.cwd ?? tm.cwd,
             status: 'idle' as const,
           };
         }
@@ -1521,6 +1558,7 @@ export class TeammateManager {
             lastActiveAt: tm.lastActiveAt,
             toolCallCount: tm.toolCallCount,
             sessionId: tm.sessionId,
+            cwd: tm.cwd,
             ...(override?.endReason ? { endReason: override.endReason, endedAt: override.endedAt ?? Date.now() } : {}),
           });
         }
@@ -1540,6 +1578,7 @@ export class TeammateManager {
             toolCallCount: tm.toolCallCount,
             lastActiveAt: tm.lastActiveAt,
             sessionId: tm.sessionId,
+            cwd: tm.cwd,
             ...(override?.endReason ? { endReason: override.endReason, endedAt: override.endedAt ?? Date.now() } : {}),
           });
         }
@@ -1731,6 +1770,7 @@ export class TeammateManager {
       startedAt: now,
       lastActiveAt: now,
       toolCallCount: 0,
+      cwd,
     };
     this.managedTeammates.set(agentId, placeholder);
 
@@ -1792,6 +1832,7 @@ export class TeammateManager {
       startedAt: now,
       lastActiveAt: now,
       toolCallCount: 0,
+      cwd,
     };
     this.managedTeammates.set(agentId, placeholder);
 
@@ -2130,6 +2171,7 @@ export class TeammateManager {
       startedAt: idleInfo.startedAt ?? now,
       lastActiveAt: now,
       toolCallCount: idleInfo.toolCallCount ?? 0,
+      cwd: idleInfo.cwd,
     });
 
     streamPromise.then((result) => {
