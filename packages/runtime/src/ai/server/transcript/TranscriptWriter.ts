@@ -54,6 +54,7 @@ export class TranscriptWriter {
       mode?: 'agent' | 'planning' | 'auto';
       inputType?: 'user' | 'system_message';
       attachments?: UserMessagePayload['attachments'];
+      teammateOrigin?: UserMessagePayload['teammateOrigin'];
       createdAt?: Date;
     },
   ): Promise<TranscriptEvent> {
@@ -61,6 +62,7 @@ export class TranscriptWriter {
       mode: options?.mode ?? 'agent',
       inputType: options?.inputType ?? 'user',
       ...(options?.attachments ? { attachments: options.attachments } : {}),
+      ...(options?.teammateOrigin ? { teammateOrigin: options.teammateOrigin } : {}),
     };
 
     return this.insertEvent(sessionId, {

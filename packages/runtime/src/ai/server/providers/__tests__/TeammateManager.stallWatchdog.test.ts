@@ -100,6 +100,19 @@ function makeDeps() {
 
 type ManagerInternals = {
   resumeIdleTeammate(sessionId: string, agentId: string, idleInfo: IdleTeammate, prompt: string): void;
+  deliverMessageToLead(
+    sessionId: string | undefined,
+    teammateAgentId: string,
+    teammateName: string,
+    content: string,
+    summary: string,
+  ): void;
+  deliverRevivalFailure(
+    sessionId: string | undefined,
+    teammateAgentId: string,
+    teammateName: string,
+    reason: string,
+  ): void;
 };
 
 const idleAlice: IdleTeammate = {
@@ -224,5 +237,29 @@ describe('TeammateManager stream stall watchdog', () => {
     manager.markTeammatePermissionResolved('session-1', 'req-a');
     await vi.waitFor(() => expect(statusOf('alice@team')).toBe('errored'), { timeout: 2000 });
     expect(allCompletedOutcomes(deps)).toEqual(['errored']);
+  });
+});
+
+/**
+ * The lead's idle-wake path re-drains this queue rather than reusing
+ * `interruptWithMessage`'s formatted string, so the per-item `kind` is what
+ * lets a batched wake say which entries were messages and which were revival
+ * failures.
+ */
+describe('TeammateManager teammate-to-lead queue origin kind', () => {
+  it('tags each queued delivery with its kind, preserving order across a mixed batch', () => {
+    const manager = new TeammateManager(makeDeps());
+    const internals = manager as unknown as ManagerInternals;
+
+    internals.deliverMessageToLead(undefined, 'alice@team', 'alice', 'done', 'alice done');
+    internals.deliverRevivalFailure(undefined, 'bob@team', 'bob', 'cwd missing');
+
+    expect(manager.drainNextTeammateMessage()).toMatchObject({
+      teammateAgentId: 'alice@team', teammateName: 'alice', kind: 'wake-message',
+    });
+    expect(manager.drainNextTeammateMessage()).toMatchObject({
+      teammateAgentId: 'bob@team', teammateName: 'bob', kind: 'revival-failed',
+    });
+    expect(manager.hasPendingTeammateMessages()).toBe(false);
   });
 });

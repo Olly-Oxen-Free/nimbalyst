@@ -403,6 +403,25 @@ describe('MessageStreamingHandler onTeammateMessageWhileIdle: gate already open 
     expect(mocks.stateManager.endSession).not.toHaveBeenCalled();
   });
 
+  it('forwards the wake\'s teammateOrigin batch to sendMessageHandler so the injected turn can be attributed', async () => {
+    const provider = new RecordingProvider();
+    const liveWindow = { isDestroyed: () => false, webContents: {} };
+    mocks.findWindowByWorkspace.mockReturnValue(liveWindow);
+    const service = await installListenersOn(provider);
+    service.sendMessageHandler = vi.fn();
+
+    const teammateOrigin = [
+      { agentId: 'alice@team', teammateName: 'alice', kind: 'wake-message' },
+      { agentId: 'bob@team', teammateName: 'bob', kind: 'revival-failed' },
+    ];
+    provider.emit('teammate:messageWhileIdle', { sessionId: 'lead-session', message: 'wake up', teammateOrigin });
+
+    await vi.waitFor(() => expect(service.sendMessageHandler).toHaveBeenCalled());
+    expect(service.sendMessageHandler).toHaveBeenCalledWith(
+      expect.anything(), 'wake up', expect.anything(), 'lead-session', expect.anything(), teammateOrigin,
+    );
+  });
+
   it('still bails without delivering when isSessionActive is false (unchanged by 1c -- proves Door B is AIService\'s startSession call, not this gate)', async () => {
     const provider = new RecordingProvider();
     const liveWindow = { isDestroyed: () => false, webContents: {} };

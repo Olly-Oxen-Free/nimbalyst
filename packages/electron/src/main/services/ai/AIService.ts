@@ -42,6 +42,7 @@ import type { SessionStore } from '@nimbalyst/runtime';
 import {
   ModelIdentifier,
   type DocumentContext,
+  type TeammateOrigin,
   type Message,
   type ProviderConfig,
   type ToolHandler,
@@ -216,7 +217,7 @@ export class AIService {
   private readonly analytics = AnalyticsService.getInstance();
   private cachedNormalizedProviderSettings: Record<string, any> | null = null;
   // Store reference to sendMessage handler for queue processing
-  private sendMessageHandler: ((event: Electron.IpcMainInvokeEvent, message: string, documentContext?: DocumentContext, sessionId?: string, workspacePath?: string) => Promise<{ content: string }>) | null = null;
+  private sendMessageHandler: ((event: Electron.IpcMainInvokeEvent, message: string, documentContext?: DocumentContext, sessionId?: string, workspacePath?: string, teammateOrigin?: TeammateOrigin[]) => Promise<{ content: string }>) | null = null;
   // NOTE: Providers are now tracked per-session in ProviderFactory, not per-window
   // This allows multiple concurrent sessions in the same window (e.g., agent mode tabs)
 

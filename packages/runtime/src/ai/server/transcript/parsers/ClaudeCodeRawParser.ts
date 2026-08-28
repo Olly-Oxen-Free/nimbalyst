@@ -18,6 +18,7 @@ import type {
   ParseContext,
   CanonicalEventDescriptor,
 } from './IRawMessageParser';
+import type { TeammateOrigin } from '../types';
 import { stagedAttachmentRegistry } from '../../attachments/stagedAttachmentRegistry';
 import { isBackgroundedToolAck, isInteractiveWidgetTool } from '../../interactivePromptTools';
 
@@ -149,6 +150,10 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
             text: parsed.prompt,
             mode,
             attachments: msg.metadata?.attachments as any,
+            // Present only on teammate wakes injected into an idle lead.
+            ...(msg.metadata?.teammateOrigin
+              ? { teammateOrigin: msg.metadata.teammateOrigin as TeammateOrigin[] }
+              : {}),
             createdAt: msg.createdAt,
           });
         }

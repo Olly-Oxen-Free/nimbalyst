@@ -42,6 +42,7 @@ import {
   CLAUDE_CODE_VARIANTS,
   ModelIdentifier,
   resolveClaudeCodeModelVariant,
+  type TeammateOrigin,
 } from '../types';
 import {
   CLAUDE_CODE_VARIANT_VERSIONS,
@@ -950,6 +951,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         }
         if (documentContext?.mode) {
           metadataToLog.mode = documentContext.mode;
+        }
+        if (documentContext?.teammateOrigin && documentContext.teammateOrigin.length > 0) {
+          metadataToLog.teammateOrigin = documentContext.teammateOrigin;
         }
         const teammateMatch = message.match(/^\[Teammate message from "([^"]+)"\]/);
         if (teammateMatch) {
@@ -2399,7 +2403,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       if (!pendingMessageBatch) return;
 
       console.log(`[CLAUDE-CODE] interruptWithMessage: lead is idle, triggering sendMessage for ${pendingMessageBatch.count} message(s): "${pendingMessageBatch.summaries}"`);
-      this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage, sessionId);
+      this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage, sessionId, pendingMessageBatch.origins);
       return;
     }
 
@@ -2433,7 +2437,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       const pendingMessageBatch = this.drainAndFormatPendingTeammateMessages();
       if (pendingMessageBatch) {
         console.log(`[CLAUDE-CODE] Re-triggering ${pendingMessageBatch.count} teammate message(s) after sendMessage exit: "${pendingMessageBatch.summaries}"`);
-        this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage);
+        this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage, undefined, pendingMessageBatch.origins);
       }
     } else if (this.transportDied) {
       // Transport died and no pending messages to re-trigger.
@@ -2457,7 +2461,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         if (pendingMessageBatch) {
           console.log(`[CLAUDE-CODE] Finally block found ${pendingMessageBatch.count} pending teammate message(s), delivering: "${pendingMessageBatch.summaries}"`);
           this.continuationCount = 0;
-          this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage);
+          this.emitTeammateMessageWhileIdle(pendingMessageBatch.formattedMessage, undefined, pendingMessageBatch.origins);
         }
       } else if (this.continuationCount < ClaudeCodeProvider.MAX_CONTINUATIONS) {
         // The lead's turn ended naturally but idle teammates exist that need managing.
@@ -2579,7 +2583,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     });
   }
 
-  private drainAndFormatPendingTeammateMessages(): { formattedMessage: string; summaries: string; count: number } | null {
+  private drainAndFormatPendingTeammateMessages(): { formattedMessage: string; summaries: string; count: number; origins: TeammateOrigin[] } | null {
     const pendingMessages: TeammateToLeadMessage[] = [];
     while (this.teammateManager.hasPendingTeammateMessages()) {
       const message = this.teammateManager.drainNextTeammateMessage();
@@ -2600,6 +2604,11 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         .join('\n\n---\n\n'),
       summaries: pendingMessages.map(message => message.summary).join(', '),
       count: pendingMessages.length,
+      origins: pendingMessages.map(message => ({
+        agentId: message.teammateAgentId,
+        teammateName: message.teammateName,
+        kind: message.kind,
+      })),
     };
   }
 
@@ -2609,11 +2618,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    * post-lead-turn call sites have no such id and fall back to
    * `lastUsedSessionId`, which their own just-finished turn populated.
    */
-  private emitTeammateMessageWhileIdle(message: string, sessionId?: string): void {
+  private emitTeammateMessageWhileIdle(message: string, sessionId?: string, teammateOrigin?: TeammateOrigin[]): void {
     this.teammateIdleMessagePending = true;
     this.emit('teammate:messageWhileIdle', {
       sessionId: sessionId ?? this.teammateManager.lastUsedSessionId,
       message,
+      ...(teammateOrigin && teammateOrigin.length > 0 ? { teammateOrigin } : {}),
     });
   }
 

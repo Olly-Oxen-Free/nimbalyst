@@ -53,6 +53,7 @@ export async function processDescriptor(
       return writer.appendUserMessage(sessionId, desc.text, {
         mode: desc.mode,
         attachments: desc.attachments,
+        teammateOrigin: desc.teammateOrigin,
         createdAt: desc.createdAt,
       });
     }

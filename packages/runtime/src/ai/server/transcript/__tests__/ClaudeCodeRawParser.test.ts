@@ -123,6 +123,46 @@ describe('ClaudeCodeRawParser', () => {
       });
     });
 
+    it('carries teammateOrigin from raw metadata onto the user_message descriptor, batched entries included', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        direction: 'input',
+        content: JSON.stringify({
+          prompt: '[Teammate message from "cpu-recorder"]\n\ndone\n\n---\n\n[Teammate revival failed: "cpu-scout"]\n\nnope',
+          options: {},
+        }),
+        metadata: {
+          teammateOrigin: [
+            { agentId: 'cpu-recorder@team-1', teammateName: 'cpu-recorder', kind: 'wake-message' },
+            { agentId: 'cpu-scout@team-1', teammateName: 'cpu-scout', kind: 'revival-failed' },
+          ],
+        },
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({
+        type: 'user_message',
+        teammateOrigin: [
+          { agentId: 'cpu-recorder@team-1', teammateName: 'cpu-recorder', kind: 'wake-message' },
+          { agentId: 'cpu-scout@team-1', teammateName: 'cpu-scout', kind: 'revival-failed' },
+        ],
+      });
+    });
+
+    it('leaves teammateOrigin undefined on a real user prompt', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        direction: 'input',
+        content: JSON.stringify({ prompt: 'Hello world', options: {} }),
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors[0]).not.toHaveProperty('teammateOrigin');
+    });
+
     it('parses tool_result blocks in input messages', async () => {
       const parser = new ClaudeCodeRawParser();
       const msg = makeRawMessage({

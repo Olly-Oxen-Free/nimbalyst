@@ -16,6 +16,7 @@ import fsp from 'fs/promises';
 import os from 'os';
 import { resolveClaudeConfigDir } from './claudeCode/claudeConfigDir';
 import { raceNextChunkWithStallWatchdog, resolveStreamStallMs } from './claudeCode/streamStallWatchdog';
+import type { TeammateOriginKind } from '../transcript/types';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -163,6 +164,12 @@ export interface TeammateToLeadMessage {
   teammateAgentId: string;
   content: string;
   summary: string;
+  /**
+   * What caused this delivery. Rides on the queue item (rather than being
+   * derived from the formatted string) so the idle-lead path, which re-drains
+   * this queue, keeps the right attribution for every entry in a batch.
+   */
+  kind: TeammateOriginKind;
 }
 
 /**
@@ -1230,6 +1237,7 @@ export class TeammateManager {
       teammateAgentId,
       content,
       summary,
+      kind: 'wake-message',
     });
 
     const formattedMessage = `[Teammate message from "${teammateName}"]\n\n${content}`;
@@ -1295,6 +1303,7 @@ export class TeammateManager {
       teammateAgentId,
       content,
       summary,
+      kind: 'revival-failed',
     });
 
     const formattedMessage = `[Teammate revival failed: "${teammateName}"]\n\n${content}`;

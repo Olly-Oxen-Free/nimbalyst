@@ -24,6 +24,22 @@ export type TranscriptEventType =
 // Per-event payload interfaces
 // ---------------------------------------------------------------------------
 
+/** Why a teammate-originated turn was injected into the lead's session. */
+export type TeammateOriginKind = 'wake-message' | 'revival-failed';
+
+/**
+ * Marks a lead turn that a teammate caused rather than the user typing it.
+ * Declared here (an import-free leaf module) so both the provider layer and the
+ * transcript pipeline can reference it without a type cycle through
+ * `ai/server/types.ts`. One entry per queued delivery, so a batched wake keeps
+ * every contributing teammate.
+ */
+export interface TeammateOrigin {
+  agentId: string;
+  teammateName: string;
+  kind: TeammateOriginKind;
+}
+
 export interface UserMessagePayload {
   mode: 'agent' | 'planning' | 'auto';
   inputType: 'user' | 'system_message';
@@ -35,6 +51,7 @@ export interface UserMessagePayload {
     size: number;
     type: string;
   }>;
+  teammateOrigin?: TeammateOrigin[];
 }
 
 export interface AssistantMessagePayload {

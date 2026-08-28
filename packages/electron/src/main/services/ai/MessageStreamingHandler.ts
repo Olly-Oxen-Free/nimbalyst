@@ -32,6 +32,7 @@ import {
   type ToolResult,
   type ProviderConfig,
   type DocumentContext,
+  type TeammateOrigin,
 } from '@nimbalyst/runtime/ai/server/types';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
@@ -161,6 +162,12 @@ export type SendMessageHandler = (
   documentContext?: DocumentContext,
   sessionId?: string,
   workspacePath?: string,
+  /**
+   * Set only by the teammate idle-wake path, which synthesizes this turn rather
+   * than receiving it from the composer. Carried separately from
+   * `documentContext` because that argument is built here, not by the caller.
+   */
+  teammateOrigin?: TeammateOrigin[],
 ) => Promise<{ content: string }>;
 
 /**
@@ -344,6 +351,7 @@ export class MessageStreamingHandler {
     documentContext?: DocumentContext,
     sessionId?: string,
     workspacePath?: string,
+    teammateOrigin?: TeammateOrigin[],
   ) => {
     // Check for queued prompt deduplication - prevents duplicate execution from multiple renderer panels
     const queuedPromptId = (documentContext as any)?.queuedPromptId as string | undefined;
@@ -1092,6 +1100,8 @@ export class MessageStreamingHandler {
     const onTeammateMessageWhileIdle = async (data: {
       sessionId: string;
       message: string;
+      /** One entry per teammate delivery batched into this wake. */
+      teammateOrigin?: TeammateOrigin[];
     }) => {
       if (!data.sessionId) {
         logger.main.warn('[AIService] teammate:messageWhileIdle with no sessionId');
@@ -1128,7 +1138,7 @@ export class MessageStreamingHandler {
             // Fire-and-forget: sendMessage will stream results to the renderer
             setImmediate(async () => {
               try {
-                await this.svc.sendMessageHandler!(mockEvent, data.message, {} as any, data.sessionId, effectiveWorkspacePath);
+                await this.svc.sendMessageHandler!(mockEvent, data.message, {} as any, data.sessionId, effectiveWorkspacePath, data.teammateOrigin);
               } catch (err) {
                 logger.main.error('[AIService] Failed to process teammate message while idle:', err);
               }
@@ -1494,6 +1504,10 @@ export class MessageStreamingHandler {
             ? undefined
             : { actor: 'human', origin: 'composer' }
         ),
+
+        // Teammate wakes reach the provider through the same path as a typed
+        // prompt; this is the only thing that tells them apart downstream.
+        teammateOrigin,
       };
 
       // Update MCP document state for Claude Code provider so it knows which tools to show

@@ -63,6 +63,8 @@ export interface TranscriptViewMessage {
   text?: string;
   mode?: 'agent' | 'planning' | 'auto';
   attachments?: UserMessagePayload['attachments'];
+  /** Set when this turn was injected by a teammate rather than typed by the user. */
+  teammateOrigin?: UserMessagePayload['teammateOrigin'];
   toolCall?: {
     toolName: string;
     toolDisplayName: string;
@@ -240,6 +242,9 @@ function projectEvent(
       base.mode = p.mode;
       if (p.attachments) {
         base.attachments = p.attachments;
+      }
+      if (p.teammateOrigin) {
+        base.teammateOrigin = p.teammateOrigin;
       }
       break;
     }

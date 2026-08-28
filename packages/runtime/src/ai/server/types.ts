@@ -13,10 +13,12 @@ import {
   normalizeClaudeCodeVariant,
 } from '../modelConstants';
 import type { TranscriptViewMessage } from './transcript/TranscriptProjector';
+import type { TeammateOrigin } from './transcript/types';
 export type { ToolDefinition } from '../tools';
 export { ModelIdentifier } from './ModelIdentifier';
 export type { ToolResult } from './protocols/ProtocolInterface';
 export type { TranscriptViewMessage } from './transcript/TranscriptProjector';
+export type { TeammateOrigin, TeammateOriginKind } from './transcript/types';
 
 export interface DocumentContext {
   filePath?: string;
@@ -75,6 +77,12 @@ export interface DocumentContext {
 
   /** Durable reciprocal links for work dispatched from a team conversation. */
   agentWakeOrigin?: AgentWakePromptOrigin;
+
+  /**
+   * Set when this turn is a teammate wake injected into an idle lead rather
+   * than something the user typed. One entry per queued delivery.
+   */
+  teammateOrigin?: TeammateOrigin[];
 }
 
 export type PromptActor = 'human' | 'agent' | 'system';
