@@ -707,8 +707,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Additional AI operations that weren't in the first block
   aiCancelRequest: (sessionId: string) => ipcRenderer.invoke('ai:cancelRequest', sessionId),
-  aiSendMessageToTeammate: (sessionId: string, agentId: string, content: string) =>
-    ipcRenderer.invoke('ai:sendMessageToTeammate', sessionId, agentId, content),
+  aiSendMessageToTeammate: (
+    sessionId: string,
+    agentId: string,
+    content: string,
+    confirmedUserShutdown?: boolean,
+  ) =>
+    ipcRenderer.invoke('ai:sendMessageToTeammate', sessionId, agentId, content, confirmedUserShutdown),
   aiGetTeammateTranscript: (sessionId: string, agentId: string, workspacePath: string) =>
     ipcRenderer.invoke('ai:getTeammateTranscript', sessionId, agentId, workspacePath),
   aiStopTeammate: (sessionId: string, agentId: string, workspacePath: string) =>

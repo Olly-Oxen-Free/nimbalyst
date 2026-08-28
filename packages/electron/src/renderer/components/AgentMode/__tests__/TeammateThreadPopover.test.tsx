@@ -165,7 +165,7 @@ describe('TeammateThreadPopover', () => {
     ['completed', false],
     ['errored', false],
   ] as [TeammateInfo['status'], boolean][])(
-    'renders the transcript for a %s teammate and gates compose to active ones',
+    'renders the transcript for a %s teammate and gates compose to revivable ones (these ended rows carry no sessionId)',
     async (status, composeAvailable) => {
       testState.teammates = [teammate(status)];
       const { baseElement } = await renderPopover();
@@ -185,7 +185,7 @@ describe('TeammateThreadPopover', () => {
       fireEvent.click(baseElement.querySelector('.teammate-thread-popover-send') as HTMLElement);
     });
 
-    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-scout', 'status?');
+    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-scout', 'status?', undefined);
     expect(baseElement.querySelector('.teammate-thread-popover-status')?.textContent).toContain('Sent');
   });
 
@@ -201,6 +201,51 @@ describe('TeammateThreadPopover', () => {
 
     expect(input.value).toBe('status?');
     expect(baseElement.querySelector('.teammate-thread-popover-status')?.textContent).toContain('Failed');
+  });
+
+  it('opens compose directly for an ended teammate the backend would revive silently', async () => {
+    testState.teammates = [{
+      ...teammate('completed'),
+      sessionId: 'sdk-session-scout',
+      endReason: 'finished',
+      endedAt: Date.now() - 60_000,
+    }];
+    const { baseElement } = await renderPopover();
+
+    expect(baseElement.querySelector('.teammate-thread-popover-revive')).toBeNull();
+    const input = baseElement.querySelector('.teammate-thread-popover-input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'resume please' } });
+    await act(async () => {
+      fireEvent.click(baseElement.querySelector('.teammate-thread-popover-send') as HTMLElement);
+    });
+
+    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-scout', 'resume please', undefined);
+  });
+
+  it('makes a user-shutdown teammate confirm a revive before compose opens, and carries the flag', async () => {
+    testState.teammates = [{
+      ...teammate('completed'),
+      sessionId: 'sdk-session-scout',
+      endReason: 'user-shutdown',
+      endedAt: Date.now() - 60_000,
+    }];
+    const { baseElement } = await renderPopover();
+
+    expect(baseElement.querySelector('.teammate-thread-popover-input')).toBeNull();
+    await act(async () => {
+      fireEvent.click(baseElement.querySelector('.teammate-thread-popover-revive') as HTMLElement);
+    });
+    await act(async () => {
+      fireEvent.click(baseElement.querySelector('.confirm-dialog-button-confirm') as HTMLElement);
+    });
+
+    const input = baseElement.querySelector('.teammate-thread-popover-input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'back to it' } });
+    await act(async () => {
+      fireEvent.click(baseElement.querySelector('.teammate-thread-popover-send') as HTMLElement);
+    });
+
+    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-scout', 'back to it', true);
   });
 
   it.each([

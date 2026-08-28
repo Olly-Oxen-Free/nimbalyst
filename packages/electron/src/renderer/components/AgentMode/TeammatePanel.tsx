@@ -16,6 +16,7 @@
 import React, { useCallback, useMemo, useState, useEffect } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import type { TeammateEndReason } from '@nimbalyst/runtime/ai/server/providers/TeammateManager';
 import {
   teammatePanelCollapsedAtom, toggleTeammatePanelCollapsedAtom,
   agentPanelCollapsedAtom, toggleAgentPanelCollapsedAtom,
@@ -42,6 +43,12 @@ export interface TeammateInfo {
   // teammate's first chunk lands, and on teammates recorded before it was
   // persisted at all.
   sessionId?: string;
+  // Why this teammate went terminal, and when. Only present on
+  // 'completed'/'errored' rows written after the fields existed; a missing
+  // endReason means 'finished'. Written by TeammateManager.emitTeammateUpdate
+  // and read here to decide whether an ended teammate can be revived.
+  endReason?: TeammateEndReason;
+  endedAt?: number;
 }
 
 interface TeammatePanelProps {
@@ -74,8 +81,18 @@ export const TeammatePanel: React.FC<TeammatePanelProps> = React.memo(({
 
   // Filter out _background/_subagent entries from teammates -- those are dead
   // after switching to SDK-native sub-agents. Only real team members remain.
+  // Ended rows sink below the live ones and sort most-recently-ended first, so
+  // the teammate an architect just stopped (and is most likely to revive) sits
+  // at the top of the dead pile. Live rows keep their spawn order. A row with
+  // no endedAt sorts oldest -- it predates the field, so it is not recent.
   const teammates = useMemo(() => {
-    return allEntries.filter(e => e.teamName !== '_background' && e.teamName !== '_subagent');
+    const visible = allEntries.filter(e => e.teamName !== '_background' && e.teamName !== '_subagent');
+    const isEnded = (e: TeammateInfo) => e.status === 'completed' || e.status === 'errored';
+    const live = visible.filter(e => !isEnded(e));
+    const ended = visible
+      .filter(isEnded)
+      .sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0));
+    return ended.length === 0 ? live : [...live, ...ended];
   }, [allEntries]);
 
   if (teammates.length === 0 && tasks.length === 0) {

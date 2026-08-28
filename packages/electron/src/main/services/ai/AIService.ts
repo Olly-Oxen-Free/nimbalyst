@@ -3209,7 +3209,7 @@ export class AIService {
     // model's own SendMessage tool call. Request/response only -- no event
     // stream, so no centralized listener is needed (docs/IPC_LISTENERS.md
     // governs event subscriptions, not invoke-style calls).
-    safeHandle('ai:sendMessageToTeammate', async (_event, sessionId: string, agentId: string, content: string) => {
+    safeHandle('ai:sendMessageToTeammate', async (_event, sessionId: string, agentId: string, content: string, confirmedUserShutdown?: boolean) => {
       if (!sessionId || !agentId || !content) {
         throw new Error('sessionId, agentId, and content are required');
       }
@@ -3252,6 +3252,9 @@ export class AIService {
         {
           cwd: session.worktreePath || session.workspacePath,
           permissionsPath: session.worktreeProjectPath || session.worktreePath || session.workspacePath,
+          // Without this the revival gate refuses a teammate the user shut
+          // down themselves, so a stray send can never restart one.
+          confirmedUserShutdown,
         },
       );
       if (!delivered && !wasActive) {
