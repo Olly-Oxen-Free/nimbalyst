@@ -215,6 +215,8 @@ const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
             messages={messages}
             settings={TILE_TRANSCRIPT_SETTINGS}
             persistScrollState={false}
+            agentName={teammateName}
+            agentModel={teammate?.model}
           />
         )}
       </div>

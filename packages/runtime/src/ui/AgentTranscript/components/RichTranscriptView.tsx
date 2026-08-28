@@ -18,6 +18,11 @@ import { TranscriptSearchBar } from './TranscriptSearchBar';
 import { formatToolDisplayName } from '../utils/toolNameFormatter';
 import { isToolLikeMessage } from '../utils/messageTypeHelpers';
 import { getCustomToolWidget, ToolWidgetErrorBoundary, type ToolCallDiffResult } from './CustomToolWidgets';
+import { SubagentStatusChip, SubagentAuditLabel, formatSubagentAuditLabel } from './SubagentCardPieces';
+
+// formatSubagentAuditLabel now lives in SubagentCardPieces.tsx; re-exported
+// here so existing importers (RichTranscriptView.test.ts) keep working.
+export { formatSubagentAuditLabel };
 import { useTranscriptToolWidgetRegistryVersion } from '../contributions';
 import { ToolCallChanges } from './ToolCallChanges';
 import { setSessionIsAtBottom, getSessionIsAtBottom } from '../../../store/atoms/transcriptScroll';
@@ -29,7 +34,7 @@ import { AttachmentStagingDeniedCard } from './AttachmentStagingDeniedCard';
 const vlistCacheMap = new Map<string, CacheSnapshot>();
 
 function summarizeRenderTeammates(
-  teammates: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }> | undefined
+  teammates: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' | 'blocked' }> | undefined
 ): string {
   if (!teammates || teammates.length === 0) return 'none';
   return teammates.map(tm => `${tm.agentId}:${tm.status}`).join(', ');
@@ -503,7 +508,7 @@ interface RichTranscriptViewProps {
     messageIndex: number; // Index of user message this belongs to (for stable positioning)
   } | null;
   /** Optional: Current teammates/agents from session metadata, used to show status on spawn cards */
-  currentTeammates?: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }>;
+  currentTeammates?: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' | 'blocked' }>;
   /** Optional: noun used in waiting text when teammates/workers are still running */
   waitingForNoun?: string;
   /** Optional: App start time (epoch ms) for rendering restart indicator line (dev mode only) */
@@ -615,17 +620,6 @@ const WRITE_TOOL_NAMES = new Set(['write', 'notebookedit']);
  * existing importers and the renderer's `sessions.ts` mirror keep working.
  */
 export { stripMcpPrefix, isInteractiveWidgetTool };
-
-/** Formats provider-supplied sub-agent execution metadata without normalizing it. */
-export function formatSubagentAuditLabel(
-  model: string | null | undefined,
-  reasoningEffort: string | null | undefined,
-): string | null {
-  const parts: string[] = [];
-  if (model) parts.push(`Model: ${model}`);
-  if (reasoningEffort) parts.push(`Reasoning effort: ${reasoningEffort}`);
-  return parts.length > 0 ? parts.join('; ') : null;
-}
 
 const isFileModifyingTool = (name?: string): boolean => {
   if (!name) return false;
@@ -1803,10 +1797,6 @@ export const RichTranscriptView = React.forwardRef<
     const toolArgs = tool.arguments as Record<string, any> | undefined;
     const description = (isSubAgent && toolArgs?.description ? toolArgs.description : null) as string | null;
     const prompt = (isSubAgent && toolArgs?.prompt ? toolArgs.prompt : null) as string | null;
-    const subagentAuditLabel = isSubAgent
-      ? formatSubagentAuditLabel(toolMsg.subagent?.model, toolMsg.subagent?.reasoningEffort)
-      : null;
-
     // Extract result text
     const resultText = tool.result ? extractResultText(tool.result) : null;
 
@@ -1849,14 +1839,8 @@ export const RichTranscriptView = React.forwardRef<
                 <span className="rich-transcript-tool-subagent-type text-[var(--nim-primary)] font-semibold"> [{toolMsg.subagent?.agentType}]</span>
               )}
             </span>
-            {subagentAuditLabel && (
-              <span
-                className="rich-transcript-subagent-audit min-w-0 max-w-40 truncate text-[11px] text-[var(--nim-text-muted)]"
-                aria-label={subagentAuditLabel}
-                title={subagentAuditLabel}
-              >
-                {toolMsg.subagent?.model}{toolMsg.subagent?.model && toolMsg.subagent?.reasoningEffort ? ' · ' : ''}{toolMsg.subagent?.reasoningEffort}
-              </span>
+            {isSubAgent && (
+              <SubagentAuditLabel model={toolMsg.subagent?.model} reasoningEffort={toolMsg.subagent?.reasoningEffort} />
             )}
             {!isSubAgent && tool.arguments && (() => {
               const argStr = formatToolArguments(tool.toolName, tool.arguments, workspacePath);
@@ -1903,39 +1887,13 @@ export const RichTranscriptView = React.forwardRef<
               const teammateStatus = agentId ? currentTeammates?.find(t => t.agentId === agentId)?.status : undefined;
               // If no metadata yet but spawn succeeded (isError due to interception), assume running
               const effectiveStatus = teammateStatus || (tool.result && toolMsg.isError ? 'running' : tool.result ? 'completed' : null);
-              if (effectiveStatus === 'running') {
-                return (
-                  <span className="flex items-center gap-1 shrink-0">
-                    <span className="inline-block w-3 h-3 border-2 border-[var(--nim-bg-tertiary)] border-t-[var(--nim-primary)] rounded-full animate-spin" />
-                    <span className="text-[11px] text-[var(--nim-text-muted)]">Running</span>
-                  </span>
-                );
+              if (effectiveStatus) {
+                return <SubagentStatusChip status={effectiveStatus} />;
               }
-              if (effectiveStatus === 'idle') {
-                return (
-                  <span className="flex items-center gap-1 shrink-0">
-                    <span className="text-[var(--nim-primary)] text-[10px]">&#9675;</span>
-                    <span className="text-[11px] text-[var(--nim-text-muted)]">Idle</span>
-                  </span>
-                );
-              }
-              if (effectiveStatus === 'completed') {
-                return (
-                  <span className="flex items-center gap-1 shrink-0">
-                    <MaterialSymbol icon="check_circle" size={14} className="text-[var(--nim-success)]" />
-                    <span className="text-[11px] text-[var(--nim-text-muted)]">Done</span>
-                  </span>
-                );
-              }
-              if (effectiveStatus === 'errored') {
-                return (
-                  <span className="flex items-center gap-1 shrink-0">
-                    <MaterialSymbol icon="cancel" size={14} className="text-[var(--nim-error)]" />
-                    <span className="text-[11px] text-[var(--nim-text-muted)]">Errored</span>
-                  </span>
-                );
-              }
-              // Still waiting for result / no status yet - show progress spinner if available
+              // Still waiting for result / no status yet - show progress spinner if
+              // available. Visually distinct from SubagentStatusChip's 'running'
+              // spinner (border classes differ) - kept inlined per reviewer
+              // correction m5, not folded into the shared chip.
               if (!tool.result && tool.progress.length > 0) {
                 return (
                   <span className="flex items-center gap-1 shrink-0">

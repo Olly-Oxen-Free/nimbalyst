@@ -57,11 +57,15 @@ const HOVER_DELAY = { open: 200, close: 150 };
 interface TaskThreadBodyProps {
   sessionId: string;
   taskId: string;
+  /** The popover's `label` prop (the task description shown in the chip) —
+   *  never TaskInfo.taskType, which is the SDK task kind ('local_agent' /
+   *  'local_bash') and would regress transcript headers to that value. */
+  agentName?: string;
 }
 
 /** Mounted only while the popover is open, so the fetch is tied to a real
  *  hover rather than to every chip that happens to be on screen. */
-const TaskThreadBody: React.FC<TaskThreadBodyProps> = ({ sessionId, taskId }) => {
+const TaskThreadBody: React.FC<TaskThreadBodyProps> = ({ sessionId, taskId, agentName }) => {
   const workspacePath = useAtomValue(sessionListWorkspaceAtom);
   const [messages, setMessages] = useState<TranscriptViewMessage[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -129,6 +133,7 @@ const TaskThreadBody: React.FC<TaskThreadBodyProps> = ({ sessionId, taskId }) =>
       messages={messages}
       settings={TASK_TRANSCRIPT_SETTINGS}
       persistScrollState={false}
+      agentName={agentName}
     />
   );
 };
@@ -204,7 +209,7 @@ export const TaskThreadPopover: React.FC<TaskThreadPopoverProps> = ({
               </div>
             </div>
             <div className="task-thread-popover-body flex-1 min-h-0 overflow-hidden rounded border border-[var(--nim-border)]">
-              <TaskThreadBody sessionId={sessionId} taskId={taskId} />
+              <TaskThreadBody sessionId={sessionId} taskId={taskId} agentName={label} />
             </div>
           </div>
         </FloatingPortal>

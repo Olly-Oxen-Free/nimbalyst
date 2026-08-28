@@ -206,6 +206,8 @@ export const TeammateThreadPopover: React.FC<TeammateThreadPopoverProps> = ({
               messages={messages}
               settings={TEAMMATE_TRANSCRIPT_SETTINGS}
               persistScrollState={false}
+              agentName={teammate?.name ?? teammateName}
+              agentModel={teammate?.model}
             />
           ) : (
             <div className="teammate-thread-popover-empty flex h-full items-center justify-center text-[11px] italic text-[var(--nim-text-faint)]">

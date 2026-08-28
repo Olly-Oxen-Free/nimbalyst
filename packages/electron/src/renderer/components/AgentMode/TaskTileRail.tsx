@@ -172,6 +172,7 @@ const TaskTile: React.FC<TaskTileProps> = ({ sessionId, taskId }) => {
             messages={messages}
             settings={TILE_TRANSCRIPT_SETTINGS}
             persistScrollState={false}
+            agentName={task?.description ?? 'Sub-Agent'}
           />
         )}
       </div>

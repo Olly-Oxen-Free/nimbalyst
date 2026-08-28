@@ -15,12 +15,31 @@ import { useAtomValue, useSetAtom } from 'jotai';
 import { RichTranscriptView } from '@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView';
 import type { CustomToolWidgetProps } from '@nimbalyst/runtime/ui/AgentTranscript/components/CustomToolWidgets';
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import {
+  SubagentAuditLabel,
+  SubagentStatusChip,
+  type SubagentStatus,
+} from '@nimbalyst/runtime/ui/AgentTranscript/components/SubagentCardPieces';
 import {
   sessionTasksAtom,
   setTaskInlineExpandAtom,
   taskTranscriptSignalAtomFamily,
   taskTranscriptSignalKey,
+  type TaskInfo,
 } from '../../store/atoms/agentMode';
+
+/** Maps SDK-native TaskInfo.status to the shared chip's plain status vocabulary. */
+function mapTaskInfoStatus(status: TaskInfo['status']): SubagentStatus {
+  switch (status) {
+    case 'running': return 'running';
+    case 'blocked': return 'blocked';
+    case 'completed': return 'completed';
+    case 'failed': return 'errored';
+    case 'stopped': return 'stopped';
+    default: return 'running';
+  }
+}
 
 /** Contribution source id for this widget's registry entry. */
 export const TASK_TOOL_WIDGET_SOURCE = 'task-subagent-visibility';
@@ -95,10 +114,15 @@ export const TaskToolWidget: React.FC<CustomToolWidgetProps> = ({
   // Live follow while expanded. The signal is keyed by taskId, which only the
   // session's task list maps back to this widget's toolUseId.
   const tasks = useAtomValue(sessionTasksAtom(sessionId));
-  const taskId = useMemo(
-    () => tasks.find(task => task.toolUseId === toolUseId)?.taskId ?? '',
+  const matchedTask = useMemo(
+    () => tasks.find(task => task.toolUseId === toolUseId),
     [tasks, toolUseId],
   );
+  const taskId = matchedTask?.taskId ?? '';
+  const chipStatus: SubagentStatus = useMemo(() => {
+    if (matchedTask) return mapTaskInfoStatus(matchedTask.status);
+    return tool?.result ? 'completed' : 'running';
+  }, [matchedTask, tool?.result]);
   const transcriptSignal = useAtomValue(
     taskTranscriptSignalAtomFamily(taskTranscriptSignalKey(sessionId, taskId)),
   );
@@ -119,6 +143,11 @@ export const TaskToolWidget: React.FC<CustomToolWidgetProps> = ({
         onClick={onToggle}
         className="task-tool-widget-header w-full py-1 px-2 flex items-center gap-1.5 text-left border-none cursor-pointer text-sm bg-transparent"
       >
+        <MaterialSymbol
+          icon={args?.run_in_background ? 'cloud_sync' : 'description'}
+          size={16}
+          className="task-tool-widget-icon w-4 h-4 text-[var(--nim-primary)] shrink-0"
+        />
         <span className="task-tool-widget-title font-mono text-sm text-[var(--nim-text)] font-medium">
           Sub-Agent
           {agentType && (
@@ -130,6 +159,13 @@ export const TaskToolWidget: React.FC<CustomToolWidgetProps> = ({
             {description}
           </span>
         )}
+        <SubagentAuditLabel model={message.subagent?.model} reasoningEffort={message.subagent?.reasoningEffort} />
+        <SubagentStatusChip status={chipStatus} />
+        <MaterialSymbol
+          icon={isExpanded ? 'expand_more' : 'chevron_right'}
+          size={16}
+          className="task-tool-widget-chevron w-3 h-3 text-[var(--nim-text-faint)]"
+        />
       </button>
 
       {isExpanded && (
@@ -144,6 +180,8 @@ export const TaskToolWidget: React.FC<CustomToolWidgetProps> = ({
               messages={messages}
               settings={TASK_TRANSCRIPT_SETTINGS}
               persistScrollState={false}
+              agentName={agentType ?? 'Sub-Agent'}
+              agentModel={message.subagent?.model ?? undefined}
             />
           ) : (
             <div className="task-tool-widget-empty p-2 text-[11px] italic text-[var(--nim-text-faint)]">

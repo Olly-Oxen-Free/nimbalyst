@@ -31,8 +31,17 @@ vi.mock('../../../store/atoms/agentMode', async () => {
 });
 
 vi.mock('@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView', () => ({
-  RichTranscriptView: ({ messages }: { messages: unknown[] }) => (
-    <div data-testid="rich-transcript" data-message-count={messages.length} />
+  RichTranscriptView: ({
+    messages,
+    agentName,
+    agentModel,
+  }: { messages: unknown[]; agentName?: string; agentModel?: string }) => (
+    <div
+      data-testid="rich-transcript"
+      data-message-count={messages.length}
+      data-agent-name={agentName}
+      data-agent-model={agentModel}
+    />
   ),
 }));
 
@@ -109,6 +118,14 @@ describe('TeammateThreadPopover', () => {
     expect(
       baseElement.querySelector('[data-testid="rich-transcript"]')?.getAttribute('data-message-count'),
     ).toBe('1');
+  });
+
+  it('passes the teammate name and model through to RichTranscriptView', async () => {
+    const { baseElement } = await renderPopover();
+
+    const transcript = baseElement.querySelector('[data-testid="rich-transcript"]');
+    expect(transcript?.getAttribute('data-agent-name')).toBe('scout');
+    expect(transcript?.getAttribute('data-agent-model')).toBe('sonnet');
   });
 
   it('refetches, debounced, when the teammate transcript signal bumps', async () => {
