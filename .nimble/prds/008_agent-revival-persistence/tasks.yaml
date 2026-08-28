@@ -1,0 +1,143 @@
+# ============================================================
+# NIMBLE TASK DEFINITIONS — NOT SCHEDULED (awaiting user decision)
+# ============================================================
+
+metadata:
+  prd_slug: "agent-revival-persistence"
+  created_at: "2026-08-28T00:00:00Z"
+  total_complexity: 22
+  task_count: 7
+  execution_hold: "Do not /nimble:run without explicit user approval — scoping deliverable"
+
+tasks:
+  - id: "1a"
+    title: "End-reason taxonomy on persisted teammate rows"
+    description: |
+      Add endReason ('finished'|'user-shutdown'|'lead-abandoned'|'errored')
+      to the persisted currentTeammates row shape and write it at every
+      terminal transition in TeammateManager.ts: stop/stopByAgentId
+      (finished), approved shutdown request (user-shutdown),
+      abandonIdleTeammates (lead-abandoned), killAll error path +
+      handleStreamError (errored). Also persist endedAt (R7). Legacy rows
+      without the field default to 'finished' via ?? (STATE_PERSISTENCE
+      rules). camelCase wire naming. Red-first unit tests per terminal
+      path, following TeammateManager.stallWatchdog.test.ts mocking.
+      Fulfills R1, R7 (persistence half), R6 (tests inline).
+    depends_on: []
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Every terminal transition writes a correct endReason; legacy rows default cleanly"
+      - "endedAt persisted; tests cover all five write sites red-first"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.test.ts"
+
+  - id: "1b"
+    title: "Persist spawn cwd per teammate row"
+    description: |
+      Persist the teammate's actual spawn cwd on its currentTeammates row
+      at spawn time; rehydrateIdleTeammate/revival uses it instead of the
+      lead's-cwd fallback at TeammateManager.ts:1333. Revival-time
+      existence check with clean failure (consumed by 2b). Same file as
+      1a — sequenced after it. Fulfills R3 (persistence half), R6 (tests inline).
+    depends_on: ["1a"]
+    complexity: 2
+    priority: "must"
+    success_criteria:
+      - "Spawn cwd persisted and preferred on rehydration; missing-dir case surfaces a typed failure"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts"
+
+  - id: "2a"
+    title: "Widen the revival gate (invert the PRD 003 terminality contract)"
+    description: |
+      Replace the RESUMABLE_PERSISTED_STATUSES set check (:183, consumed
+      at rehydrateIdleTeammate:1298-1338) with an eligibility function
+      over (status, endReason, sessionId presence): completed/errored
+      rows WITH a sessionId become resumable; 'user-shutdown' requires
+      an explicit-confirm flag on the request (UI supplies it, task 3a).
+      Rewrite — never silently edit — the pinning regression test at
+      TeammateManager.sendMessageFromHost.test.ts:193-200 to assert the
+      NEW contract, with a comment citing this PRD (decision D3).
+      Fulfills R2, R6 (test inversion).
+    depends_on: ["1a", "1b"]
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Completed/errored teammate with persisted sessionId resumes through streamTeammateOutput; user-shutdown gated on explicit confirm"
+      - "PRD 003 regression test rewritten openly with citation, not deleted"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.sendMessageFromHost.test.ts"
+
+  - id: "2b"
+    title: "Revival-failure delivery without a live lead"
+    description: |
+      When a revival attempt fails (resume error, missing cwd, missing
+      SDK session file) and no live lead turn exists to interrupt:
+      (a) desktop notification via NotificationService's agent-notification
+      path; (b) persisted system line in the session transcript via the
+      TranscriptWriter so it is visible on next open. Live-lead case
+      reuses PRD 003's deliverMessageToLead unchanged. Fulfills R5, R6 (tests inline).
+    depends_on: ["1b"]
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Both fallback channels fire when no lead is live; live-lead path unchanged; red-first tests"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/TeammateManager.ts"
+      - "packages/electron/src/main/services/NotificationService.ts"
+
+  - id: "3a"
+    title: "Revive/compose UI for ended teammates"
+    description: |
+      Widen canCompose (TeammateTileRail.tsx:110-116; TeammatePanel
+      equivalent) to eligible ended rows; 'user-shutdown' rows get an
+      explicit Revive confirm that sets the confirm flag 2a consumes.
+      Correct the inaccurate "no process left to receive a message"
+      comment. Ordering by endedAt (R7). Hooks unconditional (3fa68d3c0).
+      Fulfills R4, R7 (endedAt ordering).
+    depends_on: ["2a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "Eligible ended teammates composable; user-shutdown behind confirm; send lands in the widened host-send chain"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/TeammateTileRail.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TeammatePanel.tsx"
+
+  - id: "3b"
+    title: "Restart-path revival (rehydration widening) end-to-end test"
+    description: |
+      Scripted-IPC/unit coverage of the abandoned-by-restart case: rows
+      marked lead-abandoned by abandonIdleTeammates, app restarts (fresh
+      TeammateManager), rehydration admits them, host-send resumes.
+      No manual-restart-only verification (end-to-end-verification rule).
+      Fulfills R2/R6 for the restart path.
+    depends_on: ["2a"]
+    complexity: 2
+    priority: "must"
+    success_criteria:
+      - "Restart-shaped test resumes a lead-abandoned teammate without manual steps"
+    files_affected:
+      - "packages/runtime/src/ai/server/providers/__tests__/TeammateManager.resumeReliability.test.ts"
+
+  - id: "4a"
+    title: "Phase 2 (optional): Task sub-agent context-seeded respawn"
+    description: |
+      'Continue as new agent' on an ended Task chip/card: spawn a teammate
+      whose prompt embeds the ai:getTaskSubagentTranscript reconstruction.
+      UI copy MUST present it as a new agent seeded with prior context —
+      never as the same agent resumed (decision D4; no SDK sub-agent
+      resume exists). Detachable: ship or drop independently of 1a-3b.
+      Fulfills R8. OPEN QUESTION 5 gates this task entirely.
+    depends_on: ["3a"]
+    complexity: 3
+    priority: "could"
+    success_criteria:
+      - "Respawn carries reconstructed transcript as prompt context; labeling never claims continuity"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/TaskTileRail.tsx"
+      - "packages/electron/src/main/services/ai/AIService.ts"

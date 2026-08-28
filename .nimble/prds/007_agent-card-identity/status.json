@@ -1,0 +1,26 @@
+{
+  "slug": "agent-card-identity",
+  "phase": "planned",
+  "created": "2026-08-28",
+  "status": "ready",
+  "notes": "Coordinator running autonomously (user absent): asset prompt skipped (live screenshots described in the task brief are the visual evidence; no files provided). Research internal-only by deliberate decision (repo-internal UI fix, no library question). Two confirmed pre-existing bugs: A1 auto-expand effect (blame 769a3ede5, 2026-04-02) force-expands every spawn card via subagentId==toolUseId==providerToolCallId; A2 single per-view provider prop yields generic 'Claude Agent' headers in all five embedded agent-transcript mounts. Interview conducted autonomously; decisions D1-D7 recorded in PRD. Execution rule: NO PRs ever; worktree-free-local cadence (PRD 006 precedent); stop at ready-for-merge. | PRD reviewed (opus): approve-with-corrections; all amendments (C1,M2,M3,M4,m5-m8,m11) applied to tasks.yaml; review outcome recorded in PRD (standalone review file blocked by harness policy).",
+  "tasks_total": 4,
+  "waves": 3,
+  "execution_mode": "feature-branch",
+  "feature_branch": "feature/agent-card-identity",
+  "tasks": {
+    "1a": {
+      "state": "pending"
+    },
+    "1b": {
+      "state": "pending"
+    },
+    "2a": {
+      "state": "pending"
+    },
+    "2b": {
+      "state": "pending"
+    }
+  },
+  "prd_number": "007"
+}

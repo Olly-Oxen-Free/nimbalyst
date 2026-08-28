@@ -1,0 +1,21 @@
+prd_slug: "agent-revival-persistence"
+execution_hold: "NOT SCHEDULED — awaiting user build/no-build decision; do not /nimble:run without explicit approval"
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    note: "TeammateManager.ts endReason/endedAt foundation"
+  - wave: 2
+    tasks: ["1b"]
+    note: "Same file as 1a (cwd persistence), sequenced"
+  - wave: 3
+    tasks: ["2a", "2b"]
+    note: "2a gate widening; 2b failure delivery — both touch TeammateManager.ts, coordinator may serialize"
+  - wave: 4
+    tasks: ["3a", "3b"]
+    note: "UI affordance + restart-path test; disjoint files"
+  - wave: 5
+    tasks: ["4a"]
+    note: "Optional phase 2, gated on Open Question 5"
+longest_chain: ["1a", "1b", "2a", "3a", "4a"]
+total_complexity: 22
+max_parallel: 2

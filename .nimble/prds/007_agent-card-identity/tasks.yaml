@@ -1,0 +1,260 @@
+# ============================================================
+# NIMBLE TASK DEFINITIONS
+# ============================================================
+
+metadata:
+  prd_slug: "agent-card-identity"
+  created_at: "2026-08-28T00:00:00Z"
+  total_complexity: 11
+  task_count: 4
+
+tasks:
+  - id: "1a"
+    title: "Collapsed by default: delete the auto-expand effect"
+    description: |
+      Delete the "Auto-expand sub-agent (Task) tools" useEffect at
+      RichTranscriptView.tsx:1626-1642 (the whole effect, including its
+      comment). expandedTools must start empty and be mutated only by
+      toggleToolExpand. Root cause chain (verified): the effect adds every
+      subagent message's subagentId on every [messages] change;
+      subagentId == toolUseId == providerToolCallId
+      (ClaudeCodeRawParser.ts:524/597), the same key the card reads at
+      :1752-1754, so every spawn card mounts expanded and re-expands after
+      a user collapses it mid-turn. Blame 769a3ede5 (2026-04-02) —
+      pre-existing, predates PRD 004's TaskToolWidget which made it loud.
+
+      Applies to Task sub-agents AND teammates: collapsed-by-default for
+      both kinds is the intended outcome, not collateral.
+
+      Test (behavioral, extend an existing RichTranscriptView test file —
+      RichTranscriptView.taskWidgetGate.test.tsx is the natural home):
+      (1) a subagent message renders its card/widget collapsed (widget
+      receives isExpanded=false / expanded body absent);
+      (2) after toggling open then closed, appending a new message to the
+      messages array does NOT re-expand it. Red-first: both assertions
+      must fail against the current code before the deletion.
+
+      REVIEWER CORRECTIONS (M4, mandatory): the existing fixture at
+      taskWidgetGate.test.tsx:39-51 uses subagentId 'sub-1' !==
+      providerToolCallId 'toolu_task_1', which dodges the bug — the new
+      test's fixture MUST set subagentId === providerToolCallId, matching
+      real parser output (ClaudeCodeRawParser.ts:524/:572-573), or the
+      red-first gate is trivially green. StubWidget (:27-29) accepts no
+      props — extend it to surface isExpanded (e.g. a data-expanded
+      attribute) so assertion (1) actually observes expansion state.
+
+      Deep-path mocks only; never mock the @nimbalyst/runtime barrel.
+      Fulfills R1.
+    depends_on: []
+    complexity: 2
+    priority: "must"
+    success_criteria:
+      - "Effect at RichTranscriptView.tsx:1626-1642 removed; no other expandedTools writer than toggleToolExpand remains"
+      - "Collapsed-by-default and collapse-stickiness assertions pass, and demonstrably failed pre-change"
+    files_affected:
+      - "packages/runtime/src/ui/AgentTranscript/components/RichTranscriptView.tsx"
+      - "packages/runtime/src/ui/AgentTranscript/components/__tests__/RichTranscriptView.taskWidgetGate.test.tsx"
+    agent_context: |
+      Surgical deletion + test. Do not touch the header render, the
+      renderToolCard anatomy, or anything task 1b/2a owns. Hooks rule:
+      you are deleting a hook call site — ensure no other hook becomes
+      conditional as a side effect (plain deletion of the whole
+      useEffect is safe; partial edits are not).
+
+  - id: "1b"
+    title: "Identity override props on RichTranscriptView turn headers"
+    description: |
+      Add optional agentName?: string and agentModel?: string to
+      RichTranscriptViewProps (destructure them unconditionally in the
+      forwardRef signature at :1164). In the isNewGroup assistant header
+      (RichTranscriptView.tsx:2296-2300), when agentName is set render:
+        {agentName}{agentModel ? ' [agentModel]' : ''}
+      (model in a muted span, matching TeammateThreadPopover.tsx:177's
+      existing pattern) instead of getProviderDisplayName(provider).
+      When agentName is unset, behavior is byte-identical to today —
+      including the undefined-provider case (m11: TaskToolWidget's inner
+      mount passes no provider prop and currently falls through
+      getProviderDisplayName(undefined) -> 'Agent'; that fallback must
+      survive untouched when agentName is unset). User headers ('You')
+      unchanged. ProviderIcon avatar unchanged (non-goal).
+      Note: the embedded mounts run with compactMode: true and isNewGroup
+      headers DO render there (the live screenshot showed 'Claude Agent'
+      under exactly that setting) — assert with the same settings. Add a stable class on the model span (e.g.
+      rich-transcript-message-sender-model) per REACT_DOM_MARKERS.
+
+      Test (extend the same existing RichTranscriptView test file used in
+      1a): with agentName="weatherman", agentModel="haiku", an assistant
+      turn header renders "weatherman" and "haiku"; without the props the
+      provider fallback still renders. This is wiring coverage (PRD D6),
+      not a presentation test — the regression risk is the prop path.
+
+      No conditional hooks: the props are plain values; do not introduce
+      any hook call inside a conditional branch (3fa68d3c0 incident).
+      Fulfills R2.
+    depends_on: ["1a"]
+    complexity: 3
+    priority: "must"
+    success_criteria:
+      - "agentName/agentModel render in the assistant group header when provided; provider fallback intact when absent"
+      - "No new hook call sites; typecheck clean; wiring test passes"
+    files_affected:
+      - "packages/runtime/src/ui/AgentTranscript/components/RichTranscriptView.tsx"
+      - "packages/runtime/src/ui/AgentTranscript/components/__tests__/RichTranscriptView.taskWidgetGate.test.tsx"
+    agent_context: |
+      Same file as 1a (sequenced after it). Only the props surface and
+      the isNewGroup header block change. Do not thread call sites (2b)
+      or touch renderToolCard (2a).
+
+  - id: "2a"
+    title: "Header parity: TaskToolWidget gains the generic card's anatomy"
+    description: |
+      Bring TaskToolWidget's collapsed header (TaskToolWidget.tsx:116-133)
+      up to the generic spawn-card anatomy so both card kinds read as one
+      family (PRD D2):
+      icon -> name [+type] -> description -> model -> status -> chevron.
+
+      (1) Extract from RichTranscriptView's renderToolCard into shared
+      exported components in packages/runtime (new file next to
+      RichTranscriptView, e.g. ui/AgentTranscript/components/
+      SubagentCardPieces.tsx):
+        - SubagentStatusChip: takes a plain status
+          ('running'|'blocked'|'idle'|'completed'|'errored'|'stopped')
+          and renders the spinner/circle/check/cancel + text vocabulary
+          currently inlined at :1908-1971 (keep the existing classes,
+          preserving each variant's exact spinner/icon/color classes).
+          REVIEWER CORRECTION (M3): that block only renders four states
+          (running :1920-1927, idle :1928-1935, completed :1936-1943,
+          errored :1944-1951) — 'blocked' and 'stopped' have NO source
+          JSX to lift. Specify them: mirror SubAgentChipRow's existing
+          normalized-status styling vocabulary (its blocked treatment /
+          warning token) for 'blocked' with text "Blocked"; 'stopped'
+          renders like completed's inactive form with text "Stopped".
+          Do not invent a new color system. Second-order effect,
+          ACCEPTED AND INTENDED: TeammateInfo.status includes 'blocked',
+          so teammate cards that render no status today will start
+          showing a Blocked chip — this is a deliberate improvement,
+          not collateral (supersedes the no-behavior-change clause for
+          exactly this case).
+          REVIEWER CORRECTION (m5): the non-status progress-fallback
+          spinner at :1953-1960 is visually distinct (border classes
+          differ from running's) — leave that branch inlined in
+          renderToolCard; do NOT fold it into the chip as 'running'.
+          REVIEWER CORRECTION (m8): give the chip a stable kebab-case
+          root class (e.g. subagent-status-chip) per REACT_DOM_MARKERS —
+          "keep the existing classes" does not forbid adding it.
+        - SubagentAuditLabel: model/effort truncated label currently at
+          :1866-1874. REVIEWER CORRECTIONS (m6, m7):
+          formatSubagentAuditLabel STAYS exported from
+          RichTranscriptView.tsx (RichTranscriptView.test.ts:12,535
+          imports it from there) — reuse or re-export, never relocate.
+          Reproduce BOTH the aria-label/title formatted string
+          ('Model: x; Reasoning effort: y') and the visible
+          'model · effort' text, and keep the class
+          rich-transcript-subagent-audit.
+      Replace the inlined JSX in renderToolCard with the shared pieces;
+      the generic card's status-derivation logic (currentTeammates
+      lookup, agent_id regex, effectiveStatus fallback) stays in
+      renderToolCard and passes a plain status down. Preserve selectors
+      .rich-transcript-tool-card.sub-agent / .teammate.
+
+      (2) In TaskToolWidget's header button: add the leading
+      MaterialSymbol icon ('description', or 'cloud_sync' when
+      args.run_in_background), keep "Sub-Agent [agentType]" + description,
+      add SubagentAuditLabel fed by message.subagent?.model (+
+      reasoningEffort if present), add SubagentStatusChip fed by the
+      already-subscribed sessionTasksAtom task's status (map TaskInfo
+      status: running->running, blocked->blocked, completed->completed,
+      failed->errored, stopped->stopped; no task record -> completed when
+      tool.result exists, else running), and a trailing
+      expand_more/chevron_right chevron mirroring :1972. Preserve
+      .task-tool-widget-header and existing child classes; add stable
+      kebab-case classes for new elements (REACT_DOM_MARKERS).
+
+      (3) Pass agentName={agentType ?? 'Sub-Agent'} and
+      agentModel={message.subagent?.model} to the widget's inner
+      RichTranscriptView (R4 for this mount; the other four mounts are
+      task 2b's).
+
+      Tests: extend the existing TaskToolWidget test file (find it; PRD
+      004 shipped one) — status mapping TaskInfo->chip statuses
+      (behavioral); chevron toggle reflects expand state only if not
+      already covered. Extend nothing presentation-only (no icon-name
+      assertions). Deep-path mocks only. MaterialSymbol mock:
+      vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', ...) is the
+      cheap shape.
+
+      Hooks: TaskToolWidget already calls useAtomValue/useSetAtom/etc.
+      unconditionally — keep every hook call unconditional; new values
+      derive with plain expressions (a ?? b), never hookA() || hookB()
+      (3fa68d3c0 incident). Fulfills R3 + R4 (this mount).
+    depends_on: ["1a", "1b"]
+    complexity: 4
+    priority: "must"
+    success_criteria:
+      - "Shared SubagentStatusChip/SubagentAuditLabel exported from runtime and consumed by BOTH renderToolCard and TaskToolWidget — no duplicated status/audit JSX"
+      - "TaskToolWidget header shows icon, name [type], description, model, live status, chevron; collapsed height stays 1-2 rows; existing selectors intact"
+      - "Inner transcript receives agentName/agentModel; status-mapping test passes"
+    files_affected:
+      - "packages/runtime/src/ui/AgentTranscript/components/RichTranscriptView.tsx"
+      - "packages/runtime/src/ui/AgentTranscript/components/SubagentCardPieces.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TaskToolWidget.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/__tests__/TaskToolWidget.test.tsx"
+    agent_context: |
+      The only task allowed to touch renderToolCard, and only to swap
+      inlined status/audit JSX for the shared pieces — no behavior
+      change on the generic card path. TaskToolWidget imports the shared
+      pieces via the DEEP path (@nimbalyst/runtime/ui/AgentTranscript/
+      components/SubagentCardPieces), never the barrel.
+
+  - id: "2b"
+    title: "Thread agentName/agentModel through the other four mounts"
+    description: |
+      Pass the new RichTranscriptView identity props (task 1b) from the
+      four remaining embedded mounts, per the verified identity table:
+        - TeammateThreadPopover.tsx:204 —
+          agentName={teammate?.name ?? teammateName},
+          agentModel={teammate?.model}
+        - TeammateTileRail.tsx:213 —
+          agentName={teammate?.name ?? agentId} (line 69's teammateName),
+          agentModel={teammate?.model}
+        - TaskThreadPopover.tsx:125 — REVIEWER CORRECTIONS (C1 + M2):
+          NEVER use TaskInfo.taskType as a name — it is the SDK task
+          kind ('local_agent'/'local_bash', subagentDrain.ts:76), which
+          would regress headers to "local_agent". And TaskThreadBody
+          (:57-60) only receives { sessionId, taskId } — do not add a
+          hook there. Instead: thread the popover's EXISTING `label`
+          prop (it already carries the task description the chip shows)
+          down into TaskThreadBody as a new optional agentName prop and
+          pass it at :125. Zero new hooks, zero new files.
+          NO model (TaskInfo has no model field — do not add one, PRD D4)
+        - TaskTileRail.tsx:168 — agentName from the task's
+          TaskInfo.description (already displayed at :143) with
+          'Sub-Agent' fallback; never taskType (C1); no model
+      Undefined-model cases must render name-only (1b already handles).
+
+      Test: one dense wiring test extending an existing test file for ONE
+      representative mount (TeammateThreadPopover has tests from PRD 002/
+      006 — extend there): the popover's transcript receives the
+      name/model. Do not write four near-identical tests (token
+      discipline); the other three mounts are the same two-prop pattern
+      reviewed by diff.
+
+      Hooks: props derive from already-present values; add no hooks and
+      make none conditional. Fulfills R4.
+    depends_on: ["1b"]
+    complexity: 2
+    priority: "must"
+    success_criteria:
+      - "All four mounts pass agentName (and agentModel where the table says one exists); no TaskInfo.model added"
+      - "Representative wiring test passes; typecheck clean"
+    files_affected:
+      - "packages/electron/src/renderer/components/AgentMode/TeammateThreadPopover.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TeammateTileRail.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TaskThreadPopover.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TaskTileRail.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/__tests__/TeammateThreadPopover.test.tsx"
+    agent_context: |
+      Pure prop threading. Do not touch TaskToolWidget (2a's file), do
+      not modify RichTranscriptView, do not restructure any mount's
+      existing header JSX (their own popover/tile headers already show
+      name+model correctly and stay as-is).
