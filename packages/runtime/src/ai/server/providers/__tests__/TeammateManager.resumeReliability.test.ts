@@ -224,6 +224,47 @@ describe('resume-then-fail delivers a wake to the lead (task 1b)', () => {
   });
 });
 
+describe('revival-then-fail delivers a distinct revival_failed notice (PRD 008 task 2b)', () => {
+  it('a revived (terminal-origin) teammate that fails delivers revival_failed, not the generic resume-failed wording', async () => {
+    queryMock.mockReturnValue(failingQuery('subprocess exited'));
+    const deps = makeDeps();
+    const manager = new TeammateManager(deps);
+    const revivedCarol = { ...idleTeammate('carol', 'sdk-session-3'), revivedFromTerminal: true };
+
+    resumeAndFail(manager, 'session-1', 'carol@team', revivedCarol);
+
+    await vi.waitFor(() => expect(deps.interruptWithMessage).toHaveBeenCalledTimes(1));
+    expect(deps.interruptWithMessage.mock.calls[0][0]).toMatch(/carol/);
+    expect(deps.interruptWithMessage.mock.calls[0][0]).toMatch(/revival failed/i);
+    expect(deps.logNonBlocking).toHaveBeenCalledWith(
+      'session-1', 'claude-code', 'output',
+      expect.stringContaining('"type":"revival_failed"'),
+      expect.objectContaining({ messageType: 'revival_failed' }),
+    );
+  });
+
+  it('a plain PRD-003 resume-then-fail (no revivedFromTerminal) is completely unaffected -- still teammate_message_to_lead', async () => {
+    // Regression guard for the brief's explicit constraint: this task must not
+    // fork or alter deliverMessageToLead's existing contract for its current
+    // callers. idleAlice carries no revivedFromTerminal, matching every resume
+    // that predates PRD 008 (idle/running/blocked -- never went through the
+    // terminal-status branch of isRevivalEligible).
+    queryMock.mockReturnValue(failingQuery('subprocess exited'));
+    const deps = makeDeps();
+    const manager = new TeammateManager(deps);
+
+    resumeAndFail(manager, 'session-1', 'alice@team', idleAlice);
+
+    await vi.waitFor(() => expect(deps.interruptWithMessage).toHaveBeenCalledTimes(1));
+    expect(deps.interruptWithMessage.mock.calls[0][0]).not.toMatch(/revival failed/i);
+    expect(deps.logNonBlocking).toHaveBeenCalledWith(
+      'session-1', 'claude-code', 'output',
+      expect.stringContaining('"type":"teammate_message_to_lead"'),
+      expect.anything(),
+    );
+  });
+});
+
 describe('resume-then-fail post-restart reaches the lead (task 1c, Door A)', () => {
   it('threads the explicit sessionId into interruptWithMessage, not the unset lastUsedSessionId', async () => {
     queryMock.mockReturnValue(failingQuery('session file stale'));
@@ -545,14 +586,51 @@ describe('spawn cwd persists per teammate row (task 1b)', () => {
     );
   });
 
-  it('surfaces a typed, catchable TeammateCwdMissingError when the persisted cwd no longer exists', async () => {
+  it('catches TeammateCwdMissingError and routes it to revival-failure delivery instead of rejecting (task 2b)', async () => {
+    // PRD 008 task 2b: the raw TeammateCwdMissingError throw (still exactly
+    // what rehydrateIdleTeammate itself does -- see the error-shape assertions
+    // below) is caught inside sendMessageFromHost, not left to propagate as an
+    // unhandled rejection to whatever called it (a real gap this task closes).
+    const deps = makeDeps();
+    const manager = new TeammateManager(deps);
+    const missingCwd = path.join(os.tmpdir(), `nimbalyst-teammate-cwd-missing-${Math.random().toString(36).slice(2)}`);
+    storedTeammates = [persistedRow({ cwd: missingCwd })] as unknown as StoredTeammate[];
+
+    const result = await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'still there?');
+
+    expect(result).toEqual({ delivered: false, wasIdle: false });
+
+    // Both delivery halves fired: persisted transcript line...
+    expect(deps.logNonBlocking).toHaveBeenCalledWith(
+      LEAD_SESSION, 'claude-code', 'output',
+      expect.stringContaining('"type":"revival_failed"'),
+      expect.objectContaining({ messageType: 'revival_failed' }),
+    );
+    const [, , , chunkJson] = deps.logNonBlocking.mock.calls[0];
+    const chunk = JSON.parse(chunkJson);
+    expect(chunk.content).toContain(missingCwd);
+    expect(chunk._teammateAgentId).toBe('bob@team');
+    // ...and the live/idle wake attempt.
+    expect(deps.interruptWithMessage).toHaveBeenCalledWith(
+      expect.stringContaining('Teammate revival failed'),
+      LEAD_SESSION,
+    );
+  });
+
+  it('the underlying rehydrateIdleTeammate throw is still the typed, specific error (unit-level shape check)', async () => {
+    // Exercises the throw site directly (not through sendMessageFromHost's
+    // catch) so this specific error's shape stays pinned even as the outer
+    // call site's handling of it evolves.
     const manager = new TeammateManager(makeDeps());
     const missingCwd = path.join(os.tmpdir(), `nimbalyst-teammate-cwd-missing-${Math.random().toString(36).slice(2)}`);
     storedTeammates = [persistedRow({ cwd: missingCwd })] as unknown as StoredTeammate[];
 
-    const sendPromise = manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'still there?');
-    await expect(sendPromise).rejects.toThrow(TeammateCwdMissingError);
-    await sendPromise.catch((err: unknown) => {
+    const rehydrate = (internals(manager) as unknown as {
+      rehydrateIdleTeammate: (sessionId: string | undefined, agentId: string) => Promise<unknown>;
+    }).rehydrateIdleTeammate.bind(manager);
+
+    await expect(rehydrate(LEAD_SESSION, 'bob@team')).rejects.toThrow(TeammateCwdMissingError);
+    await rehydrate(LEAD_SESSION, 'bob@team').catch((err: unknown) => {
       expect(err).toBeInstanceOf(TeammateCwdMissingError);
       expect((err as TeammateCwdMissingError).agentId).toBe('bob@team');
       expect((err as TeammateCwdMissingError).cwd).toBe(missingCwd);

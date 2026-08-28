@@ -36,6 +36,8 @@ export interface ManagedTeammate {
   lastActiveAt: number;        // epoch ms of most recent chunk
   toolCallCount: number;       // count of tool_use blocks observed
   cwd: string;                 // the directory this teammate actually spawned into
+  // Carried from IdleTeammate.revivedFromTerminal -- see that field's doc comment.
+  revivedFromTerminal?: boolean;
 }
 
 export interface IdleTeammate {
@@ -50,6 +52,13 @@ export interface IdleTeammate {
   startedAt?: number;    // epoch ms when originally spawned (preserved across idle)
   toolCallCount?: number; // count of tool_use blocks observed during the run that just finished
   lastActiveAt?: number;  // epoch ms of most recent chunk during that run
+  // True when this entry came from rehydrateIdleTeammate's terminal-status
+  // branch (isRevivalEligible's completed/errored path), not its always-allowed
+  // non-terminal (idle/running/blocked) branch. Distinguishes a genuine PRD 003
+  // "resumed teammate died again" failure from a PRD 008 "revival attempt
+  // failed" one downstream in handleStreamError -- they need different wording
+  // and a different persisted chunk type.
+  revivedFromTerminal?: boolean;
 }
 
 /**
@@ -1234,6 +1243,71 @@ export class TeammateManager {
     });
   }
 
+  /**
+   * Deliver a revival failure (a completed/errored teammate that PRD 008's
+   * widened gate admitted into resumeIdleTeammate, but the resume itself never
+   * completed) to the lead's conversation -- called from `handleStreamError`
+   * (a resume that started but then died) and from `sendMessageFromHost` (a
+   * resume that never started at all, e.g. `TeammateCwdMissingError`).
+   *
+   * Deliberately NOT a fork of `deliverMessageToLead`: same persisted-write +
+   * interrupt shape, but a distinct `'revival_failed'` chunk type so the
+   * transcript renders "revival failed", not the generic "message from
+   * teammate" wording -- and so `ClaudeCodeRawParser` needs its own dedicated
+   * branch rather than accidentally reusing (and thus polluting) the meaning
+   * of `'teammate_message_to_lead'`.
+   *
+   * Both halves are best-effort and must not throw: a revival failure racing
+   * the session closing mid-attempt should not itself crash anything.
+   */
+  private deliverRevivalFailure(
+    sessionId: string | undefined,
+    teammateAgentId: string,
+    teammateName: string,
+    reason: string,
+  ): void {
+    const content = `Reviving teammate "${teammateName}" failed: ${reason}`;
+    const summary = `${teammateName} revival failed`;
+
+    if (sessionId) {
+      const revivalFailureChunk = {
+        type: 'revival_failed',
+        _isTeammateOutput: true,
+        _teammateAgentId: teammateAgentId,
+        _teammateName: teammateName,
+        content,
+        summary,
+        timestamp: Date.now(),
+      };
+      this.deps.logNonBlocking(
+        sessionId, 'claude-code', 'output',
+        JSON.stringify(revivalFailureChunk),
+        { messageType: 'revival_failed' }
+      );
+      this.deps.emit('teammate:transcriptUpdated', { sessionId, agentId: teammateAgentId });
+    }
+
+    // Same queue interruptWithMessage's idle-lead branch drains from -- without
+    // this, an idle-but-live lead would find nothing to wake to and neither the
+    // injected message nor the undelivered-notification fallback would fire.
+    this.pendingTeammateToLeadMessages.push({
+      teammateName,
+      teammateAgentId,
+      content,
+      summary,
+    });
+
+    const formattedMessage = `[Teammate revival failed: "${teammateName}"]\n\n${content}`;
+    this.deps.interruptWithMessage(formattedMessage, sessionId).catch(err => {
+      console.warn(`[MANAGED-TEAMMATE] Failed to interrupt lead with revival failure:`, err);
+    });
+
+    this.deps.emit('message:logged', {
+      sessionId,
+      direction: 'output' as const,
+    });
+  }
+
   // ─── UI sync ────────────────────────────────────────────────────────────
 
   /**
@@ -1319,7 +1393,19 @@ export class TeammateManager {
     // Both maps are memory-only, so a Nimbalyst restart empties them while the
     // teammate's SDK session is still on disk and resumable. Rehydrate from the
     // session metadata the emit path already persists.
-    const rehydrated = await this.rehydrateIdleTeammate(leadSessionId, agentId, resumeContext?.confirmedUserShutdown);
+    let rehydrated: IdleTeammate | undefined;
+    try {
+      rehydrated = await this.rehydrateIdleTeammate(leadSessionId, agentId, resumeContext?.confirmedUserShutdown);
+    } catch (err) {
+      // A resume-prep failure (e.g. TeammateCwdMissingError from 1b's existence
+      // check) that happens BEFORE any ManagedTeammate placeholder exists --
+      // handleStreamError never runs for this, so it needs its own delivery.
+      const reason = err instanceof Error ? err.message : String(err);
+      const displayName = agentId.split('@')[0] || agentId;
+      console.warn(`[MANAGED-TEAMMATE] Revival prep failed for "${agentId}":`, reason);
+      this.deliverRevivalFailure(leadSessionId, agentId, displayName, reason);
+      return { delivered: false, wasIdle: false };
+    }
     if (rehydrated) {
       // streamTeammateOutput reads cwd/permissions off the manager instance,
       // and nothing has assigned them in a process where the lead never ran.
@@ -1396,6 +1482,7 @@ export class TeammateManager {
       prompt: '',
       startedAt: entry.startedAt,
       toolCallCount: entry.toolCallCount,
+      revivedFromTerminal: entry.status === 'completed' || entry.status === 'errored',
     };
   }
 
@@ -1729,6 +1816,7 @@ export class TeammateManager {
     const managed = this.managedTeammates.get(agentId);
     const isBackground = managed?.isBackgroundAgent ?? false;
     const wasResumed = managed?.wasResumed ?? false;
+    const revivedFromTerminal = managed?.revivedFromTerminal ?? false;
     const teammateName = managed?.name ?? agentId;
 
     this.managedTeammates.delete(agentId);
@@ -1746,7 +1834,12 @@ export class TeammateManager {
     // interruptWithMessage() synchronously latches isLeadBusy() (mid-turn or
     // teammateIdleMessagePending), which is what suppresses a duplicate desktop
     // notification when this was also the last active teammate.
-    if (wasResumed) {
+    if (wasResumed && revivedFromTerminal) {
+      // PRD 008: this resume was a revival of a previously completed/errored
+      // teammate (see isRevivalEligible), not a PRD 003 idle-resume. Distinct
+      // wording + chunk type -- see deliverRevivalFailure's own doc comment.
+      this.deliverRevivalFailure(sessionId, agentId, teammateName, err.message);
+    } else if (wasResumed) {
       this.deliverMessageToLead(
         sessionId,
         agentId,
@@ -2210,6 +2303,7 @@ export class TeammateManager {
       lastActiveAt: now,
       toolCallCount: idleInfo.toolCallCount ?? 0,
       cwd: idleInfo.cwd,
+      revivedFromTerminal: idleInfo.revivedFromTerminal,
     });
 
     streamPromise.then((result) => {

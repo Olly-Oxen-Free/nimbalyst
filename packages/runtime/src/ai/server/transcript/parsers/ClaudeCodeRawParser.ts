@@ -462,6 +462,29 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
             createdAt: msg.createdAt,
           });
         }
+      } else if (parsed.type === 'revival_failed') {
+        // Synthetic chunk TeammateManager.deliverRevivalFailure writes when a
+        // revival attempt fails. Deliberately UNCONDITIONAL, unlike the sibling
+        // 'teammate_message_to_lead' branch above -- that one only renders into
+        // a teammate's own projected thread view; this one must render into the
+        // LEAD's own session transcript, since that's what a user reopens after
+        // an unattended revival failed with no live turn to see it in. Gating
+        // this on teammateProjection would make it vanish exactly where it's
+        // needed (PRD 008 R6).
+        const failureText = typeof parsed.content === 'string' && parsed.content.trim()
+          ? parsed.content
+          : typeof parsed.summary === 'string'
+            ? parsed.summary
+            : '';
+        if (failureText.trim()) {
+          descriptors.push({
+            type: 'system_message',
+            text: failureText,
+            systemType: 'status',
+            searchable: false,
+            createdAt: msg.createdAt,
+          });
+        }
       }
     } catch {
       // Not JSON -- treat as plain text assistant message.

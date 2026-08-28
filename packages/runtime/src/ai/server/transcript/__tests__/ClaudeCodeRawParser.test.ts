@@ -1046,4 +1046,62 @@ describe('ClaudeCodeRawParser', () => {
       });
     });
   });
+
+  describe('revival_failed (PRD 008 task 2b)', () => {
+    const revivalFailedMessage = () => makeRawMessage({
+      content: JSON.stringify({
+        type: 'revival_failed',
+        _isTeammateOutput: true,
+        _teammateAgentId: 'bob@team',
+        _teammateName: 'bob',
+        content: 'Reviving teammate "bob" failed: subprocess exited',
+        summary: 'bob revival failed',
+        timestamp: 1700000000000,
+      }),
+    });
+
+    it('renders into the LEAD session\'s own transcript (teammateProjection unset) -- the whole point of this task', async () => {
+      // The sibling teammate_message_to_lead branch is gated on teammateProjection
+      // and only renders into a teammate's own projected thread view; a naive
+      // copy-paste of that gate here would make this vanish exactly where a user
+      // reopening a session after a failed unattended revival needs it. Default
+      // parser state (no setTeammateProjectionMode call) is the lead's own view.
+      const parser = new ClaudeCodeRawParser();
+
+      const descriptors = await parser.parseMessage(revivalFailedMessage(), makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({
+        type: 'system_message',
+        systemType: 'status',
+        text: 'Reviving teammate "bob" failed: subprocess exited',
+      });
+    });
+
+    it('renders identically with teammateProjection explicitly true -- unconditional, not merely "also matches"', async () => {
+      const parser = new ClaudeCodeRawParser();
+      parser.setTeammateProjectionMode(true);
+
+      const descriptors = await parser.parseMessage(revivalFailedMessage(), makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({ type: 'system_message', systemType: 'status' });
+    });
+
+    it('falls back to summary when content is empty, and produces nothing when both are blank', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const withSummaryOnly = makeRawMessage({
+        content: JSON.stringify({ type: 'revival_failed', content: '', summary: 'bob revival failed' }),
+      });
+
+      const descriptors = await parser.parseMessage(withSummaryOnly, makeContext());
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({ text: 'bob revival failed' });
+
+      const blank = makeRawMessage({
+        content: JSON.stringify({ type: 'revival_failed', content: '', summary: '' }),
+      });
+      expect(await parser.parseMessage(blank, makeContext())).toHaveLength(0);
+    });
+  });
 });
