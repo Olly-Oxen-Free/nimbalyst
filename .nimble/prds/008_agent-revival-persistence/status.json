@@ -2,17 +2,27 @@
   "slug": "agent-revival-persistence",
   "phase": "executing",
   "created": "2026-08-28",
-  "status": "executing",
+  "status": "paused-at-gate",
   "execution_hold": false,
+  "gate_reached": {
+    "wave": 2,
+    "label": "endReason taxonomy + cwd persistence -- review the user-shutdown consent decision before the gate widens",
+    "reached_at": "2026-08-28T09:36:09Z",
+    "model": "pause"
+  },
   "notes": "Scoping deliverable only \u2014 DO NOT EXECUTE without explicit user approval. Coordinator ran research+plan autonomously (user absent). Core finding: teammate revival is a small extension of existing resume machinery (one gate: RESUMABLE_PERSISTED_STATUSES + canCompose, both pinned by a PRD 003 regression test to be inverted openly); Task sub-agent revival has NO machinery to extend \u2014 only context-seeded respawn with a weaker, honestly-labeled guarantee (phase 2, could-have). Genuinely new work: endReason taxonomy, per-row cwd persistence, no-live-lead failure delivery, revive UI. Six open questions recorded for the user, incl. session-metadata retention (unlocated) and whether phase 2 is worth building at all. | PRD reviewed: approve, no corrections; review outcome recorded in PRD. EXECUTION HOLD stands.",
   "tasks_total": 7,
   "waves": 5,
   "tasks": {
     "1a": {
-      "state": "pending"
+      "state": "done",
+      "merge_commit": "e68158984",
+      "bead_id": "nby-mbu"
     },
     "1b": {
-      "state": "pending"
+      "state": "done",
+      "merge_commit": "1b89d03e8",
+      "bead_id": "nby-48e"
     },
     "2a": {
       "state": "pending"
