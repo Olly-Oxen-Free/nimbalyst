@@ -282,3 +282,62 @@ describe('RichTranscriptView assistant header identity override', () => {
     expect(container.querySelector('.rich-transcript-message-sender-model')).toBeNull();
   });
 });
+
+function makeUserMessage(
+  teammateOrigin?: TranscriptViewMessage['teammateOrigin'],
+): TranscriptViewMessage {
+  return {
+    id: 1,
+    sequence: 1,
+    createdAt: new Date(1_784_648_445_000),
+    type: 'user_message',
+    text: 'Hello there',
+    subagentId: null,
+    ...(teammateOrigin ? { teammateOrigin } : {}),
+  } as TranscriptViewMessage;
+}
+
+// Bug A: a teammate-wake-injected turn is `user_message`-typed but is not
+// real user input. It must never render under the "You" header.
+describe('RichTranscriptView teammate wake header attribution', () => {
+  beforeEach(() => {
+    vi.stubGlobal('CSS', { highlights: { delete: vi.fn(), set: vi.fn() } });
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0);
+      return 1;
+    });
+  });
+
+  it('renders the teammate name, not "You", when teammateOrigin is present', () => {
+    const { container } = renderTranscript(
+      makeUserMessage([{ agentId: 'agent-1', teammateName: 'Ada', kind: 'wake-message' }]),
+    );
+
+    const sender = container.querySelector('.rich-transcript-message-sender');
+    expect(sender).not.toBeNull();
+    expect(sender?.textContent).toContain('Ada');
+    expect(sender?.textContent).not.toContain('You');
+  });
+
+  it('summarizes multiple queued deliveries in a batched wake', () => {
+    const { container } = renderTranscript(
+      makeUserMessage([
+        { agentId: 'agent-1', teammateName: 'Ada', kind: 'wake-message' },
+        { agentId: 'agent-2', teammateName: 'Grace', kind: 'wake-message' },
+      ]),
+    );
+
+    const sender = container.querySelector('.rich-transcript-message-sender');
+    expect(sender).not.toBeNull();
+    expect(sender?.textContent).not.toContain('You');
+    expect(sender?.textContent).toContain('2 teammates');
+  });
+
+  it('still renders "You" for an ordinary real user message', () => {
+    const { container } = renderTranscript(makeUserMessage());
+
+    const sender = container.querySelector('.rich-transcript-message-sender');
+    expect(sender).not.toBeNull();
+    expect(sender?.textContent).toContain('You');
+  });
+});

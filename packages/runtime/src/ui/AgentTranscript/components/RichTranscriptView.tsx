@@ -2015,6 +2015,12 @@ export const RichTranscriptView = React.forwardRef<
 
     const isUser = message.type === 'user_message';
     const isTool = isToolLikeMessage(message);
+    // Teammate-wake-injected turns are user-role but not real user input --
+    // never label them "You". See TeammateOrigin in TranscriptProjector.ts.
+    const teammateOrigin = message.teammateOrigin;
+    const teammateSenderLabel = teammateOrigin && teammateOrigin.length > 0
+      ? (teammateOrigin.length === 1 ? teammateOrigin[0].teammateName : `${teammateOrigin.length} teammates`)
+      : undefined;
     const isCollapsed = collapsedMessages.has(index);
 
     // Hide assistant/tool messages that sit between agent notifications.
@@ -2240,7 +2246,7 @@ export const RichTranscriptView = React.forwardRef<
             </div>
             <div className="rich-transcript-message-meta flex-1 flex items-baseline gap-2">
               <span className="rich-transcript-message-sender font-medium text-[var(--nim-text)] text-sm">
-                {isUser ? 'You' : (agentName ?? getProviderDisplayName(provider))}
+                {teammateSenderLabel ?? (isUser ? 'You' : (agentName ?? getProviderDisplayName(provider)))}
                 {!isUser && agentName && agentModel && (
                   <span className="rich-transcript-message-sender-model text-[var(--nim-text-muted)] font-normal">
                     {` [${agentModel}]`}
