@@ -31,8 +31,9 @@ vi.mock('../../../../electron/claudeCodeEnvironment', () => ({
 import { ClaudeCodeProvider } from '../ClaudeCodeProvider';
 
 type ProviderInternals = {
-  teammateManager: { enableAgentTeams?: boolean };
+  teammateManager: { enableAgentTeams?: boolean; shutdownGraceMs: number };
   syncAgentTeamsFlag: (settingsEnv: Record<string, string>) => boolean;
+  setTeammateShutdownGraceSeconds: (seconds: number) => void;
 };
 
 describe('ClaudeCodeProvider.syncAgentTeamsFlag', () => {
@@ -63,5 +64,30 @@ describe('ClaudeCodeProvider.syncAgentTeamsFlag', () => {
 
     provider.syncAgentTeamsFlag({ CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0' });
     expect(provider.teammateManager.enableAgentTeams).toBe(false);
+  });
+});
+
+/**
+ * The same wiring hazard for the shutdown grace period: the setting is stored in
+ * seconds by electron's workspace-settings store, and TeammateManager only ever
+ * reads milliseconds. TeammateManager's own grace-period tests set
+ * `shutdownGraceMs` directly, so nothing else proves the conversion happens.
+ */
+describe('ClaudeCodeProvider.setTeammateShutdownGraceSeconds', () => {
+  it('converts the stored seconds into the milliseconds TeammateManager reads', () => {
+    const provider = new ClaudeCodeProvider() as unknown as ProviderInternals;
+
+    provider.setTeammateShutdownGraceSeconds(5);
+
+    expect(provider.teammateManager.shutdownGraceMs).toBe(5000);
+  });
+
+  it.each([0, -1, Number.NaN])('clamps %p to no grace period at all', seconds => {
+    const provider = new ClaudeCodeProvider() as unknown as ProviderInternals;
+    provider.setTeammateShutdownGraceSeconds(5);
+
+    provider.setTeammateShutdownGraceSeconds(seconds);
+
+    expect(provider.teammateManager.shutdownGraceMs).toBe(0);
   });
 });
