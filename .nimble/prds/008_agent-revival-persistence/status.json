@@ -43,12 +43,12 @@
     },
     "3a": {
       "state": "done",
-      "merge_commit": "local-merge-pending-hash",
+      "merge_commit": "4bd3409b1",
       "note": "Widened canCompose in TeammateTileRail.tsx and TeammateThreadPopover.tsx via a shared teammateComposeMode() mirror of TeammateManager.isRevivalEligible (24h window, endReason gate); user-shutdown rows show an explicit Revive action behind useConfirmDialog before compose opens and before the confirm flag is sent, cancel sends nothing. Preload aiSendMessageToTeammate, the ai:sendMessageToTeammate IPC handler, and AIService.ts's TeammateResumeContext construction widened to carry confirmedUserShutdown end to end (AIService.ts change flagged for require_review). TeammatePanel.tsx sorts ended teammates most-recently-ended-first below live rows (R7). Coordinator independently verified the diff (confirm-gate, wire path from TeammateManager's scheduleEmitTeammateUpdate through session.metadata.currentTeammates, all test cases) before merging."
     },
     "3b": {
       "state": "done",
-      "merge_commit": "local-merge-pending-hash",
+      "merge_commit": "b906e0997",
       "note": "Added a restart-shaped scripted test to TeammateManager.resumeReliability.test.ts (new describe block, own provenance header, additive to 1b's existing cases): fresh TeammateManager instance never spawned on, seeded with a lead-abandoned/completed persisted row, sendMessageFromHost resumes it through 2a's widened isRevivalEligible gate and the post-resume status write-back to 'running' is asserted. Confirmed against the pre-2a commit that RESUMABLE_PERSISTED_STATUSES alone would have rejected this row."
     },
     "4a": {
