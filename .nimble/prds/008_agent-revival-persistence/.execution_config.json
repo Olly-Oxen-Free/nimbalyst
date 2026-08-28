@@ -1,0 +1,63 @@
+{
+  "configured_at": "2026-08-28T00:00:00Z",
+  "orchestration_version": 2,
+  "branch_strategy": "feature-branch",
+  "feature_branch": "feature/agent-revival-persistence",
+  "base_branch": "main",
+  "note": "Repo standing constraint: never open a PR for this repo. Local git merge/fast-forward only. Task 4a (Task sub-agent respawn) deferred per user decision -- teammate revival only this run.",
+  "orchestration": {
+    "integration": {
+      "cadence": "wave",
+      "auto_merge_on_green": false,
+      "no_pull_requests": true,
+      "no_pr_reason": "Repo standing constraint: never open a PR for this repo. Local git merge/fast-forward only."
+    },
+    "review": {
+      "trigger": "none",
+      "scope": "cumulative",
+      "skip_if_diff_under": 0,
+      "on_findings": "halt",
+      "providers": {
+        "greptile": { "fire_at": [], "on_findings": "halt" },
+        "code-review": { "fire_at": [], "on_findings": "halt" }
+      },
+      "note": "review.enabled is false in .nimble/config.yaml -- no automated review provider configured."
+    },
+    "gates": {
+      "model": "pause",
+      "auto_place": false,
+      "placements": [
+        {
+          "after_wave": 2,
+          "label": "endReason taxonomy + cwd persistence -- review the user-shutdown consent decision before the gate widens",
+          "condition": "1a/1b are the foundation the resume-gate widening (wave 3) depends on; the settled endReason semantics (stop/stopByAgentId -> user-shutdown) are the load-bearing correctness fact for the whole PRD"
+        },
+        {
+          "after_wave": 4,
+          "label": "Resume-gate widened + revival-failure delivery -- review before UI wave exposes it to the user",
+          "condition": "waves 3-4 touch the correctness-critical PRD-003 regression-test inversion and the persisted-transcript consumer fix from brief review; human-verify before wave 5 UI makes this reachable"
+        }
+      ],
+      "conditions": {
+        "require_tests_pass": true,
+        "require_build_pass": true,
+        "max_critical_findings": 0
+      }
+    }
+  },
+  "models": {
+    "default": "sonnet",
+    "complexity_threshold": 5,
+    "force_opus_tasks": ["2a"],
+    "force_sonnet_tasks": [],
+    "escalation": {
+      "after_failures": 1,
+      "triggers": ["architectural_issues", "type_system_issues"]
+    }
+  },
+  "max_revision_loops": 3,
+  "allow_bypass": {
+    "future_work_overlap": true,
+    "false_positive_factual": true
+  }
+}
