@@ -1623,24 +1623,6 @@ export const RichTranscriptView = React.forwardRef<
     }
   };
 
-  // Auto-expand sub-agent (Task) tools
-  useEffect(() => {
-    const subAgentIds = new Set<string>();
-    messages.forEach(msg => {
-      if (msg.type === 'subagent' && msg.subagentId) {
-        subAgentIds.add(msg.subagentId);
-      }
-    });
-
-    if (subAgentIds.size > 0) {
-      setExpandedTools(prev => {
-        const next = new Set(prev);
-        subAgentIds.forEach(id => next.add(id));
-        return next;
-      });
-    }
-  }, [messages]);
-
   // Helper to check if message is a login-required error
   // Uses SDK's first-class isAuthError flag when available (preferred)
   // Falls back to string matching for backwards compatibility with old messages

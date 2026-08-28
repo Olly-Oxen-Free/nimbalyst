@@ -1,5 +1,5 @@
 import React from 'react';
-import { render } from '@testing-library/react';
+import { fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TranscriptViewMessage } from '../../../../ai/server/transcript/TranscriptProjector';
 import { setTranscriptToolWidgets } from '../../contributions';
@@ -24,20 +24,34 @@ vi.mock('virtua', async () => {
 
 const SOURCE = 'task-widget-gate-test';
 
-function StubWidget() {
-  return <div data-testid="stub-task-widget" />;
+function StubWidget({
+  isExpanded,
+  onToggle,
+}: {
+  isExpanded?: boolean;
+  onToggle?: () => void;
+}) {
+  return (
+    <div
+      data-testid="stub-task-widget"
+      data-expanded={isExpanded ? 'true' : 'false'}
+      onClick={onToggle}
+    />
+  );
 }
 
 function makeTaskMessage(
   subagent: TranscriptViewMessage['subagent'],
   toolName = 'Task',
+  subagentId = 'sub-1',
+  providerToolCallId = 'toolu_task_1',
 ): TranscriptViewMessage {
   return {
     id: 1,
     sequence: 1,
     createdAt: new Date(1_784_648_445_000),
     type: 'subagent',
-    subagentId: 'sub-1',
+    subagentId,
     subagent,
     toolCall: {
       toolName,
@@ -48,7 +62,7 @@ function makeTaskMessage(
       targetFilePath: null,
       mcpServer: null,
       mcpTool: null,
-      providerToolCallId: 'toolu_task_1',
+      providerToolCallId,
       progress: [],
       result: 'done',
     },
@@ -139,6 +153,61 @@ describe('RichTranscriptView Task widget gate', () => {
 
     expect(container.querySelector('[data-testid="stub-task-widget"]')).toBeNull();
     expect(container.querySelector('.rich-transcript-tool-card.teammate')).not.toBeNull();
+  });
+
+  // REVIEWER CORRECTION M4: subagentId must equal providerToolCallId, matching
+  // real parser output (ClaudeCodeRawParser.ts:524/:572-573). A mismatched
+  // fixture (e.g. subagentId 'sub-1' vs providerToolCallId 'toolu_task_1')
+  // dodges the auto-expand bug because the effect keys expandedTools by
+  // subagentId while the card looks up expandedTools by providerToolCallId.
+  it('mounts a subagent spawn collapsed', () => {
+    const message = makeTaskMessage(
+      { agentType: 'general-purpose' } as any,
+      'Task',
+      'toolu_task_1',
+      'toolu_task_1',
+    );
+    const { container } = renderTranscript(message);
+
+    const widget = container.querySelector('[data-testid="stub-task-widget"]');
+    expect(widget).not.toBeNull();
+    expect(widget?.getAttribute('data-expanded')).toBe('false');
+  });
+
+  it('does not re-expand a collapsed subagent widget when a new message is appended', () => {
+    const message = makeTaskMessage(
+      { agentType: 'general-purpose' } as any,
+      'Task',
+      'toolu_task_1',
+      'toolu_task_1',
+    );
+    const { container, rerender } = renderTranscript(message);
+
+    const getWidget = () => container.querySelector('[data-testid="stub-task-widget"]');
+
+    // Open, then close.
+    fireEvent.click(getWidget()!);
+    expect(getWidget()?.getAttribute('data-expanded')).toBe('true');
+    fireEvent.click(getWidget()!);
+    expect(getWidget()?.getAttribute('data-expanded')).toBe('false');
+
+    // Appending a new message must not resurrect the collapsed state.
+    const secondMessage: TranscriptViewMessage = {
+      ...message,
+      id: 2,
+      sequence: 2,
+    };
+    rerender(
+      <RichTranscriptView
+        sessionId="gate-1"
+        sessionStatus="idle"
+        messages={[message, secondMessage]}
+        workspacePath="/workspace"
+        persistScrollState={false}
+      />,
+    );
+
+    expect(getWidget()?.getAttribute('data-expanded')).toBe('false');
   });
 
   it('still resolves widgets for non-Task tools', () => {
