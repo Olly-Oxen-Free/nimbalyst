@@ -12,7 +12,7 @@
   "beads": { "tier": "cli" },
   "tasks": {
     "1a": { "state": "done", "commit": "1ddbb89bb" },
-    "2a": { "state": "pending" },
+    "2a": { "state": "done", "commit": "5a5129547+d8e7ab2b5" },
     "3a": { "state": "pending" },
     "4a": { "state": "pending" },
     "5a": { "state": "pending" }
