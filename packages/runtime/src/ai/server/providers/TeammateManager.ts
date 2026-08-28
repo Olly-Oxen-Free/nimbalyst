@@ -121,6 +121,12 @@ interface TeammateStatusOverride {
 export interface TeammateResumeContext {
   cwd?: string;
   permissionsPath?: string;
+  /**
+   * The caller has explicitly confirmed reviving a teammate the user shut down
+   * themselves. Without it those rows stay unrevivable, so a stray send can
+   * never restart something the user deliberately stopped.
+   */
+  confirmedUserShutdown?: boolean;
 }
 
 export interface PendingMessage {
@@ -224,8 +230,10 @@ export class TeammateManager {
 
   private static readonly MAX_COMPLETED_TEAMMATES = 100;
   private static readonly TEAMMATE_COLORS = ['blue', 'green', 'yellow', 'purple'];
-  /** Persisted statuses a teammate can be resumed from after a restart. */
+  /** Persisted non-terminal statuses a teammate can always be resumed from after a restart. */
   private static readonly RESUMABLE_PERSISTED_STATUSES = new Set(['idle', 'running', 'blocked']);
+  /** How long after it ended a terminal teammate stays revivable. */
+  private static readonly REVIVAL_ELIGIBILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
   private teammateColorIndex: number = 0;
   private bgAgentCounter: number = 0;
   private subAgentCounter: number = 0;
@@ -1311,7 +1319,7 @@ export class TeammateManager {
     // Both maps are memory-only, so a Nimbalyst restart empties them while the
     // teammate's SDK session is still on disk and resumable. Rehydrate from the
     // session metadata the emit path already persists.
-    const rehydrated = await this.rehydrateIdleTeammate(leadSessionId, agentId);
+    const rehydrated = await this.rehydrateIdleTeammate(leadSessionId, agentId, resumeContext?.confirmedUserShutdown);
     if (rehydrated) {
       // streamTeammateOutput reads cwd/permissions off the manager instance,
       // and nothing has assigned them in a process where the lead never ran.
@@ -1337,12 +1345,13 @@ export class TeammateManager {
   /**
    * Rebuild an IdleTeammate from persisted session metadata for a teammate this
    * process never spawned. Returns undefined when there is nothing resumable --
-   * no row, no persisted SDK session id (pre-feature data), or a teammate that
-   * already reached a terminal status.
+   * no row, no persisted SDK session id (pre-feature data), or a row the
+   * revival gate refuses (see isRevivalEligible).
    */
   private async rehydrateIdleTeammate(
     leadSessionId: string | undefined,
     agentId: string,
+    confirmedUserShutdown?: boolean,
   ): Promise<IdleTeammate | undefined> {
     if (!leadSessionId) return undefined;
 
@@ -1362,10 +1371,7 @@ export class TeammateManager {
     const sessionId = entry?.sessionId;
     if (!entry || typeof sessionId !== 'string' || !sessionId) return undefined;
 
-    // 'running'/'blocked' rows are stale after a restart -- the subprocess died
-    // with the app -- so they resume exactly like 'idle'. 'completed'/'errored'
-    // are terminal and must not be brought back.
-    if (!entry.status || !TeammateManager.RESUMABLE_PERSISTED_STATUSES.has(entry.status)) return undefined;
+    if (!TeammateManager.isRevivalEligible(entry, confirmedUserShutdown)) return undefined;
 
     // The row's own cwd is the most authoritative source -- it's what this
     // teammate actually ran in, which may differ from the current process's
@@ -1391,6 +1397,38 @@ export class TeammateManager {
       startedAt: entry.startedAt,
       toolCallCount: entry.toolCallCount,
     };
+  }
+
+  /**
+   * Whether a persisted row may be brought back by a host send.
+   *
+   * 'running'/'blocked' rows are stale after a restart -- the subprocess died
+   * with the app -- so they resume exactly like 'idle', unconditionally: they
+   * never reached a terminal status, so they carry no endReason/endedAt for the
+   * window below to judge.
+   *
+   * PRD 003 stopped there, refusing 'completed'/'errored' outright. This widens
+   * that: a terminal row whose SDK session is still plausibly resumable --
+   * ended no more than REVIVAL_ELIGIBILITY_WINDOW_MS ago (a row exactly at the
+   * boundary is still eligible) -- comes back too, except one the user shut
+   * down themselves, which needs the caller's explicit confirmation.
+   *
+   * Judgment call: a row with **no** endedAt (written before that field
+   * existed, or otherwise unreadable) is treated as not subject to the cutoff
+   * rather than as expired. Rejecting every such row would make revival
+   * invisible for exactly the data that predates it, which is the worse
+   * default. An unknown endReason likewise falls through to eligible, matching
+   * the 'finished' default the write path's `??` chain already applies.
+   */
+  private static isRevivalEligible(entry: PersistedTeammateRow, confirmedUserShutdown?: boolean): boolean {
+    if (!entry.sessionId || !entry.status) return false;
+    if (TeammateManager.RESUMABLE_PERSISTED_STATUSES.has(entry.status)) return true;
+    if (entry.status !== 'completed' && entry.status !== 'errored') return false;
+
+    const age = entry.endedAt === undefined ? undefined : Date.now() - entry.endedAt;
+    if (age !== undefined && age > TeammateManager.REVIVAL_ELIGIBILITY_WINDOW_MS) return false;
+
+    return entry.endReason === 'user-shutdown' ? confirmedUserShutdown === true : true;
   }
 
   /** Stable stand-in for the spawn-order color, which is not persisted. */

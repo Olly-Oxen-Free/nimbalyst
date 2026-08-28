@@ -190,12 +190,49 @@ describe('TeammateManager.sendMessageFromHost after a restart', () => {
     expect(result).toEqual({ delivered: false, wasIdle: false });
   });
 
-  it('does not resume a teammate that already reached a terminal status', async () => {
+  /**
+   * PRD 003 pinned "terminal means dead" here: a 'completed' row was refused on
+   * status alone. PRD 008
+   * (.nimble/prds/008_agent-revival-persistence/PRD_agent-revival-persistence.md)
+   * reverses that for rows whose SDK session is still plausibly resumable -- the
+   * gate is now (status, endReason, sessionId, endedAt age). These cases replace
+   * that single blanket-rejection assertion.
+   */
+  const withinWindow = () => Date.now() - 60_000;
+  const pastWindow = () => Date.now() - 25 * 60 * 60 * 1000;
+
+  const sendAfterRestart = async (
+    row: Record<string, unknown>,
+    resumeContext?: { confirmedUserShutdown?: boolean },
+  ) => {
     const manager = new TeammateManager({ emit: vi.fn() } as unknown as TeammateManagerDeps);
-    persistedTeammates = [persistedRow({ status: 'completed' })];
+    vi.spyOn(internals(manager), 'resumeIdleTeammate').mockImplementation(() => {});
+    persistedTeammates = [persistedRow(row)];
+    return manager.sendMessageFromHost('lead-session', 'bob@team', 'still there?', resumeContext);
+  };
 
-    const result = await manager.sendMessageFromHost('lead-session', 'bob@team', 'still there?');
+  it.each([
+    ['completed', 'finished'],
+    ['errored', 'errored'],
+  ])('resumes a %s teammate that ended within the revival window', async (status, endReason) => {
+    expect(await sendAfterRestart({ status, endReason, endedAt: withinWindow() }))
+      .toEqual({ delivered: true, wasIdle: true });
+  });
 
-    expect(result).toEqual({ delivered: false, wasIdle: false });
+  it('does not resume a teammate that ended more than 24 hours ago', async () => {
+    expect(await sendAfterRestart({ status: 'completed', endReason: 'finished', endedAt: pastWindow() }))
+      .toEqual({ delivered: false, wasIdle: false });
+  });
+
+  it('does not resume a teammate the user shut down unless the caller confirms', async () => {
+    const row = { status: 'completed', endReason: 'user-shutdown', endedAt: withinWindow() };
+
+    expect(await sendAfterRestart(row)).toEqual({ delivered: false, wasIdle: false });
+    expect(await sendAfterRestart(row, { confirmedUserShutdown: true }))
+      .toEqual({ delivered: true, wasIdle: true });
+  });
+
+  it('resumes a legacy terminal row that carries neither endReason nor endedAt', async () => {
+    expect(await sendAfterRestart({ status: 'completed' })).toEqual({ delivered: true, wasIdle: true });
   });
 });
