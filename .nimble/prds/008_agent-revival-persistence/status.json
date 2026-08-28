@@ -1,9 +1,9 @@
 {
   "slug": "agent-revival-persistence",
-  "phase": "planned",
+  "phase": "executing",
   "created": "2026-08-28",
-  "status": "ready",
-  "execution_hold": true,
+  "status": "executing",
+  "execution_hold": false,
   "notes": "Scoping deliverable only \u2014 DO NOT EXECUTE without explicit user approval. Coordinator ran research+plan autonomously (user absent). Core finding: teammate revival is a small extension of existing resume machinery (one gate: RESUMABLE_PERSISTED_STATUSES + canCompose, both pinned by a PRD 003 regression test to be inverted openly); Task sub-agent revival has NO machinery to extend \u2014 only context-seeded respawn with a weaker, honestly-labeled guarantee (phase 2, could-have). Genuinely new work: endReason taxonomy, per-row cwd persistence, no-live-lead failure delivery, revive UI. Six open questions recorded for the user, incl. session-metadata retention (unlocated) and whether phase 2 is worth building at all. | PRD reviewed: approve, no corrections; review outcome recorded in PRD. EXECUTION HOLD stands.",
   "tasks_total": 7,
   "waves": 5,
@@ -27,8 +27,12 @@
       "state": "pending"
     },
     "4a": {
-      "state": "pending"
+      "state": "skipped",
+      "reason": "Phase 2 deferred per user decision -- weaker guarantee, reviewer-endorsed skepticism."
     }
   },
-  "prd_number": "008"
+  "prd_number": "008",
+  "feature_branch": "feature/agent-revival-persistence",
+  "execution_mode": "feature-branch",
+  "scope_note": "Phase 2 (task 4a, Task sub-agent context-seeded respawn) deliberately deferred/skipped per user decision 2026-08-28 -- teammate revival only. Open questions 1-4,6 resolved with conservative defaults (24h eligibility window, confirm-gated user-shutdown rows, fail-clean-on-revive worktree handling, this-machine-only v1) -- see conversation, not re-litigated in PRD prose."
 }
