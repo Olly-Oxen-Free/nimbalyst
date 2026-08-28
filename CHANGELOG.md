@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A teammate that finishes its work now hands its answer back to your conversation the moment it goes idle — even if it never sent a message — instead of the session silently stalling, and the lead is told to wait for its teammates rather than redoing their work itself.
 - A finished teammate now shows as Completed with its real tool-call count after you stop the session, instead of a false Error with zero tools, and the Teammates panel shows each teammate's model.
 - Asking Claude to spawn a named agent now correctly creates an addressable teammate you can message directly, instead of silently falling back to an anonymous one-shot sub-agent.
+- A teammate's wake-up message and shutdown handling no longer show as "You" or clutter your mainline conversation with plumbing — they collapse into one expandable card, and reviving a teammate that had shut down cleanly no longer leaves it confused about being asked to shut down again.
 
 ### Removed
 <!-- Removed features go here -->
