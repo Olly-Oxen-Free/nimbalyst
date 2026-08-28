@@ -10,10 +10,21 @@
   "execution_mode": "feature-branch",
   "feature_branch": "feature/teammate-wake-transcript-integration",
   "tasks": {
-    "1a": { "state": "pending" },
-    "1b": { "state": "pending" },
-    "2a": { "state": "pending" },
-    "2b": { "state": "pending" },
-    "3a": { "state": "pending" }
+    "1a": {
+      "state": "done",
+      "commit": "d16d5bc33"
+    },
+    "1b": {
+      "state": "pending"
+    },
+    "2a": {
+      "state": "pending"
+    },
+    "2b": {
+      "state": "pending"
+    },
+    "3a": {
+      "state": "pending"
+    }
   }
 }
