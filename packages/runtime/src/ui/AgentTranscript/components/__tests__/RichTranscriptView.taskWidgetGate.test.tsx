@@ -308,15 +308,18 @@ describe('RichTranscriptView teammate wake header attribution', () => {
     });
   });
 
+  // Task 2b moved these turns onto the condensed teammate card, so the
+  // attribution now lives on the card label rather than the sender header.
+  // The invariant under test is unchanged: never "You".
   it('renders the teammate name, not "You", when teammateOrigin is present', () => {
     const { container } = renderTranscript(
       makeUserMessage([{ agentId: 'agent-1', teammateName: 'Ada', kind: 'wake-message' }]),
     );
 
-    const sender = container.querySelector('.rich-transcript-message-sender');
-    expect(sender).not.toBeNull();
-    expect(sender?.textContent).toContain('Ada');
-    expect(sender?.textContent).not.toContain('You');
+    const card = container.querySelector('.rich-transcript-teammate-notification');
+    expect(card).not.toBeNull();
+    expect(card?.textContent).toContain('Ada');
+    expect(container.textContent).not.toContain('You');
   });
 
   it('summarizes multiple queued deliveries in a batched wake', () => {
@@ -327,10 +330,10 @@ describe('RichTranscriptView teammate wake header attribution', () => {
       ]),
     );
 
-    const sender = container.querySelector('.rich-transcript-message-sender');
-    expect(sender).not.toBeNull();
-    expect(sender?.textContent).not.toContain('You');
-    expect(sender?.textContent).toContain('2 teammates');
+    const card = container.querySelector('.rich-transcript-teammate-notification');
+    expect(card).not.toBeNull();
+    expect(container.textContent).not.toContain('You');
+    expect(card?.textContent).toContain('2 teammates');
   });
 
   it('still renders "You" for an ordinary real user message', () => {
@@ -339,5 +342,151 @@ describe('RichTranscriptView teammate wake header attribution', () => {
     const sender = container.querySelector('.rich-transcript-message-sender');
     expect(sender).not.toBeNull();
     expect(sender?.textContent).toContain('You');
+  });
+});
+
+function makeSendMessageTool(
+  sequence: number,
+  args: Record<string, unknown>,
+  toolName = 'SendMessage',
+): TranscriptViewMessage {
+  return {
+    id: sequence,
+    sequence,
+    createdAt: new Date(1_784_648_445_000),
+    type: 'tool_call',
+    subagentId: null,
+    toolCall: {
+      toolName,
+      toolDisplayName: toolName,
+      status: 'completed',
+      description: null,
+      arguments: args,
+      targetFilePath: null,
+      mcpServer: null,
+      mcpTool: null,
+      providerToolCallId: `toolu_send_${sequence}`,
+      progress: [],
+      result: 'delivered',
+    },
+  } as TranscriptViewMessage;
+}
+
+function makeWake(sequence: number, text: string, teammateName = 'Ada'): TranscriptViewMessage {
+  return {
+    id: sequence,
+    sequence,
+    createdAt: new Date(1_784_648_445_000),
+    type: 'user_message',
+    text,
+    subagentId: null,
+    teammateOrigin: [{ agentId: 'agent-1', teammateName, kind: 'wake-message' }],
+  } as TranscriptViewMessage;
+}
+
+function renderMessages(messages: TranscriptViewMessage[]) {
+  return render(
+    <RichTranscriptView
+      sessionId="gate-1"
+      sessionStatus="idle"
+      messages={messages}
+      workspacePath="/workspace"
+      persistScrollState={false}
+      settings={{ showToolCalls: true } as any}
+    />,
+  );
+}
+
+// Bug B: the whole teammate exchange -- the wake message plus the adjacent
+// SendMessage/shutdown handshake plumbing -- must condense into ONE collapsed
+// card in the lead's mainline, not bleed across several turns.
+describe('RichTranscriptView teammate exchange condensation', () => {
+  beforeEach(() => {
+    vi.stubGlobal('CSS', { highlights: { delete: vi.fn(), set: vi.fn() } });
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0);
+      return 1;
+    });
+  });
+
+  it('collapses a lone wake message into a card that is closed on mount', () => {
+    const { container } = renderMessages([
+      makeWake(1, 'Finished the sweep.\nDetails follow in the log.'),
+    ]);
+
+    const cards = container.querySelectorAll('.rich-transcript-teammate-notification');
+    expect(cards).toHaveLength(1);
+
+    const details = cards[0].querySelector('details');
+    expect(details).not.toBeNull();
+    expect(details?.hasAttribute('open')).toBe(false);
+  });
+
+  it('swallows adjacent SendMessage handshake plumbing into the same single card', () => {
+    const { container } = renderMessages([
+      makeSendMessageTool(1, { recipient: 'cpu-scout', type: 'shutdown_request' }),
+      makeWake(2, 'Approving shutdown.\nAll work is committed.'),
+      makeSendMessageTool(3, { recipient: 'cpu-scout', type: 'shutdown_response', approve: true }),
+    ]);
+
+    // One card, not three turns.
+    expect(container.querySelectorAll('.rich-transcript-teammate-notification')).toHaveLength(1);
+    // No SendMessage plumbing left rendering as its own mainline tool card.
+    expect(container.querySelectorAll('.rich-transcript-tool-container.orphan')).toHaveLength(0);
+
+    // The swallowed calls are reachable inside the card, not lost.
+    const body = container.querySelector('.rich-transcript-teammate-notification .teammate-content');
+    expect(body).not.toBeNull();
+    expect(body?.textContent).toContain('All work is committed.');
+    expect(body?.querySelectorAll('.rich-transcript-tool-container').length).toBe(2);
+  });
+
+  it('leaves an adjacent real user turn rendering normally', () => {
+    const { container } = renderMessages([
+      makeWake(1, 'Finished the sweep.\nDetails follow.'),
+      {
+        id: 2,
+        sequence: 2,
+        createdAt: new Date(1_784_648_446_000),
+        type: 'user_message',
+        text: 'Thanks, now check the disk.',
+        subagentId: null,
+      } as TranscriptViewMessage,
+    ]);
+
+    expect(container.querySelectorAll('.rich-transcript-teammate-notification')).toHaveLength(1);
+    const sender = container.querySelector('.rich-transcript-message-sender');
+    expect(sender?.textContent).toContain('You');
+    expect(container.textContent).toContain('Thanks, now check the disk.');
+  });
+
+  it('does not swallow a SendMessage call separated from the wake by a substantive turn', () => {
+    const { container } = renderMessages([
+      makeSendMessageTool(1, { recipient: 'cpu-scout', type: 'shutdown_request' }),
+      {
+        id: 2,
+        sequence: 2,
+        createdAt: new Date(1_784_648_446_000),
+        type: 'assistant_message',
+        text: 'Asked cpu-scout to wrap up.',
+        subagentId: null,
+      } as TranscriptViewMessage,
+      makeWake(3, 'Approving shutdown.\nAll work is committed.'),
+    ]);
+
+    expect(container.querySelectorAll('.rich-transcript-teammate-notification')).toHaveLength(1);
+    expect(container.textContent).toContain('Asked cpu-scout to wrap up.');
+  });
+
+  it('labels a revival-failure origin distinctly from a wake message', () => {
+    const message = {
+      ...makeWake(1, 'Could not restart cpu-scout.\nThe worktree is gone.'),
+      teammateOrigin: [{ agentId: 'agent-1', teammateName: 'Ada', kind: 'revival-failed' }],
+    } as TranscriptViewMessage;
+    const { container } = renderMessages([message]);
+
+    const card = container.querySelector('.rich-transcript-teammate-notification');
+    expect(card?.textContent).toContain('Revival failed');
+    expect(card?.textContent).toContain('Ada');
   });
 });

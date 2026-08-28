@@ -621,6 +621,24 @@ const WRITE_TOOL_NAMES = new Set(['write', 'notebookedit']);
  */
 export { stripMcpPrefix, isInteractiveWidgetTool };
 
+/**
+ * Inter-teammate plumbing: the lead's own `SendMessage` calls (plain messages,
+ * shutdown requests, and the `shutdown_response` handshake, which arrives as a
+ * `SendMessage` whose `input.type` says so). These are machinery, not
+ * conversation, so they fold into the adjacent teammate card instead of
+ * occupying their own mainline turns.
+ */
+const isTeammateCommTool = (msg: TranscriptViewMessage): boolean => {
+  if (!isToolLikeMessage(msg) || !msg.toolCall) return false;
+  if (isInteractiveWidgetTool(msg.toolCall.toolName)) return false;
+  const name = stripMcpPrefix(msg.toolCall.toolName ?? '');
+  return name === 'SendMessage' || name === 'shutdown_response';
+};
+
+/** True for a turn injected by a teammate wake, on either the canonical or the iOS path. */
+const isTeammateOriginMessage = (msg: TranscriptViewMessage): boolean =>
+  (!!msg.teammateOrigin && msg.teammateOrigin.length > 0) || !!msg.metadata?.isTeammateMessage;
+
 const isFileModifyingTool = (name?: string): boolean => {
   if (!name) return false;
   const normalized = name.toLowerCase();
@@ -1415,6 +1433,64 @@ export const RichTranscriptView = React.forwardRef<
     return indices;
   }, [messages]);
 
+  // A teammate exchange (the wake turn plus the SendMessage handshake plumbing
+  // around it) belongs in ONE collapsed card, not spread across several mainline
+  // turns. Map each wake turn to the neighbouring indices it swallows.
+  //
+  // Backward: only contiguous SendMessage calls. Those are orphans by
+  // construction -- the next non-tool message is the wake turn itself -- so
+  // hiding them cannot strip a tool out of a rendered assistant card.
+  //
+  // Forward: buffer a run of SendMessage calls and commit it only when the run
+  // ends at an empty processing turn or at the end of the transcript. A run that
+  // ends at a text-bearing assistant turn is discarded: those calls render
+  // *inside* that assistant's card via `toolMessagesBefore`, so hiding their own
+  // indices here would not remove them from the mainline anyway.
+  const teammateExchanges = useMemo(() => {
+    const absorbedIndices = new Set<number>();
+    const absorbedByAnchor = new Map<number, number[]>();
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (message.type !== 'user_message' || !isTeammateOriginMessage(message)) continue;
+
+      const taken: number[] = [];
+
+      let back = i - 1;
+      while (back >= 0 && isTeammateCommTool(messages[back]) && !absorbedIndices.has(back)) {
+        taken.push(back);
+        back--;
+      }
+
+      const pending: number[] = [];
+      let forward = i + 1;
+      while (forward < messages.length) {
+        const next = messages[forward];
+        if (isTeammateCommTool(next)) {
+          pending.push(forward);
+          forward++;
+          continue;
+        }
+        if (next.type === 'assistant_message' && !next.text?.trim()) {
+          pending.push(forward);
+          taken.push(...pending);
+          pending.length = 0;
+          forward++;
+          continue;
+        }
+        break;
+      }
+      if (forward >= messages.length) taken.push(...pending);
+
+      if (taken.length === 0) continue;
+      taken.sort((a, b) => a - b);
+      for (const idx of taken) absorbedIndices.add(idx);
+      absorbedByAnchor.set(i, taken);
+    }
+
+    return { absorbedIndices, absorbedByAnchor };
+  }, [messages]);
+
   // Find pending (unresolved) ToolPermission widgets and the VList indices where they're actually rendered.
   // Tool messages are hidden (display:none) and rendered inside the next assistant message via toolMessagesBefore,
   // so we need to find the assistant message index for scroll targeting.
@@ -2012,6 +2088,10 @@ export const RichTranscriptView = React.forwardRef<
     if (supersededToolIndices.has(index)) {
       return <div key={messageKey} style={{ display: 'none' }} />;
     }
+    // Swallowed into an adjacent teammate card; it renders there, not here.
+    if (teammateExchanges.absorbedIndices.has(index)) {
+      return <div key={messageKey} style={{ display: 'none' }} />;
+    }
 
     const isUser = message.type === 'user_message';
     const isTool = isToolLikeMessage(message);
@@ -2047,7 +2127,7 @@ export const RichTranscriptView = React.forwardRef<
         // Walk back to find the nearest user message (skipping tool and assistant messages)
         let prevIdx = index - 1;
         while (prevIdx >= 0 && messages[prevIdx].type !== 'user_message') prevIdx--;
-        if (prevIdx >= 0 && messages[prevIdx].metadata?.isTeammateMessage) {
+        if (prevIdx >= 0 && isTeammateOriginMessage(messages[prevIdx])) {
           // The most recent user message before this is a teammate notification.
           // Only hide empty processing turns (no substantive content).
           const hasNoContent = !message.text?.trim();
@@ -2089,7 +2169,11 @@ export const RichTranscriptView = React.forwardRef<
     if (checkIdx >= 0) {
       effectivePrevMessage = messages[checkIdx];
     }
-    const isNewGroup = !effectivePrevMessage || effectivePrevMessage.type !== message.type;
+    // A teammate card is not conversational context, so a real user turn that
+    // follows one still opens its own group (and keeps its "You" header).
+    const isNewGroup = !effectivePrevMessage
+      || effectivePrevMessage.type !== message.type
+      || isTeammateOriginMessage(effectivePrevMessage) !== isTeammateOriginMessage(message);
 
     // Render orphaned tool calls.
     // When settings.showToolCalls is false, hide non-interactive tool
@@ -2110,14 +2194,26 @@ export const RichTranscriptView = React.forwardRef<
     }
 
     // Render teammate/sub-agent messages as compact inline notifications
-    if (isUser && message.metadata?.isTeammateMessage) {
-      const teammateName = (message.metadata?.teammateName as string) || 'agent';
-      const label = `Received message from agent ${teammateName}`;
+    if (isUser && isTeammateOriginMessage(message)) {
+      const batchedCount = teammateOrigin?.length ?? 0;
+      const teammateName = teammateSenderLabel ?? ((message.metadata?.teammateName as string) || 'agent');
+      const isRevivalFailure = batchedCount > 0
+        && teammateOrigin!.every((origin) => origin.kind === 'revival-failed');
+      const label = isRevivalFailure
+        ? `Revival failed for agent ${teammateName}`
+        : batchedCount > 1
+          ? `Received messages from ${teammateName}`
+          : `Received message from agent ${teammateName}`;
       const content = message.text?.trim();
       // Show first line as preview (truncated)
       const firstLine = content?.split('\n')[0] || '';
       const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + '...' : firstLine;
-      const hasMoreContent = content && (content.includes('\n') || content.length > 100);
+      // The handshake plumbing this card swallowed, rendered inside it on expand
+      // so nothing is lost from the mainline -- just moved out of the way.
+      const swallowedTools = (teammateExchanges.absorbedByAnchor.get(index) ?? [])
+        .filter((idx) => !supersededToolIndices.has(idx) && !!messages[idx].toolCall);
+      const hasMoreContent = (content && (content.includes('\n') || content.length > 100))
+        || swallowedTools.length > 0;
       return (
         <div
           key={messageKey}
@@ -2139,7 +2235,8 @@ export const RichTranscriptView = React.forwardRef<
                 <span className="text-[10px] shrink-0">{formatMessageTime(message.createdAt?.getTime() ?? 0)}</span>
               </summary>
               <div className="teammate-content ml-5 mt-1 mb-0.5">
-                <MarkdownRenderer content={content} isUser={false} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />
+                <MarkdownRenderer content={content ?? ''} isUser={false} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />
+                {swallowedTools.map((idx) => renderToolCard(messages[idx], idx, 0))}
               </div>
             </details>
           ) : (
