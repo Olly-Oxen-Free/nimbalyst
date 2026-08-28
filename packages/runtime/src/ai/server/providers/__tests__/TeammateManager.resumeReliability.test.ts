@@ -637,3 +637,66 @@ describe('spawn cwd persists per teammate row (task 1b)', () => {
     });
   });
 });
+
+/**
+ * Restart-path revival, full shape (PRD 008 agent-revival-persistence, tasks
+ * 2a + 3b). Distinct from every describe block above this comment: those
+ * cover PRD 003's original resume-reliability scenarios plus PRD 008's
+ * 1b/2b slices in isolation. This block is the scripted stand-in for a real
+ * app restart, matching the "second boot" pattern
+ * `sendMessageFromHost.test.ts:145-182` already established -- construct a
+ * fresh `TeammateManager` (never call any spawn/resume method on it before
+ * the assertion), seed only the persisted repository row, then call
+ * `sendMessageFromHost`. The fresh instance's `managedTeammates`/
+ * `idleTeammates` maps are empty by construction, exactly like a process
+ * that never ran the original spawn -- the persisted row is the only
+ * surviving handle, so this proves the whole abandon -> restart -> rehydrate
+ * -> resume shape, not just that 2a's gate function accepts the row in
+ * isolation.
+ */
+describe('restart-path revival: a lead-abandoned teammate resumes through the widened gate (PRD 008, tasks 2a+3b)', () => {
+  const leadAbandonedRow = (overrides: Record<string, unknown> = {}) => ({
+    name: 'bob',
+    agentId: 'bob@team',
+    teamName: 'team',
+    agentType: 'general-purpose',
+    // Shape written by abandonIdleTeammates (PRD 008 task 1a, TeammateManager.ts:349):
+    // status: 'completed', endReason: 'lead-abandoned', endedAt: Date.now().
+    status: 'completed',
+    endReason: 'lead-abandoned',
+    endedAt: Date.now() - 60_000,
+    sessionId: 'sdk-session-9',
+    // Task 1b's persisted-cwd field, pointed at a real directory so the
+    // TeammateCwdMissingError path (covered above) does not spuriously fire.
+    cwd: os.tmpdir(),
+    startedAt: 111,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    storedTeammates = [];
+    queryMock.mockReset();
+    queryMock.mockReturnValue(wedgedQuery());
+  });
+
+  it('resumes a lead-abandoned teammate after a simulated restart (fresh TeammateManager, empty in-memory maps)', async () => {
+    const manager = new TeammateManager(makeDeps());
+    storedTeammates = [leadAbandonedRow()] as unknown as StoredTeammate[];
+
+    const result = await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'still there?', {
+      cwd: os.tmpdir(),
+      permissionsPath: os.tmpdir(),
+    });
+
+    // Resumed (options.resume set via streamTeammateOutput's idle-resume
+    // path), not a fresh spawn -- {delivered: true, wasIdle: true} is only
+    // reachable through rehydrateIdleTeammate -> resumeIdleTeammate.
+    expect(result).toEqual({ delivered: true, wasIdle: true });
+
+    // Closes the loop: the row is genuinely usable afterward, not just
+    // "the call didn't get rejected" -- resumeIdleTeammate's own
+    // scheduleEmitTeammateUpdate({ status: 'running' }) writes back through
+    // the mocked AISessionsRepository.updateMetadata into storedTeammates.
+    await vi.waitFor(() => expect(statusOf('bob@team')).toBe('running'));
+  });
+});
