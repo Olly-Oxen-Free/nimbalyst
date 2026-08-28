@@ -52,6 +52,13 @@ export interface IdleTeammate {
 }
 
 /**
+ * Why a teammate went terminal. Read sites (2a's revival gate, 3a's UI) must
+ * default a missing value to 'finished' -- rows written before this field
+ * existed have no value here at all.
+ */
+export type TeammateEndReason = 'finished' | 'user-shutdown' | 'lead-abandoned' | 'errored';
+
+/**
  * A teammate row as it sits in the lead session's `currentTeammates` metadata.
  * Every field is optional: rows written before a field existed keep their old
  * shape, and nothing validates them on the way back in.
@@ -66,6 +73,21 @@ interface PersistedTeammateRow {
   startedAt?: number;
   sessionId?: string;
   toolCallCount?: number;
+  endReason?: TeammateEndReason;
+  endedAt?: number;
+}
+
+/**
+ * What `scheduleEmitTeammateUpdate`/`emitTeammateUpdate` carry per agentId for
+ * a status transition. `endReason`/`endedAt` are only present for a terminal
+ * transition ('completed' | 'errored') -- a non-terminal override (e.g.
+ * 'running', 'blocked', 'idle') must omit them so the writer never stamps a
+ * stray `endReason` on a still-active row.
+ */
+interface TeammateStatusOverride {
+  status: 'running' | 'blocked' | 'completed' | 'errored' | 'idle';
+  endReason?: TeammateEndReason;
+  endedAt?: number;
 }
 
 /**
@@ -186,7 +208,7 @@ export class TeammateManager {
   private subAgentCounter: number = 0;
 
   // Debounce state for emitTeammateUpdate
-  private pendingStatusOverrides: Map<string, 'running' | 'blocked' | 'completed' | 'errored' | 'idle'> = new Map();
+  private pendingStatusOverrides: Map<string, TeammateStatusOverride> = new Map();
   private pendingEmitSessionId?: string;
   private emitDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -280,11 +302,11 @@ export class TeammateManager {
   abandonIdleTeammates(sessionId: string | undefined): void {
     if (this.idleTeammates.size === 0) return;
 
-    const overrides = new Map<string, 'running' | 'completed' | 'errored' | 'idle'>();
+    const overrides = new Map<string, TeammateStatusOverride>();
     for (const agentId of this.idleTeammates.keys()) {
       this.markCompleted(agentId);
       this.clearPendingMessages(agentId);
-      overrides.set(agentId, 'completed');
+      overrides.set(agentId, { status: 'completed', endReason: 'lead-abandoned', endedAt: Date.now() });
       console.log(`[MANAGED-TEAMMATE] Abandoning idle teammate "${agentId}" (lead transport dead)`);
     }
     this.idleTeammates.clear();
@@ -1203,7 +1225,7 @@ export class TeammateManager {
     const agentId = matches[0].agentId;
     this.blockedTeammatesByRequest.set(requestId, agentId);
     console.log(`[MANAGED-TEAMMATE] "${agentId}" blocked awaiting permission (request=${requestId})`);
-    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'blocked']]));
+    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'blocked' }]]));
   }
 
   /**
@@ -1218,7 +1240,7 @@ export class TeammateManager {
     // The teammate may have gone idle, completed or errored while the prompt
     // was open; that terminal status was already emitted and must win.
     if (!this.managedTeammates.has(agentId)) return;
-    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, this.statusForManaged(agentId)]]));
+    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: this.statusForManaged(agentId) }]]));
   }
 
   /**
@@ -1363,14 +1385,14 @@ export class TeammateManager {
    */
   private scheduleEmitTeammateUpdate(
     sessionId: string | undefined,
-    statusOverrides?: Map<string, 'running' | 'blocked' | 'completed' | 'errored' | 'idle'>
+    statusOverrides?: Map<string, TeammateStatusOverride>
   ): void {
     if (!sessionId) return;
 
     this.pendingEmitSessionId = sessionId;
     if (statusOverrides) {
-      for (const [agentId, status] of statusOverrides) {
-        this.pendingStatusOverrides.set(agentId, status);
+      for (const [agentId, override] of statusOverrides) {
+        this.pendingStatusOverrides.set(agentId, override);
       }
     }
 
@@ -1414,7 +1436,7 @@ export class TeammateManager {
 
   async emitTeammateUpdate(
     sessionId: string | undefined,
-    statusOverrides?: Map<string, 'running' | 'blocked' | 'completed' | 'errored' | 'idle'>
+    statusOverrides?: Map<string, TeammateStatusOverride>
   ): Promise<void> {
     if (!sessionId) {
       return;
@@ -1441,6 +1463,8 @@ export class TeammateManager {
          * seen -- never assume it is present.
          */
         sessionId?: string;
+        endReason?: TeammateEndReason;
+        endedAt?: number;
       }> = Array.isArray(currentMetadata.currentTeammates) ? currentMetadata.currentTeammates as any[] : [];
 
       const seenAgentIds = new Set<string>();
@@ -1456,7 +1480,15 @@ export class TeammateManager {
           sessionId: managed.sessionId ?? tm.sessionId,
         } : {};
         if (statusOverrides?.has(tm.agentId)) {
-          return { ...tm, ...activityFields, status: statusOverrides.get(tm.agentId)! };
+          const override = statusOverrides.get(tm.agentId)!;
+          // Only stamp endReason/endedAt for this agentId's own terminal
+          // transition -- an unrelated status override elsewhere in the same
+          // debounced batch must not touch, let alone blank out, a value
+          // already written by a prior terminal transition here.
+          const terminalFields = override.endReason
+            ? { endReason: override.endReason, endedAt: override.endedAt ?? Date.now() }
+            : {};
+          return { ...tm, ...activityFields, status: override.status, ...terminalFields };
         } else if (managed) {
           // Not 'running': any unrelated emit (another teammate's tool call)
           // would otherwise clear a blocked teammate's status while its prompt
@@ -1477,34 +1509,38 @@ export class TeammateManager {
 
       for (const [agentId, tm] of this.managedTeammates) {
         if (!seenAgentIds.has(agentId)) {
+          const override = statusOverrides?.get(agentId);
           updatedTeammates.push({
             name: tm.name,
             agentId: tm.agentId,
             teamName: tm.teamName,
             agentType: tm.agentType,
-            status: statusOverrides?.has(agentId) ? statusOverrides.get(agentId)! : this.statusForManaged(agentId),
+            status: override ? override.status : this.statusForManaged(agentId),
             model: tm.model,
             startedAt: tm.startedAt,
             lastActiveAt: tm.lastActiveAt,
             toolCallCount: tm.toolCallCount,
             sessionId: tm.sessionId,
+            ...(override?.endReason ? { endReason: override.endReason, endedAt: override.endedAt ?? Date.now() } : {}),
           });
         }
       }
 
       for (const [agentId, tm] of this.idleTeammates) {
         if (!seenAgentIds.has(agentId)) {
+          const override = statusOverrides?.get(agentId);
           updatedTeammates.push({
             name: tm.name,
             agentId,
             teamName: tm.teamName,
             agentType: tm.agentType,
-            status: statusOverrides?.has(agentId) ? statusOverrides.get(agentId)! : 'idle',
+            status: override ? override.status : 'idle',
             model: tm.model,
             startedAt: tm.startedAt,
             toolCallCount: tm.toolCallCount,
             lastActiveAt: tm.lastActiveAt,
             sessionId: tm.sessionId,
+            ...(override?.endReason ? { endReason: override.endReason, endedAt: override.endedAt ?? Date.now() } : {}),
           });
         }
       }
@@ -1547,7 +1583,7 @@ export class TeammateManager {
       this.clearPendingMessages(agentId);
       if (!isBackground) void this.removeTeammateFromConfig(teamName, agentId);
       console.log(`[MANAGED-TEAMMATE] "${agentId}" shut down (approved)`);
-      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'completed']]));
+      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'completed', endReason: 'user-shutdown', endedAt: Date.now() }]]));
     } else if (result.capturedSessionId && !isBackground) {
       // Only go idle for real teammates, not background agents
       this.idleTeammates.set(agentId, {
@@ -1557,7 +1593,7 @@ export class TeammateManager {
         lastActiveAt: managed?.lastActiveAt,
       });
       console.log(`[MANAGED-TEAMMATE] "${agentId}" idle (session=${result.capturedSessionId})`);
-      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'idle']]));
+      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'idle' }]]));
 
       // Hand the finished turn back to the lead — a teammate that never called
       // SendMessage would otherwise strand its answer here. The idle notice is
@@ -1585,7 +1621,7 @@ export class TeammateManager {
       if (!isBackground) void this.removeTeammateFromConfig(teamName, agentId);
       const reason = isBackground ? 'background agent completed' : 'no session ID';
       console.log(`[MANAGED-TEAMMATE] "${agentId}" completed (${reason})`);
-      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'completed']]));
+      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'completed', endReason: 'finished', endedAt: Date.now() }]]));
 
       // Deliver sub-agent/background agent result to lead so it can present findings to the user.
       // This reuses the same deliverMessageToLead path that teammates use for SendMessage.
@@ -1624,7 +1660,7 @@ export class TeammateManager {
     this.idleTeammates.delete(agentId);
     if (!isBackground) void this.removeTeammateFromConfig(teamName, agentId);
     console.warn(`[MANAGED-TEAMMATE] "${agentId}" errored:`, err.message);
-    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'errored']]));
+    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'errored', endReason: 'errored', endedAt: Date.now() }]]));
     this.recordBatchFailure('errored');
 
     // Wake the lead's own conversation for a resumed teammate that died — the lead
@@ -2102,14 +2138,14 @@ export class TeammateManager {
       this.handleStreamError(sessionId, agentId, idleInfo.teamName, err);
     });
 
-    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'running']]));
+    this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'running' }]]));
   }
 
   // ─── Lifecycle: stop / kill / shutdown ──────────────────────────────────
 
   killAll(): void {
     this.flushPendingEmit();
-    const overrides = new Map<string, 'errored' | 'completed'>();
+    const overrides = new Map<string, TeammateStatusOverride>();
 
     if (this.managedTeammates.size > 0) {
       console.log(`[MANAGED-TEAMMATE] Killing ${this.managedTeammates.size} running teammate(s)`);
@@ -2117,7 +2153,7 @@ export class TeammateManager {
         console.log(`[MANAGED-TEAMMATE] Aborting "${agentId}"`);
         tm.abort.abort();
         if (!tm.isBackgroundAgent) void this.removeTeammateFromConfig(tm.teamName, agentId);
-        overrides.set(agentId, 'errored');
+        overrides.set(agentId, { status: 'errored', endReason: 'errored', endedAt: Date.now() });
       }
       this.managedTeammates.clear();
     }
@@ -2127,7 +2163,9 @@ export class TeammateManager {
       for (const [agentId, idleInfo] of this.idleTeammates.entries()) {
         console.log(`[MANAGED-TEAMMATE] Removing idle teammate "${agentId}"`);
         void this.removeTeammateFromConfig(idleInfo.teamName, agentId);
-        overrides.set(agentId, 'completed');
+        // Mechanically identical to stopByAgentId on an idle teammate -- a
+        // deliberate kill, not a stream error. See stop/stopByAgentId below.
+        overrides.set(agentId, { status: 'completed', endReason: 'user-shutdown', endedAt: Date.now() });
       }
       this.idleTeammates.clear();
     }
@@ -2168,7 +2206,9 @@ export class TeammateManager {
       running.abort.abort();
       this.managedTeammates.delete(agentId);
       this.clearPendingMessages(agentId);
-      this.scheduleEmitTeammateUpdate(leadSessionId, new Map([[agentId, 'errored']]));
+      // Deliberate, direct user action -- mechanically no less deliberate than
+      // an approved shutdown handshake. Must never resurface under 2a's gate.
+      this.scheduleEmitTeammateUpdate(leadSessionId, new Map([[agentId, { status: 'errored', endReason: 'user-shutdown', endedAt: Date.now() }]]));
       return { stopped: true };
     }
 
@@ -2179,7 +2219,7 @@ export class TeammateManager {
       this.markCompleted(agentId);
       this.clearPendingMessages(agentId);
       void this.removeTeammateFromConfig(idle.teamName, agentId);
-      this.scheduleEmitTeammateUpdate(leadSessionId, new Map([[agentId, 'completed']]));
+      this.scheduleEmitTeammateUpdate(leadSessionId, new Map([[agentId, { status: 'completed', endReason: 'user-shutdown', endedAt: Date.now() }]]));
       return { stopped: true };
     }
 
@@ -2195,7 +2235,7 @@ export class TeammateManager {
         this.managedTeammates.delete(agentId);
         this.clearPendingMessages(agentId);
         if (this.lastUsedSessionId) {
-          this.scheduleEmitTeammateUpdate(this.lastUsedSessionId, new Map([[agentId, 'errored']]));
+          this.scheduleEmitTeammateUpdate(this.lastUsedSessionId, new Map([[agentId, { status: 'errored', endReason: 'user-shutdown', endedAt: Date.now() }]]));
         }
         return true;
       }
@@ -2208,7 +2248,7 @@ export class TeammateManager {
         this.clearPendingMessages(agentId);
         void this.removeTeammateFromConfig(tm.teamName, agentId);
         if (this.lastUsedSessionId) {
-          this.scheduleEmitTeammateUpdate(this.lastUsedSessionId, new Map([[agentId, 'completed']]));
+          this.scheduleEmitTeammateUpdate(this.lastUsedSessionId, new Map([[agentId, { status: 'completed', endReason: 'user-shutdown', endedAt: Date.now() }]]));
         }
         return true;
       }
@@ -2222,6 +2262,14 @@ export class TeammateManager {
     return this.handledShutdownToolUseIds.delete(toolUseId);
   }
 
+  /**
+   * A `shutdown_request` SendMessage handled entirely by the SDK's tool
+   * result (no running stream to resume for approval) -- the same deliberate
+   * shutdown handshake as `handleStreamCompletion`'s `approvedShutdown`
+   * branch above, just reached for a teammate that was already idle or never
+   * needed the resume-for-approval path. Write the same 'user-shutdown'
+   * reason for consistency.
+   */
   handleShutdownResult(sessionId: string | undefined, recipientName: string): void {
     for (const [agentId, idleInfo] of this.idleTeammates) {
       if (this.agentIdMatchesRecipient(agentId, recipientName, this.currentTeamContext)) {
@@ -2230,7 +2278,7 @@ export class TeammateManager {
         this.markCompleted(agentId);
         this.clearPendingMessages(agentId);
         void this.removeTeammateFromConfig(idleInfo.teamName, agentId);
-        this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'completed']]));
+        this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'completed', endReason: 'user-shutdown', endedAt: Date.now() }]]));
         if (!this.hasActiveTeammates()) {
           this.emitAllCompleted(sessionId);
         }
@@ -2246,7 +2294,7 @@ export class TeammateManager {
         this.markCompleted(agentId);
         this.clearPendingMessages(agentId);
         void this.removeTeammateFromConfig(managedInfo.teamName, agentId);
-        this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, 'completed']]));
+        this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'completed', endReason: 'user-shutdown', endedAt: Date.now() }]]));
         if (!this.hasActiveTeammates()) {
           this.emitAllCompleted(sessionId);
         }
