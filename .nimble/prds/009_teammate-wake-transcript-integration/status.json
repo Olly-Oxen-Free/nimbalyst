@@ -23,7 +23,8 @@
       "commit": "e92308a4a"
     },
     "2b": {
-      "state": "pending"
+      "state": "done",
+      "commit": "10de9839d"
     },
     "3a": {
       "state": "pending"
