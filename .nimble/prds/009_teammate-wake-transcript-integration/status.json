@@ -15,7 +15,8 @@
       "commit": "d16d5bc33"
     },
     "1b": {
-      "state": "pending"
+      "state": "done",
+      "commit": "541dd3c02"
     },
     "2a": {
       "state": "pending"
