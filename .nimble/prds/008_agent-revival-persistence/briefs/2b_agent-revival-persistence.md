@@ -187,13 +187,34 @@ None beyond the files above.
 |------|--------|---------|
 | `packages/runtime/src/ai/server/providers/TeammateManager.ts` | modify | Revival-failure detection; persisted transcript line via `logNonBlocking`/`message:logged`; new event emit (if the liveness check is pushed to `electron`) for the no-live-lead case. |
 | `packages/electron/src/main/services/NotificationService.ts` | modify (only if a new notification variant is needed — likely reuses `showAgentFailureNotification` unchanged; verify before adding a new method) | Confirm `showAgentFailureNotification`'s existing signature covers the revival-failure reason string; add a new method only if it genuinely cannot. |
+| `packages/runtime/src/ai/server/transcript/parsers/ClaudeCodeRawParser.ts` | modify | **Required, not optional — see Known Issues below.** Without this, the persisted `'revival_failed'` chunk this task writes has no consumer and silently vanishes from the rendered transcript. |
 
 ### File Ownership Notes
 
-Shares `TeammateManager.ts` with 2a in the same wave — coordinate or serialize to avoid conflicting
-edits near `handleStreamError`/`deliverMessageToLead`. `NotificationService.ts` is under
-`packages/electron/src/main/**`, which is `require_review` per `.nimble/config.yaml` — flag any
-change here for review, even though it is likely a no-op reuse of the existing method.
+Shares `TeammateManager.ts` with 2a — 2a now lands first (this task's `depends_on` was
+corrected during brief review to include `"2a"`; the persisted PRD-003 test guard). No longer
+concurrent with 2a, so no coordination needed there.
+
+- **Critical, found during brief review — the write side alone is not enough.** The sibling
+  pattern this task is told to follow, `'teammate_message_to_lead'`
+  (`ClaudeCodeRawParser.ts:446-464`), is gated `this.teammateProjection && parsed.type ===
+  'teammate_message_to_lead'` — it only renders when reparsing INTO a teammate's own projected
+  thread view, never into the lead's own session transcript. The parser's dispatch is a closed
+  if/else-if chain over `parsed.type` with no catch-all (confirmed live: the branch's own comment
+  says an unmatched type "vanishes from the thread"). If this task writes a `'revival_failed'`
+  chunk and adds no parser branch for it — or copies the sibling branch's `teammateProjection`
+  gate verbatim — the failure notification fires (task 2's other half) but the persisted
+  transcript line never appears anywhere, including in the lead's own transcript the user
+  actually reopens after a failed unattended revival. This defeats R6 (persisted evidence on next
+  open) silently, with no error to signal it.
+  **Fix:** add a new `else if (parsed.type === 'revival_failed')` branch, **unconditional — do
+  NOT gate it on `this.teammateProjection`**, since the reader who needs this line is the lead
+  session's own transcript, not a teammate-projection view. Push a `system_message` descriptor
+  (`systemType: 'status'`, `searchable: false`) the same shape as the sibling branch produces.
+  **Test this specifically**: a unit test asserting the descriptor renders when reparsing the
+  LEAD session's raw messages (`teammateProjection: false` / unset), not only when
+  `teammateProjection: true`. This is the one behavior a naive copy-paste of the sibling branch
+  would get backwards.
 
 ---
 

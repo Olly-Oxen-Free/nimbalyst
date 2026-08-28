@@ -81,7 +81,7 @@ tasks:
       path; (b) persisted system line in the session transcript via the
       TranscriptWriter so it is visible on next open. Live-lead case
       reuses PRD 003's deliverMessageToLead unchanged. Fulfills R5, R6 (tests inline).
-    depends_on: ["1b"]
+    depends_on: ["1b", "2a"]
     complexity: 4
     priority: "must"
     success_criteria:
