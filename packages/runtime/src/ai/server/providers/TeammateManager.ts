@@ -60,6 +60,13 @@ export interface IdleTeammate {
   // failed" one downstream in handleStreamError -- they need different wording
   // and a different persisted chunk type.
   revivedFromTerminal?: boolean;
+  // Narrower than revivedFromTerminal: true only when the row's endReason was
+  // 'user-shutdown', i.e. the teammate ended through an approved shutdown
+  // handshake. Resuming such a session replays that handshake as history, so
+  // the resume is seeded with a grounding turn (see streamTeammateOutput).
+  // A lead-abandoned or finished row is not grounded -- there is no stale
+  // shutdown for the model to react to.
+  revivedFromShutdown?: boolean;
 }
 
 /**
@@ -250,6 +257,10 @@ export class TeammateManager {
   private static readonly RESUMABLE_PERSISTED_STATUSES = new Set(['idle', 'running', 'blocked']);
   /** How long after it ended a terminal teammate stays revivable. */
   private static readonly REVIVAL_ELIGIBILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
+  /** Prepended to a resume whose session ended in an approved shutdown handshake. */
+  private static readonly REVIVAL_GROUNDING_MESSAGE =
+    'You have been revived by the user after a prior shutdown. The previous shutdown request is ' +
+    'no longer active -- respond to what follows as a fresh instruction.';
   private teammateColorIndex: number = 0;
   private bgAgentCounter: number = 0;
   private subAgentCounter: number = 0;
@@ -382,6 +393,23 @@ export class TeammateManager {
     };
     async function* stream() {
       yield payload;
+    }
+    return stream();
+  }
+
+  /**
+   * Seed a resume with a grounding turn ahead of the real prompt. Resuming a
+   * session that ended in an approved shutdown handshake replays that handshake
+   * as history, and the model's next generation answers the stale shutdown
+   * instead of the new instruction ("I've already sent the shutdown response...").
+   */
+  private createGroundedRevivalPromptStream(prompt: string): AsyncIterable<SDKUserMessage> {
+    const parts = [
+      this.createInjectedUserMessageStream(TeammateManager.REVIVAL_GROUNDING_MESSAGE),
+      this.createInjectedUserMessageStream(prompt),
+    ];
+    async function* stream() {
+      for (const part of parts) yield* part;
     }
     return stream();
   }
@@ -1492,6 +1520,7 @@ export class TeammateManager {
       startedAt: entry.startedAt,
       toolCallCount: entry.toolCallCount,
       revivedFromTerminal: entry.status === 'completed' || entry.status === 'errored',
+      revivedFromShutdown: entry.endReason === 'user-shutdown',
     };
   }
 
@@ -2002,6 +2031,7 @@ export class TeammateManager {
     color: string,
     abortController: AbortController,
     resumeSessionId?: string,
+    groundRevival?: boolean,
   ): Promise<{ capturedSessionId: string | undefined; approvedShutdown: boolean; capturedResultText: string | undefined; sentMessageToLead: boolean }> {
     const cwd = this.lastUsedCwd || process.cwd();
     const teammateAdditionalDirectories = [os.tmpdir()];
@@ -2064,7 +2094,12 @@ export class TeammateManager {
       console.log(`[MANAGED-TEAMMATE] Spawning "${name}" (${agentId}) with model=${options.model}`);
     }
 
-    const teammateQuery = query({ prompt, options });
+    // The SDK's query() takes `string | AsyncIterable<SDKUserMessage>`; the
+    // iterable form is what lets a grounded revival deliver two turns.
+    const teammateQuery = query({
+      prompt: groundRevival ? this.createGroundedRevivalPromptStream(prompt) : prompt,
+      options,
+    });
 
     const teammate = this.managedTeammates.get(agentId);
     if (teammate) {
@@ -2290,7 +2325,7 @@ export class TeammateManager {
     const streamPromise = this.streamTeammateOutput(
       sessionId, agentId, idleInfo.teamName, idleInfo.name,
       prompt, idleInfo.agentType, idleInfo.model, idleInfo.color,
-      teammateAbort, idleInfo.sessionId
+      teammateAbort, idleInfo.sessionId, idleInfo.revivedFromShutdown
     );
 
     // Preserve startedAt from idle info; reset activity tracking
@@ -2316,7 +2351,14 @@ export class TeammateManager {
     });
 
     streamPromise.then((result) => {
-      this.handleStreamCompletion(sessionId, agentId, idleInfo.teamName, idleInfo, result);
+      // Clear the grounding flag on the re-idle template: this turn already
+      // delivered it, and carrying it forward would re-ground every later
+      // ordinary resume with a shutdown notice that is no longer true.
+      this.handleStreamCompletion(
+        sessionId, agentId, idleInfo.teamName,
+        { ...idleInfo, revivedFromShutdown: false },
+        result,
+      );
     }).catch((err) => {
       this.handleStreamError(sessionId, agentId, idleInfo.teamName, err);
     });

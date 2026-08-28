@@ -93,6 +93,14 @@ function failingQuery(message: string) {
   };
 }
 
+/** A query that reports one session-id chunk and ends -- the teammate finishes its turn and goes idle. */
+function emptyQuery(sessionId: string) {
+  async function* stream() {
+    yield { type: 'system', session_id: sessionId };
+  }
+  return stream();
+}
+
 function makeDeps() {
   return {
     logNonBlocking: vi.fn(),
@@ -698,5 +706,91 @@ describe('restart-path revival: a lead-abandoned teammate resumes through the wi
     // scheduleEmitTeammateUpdate({ status: 'running' }) writes back through
     // the mocked AISessionsRepository.updateMetadata into storedTeammates.
     await vi.waitFor(() => expect(statusOf('bob@team')).toBe('running'));
+  });
+});
+
+describe('revival grounding: a shutdown-ended teammate is told the shutdown is stale (PRD 009, task 1b)', () => {
+  const terminalRow = (overrides: Record<string, unknown> = {}) => ({
+    name: 'bob',
+    agentId: 'bob@team',
+    teamName: 'team',
+    agentType: 'general-purpose',
+    status: 'completed',
+    endReason: 'finished',
+    endedAt: Date.now() - 60_000,
+    sessionId: 'sdk-session-11',
+    cwd: os.tmpdir(),
+    startedAt: 111,
+    ...overrides,
+  });
+
+  /** The prompt query() was seeded with, drained to plain strings when it is an iterable. */
+  const promptOf = async (call: unknown): Promise<string | string[]> => {
+    const prompt = (call as { prompt: string | AsyncIterable<{ message: { content: string } }> }).prompt;
+    if (typeof prompt === 'string') return prompt;
+    const contents: string[] = [];
+    for await (const msg of prompt) contents.push(msg.message.content);
+    return contents;
+  };
+
+  beforeEach(() => {
+    storedTeammates = [];
+    queryMock.mockReset();
+    queryMock.mockReturnValue(wedgedQuery());
+  });
+
+  it('seeds the resume with a grounding turn ahead of the real prompt when the prior end was an approved user shutdown', async () => {
+    const manager = new TeammateManager(makeDeps());
+    storedTeammates = [terminalRow({ endReason: 'user-shutdown' })] as unknown as StoredTeammate[];
+
+    const result = await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'which GPU processes are running?', {
+      cwd: os.tmpdir(),
+      permissionsPath: os.tmpdir(),
+      // Required by isRevivalEligible for a user-shutdown row; without it the
+      // rehydrate refuses and this would fail for the wrong reason.
+      confirmedUserShutdown: true,
+    });
+    expect(result).toEqual({ delivered: true, wasIdle: true });
+
+    await vi.waitFor(() => expect(queryMock).toHaveBeenCalled());
+    const prompt = await promptOf(queryMock.mock.calls[0][0]);
+    expect(Array.isArray(prompt)).toBe(true);
+    const [grounding, real] = prompt as string[];
+    expect(prompt).toHaveLength(2);
+    expect(grounding).toMatch(/revived/i);
+    expect(grounding).toMatch(/no longer active/i);
+    expect(real).toBe('which GPU processes are running?');
+  });
+
+  it('leaves an ordinary restart-path revival (lead-abandoned, no shutdown handshake) on a plain string prompt', async () => {
+    const manager = new TeammateManager(makeDeps());
+    storedTeammates = [terminalRow({ endReason: 'lead-abandoned' })] as unknown as StoredTeammate[];
+
+    await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'still there?', {
+      cwd: os.tmpdir(),
+      permissionsPath: os.tmpdir(),
+    });
+
+    await vi.waitFor(() => expect(queryMock).toHaveBeenCalled());
+    expect(await promptOf(queryMock.mock.calls[0][0])).toBe('still there?');
+  });
+
+  it('does not re-ground the next resume after the revived teammate has gone idle again', async () => {
+    const manager = new TeammateManager(makeDeps());
+    storedTeammates = [terminalRow({ endReason: 'user-shutdown' })] as unknown as StoredTeammate[];
+    // First turn ends normally with a captured session id -> teammate re-idles.
+    queryMock.mockReturnValue(emptyQuery('sdk-session-11'));
+
+    await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'first prompt', {
+      cwd: os.tmpdir(), permissionsPath: os.tmpdir(), confirmedUserShutdown: true,
+    });
+    await vi.waitFor(() => expect(internals(manager).idleTeammates.has('bob@team')).toBe(true));
+
+    queryMock.mockClear();
+    queryMock.mockReturnValue(wedgedQuery());
+    await manager.sendMessageFromHost(LEAD_SESSION, 'bob@team', 'second prompt');
+
+    await vi.waitFor(() => expect(queryMock).toHaveBeenCalled());
+    expect(await promptOf(queryMock.mock.calls[0][0])).toBe('second prompt');
   });
 });
