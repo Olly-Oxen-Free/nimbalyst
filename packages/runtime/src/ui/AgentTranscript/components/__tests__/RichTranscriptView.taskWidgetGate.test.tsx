@@ -113,6 +113,40 @@ describe('RichTranscriptView Task widget gate', () => {
     setTranscriptToolWidgets(SOURCE, undefined);
   });
 
+  // A teammate's folded prose and system reminders reach the card as
+  // childEvents with no `toolCall`. `renderToolCard` returns null for those, so
+  // without a dedicated branch the fold would silently become suppression --
+  // exactly what folding them under the card was meant to avoid.
+  it('renders a folded teammate turn and reminder inside the expanded card', () => {
+    const message = makeTaskMessage(
+      {
+        teammateName: 'Ada',
+        teamName: 'core',
+        childEvents: [
+          {
+            id: 2, sequence: 2, createdAt: new Date(1_784_648_446_000),
+            type: 'assistant_message', text: 'Tests look green.', subagentId: 'toolu_task_1',
+          },
+          {
+            id: 3, sequence: 3, createdAt: new Date(1_784_648_447_000),
+            type: 'system_message', text: '<SYSTEM_REMINDER>Keep the plan updated.</SYSTEM_REMINDER>',
+            systemMessage: { systemType: 'status', reminderKind: 'teammate_forwarded' },
+            subagentId: 'toolu_task_1',
+          },
+        ],
+      } as any,
+      'Task',
+      'toolu_task_1',
+      'toolu_task_1',
+    );
+    const { container, getByText } = renderTranscript(message);
+
+    fireEvent.click(container.querySelector('.rich-transcript-tool-button')!);
+
+    expect(getByText('Tests look green.')).toBeDefined();
+    expect(container.querySelector('.rich-transcript-system-reminder')).not.toBeNull();
+  });
+
   it('routes a plain Task sub-agent spawn to the registered widget', () => {
     const { container } = renderTranscript(makeTaskMessage({ agentType: 'general-purpose' } as any));
 
