@@ -54,8 +54,22 @@ const sendMessageToTeammate = vi.fn();
 const openTilesAtom = openTeammateTilesAtomFamily('lead-1') as PrimitiveAtom<string[]>;
 const teammatesAtom = sessionTeammatesAtom('lead-1') as unknown as PrimitiveAtom<unknown[]>;
 
-function teammate(agentId: string, name: string, status: string) {
-  return { agentId, name, status, teamName: 'squad', agentType: 'general-purpose', toolCallCount: 3 };
+function teammate(
+  agentId: string,
+  name: string,
+  status: string,
+  extra: { sessionId?: string; endReason?: string; endedAt?: number } = {},
+) {
+  return { agentId, name, status, teamName: 'squad', agentType: 'general-purpose', toolCallCount: 3, ...extra };
+}
+
+/** An ended row the revival gate accepts without a confirm step. */
+function revivable(endReason = 'finished') {
+  return teammate('agent-a', 'code-reviewer', 'completed', {
+    sessionId: 'sdk-session-a',
+    endReason,
+    endedAt: Date.now() - 60_000,
+  });
 }
 
 function renderRail() {
@@ -147,10 +161,15 @@ describe('TeammateTileRail', () => {
       fireEvent.click(container.querySelector('.teammate-tile-send')!);
     });
 
-    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-a', 'status update please');
+    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-a', 'status update please', undefined);
   });
 
-  it('shows no compose input for a completed teammate, since it has no process left to receive one', async () => {
+  // Was 'shows no compose input for a completed teammate, since it has no
+  // process left to receive one'. PRD 008 inverted the premise: a completed
+  // teammate's SDK session is resumable, so the gate now turns on revival
+  // eligibility rather than on terminal status. This row has no sessionId,
+  // which is still unrevivable.
+  it('shows no compose input for a completed teammate with no SDK session to resume', async () => {
     const { store, container } = renderRail();
     await act(async () => {
       store.set(teammatesAtom, [teammate('agent-a', 'code-reviewer', 'completed')]);
@@ -159,6 +178,78 @@ describe('TeammateTileRail', () => {
 
     expect(container.querySelector('.teammate-tile-input')).toBeNull();
     expect(container.querySelector('.teammate-tile-inactive')).not.toBeNull();
+  });
+
+  it('opens compose directly for an ended teammate the backend would revive silently', async () => {
+    const { store, container } = renderRail();
+    await act(async () => {
+      store.set(teammatesAtom, [revivable()]);
+    });
+    await openTile(store, 'agent-a');
+
+    expect(container.querySelector('.teammate-tile-revive')).toBeNull();
+    const textarea = container.querySelector('.teammate-tile-input') as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'pick this back up' } });
+    await act(async () => {
+      fireEvent.click(container.querySelector('.teammate-tile-send')!);
+    });
+
+    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-a', 'pick this back up', undefined);
+  });
+
+  it('refuses compose for an ended teammate past the revival window', async () => {
+    const { store, container } = renderRail();
+    await act(async () => {
+      store.set(teammatesAtom, [{ ...revivable(), endedAt: Date.now() - 25 * 60 * 60 * 1000 }]);
+    });
+    await openTile(store, 'agent-a');
+
+    expect(container.querySelector('.teammate-tile-input')).toBeNull();
+    expect(container.querySelector('.teammate-tile-revive')).toBeNull();
+    expect(container.querySelector('.teammate-tile-inactive')).not.toBeNull();
+  });
+
+  it('makes a user-shutdown teammate confirm a revive before compose opens, and carries the flag', async () => {
+    const { store, container } = renderRail();
+    await act(async () => {
+      store.set(teammatesAtom, [revivable('user-shutdown')]);
+    });
+    await openTile(store, 'agent-a');
+
+    expect(container.querySelector('.teammate-tile-input')).toBeNull();
+    await act(async () => {
+      fireEvent.click(container.querySelector('.teammate-tile-revive')!);
+    });
+    await act(async () => {
+      fireEvent.click(container.querySelector('.confirm-dialog-button-confirm')!);
+    });
+
+    const textarea = container.querySelector('.teammate-tile-input') as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'back to it' } });
+    await act(async () => {
+      fireEvent.click(container.querySelector('.teammate-tile-send')!);
+    });
+
+    expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-a', 'back to it', true);
+  });
+
+  it('sends nothing and keeps compose shut when a user-shutdown revive is cancelled', async () => {
+    const { store, container } = renderRail();
+    await act(async () => {
+      store.set(teammatesAtom, [revivable('user-shutdown')]);
+    });
+    await openTile(store, 'agent-a');
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.teammate-tile-revive')!);
+    });
+    await act(async () => {
+      fireEvent.click(container.querySelector('.confirm-dialog-button-cancel')!);
+    });
+
+    expect(sendMessageToTeammate).not.toHaveBeenCalled();
+    expect(container.querySelector('.teammate-tile-input')).toBeNull();
+    expect(container.querySelector('.teammate-tile-revive')).not.toBeNull();
   });
 
   it('closes only the tile whose close control was used', async () => {

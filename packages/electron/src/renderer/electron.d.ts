@@ -489,6 +489,8 @@ interface ElectronAPI {
     sessionId: string,
     agentId: string,
     content: string,
+    /** Set only when the user confirmed reviving a teammate they shut down. */
+    confirmedUserShutdown?: boolean,
   ) => Promise<{ success: boolean; error?: string; wasIdle?: boolean }>;
   /** A teammate's own transcript, projected from the lead session's raw log. */
   aiGetTeammateTranscript: (
