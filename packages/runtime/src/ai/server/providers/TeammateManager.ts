@@ -14,6 +14,7 @@ interface Query extends AsyncGenerator<SDKMessage, void> {
 import path from 'path';
 import fsp from 'fs/promises';
 import os from 'os';
+import { randomUUID } from 'node:crypto';
 import { resolveClaudeConfigDir } from './claudeCode/claudeConfigDir';
 import { raceNextChunkWithStallWatchdog, resolveStreamStallMs } from './claudeCode/streamStallWatchdog';
 import type { TeammateOriginKind } from '../transcript/types';
@@ -128,6 +129,15 @@ interface TeammateStatusOverride {
   status: 'running' | 'blocked' | 'completed' | 'errored' | 'idle';
   endReason?: TeammateEndReason;
   endedAt?: number;
+  /**
+   * Only set for the 'completed'/'finished' transition (handleStreamCompletion's
+   * else-branch): by the time this override reaches emitTeammateUpdate, the
+   * teammate's own ManagedTeammate entry has already been deleted, so
+   * activityFields can no longer pull a captured sessionId off it. Without this,
+   * the row silently loses a sessionId it had already captured, and the
+   * revival-compose UI (teammateComposeMode) treats the row as fully inactive.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -1687,7 +1697,8 @@ export class TeammateManager {
           const terminalFields = override.endReason
             ? { endReason: override.endReason, endedAt: override.endedAt ?? Date.now() }
             : {};
-          return { ...tm, ...activityFields, status: override.status, ...terminalFields };
+          const overrideSessionId = override.sessionId ? { sessionId: override.sessionId } : {};
+          return { ...tm, ...activityFields, status: override.status, ...terminalFields, ...overrideSessionId };
         } else if (managed) {
           // Not 'running': any unrelated emit (another teammate's tool call)
           // would otherwise clear a blocked teammate's status while its prompt
@@ -1773,7 +1784,19 @@ export class TeammateManager {
     agentId: string,
     teamName: string,
     idleTemplate: IdleTeammate,
-    result: { capturedSessionId: string | undefined; approvedShutdown: boolean; capturedResultText: string | undefined; sentMessageToLead: boolean },
+    result: {
+      capturedSessionId: string | undefined;
+      approvedShutdown: boolean;
+      capturedResultText: string | undefined;
+      sentMessageToLead: boolean;
+      /**
+       * The session id streamTeammateOutput assigned/resumed up front, known
+       * before the stream produced any chunk. Only used as a last-resort
+       * fallback for the 'finished' branch below, when the SDK itself never
+       * echoed a session_id chunk back.
+       */
+      assignedSessionId?: string;
+    },
   ): void {
     const managed = this.managedTeammates.get(agentId);
     const isBackground = managed?.isBackgroundAgent ?? false;
@@ -1823,7 +1846,13 @@ export class TeammateManager {
       if (!isBackground) void this.removeTeammateFromConfig(teamName, agentId);
       const reason = isBackground ? 'background agent completed' : 'no session ID';
       console.log(`[MANAGED-TEAMMATE] "${agentId}" completed (${reason})`);
-      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, { status: 'completed', endReason: 'finished', endedAt: Date.now() }]]));
+      const finishedSessionId = result.capturedSessionId ?? result.assignedSessionId;
+      this.scheduleEmitTeammateUpdate(sessionId, new Map([[agentId, {
+        status: 'completed',
+        endReason: 'finished',
+        endedAt: Date.now(),
+        ...(finishedSessionId ? { sessionId: finishedSessionId } : {}),
+      }]]));
 
       // Deliver sub-agent/background agent result to lead so it can present findings to the user.
       // This reuses the same deliverMessageToLead path that teammates use for SendMessage.
@@ -2032,7 +2061,7 @@ export class TeammateManager {
     abortController: AbortController,
     resumeSessionId?: string,
     groundRevival?: boolean,
-  ): Promise<{ capturedSessionId: string | undefined; approvedShutdown: boolean; capturedResultText: string | undefined; sentMessageToLead: boolean }> {
+  ): Promise<{ capturedSessionId: string | undefined; assignedSessionId: string; approvedShutdown: boolean; capturedResultText: string | undefined; sentMessageToLead: boolean }> {
     const cwd = this.lastUsedCwd || process.cwd();
     const teammateAdditionalDirectories = [os.tmpdir()];
 
@@ -2087,10 +2116,16 @@ export class TeammateManager {
       options.pathToClaudeCodeExecutable = this.packagedBuildOptions.pathToClaudeCodeExecutable;
     }
 
+    // Known before the SDK streams anything back: a resume already carries its
+    // own session id; a fresh spawn gets one from us via options.sessionId. This
+    // guarantees handleStreamCompletion always has a usable id to persist, even
+    // for a stream that ends without ever emitting a session_id chunk.
+    const ownSessionId = resumeSessionId ?? randomUUID();
     if (resumeSessionId) {
       options.resume = resumeSessionId;
       console.log(`[MANAGED-TEAMMATE] Resuming "${name}" (${agentId}) with session=${resumeSessionId}`);
     } else {
+      options.sessionId = ownSessionId;
       console.log(`[MANAGED-TEAMMATE] Spawning "${name}" (${agentId}) with model=${options.model}`);
     }
 
@@ -2305,7 +2340,7 @@ export class TeammateManager {
       );
     }
 
-    return { capturedSessionId, approvedShutdown, capturedResultText, sentMessageToLead };
+    return { capturedSessionId, assignedSessionId: ownSessionId, approvedShutdown, capturedResultText, sentMessageToLead };
   }
 
   // ─── Lifecycle: resume ──────────────────────────────────────────────────

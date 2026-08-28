@@ -19,6 +19,8 @@ type StoredTeammate = {
   status: string;
   toolCallCount?: number;
   lastActiveAt?: number;
+  sessionId?: string;
+  endReason?: string;
 };
 
 let storedTeammates: StoredTeammate[] = [];
@@ -216,6 +218,28 @@ describe('TeammateManager idle handoff to the lead', () => {
     const [message, ...rest] = delivered(deps);
     expect(rest).toEqual([]);
     expect(message.content).toContain('the roof needs replacing');
+  });
+
+  it('persists a usable sessionId on a finished row even when the stream produces zero chunks (NIM revive-compose bug)', async () => {
+    // A real stream that ends before yielding anything -- no session_id chunk
+    // was ever emitted, the failure mode teammateComposeMode's 'inactive' gate
+    // depends on. Seeded 'running' first, matching the fresh-spawn race guard
+    // documented in resumeReliability.test.ts:302-308.
+    storedTeammates = [{ agentId: 'alice@team', status: 'running' }];
+    queryMock.mockReturnValue(fakeQuery([]));
+    const deps = makeDeps();
+    const manager = new TeammateManager(deps);
+
+    manager.spawnManagedTeammate('session-1', { team_name: 'team', name: 'alice', prompt: 'work' });
+
+    await settled({ 'alice@team': 'completed' });
+    const row = rowOf('alice@team');
+    expect(row?.endReason).toBe('finished');
+    expect(row?.sessionId).toBeTruthy();
+    // The persisted id is the one streamTeammateOutput assigned up front via
+    // options.sessionId -- the SDK's own earliest-available identity for a
+    // fresh spawn.
+    expect(row?.sessionId).toBe(queryMock.mock.calls[0][0].options.sessionId);
   });
 
   it('leaves the background-agent branch delivering its raw result exactly once', async () => {
