@@ -8,7 +8,13 @@
     "wave": 2,
     "label": "endReason taxonomy + cwd persistence -- review the user-shutdown consent decision before the gate widens",
     "reached_at": "2026-08-28T09:36:09Z",
-    "model": "pause"
+    "model": "pause",
+    "resolved": "approved to continue into waves 3-4 by user 2026-08-28",
+    "second_gate": {
+      "wave": 4,
+      "status": "reached",
+      "label": "resume-gate widened + revival-failure delivery -- review before UI wave (5) makes it reachable"
+    }
   },
   "notes": "Scoping deliverable only \u2014 DO NOT EXECUTE without explicit user approval. Coordinator ran research+plan autonomously (user absent). Core finding: teammate revival is a small extension of existing resume machinery (one gate: RESUMABLE_PERSISTED_STATUSES + canCompose, both pinned by a PRD 003 regression test to be inverted openly); Task sub-agent revival has NO machinery to extend \u2014 only context-seeded respawn with a weaker, honestly-labeled guarantee (phase 2, could-have). Genuinely new work: endReason taxonomy, per-row cwd persistence, no-live-lead failure delivery, revive UI. Six open questions recorded for the user, incl. session-metadata retention (unlocated) and whether phase 2 is worth building at all. | PRD reviewed: approve, no corrections; review outcome recorded in PRD. EXECUTION HOLD stands.",
   "tasks_total": 7,
@@ -25,10 +31,15 @@
       "bead_id": "nby-48e"
     },
     "2a": {
-      "state": "pending"
+      "state": "done",
+      "merge_commit": "215092bf9",
+      "bead_id": "nby-vk3",
+      "note": "Worker committed on nimble/agent-revival-persistence-2a-impl due to sandbox worktree isolation; PM verified diff (PRD-003 test genuinely inverted, not supplemented) and ff-merged into feature branch."
     },
     "2b": {
-      "state": "pending"
+      "state": "done",
+      "note": "Fable PM agent hit its session limit mid-task and died before landing any 2b code. Coordinator implemented directly: new deliverRevivalFailure method (mirrors deliverMessageToLead exactly -- persisted revival_failed chunk + interruptWithMessage wake, reusing the EXISTING electron-layer classifyTeammateWakeDelivery/notifyUndelivered chain unchanged, since investigation showed interruptWithMessage already correctly routes both live and idle-but-live cases through it -- no new electron-layer code needed, a smaller footprint than the brief anticipated, documented here per its own instruction to record this decision). New revivedFromTerminal marker on IdleTeammate/ManagedTeammate distinguishes a PRD 008 revival-death (handleStreamError) from a PRD 003 plain resume-death, routing to deliverRevivalFailure vs deliverMessageToLead respectively -- PRD 003 callers verified unchanged by a dedicated regression test. TeammateCwdMissingError now caught in sendMessageFromHost and routed to the same delivery path instead of propagating as an unhandled rejection (the existing test asserting it rejected was intentionally rewritten, not just extended, to assert the new resolve-gracefully contract). ClaudeCodeRawParser given a new unconditional revival_failed branch per the critical review finding -- empirically red-checked by temporarily re-adding the teammateProjection gate and confirming 2 tests fail, then reverting.",
+      "commit": "pending-local-commit-by-coordinator"
     },
     "3a": {
       "state": "pending"
