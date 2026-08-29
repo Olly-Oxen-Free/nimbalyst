@@ -1,0 +1,45 @@
+{
+  "configured_at": "2026-08-29T00:00:00Z",
+  "orchestration_version": 2,
+  "configured_by": "coordinator (background /nimble:plan dispatch, no live user; explicit no-PR, no-gh, ff-only-merge-to-main instruction from dispatching session)",
+  "orchestration": {
+    "integration": {
+      "cadence": "worktree-free-local",
+      "note": "NO GitHub PRs, no gh usage, ever, per explicit instruction. Workers edit the main checkout directly on feature/native-tile-system, one task at a time (no true parallel waves). Coordinator reviews diff, runs typecheck+test:prepush itself with visible output, commits per task."
+    },
+    "review": {
+      "trigger": "per-task",
+      "provider": "none-manual",
+      "note": "Coordinator runs npm run typecheck && npm run test:prepush per task. Never trust a worker's own claim that tests passed -- verify output directly."
+    },
+    "gates": {
+      "model": "pause",
+      "placements": [
+        {
+          "after_wave": 4,
+          "label": "Foundational tiling engine (react-mosaic single-node integration) landed -- confirm version choice (OQ2), tab-strip-scoping decision (OQ1), and unified-vs-segregated tiled regions (OQ4, now baked into 3a/4a's component boundaries) before building split/stack/compose-reuse on top."
+        }
+      ],
+      "note": "Unlike PRD 010, this PRD was NOT pre-approved gate-by-gate by a live user during planning -- it was planned in a background dispatch. The wave-4 gate is set to pause (not skip-on-pass) so a human explicitly confirms the two flagged open questions (OQ1, OQ2) before the remaining 7 tasks build on that foundation."
+    }
+  },
+  "models": {
+    "default": "sonnet",
+    "complexity_threshold": 5,
+    "assignments": {
+      "1a": "sonnet",
+      "2a": "sonnet",
+      "3a": "sonnet",
+      "4a": "opus",
+      "5a": "opus",
+      "6a": "opus",
+      "7a": "opus",
+      "8a": "sonnet",
+      "9a": "sonnet",
+      "10a": "opus",
+      "11a": "sonnet"
+    },
+    "escalation": { "after_failures": 1 }
+  },
+  "max_revision_loops": 3
+}
