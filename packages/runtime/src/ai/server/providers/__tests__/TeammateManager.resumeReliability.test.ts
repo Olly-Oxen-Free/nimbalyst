@@ -109,11 +109,15 @@ function makeDeps() {
     createPostToolUseHook: vi.fn(() => vi.fn()),
     getAbortSignal: vi.fn(() => undefined),
     interruptWithMessage: vi.fn(async () => {}),
+    // Default: lead idle. Individual tests override to assert the "lead busy"
+    // no-notification branch of deliverRevivalFailure (task 2b).
+    isLeadBusy: vi.fn(() => false),
     createCanUseToolHandler: vi.fn(() => vi.fn()),
   } as unknown as TeammateManagerDeps & {
     emit: ReturnType<typeof vi.fn>;
     logNonBlocking: ReturnType<typeof vi.fn>;
     interruptWithMessage: ReturnType<typeof vi.fn>;
+    isLeadBusy: ReturnType<typeof vi.fn>;
   };
 }
 
@@ -270,6 +274,72 @@ describe('revival-then-fail delivers a distinct revival_failed notice (PRD 008 t
       expect.stringContaining('"type":"teammate_message_to_lead"'),
       expect.anything(),
     );
+  });
+});
+
+describe('revival failure notifies the user when there is no live lead turn (task 2b)', () => {
+  // deliverRevivalFailure's persisted transcript line and queued idle wake are
+  // both invisible unless the user reopens this session. When the lead has no
+  // live turn to interrupt (isLeadBusy() false at the moment of failure), it
+  // must also emit teammate:revivalFailed so the host (MessageStreamingHandler)
+  // can raise a desktop notification. A busy lead is already covered by
+  // interruptWithMessage's mid-turn branch and must not double-notify.
+  //
+  // revivedFromTerminal: true is what routes handleStreamError through
+  // deliverRevivalFailure instead of the plain deliverMessageToLead -- see the
+  // "revival-then-fail" describe block above.
+
+  it('emits teammate:revivalFailed when the lead is idle', async () => {
+    queryMock.mockReturnValue(failingQuery('subprocess exited'));
+    const deps = makeDeps();
+    deps.isLeadBusy.mockReturnValue(false);
+    const manager = new TeammateManager(deps);
+    const revivedCarol = { ...idleTeammate('carol', 'sdk-session-3'), revivedFromTerminal: true };
+
+    resumeAndFail(manager, 'session-1', 'carol@team', revivedCarol);
+
+    await vi.waitFor(() => expect(deps.interruptWithMessage).toHaveBeenCalledTimes(1));
+    const call = deps.emit.mock.calls.find(([event]) => event === 'teammate:revivalFailed');
+    expect(call).toBeDefined();
+    expect(call![1]).toMatchObject({
+      sessionId: 'session-1',
+      teammateAgentId: 'carol@team',
+      teammateName: 'carol',
+    });
+  });
+
+  it('does not emit teammate:revivalFailed when the lead is busy (interruptWithMessage handles it inline)', async () => {
+    queryMock.mockReturnValue(failingQuery('subprocess exited'));
+    const deps = makeDeps();
+    deps.isLeadBusy.mockReturnValue(true);
+    const manager = new TeammateManager(deps);
+    const revivedCarol = { ...idleTeammate('carol', 'sdk-session-3'), revivedFromTerminal: true };
+
+    resumeAndFail(manager, 'session-1', 'carol@team', revivedCarol);
+
+    await vi.waitFor(() => expect(deps.interruptWithMessage).toHaveBeenCalledTimes(1));
+    expect(deps.emit.mock.calls.some(([event]) => event === 'teammate:revivalFailed')).toBe(false);
+  });
+
+  it('reads isLeadBusy() before interruptWithMessage runs, not after (idle branch self-latches busy)', async () => {
+    // interruptWithMessage's idle branch synchronously sets teammateIdleMessagePending,
+    // which would make a naive post-call isLeadBusy() read always come back true and
+    // silently suppress the notification. Prove the manager reads the flag first by
+    // having isLeadBusy() flip to true as soon as interruptWithMessage is invoked --
+    // exactly what the real idle branch does -- and confirming the event still fires.
+    queryMock.mockReturnValue(failingQuery('subprocess exited'));
+    const deps = makeDeps();
+    deps.isLeadBusy.mockReturnValue(false);
+    deps.interruptWithMessage.mockImplementation(async () => {
+      deps.isLeadBusy.mockReturnValue(true);
+    });
+    const manager = new TeammateManager(deps);
+    const revivedCarol = { ...idleTeammate('carol', 'sdk-session-3'), revivedFromTerminal: true };
+
+    resumeAndFail(manager, 'session-1', 'carol@team', revivedCarol);
+
+    await vi.waitFor(() => expect(deps.interruptWithMessage).toHaveBeenCalledTimes(1));
+    expect(deps.emit.mock.calls.some(([event]) => event === 'teammate:revivalFailed')).toBe(true);
   });
 });
 

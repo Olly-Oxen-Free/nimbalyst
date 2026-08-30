@@ -424,6 +424,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       },
       getAbortSignal: () => this.abortController?.signal,
       interruptWithMessage: (message, sessionId) => this.interruptWithMessage(message, sessionId),
+      isLeadBusy: () => this.isLeadBusy(),
       createCanUseToolHandler: (sessionId, workspacePath, permissionsPath, teammateName) =>
         this.createCanUseToolHandler(sessionId, workspacePath, permissionsPath, teammateName),
     });

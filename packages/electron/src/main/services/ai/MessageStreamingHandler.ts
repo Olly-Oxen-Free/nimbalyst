@@ -1180,6 +1180,33 @@ export class MessageStreamingHandler {
     };
     this.installListener(provider, 'teammate:messageWhileIdle', onTeammateMessageWhileIdle);
 
+    // A revival failed with no live lead turn to interrupt (lead was idle at the
+    // moment of failure). deliverRevivalFailure already persisted a transcript
+    // line and queued a silent idle wake via the handler above -- neither one is
+    // visible unless the user reopens this session. Fire the same "agent stopped
+    // unexpectedly" desktop notification other idle-lead failure paths use so the
+    // user actually learns the revival failed. A busy lead is handled inline by
+    // interruptWithMessage's mid-turn branch instead, so this must not double-fire.
+    const onTeammateRevivalFailed = async (data: {
+      sessionId?: string;
+      teammateName: string;
+      reason: string;
+    }) => {
+      if (!data.sessionId) return;
+      try {
+        const sessionTitle = await getCurrentSessionTitle(data.sessionId);
+        await notificationService.showAgentFailureNotification(
+          data.sessionId,
+          sessionTitle,
+          `Reviving "${data.teammateName}" failed: ${data.reason}`,
+          effectiveWorkspacePath
+        );
+      } catch (error) {
+        logger.main.error('[AIService] Failed to show teammate revival failure notification:', error);
+      }
+    };
+    this.installListener(provider, 'teammate:revivalFailed', onTeammateRevivalFailed);
+
     // Live-update signal: forward each logged teammate chunk to the session's
     // window so an open teammate transcript popover can refetch. Fire-and-forget
     // -- no ack, no retry; a missed bump just means the next chunk's bump catches

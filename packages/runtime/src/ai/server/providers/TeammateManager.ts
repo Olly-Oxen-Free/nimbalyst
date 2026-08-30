@@ -209,6 +209,17 @@ export interface TeammateManagerDeps {
    * emits an event with no session to deliver to.
    */
   interruptWithMessage(message: string, sessionId?: string): Promise<void>;
+  /**
+   * Whether the lead currently has a live turn (mid-turn, or an idle wake
+   * already in flight) for `interruptWithMessage` to land on. Used to decide
+   * whether a revival failure needs its own desktop notification: when the
+   * lead is idle, `interruptWithMessage`'s idle branch re-triggers a fresh
+   * `sendMessage` turn, but that happens silently -- nothing tells the user
+   * a revival failed unless they reopen this session. Optional so hosts/tests
+   * that never touch revival delivery don't need to stub it; treated as "idle"
+   * (false) when absent.
+   */
+  isLeadBusy?(): boolean;
   /** Create a canUseTool handler that delegates to the lead's permission system */
   createCanUseToolHandler(
     sessionId: string | undefined,
@@ -1408,6 +1419,12 @@ export class TeammateManager {
     const content = `Reviving teammate "${teammateName}" failed: ${reason}`;
     const summary = `${teammateName} revival failed`;
 
+    // Captured before interruptWithMessage runs: its idle branch synchronously
+    // latches isLeadBusy() true (teammateIdleMessagePending) as soon as it fires,
+    // so checking afterward would always read "busy" and the notification below
+    // would never fire for the exact case it exists for.
+    const leadWasBusy = this.deps.isLeadBusy?.() ?? false;
+
     if (sessionId) {
       const revivalFailureChunk = {
         type: 'revival_failed',
@@ -1446,6 +1463,16 @@ export class TeammateManager {
       sessionId,
       direction: 'output' as const,
     });
+
+    // No live lead turn to interrupt -- the persisted transcript line and the
+    // silently re-triggered idle wake are the only trace of this failure.
+    // Fire a desktop notification so the user learns about it without having
+    // to reopen this session. A busy lead already has interruptWithMessage's
+    // mid-turn branch landing the failure inline, so notifying there too would
+    // be a duplicate.
+    if (!leadWasBusy) {
+      this.deps.emit('teammate:revivalFailed', { sessionId, teammateAgentId, teammateName, reason });
+    }
   }
 
   // ─── UI sync ────────────────────────────────────────────────────────────
