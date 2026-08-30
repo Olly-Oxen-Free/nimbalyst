@@ -68,6 +68,15 @@
   pointer-events: auto;
 }
 
+/* react-mosaic mounts its own root-level drop targets (RootDropTargets) alongside our custom
+   TileDropZones, covering nearly the same edge bands but at a higher z-index and as a later DOM
+   sibling - so they win hit-testing and silently swallow every drop before our own zones ever see
+   it. We deliberately build our own zones (5, including a center stack target the library's
+   RootDropTargets doesn't have) - neutralize the library's competing overlay rather than fight it. */
+.tiled-region-mosaic > .drop-target-container {
+  pointer-events: none;
+}
+
 .tiled-region-drop-zone-left {
   top: 0;
   bottom: 0;
