@@ -17,10 +17,10 @@
       "placements": [
         {
           "after_wave": 3,
-          "label": "Foundational tiling engine (react-mosaic single-node integration, task 4a) landed on top of the relocated/repurposed SubAgentChipRow switcher (task 3a, D1) -- confirm the react-mosaic version choice (1a) and that the relocated chip switcher behaves as expected before building split/stack/compose-reuse on top."
+          "label": "Foundational tiling engine (react-mosaic single-pane integration, task 4a) landed with the per-pane TileHeaderBar switcher (task 3a, D1R3) -- confirm the react-mosaic version choice (1a) and that the header-bar switcher behaves as expected before building split/stack/compose-reuse on top."
         }
       ],
-      "note": "Revision 2: D1 (chip-row relocation) was a live user decision made after reviewing 4 visual mockup options, so it is no longer an open question -- but the wave-3 gate (after task 4a, the first task that actually renders the relocated switcher inside the new mosaic host) stays a pause gate, not skip-on-pass, so a human confirms the live implementation matches the approved mockup before the remaining 7 tasks build on it."
+      "note": "Revision 3: D1R3 (per-pane header-bar stacks) was a live user decision made after reviewing the revision-2 chip-row implementation against an interactive mockup and rejecting it, so it is no longer an open question -- but the wave-3 gate (after task 4a, the first task that actually renders the header-bar switcher inside the new mosaic host) stays a pause gate, not skip-on-pass, so a human confirms the live implementation matches the approved design before the remaining 7 tasks build on it."
     }
   },
   "models": {

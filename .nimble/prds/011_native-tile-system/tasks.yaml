@@ -35,25 +35,24 @@ tasks:
          react-mosaic modeling "tab groups as a first-class node type." Confirm this against the
          library's actual current docs/API (e.g. `MosaicWindow`'s tab-group support, or whatever
          the current API calls it). Note: this PRD's design does NOT depend on the library
-         providing native tab groups -- the relocated `SubAgentChipRow` switcher (task 3a) already
-         provides stacking independently of react-mosaic's own tab-group feature, hosted inside a
-         single mosaic leaf. If the claim turns out to be false, the library recommendation likely
-         still holds (the split/resize engine is still the valuable, hard-to-hand-build part) --
-         but confirm this deliberately and record the corrected rationale in this task's commit
-         message rather than discovering it accidentally during task 5a/6a.
+         providing native tab groups -- the per-pane header-bar stack (task 3a's `TileHeaderBar`,
+         D1R3) provides stacking independently of react-mosaic's own tab-group feature, hosted
+         inside a mosaic leaf. If the claim turns out to be false, the library recommendation
+         likely still holds (the split/resize engine is still the valuable, hard-to-hand-build
+         part) -- but confirm this deliberately and record the corrected rationale in this task's
+         commit message rather than discovering it accidentally during task 5a/6a.
       2. **Drag-and-drop system compatibility -- load-bearing, not just informational.** Confirm
          what DnD mechanism react-mosaic uses internally for its own split/drop zones (commonly
-         `react-dnd` for libraries in this space -- verify, do not assume). Unlike revision 1 of
-         this PRD, task 3a is NOT reusing an existing draggable component (`SubAgentChipRow`'s
-         chips are plain, non-draggable `<div>`s today -- confirmed by reading the source, no
-         `draggable`/`dataTransfer` wiring exists) -- task 3a must build drag-source capability on
-         the chip from scratch. This task's job is to determine WHICH mechanism 3a should build
-         with: native HTML5 `dataTransfer` (consistent with `TabBar`'s existing reordering
-         elsewhere in the app, but not directly reusable here since the chip isn't `TabBar`), or
-         `react-dnd`'s `useDrag` (if react-mosaic's own drop zones only recognize `react-dnd`
-         drag sources, a native HTML5 drag will not register as a valid drop source and 3a/5a would
-         need a bridging adapter). Resolve this at this cheap, wave-1 task and record the answer in
-         this task's commit message -- it materially determines 3a's implementation approach.
+         `react-dnd` for libraries in this space -- verify, do not assume). Neither revision of
+         this PRD reuses an existing draggable component here -- the drag-source is built from
+         scratch on the new per-tile header bar (`TileHeaderBar`, task 3a; D1R3b -- not on
+         `SubAgentChipRow`, which stays a plain opener). This task's job is to determine WHICH
+         mechanism 3a should build with: native HTML5 `dataTransfer` (consistent with `TabBar`'s
+         existing reordering elsewhere in the app, but not directly reusable here), or `react-dnd`'s
+         `useDrag` (if react-mosaic's own drop zones only recognize `react-dnd` drag sources, a
+         native HTML5 drag will not register as a valid drop source and 3a/5a would need a bridging
+         adapter). Resolve this at this cheap, wave-1 task and record the answer in this task's
+         commit message -- it materially determines 3a's implementation approach.
 
       Tests: none required for a dependency addition alone (no runtime behavior yet). If the
       package ships its own type definitions, verify `npm run typecheck` passes with a trivial
@@ -64,181 +63,214 @@ tasks:
     success_criteria:
       - "react-mosaic-component is added to packages/electron/package.json at a deliberately chosen, documented version"
       - "npm install succeeds and npm run typecheck is unaffected"
-      - "The commit message records which DnD mechanism (native HTML5 vs react-dnd) task 3a must build the chip's drag-source with"
+      - "The commit message records which DnD mechanism (native HTML5 vs react-dnd) task 3a must build the header bar's drag-source with"
     files_affected:
       - "packages/electron/package.json"
       - "package-lock.json"
 
   - id: "3a"
-    title: "Relocate and repurpose SubAgentChipRow as the tiled region's stack switcher"
+    title: "Build the TileHeaderBar component (per-tile header) with drag-source and close control"
     description: |
-      Per PRD decision D1 (locked, live user decision after reviewing 4 visual mockup options):
-      the tile switcher is NOT a new pill/segment/tab-strip component and does NOT reuse `TabBar`
-      (that was revision 1's proposal; the user rejected it -- `TabBar` is scoped to parallel agent
-      sessions, not sub-agent tiles, and conflating them would be wrong). Instead, relocate the
-      EXISTING `SubAgentChipRow` component
-      (`packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx`) from its current
-      position (directly above the compose bar in `SessionTranscript.tsx`, ~line 2746) to the top
-      of the tiled region, and repurpose its behavior. Do not fork or rebuild the chip's rendering
-      (`SubAgentChip` and its `STATUS_CLASSES`/`STATUS_ICONS` maps) -- its visual identity (status
-      dot, name, model badge) must be preserved exactly; this is a relocation and behavioral
-      repurposing, not a redesign.
+      Per PRD decision D1R3 (locked, live user decision, revision 3 -- supersedes revision 2's
+      relocated-chip-row switcher, discarded from `feature/native-tile-system`, preserved for
+      reference on `archive/011-chip-switcher` at `1b9509bde`): build a new `TileHeaderBar`
+      component -- a slim, window-manager-style header bar representing ONE open tile within a
+      pane. It is NOT `SubAgentChipRow` relocated or repurposed; `SubAgentChipRow` is untouched by
+      this task and keeps its original position/job (D1R3a) as the opener, directly above the
+      compose bar in `SessionTranscript.tsx`.
 
-      Per D8 (locked): teammate and task tiles share ONE unified tiled region, matching
-      `SubAgentChipRow`'s existing unified rendering of both kinds in a single row.
+      `TileHeaderBar` renders: a status dot reusing the SAME normalized-status color derivation
+      `SubAgentChipRow`'s `STATUS_CLASSES` already uses (`mapTeammateStatus`/`mapTaskStatus` from
+      `store/atoms/subAgentStatus.ts`) -- do not invent new color literals or duplicate the
+      status-to-color mapping; the teammate/task name; a model badge; a drag handle; a close
+      control (X). Naming: call this "header" / "tile header" / "pane header" in code, comments,
+      and any UI copy -- never "niri header" or "niri-style" (internal design reference only).
 
-      Three concrete changes, all within `SubAgentChipRow.tsx` and its call site:
+      Two concrete responsibilities in this task:
 
-      1. **Position.** Move the `<SubAgentChipRow>` render call from its current call site (near
-         the compose bar) to the top of the tiled region introduced in task 4a. Until 4a lands,
-         this task can land the component's behavioral changes with the row still in its current
-         position -- confirm with 4a's author whether to move the render call in this task or defer
-         the literal repositioning to 4a while landing the behavior here (avoids two tasks touching
-         the same JSX in the shared, worktree-free checkout; prefer whichever ordering avoids a
-         double-move). Either way, the row must remain visible whenever the session has any
-         teammate/task entries, even before any tile is open -- today it IS the mechanism for
-         opening a tile, so it cannot be gated on "a tile is already open" when it moves.
-      2. **Click semantics.** Chip click currently calls `toggleTeammateTileAtom`/
-         `toggleTaskTileAtom` (a toggle: open if closed, close if open) via `onTeammateClick`/
-         `onTaskClick` in `SessionTranscript.tsx`. Change this to open-or-focus: clicking a chip
-         whose tile is not open, opens it and makes it the active tile in the region's (or, once
-         panes exist from 5a, the relevant pane's) stack; clicking a chip whose tile is already
-         open and already active is a no-op (does NOT close it); clicking a chip whose tile is open
-         but not currently active (background tab within a stack) switches to it. Closing a tile
-         remains the tile's own existing Close control (`TeammateTileRail.tsx`/`TaskTileRail.tsx`'s
-         `handleClose`) -- unchanged, do not route close through the chip.
-      3. **Drag-source wiring.** Add drag-source capability to `SubAgentChip` using the mechanism
-         determined in task 1a (native HTML5 `dataTransfer` or `react-dnd` `useDrag`), so tasks 5a
-         (edge-drop split) and 6a (center-drop stack) have a drag source to wire into
-         react-mosaic's drop zones. This task adds the drag-source only -- it does not yet
-         implement drop-target/split/stack logic (5a/6a's job).
+      1. **Drag-source wiring.** Using task 1a's determined mechanism (`react-dnd`'s `useDrag`,
+         `MosaicDragType`, a payload carrying the tile's identity and origin pane/`mosaicId` --
+         reuse the bridging pattern task 1a documented and the discarded 3a commit
+         (`b1ffa282a` on `archive/011-chip-switcher`) already proved: the chip's drag payload must
+         carry a real `mosaicId` from `MosaicContext` for react-mosaic's own drop targets to accept
+         it later in tasks 5a/6a). This task adds the drag-source only -- it does not implement
+         drop-target/split/stack logic (5a/6a's job).
+      2. **Close control.** Per D1R3c, the header's X is the tile's close control going forward.
+         Wire it to the same close atom/handler `TeammateTileRail.tsx`/`TaskTileRail.tsx`'s
+         existing `handleClose` already uses -- do not duplicate close logic. If those files still
+         render their own internal Close button after this task, note it for 4a/10a to remove (do
+         not remove it here if it requires touching those files' render trees -- that overlaps 4a's
+         scope; if removing it here is a one-line change with no other 4a conflict, do it and note
+         it in your summary instead of leaving a stub for 4a).
 
-      Also introduce a small "active tile" Jotai atom (colocated with the other tile-open atoms in
-      `agentMode.ts`, per D4 -- this does not change `openTeammateTilesAtomFamily`'s own shape,
-      it is a new, additive atom) tracking which open tile is currently focused/visible. At this
-      stage (before 4a's mosaic tree exists) this is a single session-scoped value, not yet
-      per-pane -- task 5a extends it to be pane-scoped once splitting introduces multiple panes.
+      Introduce the active-tile Jotai atom **pane-scoped from the start**, not session-scoped: key
+      it by `(sessionId, paneId)`, colocated with the other tile-open atoms in `agentMode.ts` (per
+      D4 -- does not change `openTeammateTilesAtomFamily`'s own shape, this is new and additive).
+      Since task 4a is what introduces the real multi-pane mosaic tree, this task can define the
+      atom family and a placeholder single `paneId` (e.g. a constant "root" pane id) for 4a to
+      thread through when it builds the real tree -- the point is the atom's KEY SHAPE must already
+      be pane-scoped so 5a never needs to migrate it (a real cost the discarded revision-2 3a/5a
+      split would have paid).
 
-      Tests: red-first. Extend `SubAgentChipRow.test.tsx`: assert clicking a chip for a closed tile
-      opens it and sets it active; assert clicking the already-active open tile's chip is a no-op
-      (tile stays open, no close call); assert clicking a background (open-but-inactive) tile's
-      chip switches the active-tile atom to it; assert the chip element now exposes the drag-source
-      attributes/handlers determined by 1a. Do not assert on CSS classNames for drag state.
+      Tests: red-first, new `TileHeaderBar.test.tsx`. Assert: the header renders the correct status
+      dot color/name/model badge for a teammate and a task tile using the shared status-color
+      derivation (not a hardcoded/duplicated mapping); clicking the close control invokes the same
+      close handler `TeammateTileRail`/`TaskTileRail` already use; the header exposes the
+      drag-source attributes/handlers from the mechanism task 1a determined. Do not assert on CSS
+      classNames for drag state.
     depends_on: ["1a"]
     complexity: 5
     priority: "must"
     success_criteria:
-      - "SubAgentChipRow's existing visual identity (status dot, name, model badge) is unchanged"
-      - "Chip click opens-or-focuses a tile instead of toggling it open/closed; closing remains the tile's own Close control"
-      - "SubAgentChip exposes drag-source capability using the mechanism determined in task 1a"
-      - "A new, additive active-tile Jotai atom exists in agentMode.ts; openTeammateTilesAtomFamily and sibling atoms' own shape is unchanged (D4)"
+      - "A new TileHeaderBar component exists, rendering status dot (shared color derivation), name, model badge, drag handle, and close control for one tile"
+      - "SubAgentChipRow is untouched -- still at its original position/role as opener (D1R3a)"
+      - "TileHeaderBar exposes drag-source capability using the mechanism determined in task 1a, carrying a real mosaicId payload"
+      - "The close control routes through the same close handler TeammateTileRail/TaskTileRail already use, not a new duplicate"
+      - "A new, additive activeTileAtomFamily keyed by (sessionId, paneId) exists in agentMode.ts; openTeammateTilesAtomFamily and sibling atoms' own shape is unchanged (D4)"
     files_affected:
-      - "packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx"
-      - "packages/electron/src/renderer/components/AgentMode/__tests__/SubAgentChipRow.test.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TileHeaderBar.tsx (new)"
+      - "packages/electron/src/renderer/components/AgentMode/__tests__/TileHeaderBar.test.tsx (new)"
       - "packages/electron/src/renderer/store/atoms/agentMode.ts"
-      - "packages/electron/src/renderer/components/UnifiedAI/SessionTranscript.tsx"
 
   - id: "4a"
-    title: "Core split-pane integration: single-node react-mosaic tree hosting the relocated chip switcher"
+    title: "Core split-pane integration: single-pane react-mosaic tree with a header-stack switcher"
     description: |
       Replace `TeammateTileRail.tsx`/`TaskTileRail.tsx`'s fixed horizontal-scroll rail layout with
-      a `react-mosaic-component` `Mosaic` tree. At this stage the tree has exactly ONE leaf node
-      (no splitting/stacking yet -- those are tasks 5a/6a) so day-one behavior is functionally
-      equivalent to the current rail: the relocated `SubAgentChipRow` (task 3a) sits at the top of
-      that single mosaic leaf, and the active tile (3a's active-tile atom) content pane shows the
-      focused tile's transcript view below it (reuse existing transcript-rendering, do not rebuild
-      it).
+      a `react-mosaic-component` `Mosaic` tree, built as a NEW `TiledRegion.tsx` host component. At
+      this stage the tree has exactly ONE leaf/pane (no splitting yet -- that is task 5a), but the
+      pane's internal model must already be the real one: an ordered list of tile refs occupying
+      that pane, a pane-scoped active-tile index (using 3a's `activeTileAtomFamily(sessionId,
+      paneId)`), and a stack of `TileHeaderBar`s (task 3a) at the top of the pane rendering one
+      header per occupying tile, with the focused tile's transcript content below (reuse existing
+      transcript-rendering, do not rebuild it). A pane with only one tile still renders its single
+      header bar (D1R3), not a bare content view.
 
-      If task 3a deferred the literal repositioning of `<SubAgentChipRow>`'s render call (see 3a's
-      note 1), perform that move here: render it at the top of this task's new mosaic-hosted
-      region rather than near the compose bar.
+      `SubAgentChipRow` (unmoved, D1R3a) is what opens a tile into this pane in the first place --
+      wire its `onTeammateClick`/`onTaskClick` to open-or-focus into the (currently only) pane
+      rather than toggling a standalone rail tile open/closed, matching D1R3a's click semantics:
+      opening a not-yet-open tile opens it and focuses it in the active pane; clicking an
+      already-open, already-focused tile's chip is a no-op; clicking an open-but-background tile's
+      chip switches focus to it within its pane.
 
-      This is the foundational risk task -- get the single-node case fully correct (mount/unmount
-      behavior, styling against `--nim-*` variables, sizing within `SessionTranscript.tsx`'s
-      layout) before task 5a/6a add real splitting logic on top.
+      This is the foundational risk task -- get the single-pane case (with a real, if trivial,
+      multi-tile header stack) fully correct (mount/unmount behavior, styling against `--nim-*`
+      variables, sizing within `SessionTranscript.tsx`'s layout, hide-not-unmount for background
+      tiles per the discarded revision-2 4a's `display:none` pattern, cite `f97ec3b39` on
+      `archive/011-chip-switcher` for the DndProvider/single-HTML5-backend and mosaic-under-jsdom
+      setup learnings) before task 5a adds real recursive splitting on top.
 
-      A gate follows this task (see execution_plan.yaml) -- the human should confirm the
-      react-mosaic version choice (1a) and the relocated-chip-switcher design (D1/3a) are working
-      as expected before 5a/6a/7a build further on this foundation. Note for the gate reviewer: at
-      this point simultaneous multi-tile visibility (today's side-by-side rail) is intentionally
-      NOT yet restored -- only the active tile is visible, since splitting isn't implemented until
-      5a. This is an expected interim state, not a regression.
+      A gate follows this task (see execution_plan.yaml) -- the human confirms the header-bar
+      switcher (D1R3) and the pane model are working as expected before 5a/6a/7a build further on
+      this foundation. Note for the gate reviewer: simultaneous multi-pane visibility does not
+      exist yet (only one pane exists until 5a) -- a session with multiple open tiles shows them
+      all as header bars stacked in the single pane, with only the focused one's content visible.
+      This is the expected interim state, not a regression.
 
-      Tests: red-first. Test that a single open teammate tile and a single open task tile both
-      render inside the new mosaic-hosted region, switchable via the relocated chip row; test that
-      closing all tiles collapses back to the "no tiles open" state (whatever that currently
-      renders as in `SessionTranscript.tsx`), while the chip row itself remains visible per 3a's
-      note. Do not yet test split/stack behavior (not implemented until 5a/6a).
+      Tests: red-first, `TiledRegion.test.tsx`. Test that opening a teammate tile and a task tile
+      via `SubAgentChipRow` both produce a header bar in the pane's stack and are switchable by
+      clicking their headers; test that closing all tiles collapses back to the "no tiles open"
+      state while `SubAgentChipRow` itself remains visible; test that a single-tile pane still
+      renders its one header bar. Do not yet test split/stack across multiple panes (5a/6a).
     depends_on: ["1a", "3a"]
-    complexity: 6
+    complexity: 7
     priority: "must"
     success_criteria:
-      - "TeammateTileRail/TaskTileRail's fixed-rail layout is replaced by a single-node react-mosaic tree with the relocated SubAgentChipRow switcher at its top"
-      - "Tile open/close/focus state and transcript rendering are preserved; simultaneous multi-tile visibility (today's side-by-side rail) is intentionally NOT preserved at this stage -- only the active tile is visible until 5a's splits land. This is an expected, temporary interim state, not a regression to fix here."
-      - "No split or stack capability yet -- that is explicitly out of scope for this task"
+      - "TeammateTileRail/TaskTileRail's fixed-rail layout is replaced by a react-mosaic tree (TiledRegion.tsx) whose single pane renders a TileHeaderBar stack at its top"
+      - "SubAgentChipRow (unmoved) opens-or-focuses tiles into the pane; header-bar clicks focus within the pane"
+      - "A single-tile pane still shows its one header bar, not a bare content view"
+      - "Backgrounded tiles within the pane are hidden (CSS), not unmounted"
+      - "No split or stack across multiple panes yet -- that is explicitly out of scope for this task"
     files_affected:
       - "packages/electron/src/renderer/components/AgentMode/TeammateTileRail.tsx"
       - "packages/electron/src/renderer/components/AgentMode/TaskTileRail.tsx"
       - "packages/electron/src/renderer/components/AgentMode/TiledRegion.tsx (new -- mosaic host component)"
+      - "packages/electron/src/renderer/components/AgentMode/TiledRegion.css (new)"
       - "packages/electron/src/renderer/components/AgentMode/__tests__/TiledRegion.test.tsx (new)"
+      - "packages/electron/src/renderer/components/UnifiedAI/SessionTranscript.tsx"
 
   - id: "5a"
-    title: "Drag-to-edge splitting: dragging a chip to a pane edge creates a horizontal or vertical split"
+    title: "Drag-to-edge splitting: dragging a header to any pane's edge creates a horizontal or vertical split, to arbitrary depth"
     description: |
-      Wire the chip's drag-source (added in task 3a, using the mechanism task 1a determined) to
-      react-mosaic's split API. When a chip is dragged and dropped near the edge of a pane, create
-      a new mosaic split node at that edge: dropping on the left/right edge creates a vertical
-      split (side-by-side columns); dropping on the top/bottom edge creates a horizontal split
-      (stacked rows) -- matching niri's edge-drop convention described in the PRD.
+      Wire the header's drag-source (`TileHeaderBar`, task 3a, using the mechanism task 1a
+      determined) to react-mosaic's split API. When a header is dragged and dropped near the edge
+      of a pane, create a new mosaic split node at that edge: dropping on the left/right edge
+      creates a vertical split (side-by-side columns); dropping on the top/bottom edge creates a
+      horizontal split (stacked rows) -- matching niri's edge-drop convention (D1R3d).
 
-      Determine edge-vs-center (task 6a) intent by drop-zone geometry within the target pane (e.g.
-      edge zones as a percentage of the pane's bounding box, center zone for 6a). React-mosaic's
-      own drag-and-drop primitives (`MosaicDragType`, `MosaicWindow`'s built-in drop-target
-      support) may already provide this distinction -- prefer using them over hand-rolling geometry
-      detection if they cover this case; investigate react-mosaic's own DnD API before building a
-      custom one.
+      Per D1R3d, this must be genuine recursive binary splitting, not a single top-level split:
+      the target of a drop can be ANY existing pane in the current tree, at ANY depth (a pane that
+      is itself already the result of a prior split), and the resulting mosaic tree must nest
+      correctly -- splitting a pane that is already a child of another split produces a
+      three-(or-more)-level tree, matching niri/i3 manual tiling exactly. Do not special-case or
+      assume a maximum of one split level; lean on react-mosaic's own recursive tree/window/split
+      APIs (D2/D1R3d) so arbitrary depth falls out of the library's own model rather than custom
+      depth-limited logic.
 
-      Extend task 3a's single session-scoped "active tile" atom to be pane-scoped now that a split
-      can create multiple panes: once a chip's tile is moved to a new pane via edge-drop, that
-      pane's own active-tile value must track it, independent of any other pane's active tile.
+      Determine edge-vs-center (task 6a) intent by drop-zone geometry within the target pane:
+      within roughly 28% of that pane's shorter dimension from an edge is an edge-drop; the
+      remainder is the center zone for 6a (D1R3d). React-mosaic's own drag-and-drop primitives
+      (`MosaicDragType`, `MosaicWindow`'s built-in drop-target support) may already provide this
+      distinction -- prefer using them over hand-rolling geometry detection if they cover this
+      case; investigate react-mosaic's own DnD API before building a custom one.
+
+      Task 3a's `activeTileAtomFamily` is already pane-scoped (keyed by `(sessionId, paneId)`) --
+      this task does not need to migrate its shape, only ensure that once a header's tile is moved
+      to a newly-created pane via edge-drop, that new pane's own active-tile entry tracks it,
+      independent of the origin pane's.
+
+      Per D1R3d/R9, this task also owns the reverse operation: closing the last tile in a pane
+      (via that tile's header close control, D1R3c) must auto-collapse that pane's split so the
+      sibling pane takes over the freed space, using react-mosaic's own tree-removal API (do not
+      hand-roll tree surgery if react-mosaic covers pane removal natively). This is required
+      behavior, not an optional follow-up -- a pane-creation task that does not also handle
+      pane-removal leaves the tree in a permanently-growing, never-shrinking state.
 
       Tests: red-first. Simulate a drop event at each edge (top/bottom/left/right) of an existing
       pane and assert the resulting mosaic tree shape (a new split node of the correct orientation
-      containing both the original and moved tile). Assert on the resulting tree/state, not on
-      pixel positions or CSS classes.
+      containing both the original and moved tile). Additionally simulate a second split on one of
+      the two resulting panes and assert the tree now nests three levels deep with correct
+      orientations at each level -- this is the test that actually proves "arbitrary depth," a
+      single top-level split test does not. Also simulate closing the last tile in a split-created
+      pane and assert the mosaic tree collapses back to the sibling pane occupying the freed space
+      (an actual tree-shape assertion, not just a visual claim).
     depends_on: ["4a"]
     complexity: 7
     priority: "must"
     success_criteria:
-      - "Dragging a chip to a pane's left/right edge creates a vertical (side-by-side) split"
-      - "Dragging a chip to a pane's top/bottom edge creates a horizontal (stacked) split"
-      - "The moved tile is removed from its origin pane's stack and appears as the active tile in the new pane"
-      - "Active-tile state is pane-scoped once more than one pane exists"
+      - "Dragging a header to a pane's left/right edge creates a vertical (side-by-side) split"
+      - "Dragging a header to a pane's top/bottom edge creates a horizontal (stacked) split"
+      - "Splitting a pane that is already the child of a prior split produces a correctly-nested multi-level tree -- verified by a test that performs two successive splits, not just one"
+      - "The moved tile is removed from its origin pane's header stack and appears as the active tile in the new pane"
+      - "Active-tile state (already pane-scoped from 3a) correctly tracks the new pane once it is created"
+      - "Closing the last tile in a split-created pane collapses that split and the sibling pane takes over the freed space (R9), verified by a tree-shape test"
     files_affected:
       - "packages/electron/src/renderer/components/AgentMode/TiledRegion.tsx"
-      - "packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx"
+      - "packages/electron/src/renderer/components/AgentMode/TileHeaderBar.tsx"
       - "packages/electron/src/renderer/store/atoms/agentMode.ts"
       - "packages/electron/src/renderer/components/AgentMode/__tests__/TiledRegion.test.tsx"
 
   - id: "6a"
-    title: "Tab-stacking: dragging a chip to a pane's center adds it to that pane's tab stack"
+    title: "Tab-stacking: dragging a header to a pane's center adds it to that pane's header stack"
     description: |
       Complete the drop-intent handling started in 5a: a drop in the CENTER zone of a target pane
-      (not an edge) adds the dragged tile to that pane's stack (both tiles are now reachable via
-      chips within the same pane's switcher row) instead of creating a new split.
+      (not an edge, per D1R3d's ~28%-of-shorter-dimension edge threshold) adds the dragged tile to
+      that pane's header stack (both tiles are now reachable via headers within the same pane)
+      instead of creating a new split.
 
       Sequenced after 5a (not a hard functional dependency, but both tasks touch the same
       `TiledRegion.tsx` drop-handling logic -- sequenced for file-conflict safety in the shared,
-      worktree-free checkout per D7).
+      worktree-free checkout per D7). Center-drop stacking applies to any pane in the tree, at any
+      depth, same as 5a's edge-drop splitting -- there is nothing depth-limited about which panes
+      are valid stack targets.
 
-      Tests: red-first. Simulate a center-zone drop and assert the target pane's stack now contains
-      both tiles, with no new mosaic split node created, and the dragged tile becomes the active
-      tile in its new pane.
+      Tests: red-first. Simulate a center-zone drop and assert the target pane's header stack now
+      contains both tiles, with no new mosaic split node created, and the dragged tile becomes the
+      active tile in its new pane.
     depends_on: ["5a"]
     complexity: 5
     priority: "must"
     success_criteria:
-      - "Dragging a chip to a pane's center zone adds it to that pane's tab stack, not a new split"
+      - "Dragging a header to a pane's center zone adds it to that pane's header stack, not a new split"
       - "The stacked tile becomes the active tile in its destination pane"
       - "Edge-drop splitting (5a) is unaffected by this change"
     files_affected:
@@ -284,7 +316,7 @@ tasks:
       - "packages/electron/src/renderer/components/AgentMode/TeammateTileRail.tsx"
       - "packages/electron/src/renderer/components/AgentMode/TaskTileRail.tsx"
       - "packages/electron/src/renderer/components/UnifiedAI/AIInput.tsx (read/instantiate only -- do not modify unless a genuine prop gap is found; if so, note the gap in the commit message)"
-      - "packages/electron/src/renderer/store/atoms/agentMode.ts (read only -- reads the active-tile atom introduced in 3a/5a to determine which tile's compose box to render)"
+      - "packages/electron/src/renderer/store/atoms/agentMode.ts (read only -- reads the pane-scoped activeTileAtomFamily introduced in 3a to determine which tile's compose box to render)"
       - "packages/electron/src/renderer/components/AgentMode/__tests__/TeammateTileRail.test.tsx"
       - "packages/electron/src/renderer/components/AgentMode/__tests__/TaskTileRail.test.tsx"
 
@@ -293,7 +325,7 @@ tasks:
     description: |
       Per the editor-state rule's spirit and research's remount-constraint finding: when a pane's
       stack has multiple tiles (post-6a) and the user switches the active tile within that stack
-      (via the relocated chip row), the previously-active tile's content must be hidden (CSS
+      (by clicking a header in the pane's header stack, D1R3), the previously-active tile's content must be hidden (CSS
       `display:none` or equivalent), not unmounted -- avoiding a refetch-on-remount cost against
       `aiGetTeammateTranscript`. `RichTranscriptView` already keeps a per-session VList cache that
       survives remounts (more forgiving than Monaco/Lexical/RevoGrid), but hide-not-unmount is
@@ -305,8 +337,8 @@ tasks:
       a CSS-hide pattern (render all stacked tiles' content, toggle visibility, rather than
       conditionally rendering only the active one).
 
-      Tests: red-first. Render a pane with two stacked tiles; switch the active tile via the chip
-      row; assert the previously-active tile's content component is still mounted (e.g. via a
+      Tests: red-first. Render a pane with two stacked tiles; switch the active tile by clicking
+      the other tile's header; assert the previously-active tile's content component is still mounted (e.g. via a
       mount-count spy or an effect that would re-fire `aiGetTeammateTranscript` on remount) rather
       than unmounted and remounted.
     depends_on: ["6a", "7a"]
@@ -314,7 +346,7 @@ tasks:
     priority: "should"
     success_criteria:
       - "Switching the active tile within a stacked pane hides, rather than unmounts, the previously-active tile's content"
-      - "No duplicate aiGetTeammateTranscript fetch occurs when returning to a previously-viewed tile via its chip"
+      - "No duplicate aiGetTeammateTranscript fetch occurs when returning to a previously-viewed tile via its header"
     files_affected:
       - "packages/electron/src/renderer/components/AgentMode/TiledRegion.tsx"
       - "packages/electron/src/renderer/components/AgentMode/__tests__/TiledRegion.test.tsx"
@@ -350,11 +382,14 @@ tasks:
     description: |
       `SessionTranscript.tsx` currently composes `TeammateTileRail`/`TaskTileRail` alongside the
       main thread pane using the old fixed-rail layout, with `SubAgentChipRow` rendered separately
-      near the compose bar. Migrate this composition to render the new `TiledRegion` (from 4a,
-      extended through 5a/6a/7a/8a/9a, with the relocated chip switcher at its top) instead. Remove
-      the old fixed-rail rendering path and the old standalone `SubAgentChipRow` call site entirely
-      -- do not leave both paths co-existing behind a flag (no evidence this needs to be
-      gradual/flagged; this repo's convention per prior PRDs is a clean cutover).
+      near the compose bar as the opener. Migrate the rail composition to render the new
+      `TiledRegion` (from 4a, extended through 5a/6a/7a/8a/9a, with each pane's `TileHeaderBar`
+      stack) instead. Remove the old fixed-rail rendering path only. Per D1R3a, `SubAgentChipRow`
+      is NOT removed and its call site does NOT move -- it stays exactly where it already is,
+      directly above the compose bar, still the mechanism that opens a tile into `TiledRegion` in
+      the first place. Do not leave the old fixed-rail path co-existing behind a flag (no evidence
+      this needs to be gradual/flagged; this repo's convention per prior PRDs is a clean cutover) --
+      that clean-cutover rule applies to the rail layout, not to `SubAgentChipRow`.
 
       Verify no other consumer references the old rail components' now-removed rendering path
       (grep for `TeammateTileRail`/`TaskTileRail` imports across the renderer) before deleting dead
@@ -367,16 +402,18 @@ tasks:
       it -- if 8a is descoped at review, this task proceeds unaffected.
 
       Tests: red-first, and this is the integration-level test point -- extend or add a
-      `SessionTranscript` test asserting the tiled region (with its chip-row switcher) renders in
-      place of the old rail + separate chip row, with the same open-tile fixture data producing the
-      same reachable tiles. Run the full existing `TeammateTileRail.test.tsx`/`TaskTileRail.test.tsx`
-      suites (now presumably integrated into `TiledRegion.test.tsx` across 4a-9a) to confirm no
-      regression from the migration itself.
+      `SessionTranscript` test asserting the tiled region (with `SubAgentChipRow` still rendered
+      above the compose bar as the opener) renders in place of the old rail, with the same
+      open-tile fixture data producing the same reachable tiles via their header bars. Run the full
+      existing `TeammateTileRail.test.tsx`/`TaskTileRail.test.tsx` suites (now presumably
+      integrated into `TiledRegion.test.tsx` across 4a-9a) to confirm no regression from the
+      migration itself.
     depends_on: ["6a", "7a", "9a"]
     complexity: 5
     priority: "must"
     success_criteria:
-      - "SessionTranscript.tsx renders TiledRegion (with the relocated chip switcher) in place of the old TeammateTileRail/TaskTileRail fixed layout and the old standalone SubAgentChipRow call site"
+      - "SessionTranscript.tsx renders TiledRegion (with each pane's TileHeaderBar stack) in place of the old TeammateTileRail/TaskTileRail fixed layout"
+      - "SubAgentChipRow's call site is unchanged -- still directly above the compose bar, still the opener into TiledRegion (D1R3a)"
       - "No dead references to the removed fixed-rail rendering path remain"
       - "Full existing tile-related test suite passes against the new integration"
     files_affected:
@@ -389,11 +426,11 @@ tasks:
     description: |
       Add one CHANGELOG.md bullet under `[Unreleased]` (`### Changed` or `### Added`, whichever
       fits the existing voice) describing the user-facing result: teammate/task tiles now open via
-      their status chips at the top of the tiled view and can be dragged to split the view
+      their status chips, and open tiles show a slim header that can be dragged to split the view
       horizontally or vertically, or stacked together, similar to a tiling window manager. One
       sentence, no internal scaffolding, no symbol/file/library names (do not mention
-      react-mosaic, SubAgentChipRow, TiledRegion, Jotai atoms, etc.), matching the existing voice in
-      `[Unreleased]` and recent `git log --oneline`.
+      react-mosaic, SubAgentChipRow, TileHeaderBar, TiledRegion, Jotai atoms, etc.), matching the
+      existing voice in `[Unreleased]` and recent `git log --oneline`.
     depends_on: ["10a"]
     complexity: 1
     priority: "must"
