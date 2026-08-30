@@ -212,6 +212,46 @@ describe('TiledRegion', () => {
     expect(getTeammateTranscript).toHaveBeenCalledTimes(1);
   });
 
+  // 8a audit: hide-not-unmount must hold for a stack assembled via center-drop
+  // (6a), not just tiles that landed in the same pane by default. A tile that
+  // moved panes is allowed to remount once (it is a new place in the tree);
+  // switching focus within the resulting stack afterward must not remount it
+  // again.
+  it('keeps a center-drop-stacked tile mounted across repeated focus switches within that pane', async () => {
+    const { store, dropTile, headers, panes, visiblePane, tilesIn } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await open(store, { kind: 'teammate', id: 'agent-b' });
+    await act(async () => { dropTile('agent-a', 'root', 'left'); });
+    await act(async () => { dropTile('agent-b', 'pane-2', 'center'); });
+    expect(tilesIn('pane-2')).toEqual(['agent-a', 'agent-b']);
+
+    // Each tile remounts exactly once for its cross-pane move (agent-a's edge
+    // drop, agent-b's center drop) on top of its initial open-mount fetch -
+    // that is the one exception this file's own header comment carves out.
+    // What must NOT happen is any fetch beyond that from focus switching.
+    await waitFor(() => expect(getTeammateTranscript).toHaveBeenCalledTimes(4));
+    const fetchesAfterStack = getTeammateTranscript.mock.calls.length;
+    const mountedAfterStack = panes().length;
+
+    const headerIn = (paneId: string, dragId: string) => headers()
+      .find(h => h.closest(`[data-pane-id="${paneId}"]`) && h.dataset.dragId === dragId)!;
+
+    // agent-b is focused (it was the one dragged in); switch to agent-a, then
+    // back, then to agent-a again.
+    await act(async () => { fireEvent.click(headerIn('pane-2', 'agent-a')); });
+    expect(visiblePane()?.dataset.tileId).toBe('agent-a');
+    await act(async () => { fireEvent.click(headerIn('pane-2', 'agent-b')); });
+    expect(visiblePane()?.dataset.tileId).toBe('agent-b');
+    await act(async () => { fireEvent.click(headerIn('pane-2', 'agent-a')); });
+    expect(visiblePane()?.dataset.tileId).toBe('agent-a');
+
+    // No new mount and no new fetch: both bodies were hidden via CSS, not
+    // unmounted and recreated.
+    expect(panes().length).toBe(mountedAfterStack);
+    expect(getTeammateTranscript.mock.calls.length).toBe(fetchesAfterStack);
+  });
+
   it('closing through the header collapses back to no region once the last tile goes', async () => {
     const { store, headers, region, visiblePane } = renderRegion();
     await open(store, { kind: 'teammate', id: 'agent-a' });
