@@ -13,33 +13,88 @@ on faith.
 
 ## Research Findings
 
-### Root cause 1 (confirmed) — drag-and-tile is inert
+### Root cause 1 (corrected — see below) — drag-and-tile is inert
 
-`packages/electron/src/renderer/components/AgentMode/TiledRegion.css` gates the five drop zones
-behind `.mosaic.-dragging .tiled-region-drop-zone { pointer-events: auto; }`, with a comment
-claiming "the library puts `-dragging` on the mosaic root for exactly this."
+**Original hypothesis (WRONG, superseded).** An earlier pass of this research claimed
+`.mosaic.-dragging` was a fictional selector never applied by anything, based on a `grep -iname
+"*.js"` that only matched `.js` files and silently missed the library's actual `.cjs`/`.mjs`
+build output. Task 1a's implementer caught this empirically: `.mosaic.-dragging` IS real.
+`node_modules/react-mosaic-component/lib/Mosaic.cjs`'s `MosaicRootWithDragDetection` — the actual
+root div `<Mosaic className="tiled-region-mosaic">` renders — runs a live `useDrop({ accept:
+MosaicDragType.WINDOW })` and applies `-dragging` to its own class list whenever a `WINDOW`-type
+drag is active. The CSS gate the original research called dead is live and correctly toggled.
+Re-implementing it via `useDragLayer` (the original planned fix) would have changed nothing, and
+in fact `useDragLayer` cannot even be called at the `TiledRegion` level as originally briefed:
+`<Mosaic>` owns its own internal `DndProvider` wrapping only its own subtree, so `TiledRegion`
+(the provider's parent, not a descendant) has no drag-drop context to read from without additional
+plumbing. Credit to the implementer for verifying this against source and against a real jsdom
+repro instead of shipping a fix that wouldn't have worked.
 
-Verified directly: no file under `node_modules/react-mosaic-component/` (`lib/*.cjs`, `lib/*.mjs`,
-`react-mosaic-component.css`) contains the string `dragging` anywhere. The library never adds
-`.mosaic.-dragging`, and nothing in `TiledRegion.tsx` adds it either. `.tiled-region-drop-zone {
-pointer-events: none; }` is therefore never overridden in a real browser — `TileDropZone`'s
-`useDrop` target never receives pointer events. Dropping a dragged `TileHeaderBar` anywhere is a
-complete no-op in the running app today.
+**Actual, verified root cause.** `<Mosaic>` always renders a *second*, always-mounted drop-target
+system alongside the app's own custom `TileDropZone`s: `RootDropTargets`
+(`node_modules/react-mosaic-component/lib/RootDropTargets.cjs`), rendered as the direct next
+sibling after the whole rendered tree, inside the same root div (`Mosaic.cjs` line ~84:
+`renderTree(), createElement(RootDropTargets)`). It stands up 4 of its own drop targets (top,
+bottom, left, right — no center; `internalTypes.cjs`'s `MosaicDropTargetPosition`), always scoped
+to the tree's root (`path: []`), regardless of how many panes the tree actually has.
 
-The drag *source* (`useDrag` in `TileHeaderBar.tsx`) is correctly wired to `MosaicDragType.WINDOW`.
-Only the drop-side CSS gate is broken.
+The library's own stylesheet (`react-mosaic-component.css` lines 101-134) makes these targets:
+- `display: none` normally, `display: block` for the *entire* duration of any `WINDOW`-type
+  drag (`.drop-target-container.-dragging`) — i.e. active for the whole drag, not just the moment
+  of hover.
+- `position: absolute; inset: 0` for the container, each of the 4 `.drop-target` children also
+  `position: absolute` and sized to a ~30%-wide edge band of the *entire root rectangle*
+  (`calc(100% - 30%)` from the relevant edge) — nearly the same physical area the app's own
+  `.tiled-region-drop-zone-{top,bottom,left,right}` occupy (28%-wide bands, `TiledRegion.css` lines
+  71-99), for *every* pane, not just the root.
+- `z-index: 5`, versus the app's own zones at `z-index: 1` (`TiledRegion.css` line 63).
 
-**Why this shipped green:** `TiledRegion.test.tsx`'s `dropTile` helper drives the drop via
-`fireEvent.dragStart/dragEnter/dragOver/drop` directly on the drop-zone DOM node. jsdom performs no
-hit-testing and does not apply CSS `pointer-events` to event dispatch, so `fireEvent.drop()` reaches
-the `useDrop` handler regardless of the CSS gate. The existing suite is real coverage of the
-tree-update logic (`handleEdgeDrop`/`handleCenterDrop`) but structurally cannot catch a
-`pointer-events` regression in the gating CSS. Closing that gap is part of task 1a.
+Later DOM sibling + higher z-index + near-identical physical coverage = the library's own root
+drop targets sit on top of and physically intercept the app's custom edge zones for the whole
+duration of every drag. `opacity: 0` (their default, unhovered visual state) does not disable
+pointer-event capture — an invisible element still wins hit-testing unless `pointer-events: none`
+is set, which nothing does today. This is airtight from static CSS/DOM-order analysis; it is not
+independently provable in jsdom (jsdom performs no layout/hit-testing at all — this is exactly why
+the original `dropTile` test helper, which fires events directly on the target node, "passed" both
+before and after this bug: fireEvent bypasses real hit-testing entirely, so no jsdom test can
+observe stacking-order/pointer-events regressions of this kind. Vitest's default `css: false` also
+means imported `.css` files are not parsed into jsdom's style engine during unit tests, so this
+repo's current test tier cannot assert on the fix's actual effect either).
 
-**Fix:** replace the fictional CSS selector with a real signal via `react-dnd`'s `useDragLayer`,
-called once in `TiledRegion` (not per-pane), deriving `isDragging = monitor.isDragging() &&
-monitor.getItemType() === MosaicDragType.WINDOW`, applied as a real class on the region wrapper
-that `TiledRegion.css` targets instead of `.mosaic.-dragging`.
+`TiledRegion.tsx`'s own header comment already documents the deliberate choice to build custom
+zones instead of the library's ("`MosaicDropTarget` is not exported from the package index, and its
+targets quarter the whole pane with no center region") — but the library's *own* root-level
+targets were never suppressed, so they were left mounted and silently absorbing every drop attempt.
+
+The drag *source* (`useDrag` in `TileHeaderBar.tsx`) is correctly wired to `MosaicDragType.WINDOW`
+and needs no change.
+
+**Fix:** CSS-only. Suppress the library's own root drop-target overlay inside the tiled region so
+it never competes for pointer capture with the app's own zones:
+
+```css
+.tiled-region-mosaic > .drop-target-container {
+  pointer-events: none;
+}
+```
+
+(Confirmed via `Mosaic.cjs`: `.drop-target-container` — `RootDropTargets`'s own root element — is a
+direct child of the div carrying `.tiled-region-mosaic`, so a direct-child selector is safe and
+specific.) No React/TSX changes are required for this fix. Correct the existing misleading comment
+above the `.mosaic.-dragging` rule (it now needs to say the class IS real and library-driven,
+which was already true — the original comment's factual content was actually correct, only the
+research that flagged it as fictional was wrong) and add a comment on the new rule explaining what
+it suppresses and why.
+
+**Testing tier note.** This bug class (CSS stacking-order / pointer-events interception between
+two sibling absolutely-positioned overlays) is not observable under jsdom, which performs no
+layout or hit-testing, and this repo's vitest config does not parse imported CSS into jsdom's style
+engine (`css: false` default). Per `.claude/rules/end-to-end-verification.md`, the correct
+verification tier for this class of bug is a real rendering engine (E2E/Playwright), not a vitest
+unit test asserting on CSS source text (explicitly disallowed by this repo's own testing rules).
+No E2E harness for `TiledRegion`/tiling exists yet in `packages/electron/e2e/`, and building one
+from scratch is out of scope for this small PRD. This is called out explicitly rather than shipped
+behind a placebo test — manual verification steps are provided in the PM's final report instead.
 
 ### Root cause 2 (confirmed) — "non-functional buttons" fully explained by root cause 1
 

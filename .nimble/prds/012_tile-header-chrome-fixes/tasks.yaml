@@ -6,15 +6,29 @@ metadata:
 
 tasks:
   - id: "1a"
-    title: "Fix drag-and-tile: replace fictional .mosaic.-dragging CSS gate with real react-dnd signal"
-    complexity: 4
+    title: "Fix drag-and-tile: suppress react-mosaic's own competing root drop targets (CSS only)"
+    complexity: 3
     wave: 1
     depends_on: []
     files:
-      - packages/electron/src/renderer/components/AgentMode/TiledRegion.tsx
       - packages/electron/src/renderer/components/AgentMode/TiledRegion.css
-      - packages/electron/src/renderer/components/AgentMode/__tests__/TiledRegion.test.tsx
     description: |
+      CORRECTED (v2): see briefs/1a_tile-header-chrome-fixes.md for full detail. The original
+      hypothesis below (kept for history) was disproven by the first dispatch of this task: the
+      grep behind it only searched *.js files and missed react-mosaic's actual .cjs/.mjs build
+      output, where .mosaic.-dragging IS real and correctly toggled. The actual bug: react-mosaic's
+      Mosaic component always mounts its OWN root-level drop targets (RootDropTargets, 4 edge
+      zones, no center, always scoped to path:[]) as a later DOM sibling of the rendered tree, at
+      z-index 5 vs the app's own zones at z-index 1, covering nearly the same edge-band area,
+      display:block for the whole duration of any WINDOW-type drag. That overlay wins hit-testing
+      and silently intercepts every drop before the app's own TileDropZones ever see it. Fix is
+      CSS-only: `.tiled-region-mosaic > .drop-target-container { pointer-events: none; }` in
+      TiledRegion.css, suppressing the library's own overlay. No React/TSX changes needed. This bug
+      class (CSS stacking-order / pointer-events interception) is not observable in jsdom (no
+      layout/hit-testing, and vitest's css:false means imported CSS isn't parsed into jsdom's style
+      engine) — do not write a placebo test asserting CSS source text; state the verification-tier
+      limitation explicitly instead. Original (superseded) hypothesis text below for history only:
+    original_hypothesis_superseded: |
       Dragging a TileHeaderBar to split or stack a tiled pane is a complete no-op in the running
       app. Root cause, confirmed by grepping node_modules/react-mosaic-component for the string
       "dragging" (zero matches anywhere in the library): TiledRegion.css gates the five drop zones
@@ -54,10 +68,10 @@ tasks:
       Verify: `npm run typecheck && npm run test:prepush` (or the narrower vitest command for this
       file while iterating, but the full gate before considering the task done).
     success_criteria:
-      - "TiledRegion.css no longer references `.mosaic.-dragging` anywhere"
-      - "A real react-dnd useDragLayer-derived class gates .tiled-region-drop-zone pointer-events"
-      - "New/extended test proves the gating class toggles with an active WINDOW drag via the same event-driven path the existing dropTile helper uses, not by asserting the atom-level tree update alone"
+      - "TiledRegion.css suppresses pointer-events on react-mosaic's own .drop-target-container scoped to .tiled-region-mosaic, with an explanatory comment"
+      - "No React/TSX files changed for this task"
       - "All existing TiledRegion.test.tsx / TileHeaderBar.test.tsx cases still pass unmodified in behavior"
+      - "Report states plainly that this fix's real-world effect requires manual/browser verification, not a vitest assertion, and why"
       - "npm run typecheck && npm run test:prepush pass"
 
   - id: "2a"
