@@ -1,0 +1,82 @@
+/**
+ * Structural layout for the mosaic tree comes from
+ * `react-mosaic-component.css`, which `TiledRegion.tsx` imports - its tiles are
+ * absolutely positioned, so nothing lays out without it. The library's own
+ * `mosaic-blueprint-theme` is deliberately NOT used; everything it would paint
+ * is rebased here onto `--nim-*` tokens instead.
+ */
+
+.tiled-region {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* `.mosaic-root` is absolutely positioned, so the root needs to be the
+   containing block; the library insets it by 3px for split handles, which a
+   single-leaf tree has no use for. */
+.tiled-region-mosaic.mosaic {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.tiled-region-mosaic .mosaic-root {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+}
+
+.tiled-region-mosaic .mosaic-tile {
+  margin: 0;
+}
+
+/* Split handles and drop targets are the only chrome the library paints
+   outside its blueprint theme; both hardcode colors, so restate them here. */
+.tiled-region-mosaic .mosaic-split:hover {
+  background: var(--nim-primary);
+}
+
+.tiled-region-mosaic .mosaic-drop-target .drop-target-container .drop-target {
+  background: color-mix(in srgb, var(--nim-primary) 20%, transparent);
+  border-color: var(--nim-primary);
+}
+
+.tiled-region-leaf {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* The stack of one `TileHeaderBar` per tile occupying this pane. A pane with a
+   single tile still shows its one header - the header is how the tile is
+   dragged elsewhere and closed, so a bare content view has no handle at all. */
+.tiled-region-headers {
+  flex: 0 0 auto;
+}
+
+.tiled-region-header-slot {
+  cursor: pointer;
+}
+
+.tiled-region-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Every open tile stays mounted; the pane shows one at a time by toggling
+   `display`, so a transcript view is never remounted on a focus switch. */
+.tiled-region-pane {
+  position: absolute;
+  inset: 0;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}

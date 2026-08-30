@@ -113,9 +113,8 @@ import {
   MIN_CLI_TERMINAL_HEIGHT,
   MAX_CLI_TERMINAL_HEIGHT,
 } from '../../store/atoms/terminals';
-import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, toggleTaskTileAtom, openTaskTilesAtomFamily, toggleTeammateTileAtom, openTeammateTilesAtomFamily } from '../../store/atoms/agentMode';
-import { TaskTileRail } from '../AgentMode/TaskTileRail';
-import { TeammateTileRail } from '../AgentMode/TeammateTileRail';
+import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom, openOrFocusTaskTileAtom, openTaskTilesAtomFamily, openOrFocusTeammateTileAtom, openTeammateTilesAtomFamily } from '../../store/atoms/agentMode';
+import { TiledRegion } from '../AgentMode/TiledRegion';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, defaultThinkingModeAtom, chatShowToolCallsAtom, developerModeAtom } from '../../store/atoms/appSettings';
 import { supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
@@ -2262,22 +2261,21 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   }, [scrollToTeammate, setScrollToTeammate, sessionId, messages]);
 
   // Teammate chip click-to-thread (R5): a separate flow from the scroll-to-
-  // Teammate chip click-to-tile: toggles that teammate's transcript tile in
-  // the rail beside the main thread, matching the Task chip's own
-  // click-to-tile behavior below (they used to diverge -- a teammate chip
-  // click opened a floating compose popover instead -- unified so both kinds
-  // behave the same way from the chip row and the sidebar list).
-  const toggleTeammateTile = useSetAtom(toggleTeammateTileAtom);
+  // Teammate chip click-to-tile: opens that teammate's transcript tile in the
+  // tiled region beside the main thread, or focuses it when it is already
+  // open. The chip is the opener only -- closing a tile is its header bar's
+  // own control, so a click never takes a tile away.
+  const openOrFocusTeammateTile = useSetAtom(openOrFocusTeammateTileAtom);
   const handleTeammateChipClick = useCallback((agentId: string) => {
-    toggleTeammateTile({ sessionId, agentId });
-  }, [toggleTeammateTile, sessionId]);
+    openOrFocusTeammateTile({ sessionId, agentId });
+  }, [openOrFocusTeammateTile, sessionId]);
 
-  // Task chip click-to-tile (R7): toggles that task's transcript tile in the
-  // rail beside the main thread. Hovering the same chip still shows the popover.
-  const toggleTaskTile = useSetAtom(toggleTaskTileAtom);
+  // Task chip click-to-tile (R7): opens or focuses that task's tile in the
+  // tiled region. Hovering the same chip still shows the popover.
+  const openOrFocusTaskTile = useSetAtom(openOrFocusTaskTileAtom);
   const handleTaskChipClick = useCallback((taskId: string) => {
-    toggleTaskTile({ sessionId, taskId });
-  }, [toggleTaskTile, sessionId]);
+    openOrFocusTaskTile({ sessionId, taskId });
+  }, [openOrFocusTaskTile, sessionId]);
 
   // Whether any Task or teammate tile is open beside the main thread right
   // now. Drives the main thread's own pane chrome below - when nothing is
@@ -2537,7 +2535,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             }}
           >
             {hasOpenTaskTiles && (
-              // Matches TaskTileRail's own tile-header chrome, so a tiled
+              // Matches the tiled region's own tile-header chrome, so a tiled
               // view reads as two threads open side by side rather than
               // "the main thread got smaller and a box appeared next to it."
               <div className="session-transcript-main-pane-header flex items-center h-[30px] shrink-0 px-2.5 border-b border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[11px] text-[var(--nim-text-faint)]">
@@ -2596,8 +2594,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
               />
             </div>
           </div>
-          <TeammateTileRail sessionId={sessionId} />
-          <TaskTileRail sessionId={sessionId} />
+          <TiledRegion sessionId={sessionId} />
         </div>
       )}
 

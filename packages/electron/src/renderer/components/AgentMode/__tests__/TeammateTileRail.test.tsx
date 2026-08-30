@@ -5,11 +5,12 @@ import { Provider, createStore, type PrimitiveAtom } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Narrow mocks only - never the runtime barrel. The real atom module is
-// replaced so a test can drive sessionTeammatesAtom's contents directly.
+// replaced so a test can drive sessionTeammatesAtom's contents directly. Its
+// export list mirrors exactly what TeammateTile imports; an export the tile no
+// longer imports would be a silent no-op mock.
 vi.mock('../../../store/atoms/agentMode', async () => {
   const { atom: makeAtom } = await import('jotai');
   const signalAtoms = new Map<string, PrimitiveAtom<number>>();
-  const openTiles = makeAtom<string[]>([]);
   const teammates = makeAtom<unknown[]>([]);
   return {
     teammateTranscriptSignalKey: (sessionId: string, agentId: string) => `${sessionId}:${agentId}`,
@@ -21,15 +22,7 @@ vi.mock('../../../store/atoms/agentMode', async () => {
       }
       return existing;
     },
-    openTeammateTilesAtomFamily: () => openTiles,
     sessionTeammatesAtom: () => teammates,
-    // Mirrors the real close atom: drop the id from the open list.
-    closeTeammateTileAtom: makeAtom(
-      null,
-      (get, set, arg: { sessionId: string; agentId: string }) => {
-        set(openTiles, get(openTiles).filter(id => id !== arg.agentId));
-      },
-    ),
   };
 });
 
@@ -44,14 +37,13 @@ vi.mock('@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView', (
   ),
 }));
 
-import { TeammateTileRail } from '../TeammateTileRail';
-import { openTeammateTilesAtomFamily, sessionTeammatesAtom } from '../../../store/atoms/agentMode';
+import { TeammateTile } from '../TeammateTileRail';
+import { sessionTeammatesAtom } from '../../../store/atoms/agentMode';
 
 const getTeammateTranscript = vi.fn();
 const stopTeammate = vi.fn();
 const sendMessageToTeammate = vi.fn();
 
-const openTilesAtom = openTeammateTilesAtomFamily('lead-1') as PrimitiveAtom<string[]>;
 const teammatesAtom = sessionTeammatesAtom('lead-1') as unknown as PrimitiveAtom<unknown[]>;
 
 function teammate(
@@ -72,33 +64,33 @@ function revivable(endReason = 'finished') {
   });
 }
 
-function renderRail() {
+/**
+ * Renders one teammate tile the way `TiledRegion` mounts it: the tile no
+ * longer owns the open list or a close control of its own (the pane's
+ * `TileHeaderBar` does), so this drives it directly off session metadata.
+ */
+async function renderTile(teammates: unknown[] = [
+  teammate('agent-a', 'code-reviewer', 'running'),
+  teammate('agent-b', 'db-migrator', 'idle'),
+]) {
   const store = createStore();
-  store.set(openTilesAtom, []);
-  store.set(teammatesAtom, [
-    teammate('agent-a', 'code-reviewer', 'running'),
-    teammate('agent-b', 'db-migrator', 'idle'),
-  ]);
-  const result = render(
-    <Provider store={store}>
-      <TeammateTileRail sessionId="lead-1" />
-    </Provider>,
-  );
+  store.set(teammatesAtom, teammates);
+  let result!: ReturnType<typeof render>;
+  await act(async () => {
+    result = render(
+      <Provider store={store}>
+        <TeammateTile sessionId="lead-1" agentId="agent-a" />
+      </Provider>,
+    );
+  });
   return {
     ...result,
     store,
-    rail: () => result.container.querySelector('.teammate-tile-rail'),
-    tiles: () => Array.from(result.container.querySelectorAll('.teammate-tile')),
+    tile: () => result.container.querySelector('.teammate-tile'),
   };
 }
 
-async function openTile(store: ReturnType<typeof createStore>, ...agentIds: string[]) {
-  await act(async () => {
-    store.set(openTilesAtom, agentIds);
-  });
-}
-
-describe('TeammateTileRail', () => {
+describe('TeammateTile', () => {
   beforeEach(() => {
     getTeammateTranscript.mockReset().mockResolvedValue([{ type: 'assistant_message', content: 'hi' }]);
     stopTeammate.mockReset().mockResolvedValue({ success: true });
@@ -112,37 +104,15 @@ describe('TeammateTileRail', () => {
 
   afterEach(cleanup);
 
-  it('renders nothing until a teammate is opened, then one tile fetching that teammate', async () => {
-    const { store, rail, tiles } = renderRail();
-    expect(rail()).toBeNull();
+  it('fetches and renders the transcript of the teammate it was given', async () => {
+    const { tile } = await renderTile();
 
-    await openTile(store, 'agent-a');
-
-    expect(tiles()).toHaveLength(1);
     expect(getTeammateTranscript).toHaveBeenCalledWith('lead-1', 'agent-a', '/ws');
-    expect(rail()!.textContent).toContain('code-reviewer');
-  });
-
-  it('opens a second concurrent tile alongside the first rather than replacing it', async () => {
-    const { store, tiles } = renderRail();
-    await openTile(store, 'agent-a');
-    await openTile(store, 'agent-a', 'agent-b');
-
-    expect(tiles().map(t => t.getAttribute('data-agent-id'))).toEqual(['agent-a', 'agent-b']);
-  });
-
-  it('caps the rail so the main thread keeps width priority, at a per-tile floor', async () => {
-    const { store, rail, tiles } = renderRail();
-    await openTile(store, 'agent-a', 'agent-b');
-
-    expect(rail()!.getAttribute('style')).toContain('max-width: 50%');
-    expect(rail()!.className).toContain('overflow-x-auto');
-    expect(tiles()[0].getAttribute('style')).toContain('320px');
+    expect(tile()!.textContent).toContain('code-reviewer');
   });
 
   it('shows a Stop control for a running teammate and calls aiStopTeammate on click', async () => {
-    const { store, container } = renderRail();
-    await openTile(store, 'agent-a');
+    const { container } = await renderTile();
 
     await act(async () => {
       fireEvent.click(container.querySelector('.teammate-tile-stop')!);
@@ -152,8 +122,7 @@ describe('TeammateTileRail', () => {
   });
 
   it('lets the architect compose and send a message to a running teammate', async () => {
-    const { store, container } = renderRail();
-    await openTile(store, 'agent-a');
+    const { container } = await renderTile();
 
     const textarea = container.querySelector('.teammate-tile-input') as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: 'status update please' } });
@@ -170,22 +139,14 @@ describe('TeammateTileRail', () => {
   // eligibility rather than on terminal status. This row has no sessionId,
   // which is still unrevivable.
   it('shows no compose input for a completed teammate with no SDK session to resume', async () => {
-    const { store, container } = renderRail();
-    await act(async () => {
-      store.set(teammatesAtom, [teammate('agent-a', 'code-reviewer', 'completed')]);
-    });
-    await openTile(store, 'agent-a');
+    const { container } = await renderTile([teammate('agent-a', 'code-reviewer', 'completed')]);
 
     expect(container.querySelector('.teammate-tile-input')).toBeNull();
     expect(container.querySelector('.teammate-tile-inactive')).not.toBeNull();
   });
 
   it('opens compose directly for an ended teammate the backend would revive silently', async () => {
-    const { store, container } = renderRail();
-    await act(async () => {
-      store.set(teammatesAtom, [revivable()]);
-    });
-    await openTile(store, 'agent-a');
+    const { container } = await renderTile([revivable()]);
 
     expect(container.querySelector('.teammate-tile-revive')).toBeNull();
     const textarea = container.querySelector('.teammate-tile-input') as HTMLTextAreaElement;
@@ -198,11 +159,9 @@ describe('TeammateTileRail', () => {
   });
 
   it('refuses compose for an ended teammate past the revival window', async () => {
-    const { store, container } = renderRail();
-    await act(async () => {
-      store.set(teammatesAtom, [{ ...revivable(), endedAt: Date.now() - 25 * 60 * 60 * 1000 }]);
-    });
-    await openTile(store, 'agent-a');
+    const { container } = await renderTile([
+      { ...revivable(), endedAt: Date.now() - 25 * 60 * 60 * 1000 },
+    ]);
 
     expect(container.querySelector('.teammate-tile-input')).toBeNull();
     expect(container.querySelector('.teammate-tile-revive')).toBeNull();
@@ -210,11 +169,7 @@ describe('TeammateTileRail', () => {
   });
 
   it('makes a user-shutdown teammate confirm a revive before compose opens, and carries the flag', async () => {
-    const { store, container } = renderRail();
-    await act(async () => {
-      store.set(teammatesAtom, [revivable('user-shutdown')]);
-    });
-    await openTile(store, 'agent-a');
+    const { container } = await renderTile([revivable('user-shutdown')]);
 
     expect(container.querySelector('.teammate-tile-input')).toBeNull();
     await act(async () => {
@@ -234,11 +189,7 @@ describe('TeammateTileRail', () => {
   });
 
   it('sends nothing and keeps compose shut when a user-shutdown revive is cancelled', async () => {
-    const { store, container } = renderRail();
-    await act(async () => {
-      store.set(teammatesAtom, [revivable('user-shutdown')]);
-    });
-    await openTile(store, 'agent-a');
+    const { container } = await renderTile([revivable('user-shutdown')]);
 
     await act(async () => {
       fireEvent.click(container.querySelector('.teammate-tile-revive')!);
@@ -250,16 +201,5 @@ describe('TeammateTileRail', () => {
     expect(sendMessageToTeammate).not.toHaveBeenCalled();
     expect(container.querySelector('.teammate-tile-input')).toBeNull();
     expect(container.querySelector('.teammate-tile-revive')).not.toBeNull();
-  });
-
-  it('closes only the tile whose close control was used', async () => {
-    const { store, tiles, container } = renderRail();
-    await openTile(store, 'agent-a', 'agent-b');
-
-    await act(async () => {
-      fireEvent.click(container.querySelectorAll('.teammate-tile-close')[0]);
-    });
-
-    expect(tiles().map(t => t.getAttribute('data-agent-id'))).toEqual(['agent-b']);
   });
 });

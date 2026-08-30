@@ -383,6 +383,67 @@ export const activeTileAtomFamily = atomFamily((_key: string) =>
   atom<ActiveTileRef | null>(null)
 );
 
+/**
+ * Per-session order in which the pane's tiles were opened, interleaving both
+ * kinds. The two `openXTilesAtomFamily` lists stay the authority on *whether* a
+ * tile is open; this only records the cross-kind ordering neither of them can
+ * express on its own.
+ *
+ * Readers filter it against those lists, so closing a tile never has to touch
+ * it, and a tile opened through the older toggle atoms (which don't write here)
+ * simply falls to the end rather than disappearing.
+ */
+export const paneTileOrderAtomFamily = atomFamily((_sessionId: string) =>
+  atom<ActiveTileRef[]>([])
+);
+
+/**
+ * Write-only: open-or-focus for a teammate tile. Opens the tile if it is not
+ * open yet, and focuses it in the root pane. Never closes a tile - closing is
+ * the tile header's own control now, so a chip click on an already-focused
+ * tile is a no-op.
+ */
+export const openOrFocusTeammateTileAtom = atom(
+  null,
+  (get, set, { sessionId, agentId }: { sessionId: string; agentId: string }) => {
+    const openTiles = openTeammateTilesAtomFamily(sessionId);
+    const open = get(openTiles);
+    if (!open.includes(agentId)) {
+      set(openTiles, [...open, agentId]);
+      const order = paneTileOrderAtomFamily(sessionId);
+      set(order, [
+        ...get(order).filter(ref => !(ref.kind === 'teammate' && ref.id === agentId)),
+        { kind: 'teammate', id: agentId },
+      ]);
+    }
+    const activeTile = activeTileAtomFamily(activeTileKey(sessionId, ROOT_PANE_ID));
+    const active = get(activeTile);
+    if (active?.kind === 'teammate' && active.id === agentId) return;
+    set(activeTile, { kind: 'teammate', id: agentId });
+  }
+);
+
+/** Write-only: the Task sub-agent sibling of `openOrFocusTeammateTileAtom`. */
+export const openOrFocusTaskTileAtom = atom(
+  null,
+  (get, set, { sessionId, taskId }: { sessionId: string; taskId: string }) => {
+    const openTiles = openTaskTilesAtomFamily(sessionId);
+    const open = get(openTiles);
+    if (!open.includes(taskId)) {
+      set(openTiles, [...open, taskId]);
+      const order = paneTileOrderAtomFamily(sessionId);
+      set(order, [
+        ...get(order).filter(ref => !(ref.kind === 'task' && ref.id === taskId)),
+        { kind: 'task', id: taskId },
+      ]);
+    }
+    const activeTile = activeTileAtomFamily(activeTileKey(sessionId, ROOT_PANE_ID));
+    const active = get(activeTile);
+    if (active?.kind === 'task' && active.id === taskId) return;
+    set(activeTile, { kind: 'task', id: taskId });
+  }
+);
+
 /** Task info from SDK-native sub-agents (task_started/task_progress/task_notification) */
 export interface TaskInfo {
   taskId: string;

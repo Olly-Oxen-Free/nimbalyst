@@ -1,28 +1,25 @@
 /**
- * TeammateTileRail - the column of teammate transcript tiles that sits beside
- * the main thread in `SessionTranscript`, alongside `TaskTileRail`. Clicking a
- * teammate chip (inline row) or a Teammates sidebar row toggles that
- * teammate's tile in `openTeammateTilesAtomFamily`.
+ * TeammateTile - one teammate's transcript, as shown inside a `TiledRegion`
+ * pane alongside `TaskTile`. Clicking a teammate chip (inline row) or a
+ * Teammates sidebar row opens that teammate's tile in
+ * `openTeammateTilesAtomFamily`.
  *
- * Sibling of `TaskTileRail`, not a shared component with it: a teammate tile
- * is interactive (compose input, stop control) where a Task tile is read-only,
- * so the two kinds don't share tile-body logic, matching how
+ * Sibling of `TaskTile`, not a shared component with it: a teammate tile is
+ * interactive (compose input, stop control) where a Task tile is read-only, so
+ * the two kinds don't share tile-body logic, matching how
  * `TeammateThreadPopover`/`TaskThreadPopover` are also two independent
  * implementations rather than one kind-branching component.
  *
- * Layout decisions mirror `TaskTileRail`'s (see its own doc comment for the
- * reasoning): main thread keeps priority, many tiles scroll rather than
- * shrink, zero tiles renders nothing, a tile is user-closable and never
- * auto-closes.
+ * The tile fills whatever pane the region gives it, and the pane's
+ * `TileHeaderBar` owns the close control, so the tile has none of its own. A
+ * tile never auto-closes.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useAtomValue, useSetAtom } from 'jotai';
+import { useAtomValue } from 'jotai';
 import { RichTranscriptView } from '@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView';
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
 import {
-  closeTeammateTileAtom,
-  openTeammateTilesAtomFamily,
   sessionTeammatesAtom,
   teammateTranscriptSignalAtomFamily,
   teammateTranscriptSignalKey,
@@ -32,11 +29,6 @@ import { mapTeammateStatus } from '../../store/atoms/subAgentStatus';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { ConfirmDialog } from '../ConfirmDialog/ConfirmDialog';
 import type { TeammateInfo } from './TeammatePanel';
-
-/** Per-tile width. Below this a transcript is not readable. */
-const TILE_WIDTH = 320;
-/** Share of the row the rail may take before it starts scrolling horizontally. */
-const MAX_RAIL_WIDTH = '50%';
 
 /** Matches the hover popover's knobs - a teammate's reasoning is most of what
  *  the architect opens this to read. */
@@ -85,14 +77,13 @@ function teammateComposeMode(
   return reviveConfirmed ? 'compose' : 'revive';
 }
 
-interface TeammateTileProps {
+export interface TeammateTileProps {
   sessionId: string;
   agentId: string;
 }
 
-const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
+export const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
   const workspacePath = useAtomValue(sessionListWorkspaceAtom);
-  const closeTile = useSetAtom(closeTeammateTileAtom);
   const teammates = useAtomValue(sessionTeammatesAtom(sessionId));
   const teammate = useMemo(
     () => teammates.find(t => t.agentId === agentId),
@@ -209,10 +200,6 @@ const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
     }
   }, [handleSend]);
 
-  const handleClose = useCallback(() => {
-    closeTile({ sessionId, agentId });
-  }, [closeTile, sessionId, agentId]);
-
   const status = teammate ? mapTeammateStatus(teammate.status) : 'complete';
   // Never the lead's id, and never the hover popover's key: RichTranscriptView
   // caches virtual-list state per sessionId.
@@ -222,8 +209,7 @@ const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
 
   return (
     <div
-      className="teammate-tile flex flex-col rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] overflow-hidden"
-      style={{ flex: `0 0 ${TILE_WIDTH}px`, width: TILE_WIDTH }}
+      className="teammate-tile flex flex-col h-full w-full min-h-0 rounded-md border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] overflow-hidden"
       data-agent-id={agentId}
       data-status={status}
     >
@@ -248,14 +234,6 @@ const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
             {stopping ? 'Stopping…' : 'Stop'}
           </button>
         )}
-        <button
-          type="button"
-          className="teammate-tile-close shrink-0 bg-transparent border-none cursor-pointer text-[var(--nim-text-muted)] hover:text-[var(--nim-text)] leading-none px-1"
-          onClick={handleClose}
-          aria-label={`Close ${teammateName} tile`}
-        >
-          &#x2715;
-        </button>
       </div>
       <div className="teammate-tile-body flex-1 min-h-0 overflow-hidden">
         {loading ? (
@@ -336,32 +314,3 @@ const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
 };
 
 TeammateTile.displayName = 'TeammateTile';
-
-export interface TeammateTileRailProps {
-  sessionId: string;
-}
-
-/** Renders one tile per open teammate, or nothing when none are open. */
-export const TeammateTileRail: React.FC<TeammateTileRailProps> = React.memo(({ sessionId }) => {
-  const openAgentIds = useAtomValue(openTeammateTilesAtomFamily(sessionId));
-  const tiles = useMemo(
-    () => openAgentIds.map(agentId => (
-      <TeammateTile key={agentId} sessionId={sessionId} agentId={agentId} />
-    )),
-    [openAgentIds, sessionId],
-  );
-
-  if (openAgentIds.length === 0) return null;
-
-  return (
-    <div
-      className="teammate-tile-rail flex gap-2 overflow-x-auto overflow-y-hidden"
-      style={{ flex: '0 1 auto', maxWidth: MAX_RAIL_WIDTH }}
-      aria-label="Teammate transcripts"
-    >
-      {tiles}
-    </div>
-  );
-});
-
-TeammateTileRail.displayName = 'TeammateTileRail';
