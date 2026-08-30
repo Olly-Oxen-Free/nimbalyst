@@ -30,7 +30,7 @@ waves:
   - wave: 10
     tasks: ["11a"]
     note: "CHANGELOG entry, after all behavior changes land"
-longest_chain: ["1a", "3a", "4a", "5a", "6a", "8a", "10a", "11a"]
+longest_chain: ["1a", "3a", "4a", "5a", "6a", "7a", "10a", "11a"]
 total_complexity: 45
 max_parallel: 1
 note: "Worktree-free-local cadence (no PRs, no git worktrees, no gh), per D7: all tasks edit the main checkout on feature/native-tile-system sequentially, one at a time, coordinator commits per task. Every wave is single-task -- sequenced for both genuine dependencies and file-conflict safety in the shared checkout, matching PRD 006-010 precedent for this repo."

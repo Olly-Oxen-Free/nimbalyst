@@ -134,10 +134,12 @@ user-facing or code-facing term).
 
 Each pane in the tiled region renders a **stack of slim window-manager-style header bars, one per
 tile currently occupying that pane** -- not a relocated chip row. Each header bar shows: a status
-dot (reusing the normalized `SubAgentStatus` color vocabulary already shared by `SubAgentChipRow`'s
-`STATUS_CLASSES` and `SubagentStatusChip` in `packages/runtime/src/ui/AgentTranscript/components/
-SubagentCardPieces.tsx` -- both derive from `store/atoms/subAgentStatus.ts`'s `mapTeammateStatus`/
-`mapTaskStatus`; the header must reuse this derivation, not invent new color literals), the
+dot (reusing the normalized `SubAgentStatus` color vocabulary `SubAgentChipRow`'s `STATUS_CLASSES`
+already derives from `store/atoms/subAgentStatus.ts`'s `mapTeammateStatus`/`mapTaskStatus` -- the
+header must reuse this derivation, not invent new color literals. Note: `SubagentStatusChip` in
+`packages/runtime/src/ui/AgentTranscript/components/SubagentCardPieces.tsx` is NOT a reuse target
+here -- it takes an unrelated `SubagentStatus` type and hand-mirrors its colors rather than deriving
+from `mapTeammateStatus`/`mapTaskStatus`), the
 teammate/task name, a model badge, a drag handle, and a close control (X). Clicking a header
 focuses that tile within its pane; a pane with only one tile still shows its header (for
 drag-to-split affordance and the close control) but renders as a single slim bar, not a
