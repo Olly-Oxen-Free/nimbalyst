@@ -355,6 +355,34 @@ export const closeTeammateTileAtom = atom(
   }
 );
 
+/** Which open tile a pane currently has focused. */
+export interface ActiveTileRef {
+  kind: 'teammate' | 'task';
+  id: string;
+}
+
+/**
+ * Placeholder pane id, used until task 4a builds the real multi-pane mosaic
+ * tree and threads each pane's own id through. Only the key *shape* matters
+ * now: `activeTileAtomFamily` is pane-scoped from the start so splitting never
+ * has to migrate it.
+ */
+export const ROOT_PANE_ID = 'root';
+
+/** Builds the compound key used by `activeTileAtomFamily`. */
+export function activeTileKey(sessionId: string, paneId: string): string {
+  return `${sessionId}:${paneId}`;
+}
+
+/**
+ * Per-(session, pane) pointer at the open tile that is currently frontmost.
+ * Additive: the open-tile atom families keep their own shape, this only says
+ * which of the already-open tiles a pane is showing.
+ */
+export const activeTileAtomFamily = atomFamily((_key: string) =>
+  atom<ActiveTileRef | null>(null)
+);
+
 /** Task info from SDK-native sub-agents (task_started/task_progress/task_notification) */
 export interface TaskInfo {
   taskId: string;
