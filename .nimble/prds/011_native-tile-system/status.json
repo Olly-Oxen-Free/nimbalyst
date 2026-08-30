@@ -3,7 +3,7 @@
   "prd_number": "011",
   "phase": "executing",
   "created": "2026-08-29",
-  "status": "running",
+  "status": "paused-at-gate",
   "notes": "Revision 3, approved by live user (locked D1R3: per-pane TileHeaderBar header-bar stacks, superseding revision 2's relocated-SubAgentChipRow switcher, which was built through task 4a, reviewed live, and rejected -- discarded commits preserved on archive/011-chip-switcher). feature/native-tile-system was reset to commit 7b9e017ac (task 1a only); tasks 3a onward re-execute against the header-bar design. Execution rule: NO PRs ever, no gh; worktree-free-local cadence (PRD 006-010 precedent) -- workers edit the shared main checkout on feature/native-tile-system sequentially, coordinator reviews/tests/commits per task. Wave-3 gate (after task 4a) is a pause gate: human confirms the live header-bar switcher implementation matches the approved design before waves 4-10 proceed.",
   "tasks_total": 10,
   "waves": 10,
@@ -25,6 +25,15 @@
       "state": "done",
       "commit": "172edffb3",
       "wave": 2
+    },
+    "4a": {
+      "state": "done",
+      "commit": "56d50df32",
+      "wave": 3
     }
+  },
+  "gate_reached": {
+    "wave": 3,
+    "label": "confirm header-bar switcher (D1R3) and mosaic single-pane model before splitting lands"
   }
 }
