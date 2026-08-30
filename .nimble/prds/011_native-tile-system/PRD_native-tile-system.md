@@ -2,13 +2,11 @@
 
 ## Status
 
-Draft, unapproved. Planned via a background /nimble:plan dispatch with no live interactive user
-present -- per explicit dispatch instruction, the coordinator (this session) made the interview's
-judgment calls directly from the user's own feature-request brief rather than running a live Q&A,
-and documents every such call below in Decisions. Anything genuinely ambiguous or product-level is
-listed under Open Questions instead of being silently resolved, per the same instruction. This PRD
-requires human review and explicit approval (folder numbering + status: ready) before
-`/nimble:run` -- that step was intentionally not taken by this dispatch.
+Draft, unapproved -- revision 2. Planned via a background /nimble:plan dispatch with no live
+interactive user present; revised after the user reviewed 4 visual mockup options for the tile
+switcher and made a live decision (see Decisions D1, now locked). All Open Questions from revision
+1 are now resolved -- **none remain blocking approval.** This PRD still requires explicit human
+approval (folder numbering + status: ready) before `/nimble:run`.
 
 Execution rule (repo-wide, confirmed by user for this dispatch, consistent with PRD 006-010
 precedent): **no PR workflow, ever.** No `gh` usage, no GitHub PRs. Execution uses the
@@ -35,7 +33,8 @@ system from scratch:
 The user wants to extend the *existing* app-wide structure to tiles, instead of continuing to grow
 a parallel, bespoke one:
 
-1. Each tile gets a tab, identical to the top tab list.
+1. Each tile gets a tab, identical to the top tab list. (Superseded by D1 in revision 2: the tab
+   strip reuse was rejected; tiles are switched via the relocated `SubAgentChipRow`, not a tab.)
 2. The bottom task bar (shared compose UI) replaces each tile's own custom message box.
 3. Tiles can be tiled horizontally as well as vertically, via manual drag, niri-style (drag toward
    an edge to split; tiles in the same region can be stacked).
@@ -45,11 +44,36 @@ a parallel, bespoke one:
 Full detail in `research/internal/findings.md`, `research/external/findings.md`,
 `research/summary.md`. Summary:
 
-- **Top tab strip is reusable.** `TabBar.tsx`/`TabManager.tsx`
-  (`packages/electron/src/renderer/components/TabManager/`) take `tabs`/`activeTabId` as props (not
-  hard-wired globally) and already have a `kind` discriminator precedent (`'file' | 'tracker'`).
-  Adding `'teammate'`/`'task'` kinds and instantiating one `TabBar` per tiled region is additive,
-  not a redesign.
+- **Top tab strip finding -- superseded by D1 (revision 2).** Revision 1 recommended reusing
+  `TabBar.tsx`/`TabManager.tsx` (`packages/electron/src/renderer/components/TabManager/`) as the
+  tile switcher, adding `'teammate'`/`'task'` `kind` values to its existing `'file' | 'tracker'`
+  discriminator. The user rejected this after review: `TabBar` is scoped to parallel agent
+  *sessions* (top-level tabs), and reusing it for sub-agent tiles would conflate two different
+  things. **Superseded by D1**: the tile switcher is the existing `SubAgentChipRow` component,
+  relocated and repurposed, not `TabBar`. `TabBar`/`TabManager` are unaffected by this PRD.
+- **`SubAgentChipRow` is already most of the switcher.**
+  (`packages/electron/src/renderer/components/AgentMode/SubAgentChipRow.tsx`) already renders one
+  chip per open teammate/task sub-agent, reading `sessionTeammatesAtom`/`sessionTasksAtom` directly
+  (no `Tab[]` projection needed). It already sits directly above the compose bar in
+  `SessionTranscript.tsx` (line ~2746), and its `onTeammateClick`/`onTaskClick` handlers already
+  call `toggleTeammateTileAtom`/`toggleTaskTileAtom` -- both chip kinds are already unified to a
+  single click-to-tile behavior (a prior PRD already collapsed the teammate chip's old
+  click-opens-popover behavior into the same toggle-tile behavior the task chip uses). This is why
+  D1's "relocate and repurpose" framing is accurate: the click-to-open-a-tile behavior already
+  exists; what's new is (a) its position (top of the tiled region, not bottom, near compose), (b) a
+  drag-source capability it does not have today (needed for 5a/6a's edge/center drop), and (c) its
+  click semantics changing from toggle-open/close to open-or-focus (closing a tile remains the
+  tile's own Close control, unchanged).
+- **`SubAgentChipRow` has no drag-and-drop today.** Its chips are plain `<div role="button">`
+  elements with `onClick`/`onKeyDown` only -- no `draggable`/`dataTransfer` wiring. This differs
+  from revision 1's assumption (that `TabBar`'s existing native-HTML5 tab-drag could be reused
+  as-is): task 3a must add drag-source capability to the chip from scratch, and task 1a's DnD
+  compatibility check (below) now determines *which* mechanism 3a builds with, not just whether an
+  existing mechanism is compatible.
+- **`TeammateThreadPopover.tsx` is pre-existing dead code, unrelated to this PRD.** It has no
+  render callsite anywhere in the app (only its own test renders it) -- the teammate chip's click
+  behavior already moved to toggle-tile in a prior PRD and nothing was cleaned up. Out of scope to
+  fix here; flagged for 10a's dead-reference sweep to note (not silently touch).
 - **Bottom compose bar is reusable.** `AIInput.tsx` (wrapped by `SessionAIInput` in
   `SessionTranscript.tsx`, both under `packages/electron/src/renderer/components/UnifiedAI/`) is
   already parameterized by `sessionId`. It directly resolves the duplication
@@ -72,8 +96,9 @@ Full detail in `research/internal/findings.md`, `research/external/findings.md`,
 
 ## Goals
 
-1. A tile (teammate or task) presents as a tab, visually and behaviorally consistent with the
-   app's existing tab strip component.
+1. A tile (teammate or task) is switched to via the existing `SubAgentChipRow` chip component,
+   relocated to the top of the tiled region and repurposed as a switcher -- preserving its current
+   visual identity (status dot, name, model badge) exactly, per D1.
 2. A tile's compose box is the app's existing shared bottom compose bar, not a bespoke duplicate.
 3. Tiles can be manually dragged to split the tiled region horizontally or vertically (niri-style
    edge-drop), and tiles in the same split region can be stacked (tabbed) together.
@@ -86,14 +111,21 @@ Full detail in `research/internal/findings.md`, `research/external/findings.md`,
 - Any change to how teammates/tasks are spawned, stopped, or revived (only how they are *presented
   and composed to*).
 
-## Decisions (judgment calls made during this background-dispatch interview, not by a live user)
+## Decisions
 
-**D1 -- Tab strip scoping.** Tiles get their OWN tab strip -- visually/behaviorally identical to
-the top one (same `TabBar` component, reused), but scoped to the tiled region, not merged into the
-same tab strip/namespace as document/editor tabs. Rationale: avoids conflating document tabs and
-agent tiles in one namespace; matches the safer default named in the dispatch brief. **Also listed
-under Open Questions below** -- this changes user-facing information architecture and should be
-confirmed by the user before or at PRD approval, not just accepted because a coordinator picked it.
+**D1 -- Tile switcher component (LOCKED, live user decision).** Revision 1 proposed reusing
+`TabBar` for a tile-scoped tab strip; the user reviewed 4 visual mockup options (niri-style stacked
+headers / segmented pill switcher / tab-strip lookalike / no-chrome-by-default) and rejected the
+`TabBar`-reuse framing entirely -- `TabBar` is scoped to parallel agent *sessions*, and conflating
+that with sub-agent *tiles* would be wrong. **Chosen: Option B (segmented pill switcher),
+implemented by relocating the existing `SubAgentChipRow` component** (currently rendered just above
+the compose bar in `SessionTranscript.tsx`) to the top of the tiled region, and repurposing its
+existing click-to-tile behavior to focus a tile within the region's stack instead of toggling a
+standalone rail tile open/closed. This is a relocation and behavioral repurposing of an existing
+component, not a new component build -- the chip's visual identity (status dot, name, model badge)
+is preserved exactly. No new pill/segment/tab-strip component is built from scratch. This
+supersedes revision 1's `TabBar`-reuse research finding (see Research Findings above) and resolves
+former OQ1.
 
 **D2 -- Split-pane engine.** Adopt `react-mosaic-component` rather than hand-build a binary-tree
 split-pane engine. Rationale: it is the only evaluated library that natively models both
@@ -116,35 +148,28 @@ tab-stacking within one region, and resizable split dividers are IN scope. Full 
 (workspaces, dynamic column widths, focus-follows-mouse) is OUT of scope, per explicit user
 instruction -- do not silently expand scope to chase parity.
 
-**D6 -- Layout persistence.** Split-pane layout (the mosaic tree shape) persists only for the
-session's lifetime (a Jotai atom), not across app restarts, to bound this PRD's scope. Also listed
-under Open Questions -- persisting layout across restarts is a reasonable should-have the user may
-want, deferred rather than silently dropped.
+**D6 -- Layout persistence (LOCKED).** Split-pane layout (the mosaic tree shape) persists only for
+the session's lifetime (a Jotai atom), not across app restarts (former OQ3, now locked to this
+default). Kept as a should-have (R8, deferred) since it is a reasonable future want, not dropped.
 
 **D7 -- Execution cadence.** No PR workflow, ever, per explicit user instruction for this repo.
 Worktree-free-local cadence, feature branch, `git merge --ff-only` to main -- matching PRD
 006-010 precedent, encoded in `.execution_config.json` below.
 
-## Open Questions (for user confirmation -- NOT resolved by this dispatch)
+**D8 -- Unified tiled region (LOCKED).** Teammate and task tiles share ONE unified tiled region
+(former OQ4, now locked). Since the switcher (D1) is the same `SubAgentChipRow` that already lists
+teammates and tasks together in one row with unified chip styling, a unified region is the natural
+default -- a segregated-region design would require either two separate chip-row instances (losing
+the "one relocated row" simplicity D1 chose) or artificial filtering of a single row into two
+regions, neither of which the user's decision calls for.
 
-**OQ1.** Confirm D1: should tiles get their own tab strip scoped to the tiled region (current
-default), or should tiles literally join the SAME tab strip as document/editor tabs (one unified
-tab row for everything open)? This changes the app's information architecture and should be a
-human call before/at PRD approval.
+## Open Questions
 
-**OQ2.** `react-mosaic-component` version: v6 (stable, binary-tree model) vs v7 (beta at research
-time, n-ary tree model). Needs a pre-implementation check (task 1a) before the split-pane engine
-task begins -- this PRD does not block planning on it, but flags it so the check isn't skipped.
-
-**OQ3.** Should split-pane layout persist across app restarts (via workspace-settings, IPC-routed,
-never `localStorage`), or is session-lifetime-only (D6's default) acceptable for v1? Deferred as a
-should-have if the user wants it.
-
-**OQ4.** Do teammate and task tiles share ONE unified tiled region (a teammate tab and a task tab
-can sit side-by-side or stacked together), or do teammate tiles and task tiles get separate tiled
-regions that don't mix? The dispatch brief implies unified (niri-style tiling is spatial, not
-type-segregated), and this PRD's tasks assume a single unified region -- but this is a product call
-the user should confirm, since it affects task 3a/4a's component boundaries.
+None remain blocking approval. Former OQ1 is resolved by D1 (live user decision). Former OQ3 is
+locked by D6 (session-only, deferred as should-have R8). Former OQ4 is locked by D8 (unified
+region). Former OQ2 (`react-mosaic-component` v6 vs v7) was never a product-level open question --
+it is a pre-implementation technical check already embedded in task 1a's description, executed
+before the split-pane engine task begins; it does not block PRD approval and is not re-listed here.
 
 ## Requirements
 
@@ -152,10 +177,10 @@ the user should confirm, since it affects task 3a/4a's component boundaries.
 
 | ID | Requirement | Acceptance Criteria |
 | -- | ----------- | -------------------- |
-| R1 | Teammate/task tiles present as tabs via the existing `TabBar` component | A tile's tab is visually and behaviorally consistent with the top tab strip (open/close/reorder/active-state) |
+| R1 | Teammate/task tiles are switched to via the relocated, repurposed `SubAgentChipRow` | A tile's chip sits in a switcher row at the top of the tiled region; clicking it opens-or-focuses that tile's content within the region's active stack; the chip's existing visual identity (status dot, name, model badge) is unchanged |
 | R2 | Tile compose box is the shared `AIInput`/`SessionAIInput` component | No bespoke duplicated compose box remains in `TeammateTileRail.tsx`/`TaskTileRail.tsx` |
-| R3 | Drag a tile's tab to an edge of another pane to split horizontally or vertically | Drop edge determines split orientation, matching niri's manual-tiling model |
-| R4 | Drag a tile's tab to the center of another pane to stack (tab together) instead of splitting | Both tiles are reachable via tabs within the same pane after a center-drop |
+| R3 | Drag a chip to an edge of another pane to split horizontally or vertically | Drop edge determines split orientation, matching niri's manual-tiling model |
+| R4 | Drag a chip to the center of another pane to stack (tab together) instead of splitting | Both tiles are reachable via chips within the same pane's stack after a center-drop |
 | R5 | Split dividers are resizable | Dragging a divider resizes adjacent panes |
 | R6 | Existing tile-open atoms and transcript-fetch IPC are unmodified | No task in this PRD changes `openTeammateTilesAtomFamily`'s shape or `aiGetTeammateTranscript`'s contract |
 
@@ -173,7 +198,7 @@ the user should confirm, since it affects task 3a/4a's component boundaries.
 
 ## Tasks
 
-See `tasks.yaml` for the full executable task breakdown (11 tasks, single-shared-checkout
+See `tasks.yaml` for the full executable task breakdown (10 tasks, single-shared-checkout
 sequential waves per D7).
 
 ## Testing
@@ -181,6 +206,6 @@ sequential waves per D7).
 Per this repo's CLAUDE.md: any task touching runtime behavior ships with red-first unit test
 coverage; no presentation-only tests (no CSS-class/drag-state assertions, no
 `readFileSync`+`toContain` source assertions). Each task below embeds its own test instructions.
-Extend existing test files (`TeammateTileRail.test.tsx`, `TaskTileRail.test.tsx`,
-`TabBar.test.tsx`/`TabManager` tests if they exist -- check first) rather than adding new ones
-where a suitable file already exists.
+Extend existing test files (`SubAgentChipRow.test.tsx`, `TeammateTileRail.test.tsx`,
+`TaskTileRail.test.tsx` -- check first) rather than adding new ones where a suitable file already
+exists.

@@ -16,11 +16,11 @@
       "model": "pause",
       "placements": [
         {
-          "after_wave": 4,
-          "label": "Foundational tiling engine (react-mosaic single-node integration) landed -- confirm version choice (OQ2), tab-strip-scoping decision (OQ1), and unified-vs-segregated tiled regions (OQ4, now baked into 3a/4a's component boundaries) before building split/stack/compose-reuse on top."
+          "after_wave": 3,
+          "label": "Foundational tiling engine (react-mosaic single-node integration, task 4a) landed on top of the relocated/repurposed SubAgentChipRow switcher (task 3a, D1) -- confirm the react-mosaic version choice (1a) and that the relocated chip switcher behaves as expected before building split/stack/compose-reuse on top."
         }
       ],
-      "note": "Unlike PRD 010, this PRD was NOT pre-approved gate-by-gate by a live user during planning -- it was planned in a background dispatch. The wave-4 gate is set to pause (not skip-on-pass) so a human explicitly confirms the two flagged open questions (OQ1, OQ2) before the remaining 7 tasks build on that foundation."
+      "note": "Revision 2: D1 (chip-row relocation) was a live user decision made after reviewing 4 visual mockup options, so it is no longer an open question -- but the wave-3 gate (after task 4a, the first task that actually renders the relocated switcher inside the new mosaic host) stays a pause gate, not skip-on-pass, so a human confirms the live implementation matches the approved mockup before the remaining 7 tasks build on it."
     }
   },
   "models": {
@@ -28,8 +28,7 @@
     "complexity_threshold": 5,
     "assignments": {
       "1a": "sonnet",
-      "2a": "sonnet",
-      "3a": "sonnet",
+      "3a": "opus",
       "4a": "opus",
       "5a": "opus",
       "6a": "opus",

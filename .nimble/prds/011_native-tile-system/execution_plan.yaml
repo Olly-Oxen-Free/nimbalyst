@@ -2,38 +2,35 @@ prd_slug: "native-tile-system"
 waves:
   - wave: 1
     tasks: ["1a"]
-    note: "react-mosaic version decision -- foundational, no dependents yet in this wave"
+    note: "react-mosaic version decision, and determines which DnD mechanism task 3a builds the chip's drag-source with -- foundational, no dependents yet in this wave"
   - wave: 2
-    tasks: ["2a"]
-    note: "Tab model extension -- logically independent of 1a, sequenced next for single-shared-checkout safety"
-  - wave: 3
     tasks: ["3a"]
-    note: "TileTabStrip -- depends on 2a's Tab kinds"
-  - wave: 4
+    note: "Relocate and repurpose the existing SubAgentChipRow as the tile-stack switcher (D1) -- depends on 1a's DnD mechanism decision"
+  - wave: 3
     tasks: ["4a"]
-    note: "Core single-node react-mosaic integration -- depends on 1a (library) and 3a (tab strip). GATE follows this wave: confirm the mosaic version choice and the tab-strip-scoping decision (OQ1) are working as expected before building split/stack/compose-reuse on top."
-  - wave: 5
+    note: "Core single-node react-mosaic integration -- depends on 1a (library) and 3a (relocated chip switcher). GATE follows this wave: confirm the mosaic version choice and the relocated-chip-switcher design (D1) are working as expected before building split/stack/compose-reuse on top."
+  - wave: 4
     tasks: ["5a"]
-    note: "Drag-to-edge splitting -- depends on 4a's foundation"
-  - wave: 6
+    note: "Drag-to-edge splitting via the chip's drag-source (3a) -- depends on 4a's foundation; also extends active-tile state to be pane-scoped"
+  - wave: 5
     tasks: ["6a"]
     note: "Tab-stacking on center-drop -- depends on 5a; also sequenced after for file-conflict safety (both touch TiledRegion.tsx's drop-handling)"
-  - wave: 7
+  - wave: 6
     tasks: ["7a"]
     note: "Shared compose-bar reuse -- depends on 4a; sequenced after 6a for file-conflict safety in the shared checkout (touches TeammateTileRail.tsx/TaskTileRail.tsx which 5a/6a also touch indirectly)"
-  - wave: 8
+  - wave: 7
     tasks: ["9a"]
     note: "Resizable dividers + session-lifetime layout state -- depends on 5a; run before 8a's remount-safety task since 8a needs stacking (6a) and compose (7a) both landed"
-  - wave: 9
+  - wave: 8
     tasks: ["8a"]
     note: "Remount-safety hide-not-unmount -- depends on 6a and 7a, both landed by this point"
-  - wave: 10
+  - wave: 9
     tasks: ["10a"]
-    note: "Final integration -- migrate SessionTranscript.tsx, remove old rail path -- hard depends_on is 6a/7a/9a (all must-have); sequenced after 8a but does not require it, so an 8a descope at review does not block this wave"
-  - wave: 11
+    note: "Final integration -- migrate SessionTranscript.tsx, remove old rail path and the old standalone SubAgentChipRow call site -- hard depends_on is 6a/7a/9a (all must-have); sequenced after 8a but does not require it, so an 8a descope at review does not block this wave"
+  - wave: 10
     tasks: ["11a"]
     note: "CHANGELOG entry, after all behavior changes land"
-longest_chain: ["2a", "3a", "4a", "5a", "6a", "8a", "10a", "11a"]
-total_complexity: 46
+longest_chain: ["1a", "3a", "4a", "5a", "6a", "8a", "10a", "11a"]
+total_complexity: 44
 max_parallel: 1
 note: "Worktree-free-local cadence (no PRs, no git worktrees, no gh), per D7: all tasks edit the main checkout on feature/native-tile-system sequentially, one at a time, coordinator commits per task. Every wave is single-task -- sequenced for both genuine dependencies and file-conflict safety in the shared checkout, matching PRD 006-010 precedent for this repo."
