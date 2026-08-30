@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+- Panes can now be resized with draggable dividers, split and nested arbitrarily by dragging headers, stacked by dropping one onto another, and all use the app's unified message box.
 
 ### Fixed
 <!-- Bug fixes go here -->
