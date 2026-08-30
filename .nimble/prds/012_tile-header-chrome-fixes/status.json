@@ -1,9 +1,9 @@
 {
   "slug": "tile-header-chrome-fixes",
   "prd_number": "012",
-  "phase": "ready-for-merge",
+  "phase": "merged",
   "created": "2026-08-30",
-  "status": "executing",
+  "status": "complete",
   "notes": "Requirements from user live-test of PRD 011 (merged f297f677b), no interview run -- root causes verified against live source before planning. Execution rule: NO PRs ever, no gh; worktree-free-local cadence (PRD 006-011 precedent) -- workers edit the shared main checkout on feature/tile-header-chrome-fixes sequentially, coordinator (this session) reviews/tests/commits per task. Two tasks, sequential waves due to file overlap (TiledRegion.tsx/.css, TileHeaderBar.tsx).",
   "tasks_total": 2,
   "waves": 2,
