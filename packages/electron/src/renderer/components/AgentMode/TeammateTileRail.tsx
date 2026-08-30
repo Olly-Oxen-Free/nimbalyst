@@ -10,6 +10,9 @@
  * `TeammateThreadPopover`/`TaskThreadPopover` are also two independent
  * implementations rather than one kind-branching component.
  *
+ * The compose surface is the app's shared `AIInput`, not a box of this tile's
+ * own, and only the tile its pane currently shows mounts one (`composeActive`).
+ *
  * The tile fills whatever pane the region gives it, and the pane's
  * `TileHeaderBar` owns the close control, so the tile has none of its own. A
  * tile never auto-closes.
@@ -28,6 +31,7 @@ import { sessionListWorkspaceAtom } from '../../store/atoms/sessions';
 import { mapTeammateStatus } from '../../store/atoms/subAgentStatus';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { ConfirmDialog } from '../ConfirmDialog/ConfirmDialog';
+import { AIInput } from '../UnifiedAI/AIInput';
 import type { TeammateInfo } from './TeammatePanel';
 
 /** Matches the hover popover's knobs - a teammate's reasoning is most of what
@@ -60,6 +64,10 @@ const REVIVAL_ELIGIBILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
  * `TeammateThreadPopover` rather than shared -- the two compose surfaces are
  * independent implementations; keep them changed in lockstep.
  *
+ * This is the one part of composing the shared `AIInput` has no equivalent for,
+ * so it stays a wrapper *around* the input rather than something inside it: the
+ * 'compose' branch is the only one that mounts one.
+ *
  * Matches `TeammateManager.isRevivalEligible`, including its two judgment
  * calls: a row with no `endedAt` is not subject to the cutoff, and an unknown
  * `endReason` falls through to eligible.
@@ -80,9 +88,17 @@ function teammateComposeMode(
 export interface TeammateTileProps {
   sessionId: string;
   agentId: string;
+  /**
+   * Whether this tile is the one its pane currently shows. Only the focused
+   * tile of a pane gets a compose surface at all - the shared `AIInput` keys
+   * its undo stack and its voice-command registration off `sessionId`, so a
+   * stacked pane standing up one per occupant would have them fight over the
+   * key. Background tiles render no footer, not a hidden one.
+   */
+  composeActive: boolean;
 }
 
-export const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }) => {
+export const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId, composeActive }) => {
   const workspacePath = useAtomValue(sessionListWorkspaceAtom);
   const teammates = useAtomValue(sessionTeammatesAtom(sessionId));
   const teammate = useMemo(
@@ -193,13 +209,6 @@ export const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }
     if (confirmed) setReviveConfirmed(true);
   }, [confirmDialog, teammateName]);
 
-  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      void handleSend();
-    }
-  }, [handleSend]);
-
   const status = teammate ? mapTeammateStatus(teammate.status) : 'complete';
   // Never the lead's id, and never the hover popover's key: RichTranscriptView
   // caches virtual-list state per sessionId.
@@ -255,7 +264,7 @@ export const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }
           />
         )}
       </div>
-      {composeMode === 'inactive' ? (
+      {!composeActive ? null : composeMode === 'inactive' ? (
         <div className="teammate-tile-inactive px-2 py-1.5 border-t border-[var(--nim-border)] text-[10px] text-[var(--nim-text-faint)]">
           This teammate is no longer active — messages can&apos;t be delivered.
         </div>
@@ -274,29 +283,25 @@ export const TeammateTile: React.FC<TeammateTileProps> = ({ sessionId, agentId }
         </div>
       ) : (
         <div className="teammate-tile-compose flex flex-col gap-1 px-2 py-1.5 border-t border-[var(--nim-border)]">
-          <textarea
-            className="teammate-tile-input text-[11px] p-1 rounded border border-[var(--nim-border)] bg-[var(--nim-bg)] text-[var(--nim-text)] resize-none focus:outline-none focus:border-[var(--nim-primary)]"
-            rows={2}
+          <AIInput
             value={message}
-            placeholder={`Message ${teammateName}…`}
-            onChange={(e) => setMessage(e.target.value)}
-            onKeyDown={handleKeyDown}
+            onChange={setMessage}
+            onSend={() => { void handleSend(); }}
+            // `disabled`, not `isLoading`: with no `onCancel` to offer, the
+            // loading branch drops the send control entirely rather than
+            // greying it out, which is what the box here used to do.
             disabled={sendState === 'sending'}
+            placeholder={`Message ${teammateName}…`}
+            workspacePath={workspacePath ?? undefined}
+            // Not the lead's id: the lead's own compose bar is mounted beside
+            // this one, and AIInput keys per-session state (undo stack, voice
+            // command registration) off this prop.
+            sessionId={`${sessionId}:${agentId}`}
           />
-          <div className="flex items-center justify-between gap-2">
-            <span className="teammate-tile-send-status text-[10px] text-[var(--nim-text-faint)]">
-              {sendState === 'sent' && 'Sent'}
-              {sendState === 'failed' && 'Failed — try again'}
-            </span>
-            <button
-              type="button"
-              className="teammate-tile-send text-[10px] px-1.5 py-0.5 rounded bg-[var(--nim-primary)] text-white disabled:opacity-50"
-              onClick={handleSend}
-              disabled={!message.trim() || sendState === 'sending'}
-            >
-              {sendState === 'sending' ? 'Sending…' : 'Send'}
-            </button>
-          </div>
+          <span className="teammate-tile-send-status text-[10px] text-[var(--nim-text-faint)]">
+            {sendState === 'sent' && 'Sent'}
+            {sendState === 'failed' && 'Failed — try again'}
+          </span>
         </div>
       )}
       <ConfirmDialog

@@ -207,21 +207,24 @@ const TilePane: React.FC<TilePaneProps> = ({
         ))}
       </div>
       <div className="tiled-region-body">
-        {occupants.map(ref => (
-          <div
-            key={`${ref.kind}:${ref.id}`}
-            className="tiled-region-pane"
-            data-tile-kind={ref.kind}
-            data-tile-id={ref.id}
-            style={{
-              display: focused?.kind === ref.kind && focused.id === ref.id ? 'flex' : 'none',
-            }}
-          >
-            {ref.kind === 'teammate'
-              ? <TeammateTile sessionId={sessionId} agentId={ref.id} />
-              : <TaskTile sessionId={sessionId} taskId={ref.id} />}
-          </div>
-        ))}
+        {occupants.map(ref => {
+          const isFocused = focused?.kind === ref.kind && focused.id === ref.id;
+          return (
+            <div
+              key={`${ref.kind}:${ref.id}`}
+              className="tiled-region-pane"
+              data-tile-kind={ref.kind}
+              data-tile-id={ref.id}
+              style={{ display: isFocused ? 'flex' : 'none' }}
+            >
+              {ref.kind === 'teammate'
+                // Bodies stay mounted through a focus switch, but the compose
+                // surface does not: only the shown tile gets one.
+                ? <TeammateTile sessionId={sessionId} agentId={ref.id} composeActive={isFocused} />
+                : <TaskTile sessionId={sessionId} taskId={ref.id} />}
+            </div>
+          );
+        })}
       </div>
       {DROP_EDGES.map(edge => (
         <TileDropZone

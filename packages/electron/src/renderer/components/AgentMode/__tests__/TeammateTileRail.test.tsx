@@ -37,6 +37,28 @@ vi.mock('@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView', (
   ),
 }));
 
+// The real AIInput pulls the `@nimbalyst/runtime` barrel (and the Lexical tree
+// behind it). Stub it down to the three props the tile drives it with.
+vi.mock('../../UnifiedAI/AIInput', () => ({
+  AIInput: ({ value, onChange, onSend, sessionId, disabled }: {
+    value: string;
+    onChange: (next: string) => void;
+    onSend: () => void;
+    sessionId?: string;
+    disabled?: boolean;
+  }) => (
+    <div data-testid="ai-input" data-session-id={sessionId}>
+      <textarea
+        className="ai-input-stub"
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <button type="button" className="ai-input-stub-send" onClick={() => onSend()}>Send</button>
+    </div>
+  ),
+}));
+
 import { TeammateTile } from '../TeammateTileRail';
 import { sessionTeammatesAtom } from '../../../store/atoms/agentMode';
 
@@ -64,6 +86,16 @@ function revivable(endReason = 'finished') {
   });
 }
 
+/** Types into the shared input's stub and hits its send control. */
+async function compose(container: HTMLElement, text: string) {
+  fireEvent.change(container.querySelector('.ai-input-stub') as HTMLTextAreaElement, {
+    target: { value: text },
+  });
+  await act(async () => {
+    fireEvent.click(container.querySelector('.ai-input-stub-send')!);
+  });
+}
+
 /**
  * Renders one teammate tile the way `TiledRegion` mounts it: the tile no
  * longer owns the open list or a close control of its own (the pane's
@@ -72,14 +104,14 @@ function revivable(endReason = 'finished') {
 async function renderTile(teammates: unknown[] = [
   teammate('agent-a', 'code-reviewer', 'running'),
   teammate('agent-b', 'db-migrator', 'idle'),
-]) {
+], composeActive = true) {
   const store = createStore();
   store.set(teammatesAtom, teammates);
   let result!: ReturnType<typeof render>;
   await act(async () => {
     result = render(
       <Provider store={store}>
-        <TeammateTile sessionId="lead-1" agentId="agent-a" />
+        <TeammateTile sessionId="lead-1" agentId="agent-a" composeActive={composeActive} />
       </Provider>,
     );
   });
@@ -124,13 +156,27 @@ describe('TeammateTile', () => {
   it('lets the architect compose and send a message to a running teammate', async () => {
     const { container } = await renderTile();
 
-    const textarea = container.querySelector('.teammate-tile-input') as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: 'status update please' } });
-    await act(async () => {
-      fireEvent.click(container.querySelector('.teammate-tile-send')!);
-    });
+    await compose(container, 'status update please');
 
     expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-a', 'status update please', undefined);
+  });
+
+  // The shared input keys its undo stack and voice-command registration off
+  // `sessionId`, and the lead's own compose bar is mounted at the same time, so
+  // a tile has to claim a key of its own rather than the lead's.
+  it('drives the shared AIInput under a tile-scoped session key', async () => {
+    const { container } = await renderTile();
+
+    expect(container.querySelector('[data-testid="ai-input"]')!.getAttribute('data-session-id'))
+      .toBe('lead-1:agent-a');
+  });
+
+  it('renders no compose surface at all in a pane where another tile is focused', async () => {
+    const { container } = await renderTile(undefined, false);
+
+    expect(container.querySelector('[data-testid="ai-input"]')).toBeNull();
+    expect(container.querySelector('.teammate-tile-compose')).toBeNull();
+    expect(container.querySelector('.teammate-tile-inactive')).toBeNull();
   });
 
   // Was 'shows no compose input for a completed teammate, since it has no
@@ -141,7 +187,7 @@ describe('TeammateTile', () => {
   it('shows no compose input for a completed teammate with no SDK session to resume', async () => {
     const { container } = await renderTile([teammate('agent-a', 'code-reviewer', 'completed')]);
 
-    expect(container.querySelector('.teammate-tile-input')).toBeNull();
+    expect(container.querySelector('[data-testid="ai-input"]')).toBeNull();
     expect(container.querySelector('.teammate-tile-inactive')).not.toBeNull();
   });
 
@@ -149,11 +195,7 @@ describe('TeammateTile', () => {
     const { container } = await renderTile([revivable()]);
 
     expect(container.querySelector('.teammate-tile-revive')).toBeNull();
-    const textarea = container.querySelector('.teammate-tile-input') as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: 'pick this back up' } });
-    await act(async () => {
-      fireEvent.click(container.querySelector('.teammate-tile-send')!);
-    });
+    await compose(container, 'pick this back up');
 
     expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-a', 'pick this back up', undefined);
   });
@@ -163,7 +205,7 @@ describe('TeammateTile', () => {
       { ...revivable(), endedAt: Date.now() - 25 * 60 * 60 * 1000 },
     ]);
 
-    expect(container.querySelector('.teammate-tile-input')).toBeNull();
+    expect(container.querySelector('[data-testid="ai-input"]')).toBeNull();
     expect(container.querySelector('.teammate-tile-revive')).toBeNull();
     expect(container.querySelector('.teammate-tile-inactive')).not.toBeNull();
   });
@@ -171,7 +213,7 @@ describe('TeammateTile', () => {
   it('makes a user-shutdown teammate confirm a revive before compose opens, and carries the flag', async () => {
     const { container } = await renderTile([revivable('user-shutdown')]);
 
-    expect(container.querySelector('.teammate-tile-input')).toBeNull();
+    expect(container.querySelector('[data-testid="ai-input"]')).toBeNull();
     await act(async () => {
       fireEvent.click(container.querySelector('.teammate-tile-revive')!);
     });
@@ -179,11 +221,7 @@ describe('TeammateTile', () => {
       fireEvent.click(container.querySelector('.confirm-dialog-button-confirm')!);
     });
 
-    const textarea = container.querySelector('.teammate-tile-input') as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: 'back to it' } });
-    await act(async () => {
-      fireEvent.click(container.querySelector('.teammate-tile-send')!);
-    });
+    await compose(container, 'back to it');
 
     expect(sendMessageToTeammate).toHaveBeenCalledWith('lead-1', 'agent-a', 'back to it', true);
   });
@@ -199,7 +237,7 @@ describe('TeammateTile', () => {
     });
 
     expect(sendMessageToTeammate).not.toHaveBeenCalled();
-    expect(container.querySelector('.teammate-tile-input')).toBeNull();
+    expect(container.querySelector('[data-testid="ai-input"]')).toBeNull();
     expect(container.querySelector('.teammate-tile-revive')).not.toBeNull();
   });
 });

@@ -15,6 +15,14 @@ vi.mock('@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView', (
   ),
 }));
 
+// Same reasoning for the shared compose input: the real one drags in the
+// `@nimbalyst/runtime` barrel. Only its presence and its session key matter here.
+vi.mock('../../UnifiedAI/AIInput', () => ({
+  AIInput: ({ sessionId }: { sessionId?: string }) => (
+    <div data-testid="ai-input" data-session-id={sessionId} />
+  ),
+}));
+
 import { TiledRegion } from '../TiledRegion';
 import {
   activeTileAtomFamily,
@@ -168,6 +176,26 @@ describe('TiledRegion', () => {
     const teammatePane = panes().find(p => p.dataset.tileId === 'agent-a')!;
     expect(teammatePane.style.display).toBe('none');
     expect(teammatePane.querySelector('.teammate-tile')).not.toBeNull();
+  });
+
+  // Both teammate bodies stay mounted, but only one of them may hold a live
+  // compose instance: the shared input keys undo and voice registration off its
+  // session key, and a stacked pane would otherwise stand up two at once.
+  it('gives only the pane\'s focused tile a compose input', async () => {
+    const { store, container, headers } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'teammate', id: 'agent-b' });
+
+    const inputs = () => Array.from(
+      container.querySelectorAll<HTMLElement>('[data-testid="ai-input"]'),
+    ).map(node => node.dataset.sessionId);
+
+    expect(inputs()).toEqual([`${SESSION}:agent-b`]);
+
+    await act(async () => {
+      fireEvent.click(headers()[0]);
+    });
+    expect(inputs()).toEqual([`${SESSION}:agent-a`]);
   });
 
   it('does not refetch or remount the tile body when focus moves back to it', async () => {
