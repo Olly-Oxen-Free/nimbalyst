@@ -1,13 +1,13 @@
 {
   "slug": "tile-header-chrome-fixes",
   "prd_number": "012",
-  "phase": "executing",
+  "phase": "ready-for-merge",
   "created": "2026-08-30",
   "status": "executing",
   "notes": "Requirements from user live-test of PRD 011 (merged f297f677b), no interview run -- root causes verified against live source before planning. Execution rule: NO PRs ever, no gh; worktree-free-local cadence (PRD 006-011 precedent) -- workers edit the shared main checkout on feature/tile-header-chrome-fixes sequentially, coordinator (this session) reviews/tests/commits per task. Two tasks, sequential waves due to file overlap (TiledRegion.tsx/.css, TileHeaderBar.tsx).",
   "tasks_total": 2,
   "waves": 2,
-  "current_wave": 1,
+  "current_wave": 2,
   "execution_mode": "feature-branch",
   "feature_branch": "feature/tile-header-chrome-fixes",
   "base_branch": "main",
@@ -16,7 +16,25 @@
     "resolved_at": "2026-08-30T00:00:00Z"
   },
   "tasks": {
-    "1a": { "state": "pending", "wave": 1 },
-    "2a": { "state": "pending", "wave": 2 }
+    "1a": {
+      "state": "done",
+      "wave": 1,
+      "commits": ["43b0a3cbc", "36c263ef3", "84bda471b"],
+      "gate": {
+        "typecheck": "clean, 23/23 workspaces",
+        "test:prepush": "1444 files, 11722 passed, 2 pre-declared false positives (AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx)",
+        "verified_by": "orchestrator, direct run against commit 84bda471b, clean working tree"
+      }
+    },
+    "2a": {
+      "state": "done",
+      "wave": 2,
+      "commits": ["003f96f67"],
+      "gate": {
+        "typecheck": "clean, 23/23 workspaces",
+        "test:prepush": "1444 files, 11726 passed, 2 pre-declared false positives (AgentTranscriptPanel.listenerCleanup.test.tsx, MarkdownRenderer.rtl.test.tsx)",
+        "verified_by": "orchestrator, direct run against commit 003f96f67, clean working tree"
+      }
+    }
   }
 }
