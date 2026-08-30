@@ -5,13 +5,16 @@
  * `data-card-index` are what the document-level drag handlers and the kanban E2E
  * spec address.
  *
- * The unread dot, the favorite star, and the milestone chip all arrive as slots
- * rather than imports. For the milestone chip that is a weight argument -- it
- * drags a picker, a relationship resolver, and a write path behind it. For the
- * other two it is a boundary: they ride the personal lane behind a personal JWT,
- * the browser holds team auth only, and a slot is the one shape that makes their
- * absence structural. A host with no personal lane has nothing to pass, so the
- * modules never enter its bundle graph and no future edit here can wire them up.
+ * The unread dot, the favorite star, the milestone chip, and the session
+ * action button all arrive as slots rather than imports. For the milestone
+ * chip that is a weight argument -- it drags a picker, a relationship
+ * resolver, and a write path behind it. For the others it is a boundary:
+ * the unread dot and favorite star ride the personal lane behind a personal
+ * JWT (the browser holds team auth only), and the session action button
+ * dispatches into electron's local session registry, which has no meaning
+ * in a browser tab. A slot is the one shape that makes their absence
+ * structural. A host with none of this has nothing to pass, so the modules
+ * never enter its bundle graph and no future edit here can wire them up.
  */
 import React from 'react';
 import type { TrackerRecord } from '../../../../runtime/src/core/TrackerRecord';
@@ -47,5 +50,7 @@ export interface TrackerBoardCardProps {
     unreadSlot?: React.ReactNode;
     /** Personal lane, desktop only. Omitted by a host with team auth only. */
     favoriteSlot?: React.ReactNode;
+    /** Desktop only -- dispatches into electron's local session registry. */
+    sessionActionSlot?: React.ReactNode;
 }
 export declare const TrackerBoardCard: React.FC<TrackerBoardCardProps>;
