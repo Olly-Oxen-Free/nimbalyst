@@ -66,6 +66,7 @@ export const BUILTIN_FILE_CHANGE_FIDELITY: Readonly<Record<AIProviderType, FileC
     claude: 'none',
     openai: 'none',
     lmstudio: 'none',
+    ollama: 'none',
 
     // The Agent SDK surfaces Edit/Write/MultiEdit tool calls with the path in
     // their arguments, but no post-hoc authoritative change list.
@@ -131,6 +132,7 @@ export const PROVIDER_EDIT_TOOL_NAMES: Readonly<Record<AIProviderType, readonly 
     claude: Object.freeze([]),
     openai: Object.freeze([]),
     lmstudio: Object.freeze([]),
+    ollama: Object.freeze([]),
 
     // Claude Code's pre-edit baseline comes from the SDK's own hooks, not from
     // this table.

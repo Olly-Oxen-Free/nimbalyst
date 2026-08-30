@@ -186,6 +186,7 @@ vi.mock('../tools', () => ({
 
 vi.mock('../providerResolution', () => ({
   resolveExtensionAgentRef: vi.fn(() => null),
+  usesHostSuppliedToolLoop: vi.fn(() => false),
 }));
 
 vi.mock('../../../extensions/AgentProviderRegistry', () => ({
