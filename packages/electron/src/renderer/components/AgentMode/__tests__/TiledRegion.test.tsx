@@ -30,6 +30,7 @@ import {
   openOrFocusTaskTileAtom,
   openOrFocusTeammateTileAtom,
   paneTreeAtomFamily,
+  ROOT_PANE_ID,
   sessionTasksAtom,
   sessionTeammatesAtom,
 } from '../../../store/atoms/agentMode';
@@ -347,6 +348,62 @@ describe('TiledRegion', () => {
 
     await open(store, { kind: 'teammate', id: 'agent-b' });
     expect(tilesIn('pane-2')).toEqual(['task-1', 'agent-b']);
+  });
+
+  // The divider itself is react-mosaic's own <Split>, which measures its
+  // parent through getBoundingClientRect - jsdom's default is a zero rect, so
+  // it is stubbed only after the split exists, to avoid feeding a fake rect
+  // to the drop machinery that created it.
+  it('dragging a divider resizes the split and writes the new percentages into the session-lifetime atom', async () => {
+    const { store, container, dropTile, tree } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await act(async () => { dropTile('agent-a', 'root', 'left'); });
+
+    const rect = {
+      width: 1000, height: 600, top: 0, left: 0, right: 1000, bottom: 600, x: 0, y: 0, toJSON: () => {},
+    } as DOMRect;
+    const rectSpy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue(rect);
+    try {
+      const splitEl = container.querySelector('.mosaic-split')!;
+      // One mousemove (throttle fires leading-edge) plus clientX on mouseup
+      // (Split's onRelease reads the event directly, unthrottled) makes the
+      // resulting percentages deterministic regardless of throttle timing.
+      await act(async () => {
+        fireEvent.mouseDown(splitEl, { button: 0 });
+        fireEvent.mouseMove(document, { clientX: 700 });
+        fireEvent.mouseUp(document, { clientX: 700 });
+      });
+    } finally {
+      rectSpy.mockRestore();
+    }
+
+    expect(tree()).toEqual({
+      type: 'split',
+      direction: 'row',
+      children: ['pane-2', 'root'],
+      splitPercentages: [70, 30],
+    });
+  });
+
+  // The pane tree lives only in a plain Jotai atom family - no persistence
+  // middleware, no IPC/workspace-settings write path - so it must not survive
+  // past the store that held it, which is what an app reload replaces.
+  it('does not survive a simulated app reload - the pane tree is session-lifetime only', async () => {
+    const first = renderRegion();
+    await open(first.store, { kind: 'teammate', id: 'agent-a' });
+    await open(first.store, { kind: 'task', id: 'task-1' });
+    await act(async () => { first.dropTile('agent-a', 'root', 'left'); });
+    expect(first.tree()).not.toBe(ROOT_PANE_ID);
+
+    first.unmount();
+
+    // A fresh store simulates a renderer reload: paneTreeAtomFamily caches the
+    // atom *instance* at module scope, but a new store starts every atom at
+    // its own initial value, so nothing survives that was never written to
+    // disk.
+    const second = renderRegion(seededStore());
+    expect(second.tree()).toBe(ROOT_PANE_ID);
   });
 
   it('renders a tile the sidebar opened through the older toggle atom', async () => {
