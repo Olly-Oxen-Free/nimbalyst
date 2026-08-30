@@ -1,0 +1,135 @@
+metadata:
+  prd_slug: "tile-header-chrome-fixes"
+  created_at: "2026-08-30T00:00:00Z"
+  total_complexity: 8
+  task_count: 2
+
+tasks:
+  - id: "1a"
+    title: "Fix drag-and-tile: replace fictional .mosaic.-dragging CSS gate with real react-dnd signal"
+    complexity: 4
+    wave: 1
+    depends_on: []
+    files:
+      - packages/electron/src/renderer/components/AgentMode/TiledRegion.tsx
+      - packages/electron/src/renderer/components/AgentMode/TiledRegion.css
+      - packages/electron/src/renderer/components/AgentMode/__tests__/TiledRegion.test.tsx
+    description: |
+      Dragging a TileHeaderBar to split or stack a tiled pane is a complete no-op in the running
+      app. Root cause, confirmed by grepping node_modules/react-mosaic-component for the string
+      "dragging" (zero matches anywhere in the library): TiledRegion.css gates the five drop zones
+      behind `.mosaic.-dragging .tiled-region-drop-zone { pointer-events: auto; }`, and nothing —
+      not the library, not TiledRegion.tsx — ever adds a `.mosaic.-dragging` class to anything.
+      `.tiled-region-drop-zone { pointer-events: none; }` is therefore never overridden, so
+      TileDropZone's useDrop target never receives a real pointer event.
+
+      Fix: derive a real "is a MosaicDragType.WINDOW drag active" signal in TiledRegion.tsx using
+      react-dnd's `useDragLayer` hook — call it once at the TiledRegion level (not per-pane, to
+      avoid N redundant subscriptions):
+        const isDraggingTile = useDragLayer(monitor =>
+          monitor.isDragging() && monitor.getItemType() === MosaicDragType.WINDOW);
+      Apply a real class (e.g. `tiled-region-mosaic--dragging`, or whatever reads clearly) to the
+      `.tiled-region-mosaic` wrapper (or `.tiled-region`) when true. Update TiledRegion.css to gate
+      `.tiled-region-drop-zone { pointer-events: auto; }` off that real class instead of the
+      fictional `.mosaic.-dragging` selector. Delete or correct the misleading comment above the
+      current rule (it wrongly credits the library).
+
+      The drag SOURCE side (`useDrag` in TileHeaderBar.tsx) is already correctly wired to
+      `MosaicDragType.WINDOW` — do not touch TileHeaderBar.tsx for this task.
+
+      Coverage gap to close: TiledRegion.test.tsx's existing `dropTile` helper fires
+      dragStart/dragEnter/dragOver/drop events directly on the drop-zone DOM node via
+      `fireEvent`, which bypasses CSS pointer-events entirely in jsdom (no hit-testing) — this is
+      exactly why the original pointer-events bug shipped with a green suite. Add a new test (or
+      extend the existing file, do not create a parallel test file) that actually asserts the
+      dragging-state class appears on the wrapper during an active WINDOW-type drag and disappears
+      after drop/dragEnd — i.e. assert on the className/attribute the fix introduces, driven by the
+      same dragStart/dragEnd event sequence the existing dropTile helper already uses. This proves
+      the gating mechanism itself is wired to a real signal, which the existing tree-update tests
+      (handleEdgeDrop/handleCenterDrop coverage) do not prove on their own.
+
+      Do not touch TileHeaderBar.tsx, paneTreeAtomFamily, or any of the split/stack tree-update
+      logic — this task is scoped strictly to the drop-zone visibility gate and its test coverage.
+
+      Verify: `npm run typecheck && npm run test:prepush` (or the narrower vitest command for this
+      file while iterating, but the full gate before considering the task done).
+    success_criteria:
+      - "TiledRegion.css no longer references `.mosaic.-dragging` anywhere"
+      - "A real react-dnd useDragLayer-derived class gates .tiled-region-drop-zone pointer-events"
+      - "New/extended test proves the gating class toggles with an active WINDOW drag via the same event-driven path the existing dropTile helper uses, not by asserting the atom-level tree update alone"
+      - "All existing TiledRegion.test.tsx / TileHeaderBar.test.tsx cases still pass unmodified in behavior"
+      - "npm run typecheck && npm run test:prepush pass"
+
+  - id: "2a"
+    title: "Minimize/expand pane chrome: chevron control collapses a pane's body, headers stay visible"
+    complexity: 4
+    wave: 2
+    depends_on: ["1a"]
+    files:
+      - packages/electron/src/renderer/store/atoms/agentMode.ts
+      - packages/electron/src/renderer/components/AgentMode/TileHeaderBar.tsx
+      - packages/electron/src/renderer/components/AgentMode/TiledRegion.tsx
+      - packages/electron/src/renderer/components/AgentMode/TiledRegion.css
+      - packages/electron/src/renderer/components/AgentMode/__tests__/TiledRegion.test.tsx
+      - packages/electron/src/renderer/components/AgentMode/__tests__/TileHeaderBar.test.tsx
+      - CHANGELOG.md
+    description: |
+      The tile header needs to "also function as the chrome in that window... a minimize/expand
+      kind of chrome header" (user's words). Today a header slot's only interaction is
+      `onClick={() => setActiveTile(...)}` in TiledRegion.tsx's TilePane (~lines 194-242), which
+      switches focus within the pane's stack. There is no collapse/expand affordance.
+
+      Design (already decided, implement as specified — do not re-litigate): add a dedicated
+      chevron/disclosure control to TileHeaderBar, visually and functionally distinct from the
+      existing close (✕) button and drag grip (⋮⋮). Clicking the chevron toggles collapse for the
+      PANE the tile belongs to (all tiles in that pane's stack, not just the one clicked) — a
+      niri-style collapsed pane keeps every stacked header visible and clickable while the content
+      area collapses to zero height/width. A collapsed pane's five drop zones (four edges + center)
+      must keep working for receiving a dragged tile — collapsing hides content, it does not remove
+      the pane from the tree or make it undroppable.
+
+      Implementation:
+      1. In `store/atoms/agentMode.ts`, add `paneCollapsedAtomFamily` following the exact pattern
+         of `paneTreeAtomFamily`/`tilePaneAtomFamily` (atomFamily keyed by session+pane, plain
+         session-lifetime atom, no persistence — read those two for the established shape before
+         writing this one).
+      2. Add the chevron control to `TileHeaderBar.tsx` as a new button (separate from the existing
+         close button, same header row). It needs to know which pane it belongs to and a click
+         handler — thread whatever prop TileHeaderBarProps needs (check how `sessionId`/`id` are
+         already threaded from TiledRegion.tsx's `headerProps` callback and extend that shape
+         rather than inventing a parallel path). The chevron's click handler must NOT also trigger
+         TilePane's own `onClick={() => setActiveTile(...)}` on the header slot — stop propagation
+         the same way the existing close button's click already must (check how close currently
+         avoids also firing the header-slot focus-switch onClick; TileHeaderBar.test.tsx's existing
+         close-button test shows the pattern to follow for the chevron).
+      3. In `TiledRegion.tsx`'s `TilePane`, read `paneCollapsedAtomFamily` for this pane and apply
+         it to the `.tiled-region-body` container: when collapsed, hide it via CSS (e.g. a
+         `data-collapsed` attribute or class toggled to `display: none` / height 0 in
+         TiledRegion.css) — never conditionally render/unmount `.tiled-region-pane` children. Every
+         occupying tile's body must stay mounted through a collapse exactly as it already does
+         through a focus switch (this file's own documented invariant — "every occupying tile stays
+         mounted"). The five TileDropZone children must remain rendered and functional regardless
+         of collapsed state.
+      4. Update TiledRegion.css for whatever collapsed-state selector you introduce.
+      5. CHANGELOG.md: add exactly one `[Unreleased]` bullet, user-facing, no internal symbol names
+         (no "TileHeaderBar", no "atomFamily", no "react-dnd") — e.g. "Tiled agent panes can now be
+         collapsed to just their header, freeing space without closing anything."
+
+      Tests: extend TileHeaderBar.test.tsx (chevron renders, click calls the collapse toggle, click
+      does not also fire the header-slot focus onClick) and TiledRegion.test.tsx (collapsing a pane
+      hides `.tiled-region-body`'s content via CSS/attribute while `.tiled-region-pane` bodies
+      remain in the DOM — assert on DOM presence + style/attribute, not just the atom value;
+      expanding again does not remount/refetch, following the same not-remounted assertion pattern
+      already used elsewhere in this file for focus switches). Follow the repo's testing rules: no
+      presentation-only assertions, no readFileSync+toContain, extend the existing files rather than
+      adding new ones.
+
+      Verify: `npm run typecheck && npm run test:prepush`.
+    success_criteria:
+      - "paneCollapsedAtomFamily exists in agentMode.ts, following the paneTreeAtomFamily/tilePaneAtomFamily pattern"
+      - "TileHeaderBar has a chevron control distinct from close and the drag grip"
+      - "Clicking the chevron toggles collapse for the whole pane, not just one tile"
+      - "Collapsing hides the pane body via CSS/attribute only — no tile body is ever unmounted by a collapse"
+      - "Drop zones remain functional on a collapsed pane"
+      - "CHANGELOG.md has exactly one new user-facing [Unreleased] bullet with no internal symbol names"
+      - "npm run typecheck && npm run test:prepush pass"

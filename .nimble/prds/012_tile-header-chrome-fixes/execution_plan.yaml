@@ -1,0 +1,12 @@
+prd_slug: "tile-header-chrome-fixes"
+execution_mode: "feature-branch"
+feature_branch: "feature/tile-header-chrome-fixes"
+base_branch: "main"
+cadence: "worktree-free-local"  # precedent: PRD 011 — no PRs, no gh, ever; PM commits per task
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    reason: "Fix drag-and-tile first — it's the load-bearing interaction bug"
+  - wave: 2
+    tasks: ["2a"]
+    reason: "Depends on 1a (same files: TiledRegion.tsx/.css, TileHeaderBar.tsx) — sequential, not parallel, due to file overlap"
