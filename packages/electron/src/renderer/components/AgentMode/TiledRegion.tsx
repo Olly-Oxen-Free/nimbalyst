@@ -67,6 +67,7 @@ import {
   activeTileKey,
   openTaskTilesAtomFamily,
   openTeammateTilesAtomFamily,
+  paneCollapsedAtomFamily,
   paneTileOrderAtomFamily,
   paneTreeAtomFamily,
   sessionTasksAtom,
@@ -160,7 +161,7 @@ interface TilePaneProps {
   paneId: string;
   path: MosaicPath;
   occupants: ActiveTileRef[];
-  headerProps: (ref: ActiveTileRef) => TileHeaderBarProps;
+  headerProps: (ref: ActiveTileRef, paneId: string) => TileHeaderBarProps;
   onEdgeDrop: (path: MosaicPath, edge: TileDropEdge, ref: ActiveTileRef) => void;
   onCenterDrop: (path: MosaicPath, ref: ActiveTileRef) => void;
 }
@@ -179,6 +180,7 @@ const TilePane: React.FC<TilePaneProps> = ({
   const key = activeTileKey(sessionId, paneId);
   const activeTile = useAtomValue(activeTileAtomFamily(key));
   const setActiveTile = useSetAtom(activeTileAtomFamily(key));
+  const collapsed = useAtomValue(paneCollapsedAtomFamily(key));
 
   // Closing the focused tile leaves the stored pointer aimed at a tile that is
   // no longer open (the header's close and this pane's focus-on-click both
@@ -202,11 +204,11 @@ const TilePane: React.FC<TilePaneProps> = ({
             // why `focused` recomputes defensively rather than this gating.
             onClick={() => setActiveTile({ kind: ref.kind, id: ref.id })}
           >
-            <TileHeaderBar {...headerProps(ref)} />
+            <TileHeaderBar {...headerProps(ref, paneId)} />
           </div>
         ))}
       </div>
-      <div className="tiled-region-body">
+      <div className="tiled-region-body" data-collapsed={collapsed ? 'true' : undefined}>
         {occupants.map(ref => {
           const isFocused = focused?.kind === ref.kind && focused.id === ref.id;
           return (
@@ -356,12 +358,16 @@ export const TiledRegion: React.FC<TiledRegionProps> = React.memo(({ sessionId }
     if (next !== tree) setTree(next);
   }, [tree, leaves, occupantsByPane, setTree]);
 
-  const headerProps = useCallback((ref: ActiveTileRef): TileHeaderBarProps => {
+  // `paneId` comes in as an argument rather than closing over it - it is
+  // constant per `ref` (which kind/id it is), and the pane it currently
+  // occupies is only known at the `TilePane` call site.
+  const headerProps = useCallback((ref: ActiveTileRef, paneId: string): TileHeaderBarProps => {
     if (ref.kind === 'teammate') {
       const teammate = teammates.find(t => t.agentId === ref.id);
       return {
         kind: 'teammate',
         sessionId,
+        paneId,
         id: ref.id,
         name: teammate?.name ?? ref.id,
         model: teammate?.model,
@@ -374,6 +380,7 @@ export const TiledRegion: React.FC<TiledRegionProps> = React.memo(({ sessionId }
     return {
       kind: 'task',
       sessionId,
+      paneId,
       id: ref.id,
       name: task?.description ?? 'Sub-agent',
       rawStatus: task?.status ?? 'completed',

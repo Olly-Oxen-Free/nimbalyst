@@ -131,6 +131,13 @@
   overflow: hidden;
 }
 
+/* Collapsed pane: headers stay visible and clickable, the body goes to zero
+   height (niri-style). Every occupying tile stays mounted underneath - this
+   only hides the container, it never unmounts `.tiled-region-pane`. */
+.tiled-region-body[data-collapsed='true'] {
+  display: none;
+}
+
 /* Every open tile stays mounted; the pane shows one at a time by toggling
    `display`, so a transcript view is never remounted on a focus switch. */
 .tiled-region-pane {

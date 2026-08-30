@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 <!-- Changes to existing functionality go here -->
 - Panes can now be resized with draggable dividers, split and nested arbitrarily by dragging headers, stacked by dropping one onto another, and all use the app's unified message box.
+- A tiled pane's header now has a chevron to collapse its content down to just the header row, freeing up space without closing any of its tiles.
 - An animation plays inline in the agent transcript when an agent creates or edits it, as a click-to-activate stage rather than a plain file row.
 - In the tracker table the Key cell is the open button: click it for the detail pane, or its expand icon to open the document. Clicking any other cell just selects it, and double-click always means edit.
 

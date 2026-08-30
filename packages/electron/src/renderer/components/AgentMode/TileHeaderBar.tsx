@@ -12,13 +12,15 @@
  */
 
 import React, { useCallback, useContext } from 'react';
-import { useSetAtom } from 'jotai';
+import { useAtom, useSetAtom } from 'jotai';
 import { DndContext, DndProvider, useDrag } from 'react-dnd';
 import { HTML5Backend } from 'react-dnd-html5-backend';
 import { MosaicContext, MosaicDragType } from 'react-mosaic-component';
 import {
+  activeTileKey,
   closeTaskTileAtom,
   closeTeammateTileAtom,
+  paneCollapsedAtomFamily,
   type TaskInfo,
 } from '../../store/atoms/agentMode';
 import {
@@ -73,6 +75,9 @@ const DragContextBoundary: React.FC<{ children: React.ReactNode }> = ({ children
 export type TileHeaderBarProps = {
   /** Session the tile belongs to. */
   sessionId: string;
+  /** Id of the pane this tile currently occupies - the collapse toggle is
+   *  pane-scoped, not tile-scoped, so every header in a stack shares it. */
+  paneId: string;
   /** Teammate agent id / task id - travels with the drag and with the close. */
   id: string;
   /** Teammate name / task description. */
@@ -90,6 +95,7 @@ export type TileHeaderBarProps = {
  */
 const TileHeaderBarInner: React.FC<TileHeaderBarProps> = ({
   sessionId,
+  paneId,
   id,
   name,
   model,
@@ -117,6 +123,16 @@ const TileHeaderBarInner: React.FC<TileHeaderBarProps> = ({
     }
   }, [kind, sessionId, id, closeTeammateTile, closeTaskTile]);
 
+  // Collapse is pane-scoped (every header in the stack shares one flag), keyed
+  // the same way `activeTileAtomFamily` is - both are (session, pane) state.
+  const [collapsed, setCollapsed] = useAtom(paneCollapsedAtomFamily(activeTileKey(sessionId, paneId)));
+  const handleToggleCollapse = useCallback((event: React.MouseEvent) => {
+    // The header slot one level up also toggles focus on click; the chevron is
+    // its own affordance and must not also switch which tile is frontmost.
+    event.stopPropagation();
+    setCollapsed(current => !current);
+  }, [setCollapsed]);
+
   return (
     <div
       ref={(node) => { connectDrag(node); }}
@@ -143,6 +159,15 @@ const TileHeaderBarInner: React.FC<TileHeaderBarProps> = ({
       >
         &#x22EE;&#x22EE;
       </span>
+      <button
+        type="button"
+        className="tile-header-bar-collapse shrink-0 bg-transparent border-none cursor-pointer text-[var(--nim-text-muted)] hover:text-[var(--nim-text)] leading-none px-1"
+        onClick={handleToggleCollapse}
+        aria-label={collapsed ? 'Expand pane' : 'Collapse pane'}
+        aria-expanded={!collapsed}
+      >
+        {collapsed ? '›' : '⌄'}
+      </button>
       <button
         type="button"
         className="tile-header-bar-close shrink-0 bg-transparent border-none cursor-pointer text-[var(--nim-text-muted)] hover:text-[var(--nim-text)] leading-none px-1"

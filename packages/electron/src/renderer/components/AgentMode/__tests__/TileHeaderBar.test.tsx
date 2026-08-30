@@ -2,10 +2,12 @@
 import React from 'react';
 import { cleanup, fireEvent, render } from '@testing-library/react';
 import { Provider, createStore } from 'jotai';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  activeTileKey,
   openTaskTilesAtomFamily,
   openTeammateTilesAtomFamily,
+  paneCollapsedAtomFamily,
 } from '../../../store/atoms/agentMode';
 import { TileHeaderBar, type TileHeaderBarProps } from '../TileHeaderBar';
 
@@ -16,6 +18,7 @@ import { TileHeaderBar, type TileHeaderBarProps } from '../TileHeaderBar';
 function renderHeader(props?: Partial<TileHeaderBarProps>, store = createStore()) {
   const merged = {
     sessionId: 's1',
+    paneId: 'root',
     kind: 'task',
     id: 'task-1',
     name: 'db migration',
@@ -81,6 +84,45 @@ describe('TileHeaderBar', () => {
       fireEvent.click(header().querySelector('.tile-header-bar-close')!);
 
       expect(store.get(openTeammateTilesAtomFamily('s1'))).toEqual(['agent-2']);
+    });
+  });
+
+  describe('collapse control', () => {
+    it('toggles paneCollapsedAtomFamily for the tile\'s pane, distinct from close and the drag grip', () => {
+      const store = createStore();
+      const key = activeTileKey('s1', 'pane-2');
+
+      const { header } = renderHeader({ sessionId: 's1', paneId: 'pane-2' }, store);
+      const chevron = header().querySelector('.tile-header-bar-collapse')!;
+      expect(chevron).not.toBeNull();
+      expect(chevron).not.toBe(header().querySelector('.tile-header-bar-close'));
+      expect(chevron).not.toBe(header().querySelector('.tile-header-bar-grip'));
+
+      expect(store.get(paneCollapsedAtomFamily(key))).toBe(false);
+      fireEvent.click(chevron);
+      expect(store.get(paneCollapsedAtomFamily(key))).toBe(true);
+      fireEvent.click(chevron);
+      expect(store.get(paneCollapsedAtomFamily(key))).toBe(false);
+    });
+
+    // `TiledRegion`'s `.tiled-region-header-slot` wraps every header with its
+    // own onClick that switches focus (`TiledRegion.tsx` ~line 200-204). The
+    // chevron is its own affordance and must not also fire that click.
+    it('does not also fire an ancestor click handler (the header-slot focus switch)', () => {
+      const store = createStore();
+      const onSlotClick = vi.fn();
+      const { container } = render(
+        <Provider store={store}>
+          <div onClick={onSlotClick}>
+            <TileHeaderBar sessionId="s1" paneId="pane-2" kind="task" id="task-1" name="db migration" rawStatus="running" />
+          </div>
+        </Provider>,
+      );
+
+      fireEvent.click(container.querySelector('.tile-header-bar-collapse')!);
+
+      expect(onSlotClick).not.toHaveBeenCalled();
+      expect(store.get(paneCollapsedAtomFamily(activeTileKey('s1', 'pane-2')))).toBe(true);
     });
   });
 

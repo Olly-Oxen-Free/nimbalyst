@@ -412,6 +412,15 @@ export const activeTileAtomFamily = atomFamily((_key: string) =>
 );
 
 /**
+ * Per-(session, pane) collapsed flag. Keyed the same way as
+ * `activeTileAtomFamily` (via `activeTileKey`) since both are pane-scoped,
+ * not tile-scoped. Collapsing hides a pane's body via CSS only - it never
+ * changes the mosaic tree or unmounts anything. Session-lifetime only, like
+ * the other tile-layout atoms above: not persisted across an app restart.
+ */
+export const paneCollapsedAtomFamily = atomFamily((_key: string) => atom<boolean>(false));
+
+/**
  * Per-session order in which the pane's tiles were opened, interleaving both
  * kinds. The two `openXTilesAtomFamily` lists stay the authority on *whether* a
  * tile is open; this only records the cross-kind ordering neither of them can

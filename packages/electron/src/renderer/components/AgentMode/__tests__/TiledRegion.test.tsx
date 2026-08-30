@@ -74,6 +74,14 @@ function renderRegion(store = seededStore()) {
     headers: () => Array.from(result.container.querySelectorAll<HTMLElement>('.tile-header-bar')),
     panes: () => Array.from(result.container.querySelectorAll<HTMLElement>('.tiled-region-pane')),
     visiblePane: () => result.container.querySelector<HTMLElement>('.tiled-region-pane[style*="flex"]'),
+    body: (paneId = 'root') => result.container.querySelector<HTMLElement>(
+      `.tiled-region-leaf[data-pane-id="${paneId}"] .tiled-region-body`,
+    ),
+    dropZones: (paneId = 'root') => Array.from(
+      result.container.querySelectorAll<HTMLElement>(
+        `.tiled-region-leaf[data-pane-id="${paneId}"] .tiled-region-drop-zone`,
+      ),
+    ),
     tree: () => store.get(paneTreeAtomFamily(SESSION)),
     /** The tiles occupying one leaf of the tree, in header order. */
     tilesIn: (paneId: string) => Array.from(
@@ -251,6 +259,61 @@ describe('TiledRegion', () => {
     // unmounted and recreated.
     expect(panes().length).toBe(mountedAfterStack);
     expect(getTeammateTranscript.mock.calls.length).toBe(fetchesAfterStack);
+  });
+
+  // Collapsing a pane is the same "hide via CSS, never unmount" invariant as
+  // a focus switch (see the mounted-tile test above) - it only adds a second
+  // way to hide the body, not a second way to remove a tile from the tree.
+  it('collapsing a pane hides its body via CSS while every occupying tile stays mounted, and expanding again does not remount', async () => {
+    const { store, headers, panes, body, dropZones } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await waitFor(() => expect(getTeammateTranscript).toHaveBeenCalledTimes(1));
+
+    expect(body()?.dataset.collapsed).toBeUndefined();
+    expect(dropZones()).toHaveLength(5);
+
+    await act(async () => {
+      fireEvent.click(headers()[0].querySelector('.tile-header-bar-collapse')!);
+    });
+
+    expect(body()?.dataset.collapsed).toBe('true');
+    // Both tile bodies stay in the DOM - collapsing hides the container the
+    // pane's own header comment already documents ("Every occupying tile
+    // stays mounted"), it never conditionally renders `.tiled-region-pane`.
+    expect(panes()).toHaveLength(2);
+    // The drop zones are siblings of the body, not children of it, so a
+    // collapsed pane keeps every one of them rendered and droppable.
+    expect(dropZones()).toHaveLength(5);
+    const mountedWhileCollapsed = panes().length;
+
+    await act(async () => {
+      fireEvent.click(headers()[0].querySelector('.tile-header-bar-collapse')!);
+    });
+
+    expect(body()?.dataset.collapsed).toBeUndefined();
+    // No new mount and no new fetch on expand: the body was hidden via CSS,
+    // not unmounted and recreated.
+    expect(panes().length).toBe(mountedWhileCollapsed);
+    expect(getTeammateTranscript).toHaveBeenCalledTimes(1);
+  });
+
+  // The chevron toggles the whole pane, not just the tile whose header it sits
+  // on - every stacked header shares one collapsed flag.
+  it('collapsing from any header in a stack collapses the whole pane, and any header can expand it again', async () => {
+    const { store, headers, body } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+
+    await act(async () => {
+      fireEvent.click(headers()[1].querySelector('.tile-header-bar-collapse')!);
+    });
+    expect(body()?.dataset.collapsed).toBe('true');
+
+    await act(async () => {
+      fireEvent.click(headers()[0].querySelector('.tile-header-bar-collapse')!);
+    });
+    expect(body()?.dataset.collapsed).toBeUndefined();
   });
 
   it('closing through the header collapses back to no region once the last tile goes', async () => {
