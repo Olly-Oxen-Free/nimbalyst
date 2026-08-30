@@ -10,6 +10,10 @@
  * react-mosaic's own tree model (`MosaicPath` + `updateTree`), not a shape this
  * file tracks itself.
  *
+ * A drop on a pane's *center* is the other half of that gesture: it stacks
+ * instead of splitting. The tile is reassigned to the target pane and joins its
+ * header stack, and the tree is not touched at all.
+ *
  * `SubAgentChipRow` does not live here. It keeps its own job above the compose
  * bar as the *opener*; what it opens lands in this pane.
  *
@@ -21,12 +25,12 @@
  *   than above the tree: only in there does `MosaicContext` resolve, so
  *   `TileHeaderBar`'s own `DragContextBoundary` finds the surrounding context
  *   and stands up nothing.
- * - **Our own edge drop zones, not the library's.** `MosaicDropTarget` is not
+ * - **Our own drop zones, not the library's.** `MosaicDropTarget` is not
  *   exported from the package index, and its targets quarter the whole pane
- *   with no center region - task 6a needs that center free. So the four zones
- *   below are ours, sized in CSS (`TiledRegion.css`) rather than measured, and
- *   what they carry to `createDragToUpdates` would be wrong anyway: the thing
- *   being dragged is a tile *inside* a pane, not a node of the tree.
+ *   with no center region, which is the one this file needs most. So the five
+ *   zones below are ours, sized in CSS (`TiledRegion.css`) rather than measured,
+ *   and what they carry to `createDragToUpdates` would be wrong anyway: the
+ *   thing being dragged is a tile *inside* a pane, not a node of the tree.
  * - **A single-tile pane still shows its one header.** The header is the tile's
  *   drag handle and its close control, so a bare content view would have no
  *   handle at all.
@@ -81,10 +85,14 @@ const REGION_WIDTH = 420;
 /** The main thread always keeps at least half the row. */
 const MAX_REGION_WIDTH = '50%';
 
-/** The pane edges a header can be dropped on. The remaining center belongs to
- *  task 6a and has no zone here. */
+/** The pane edges a header can be dropped on to split it. The remaining center
+ *  is `CENTER_ZONE`, which stacks instead. */
 const DROP_EDGES = ['top', 'bottom', 'left', 'right'] as const;
 type TileDropEdge = (typeof DROP_EDGES)[number];
+
+/** The fifth zone: the middle the four edges leave uncovered. */
+const CENTER_ZONE = 'center';
+type TileDropZoneName = TileDropEdge | typeof CENTER_ZONE;
 
 /** niri's convention: a left/right drop puts the panes side by side (mosaic's
  *  'row'), a top/bottom drop stacks them ('column'). */
@@ -124,12 +132,12 @@ function mintPaneId(tree: MosaicNode<string>): string {
 }
 
 /**
- * One edge drop zone. Sized and gated in CSS - the library only lets its own
+ * One drop zone. Sized and gated in CSS - the library only lets its own
  * targets through while a window drag is running (`.mosaic.-dragging`), and
  * these follow that, so they never swallow a click.
  */
 const TileDropZone: React.FC<{
-  edge: TileDropEdge;
+  edge: TileDropZoneName;
   onDrop: (ref: ActiveTileRef) => void;
 }> = ({ edge, onDrop }) => {
   const [, connectDrop] = useDrop<TileHeaderDragItem, unknown, unknown>(() => ({
@@ -154,10 +162,11 @@ interface TilePaneProps {
   occupants: ActiveTileRef[];
   headerProps: (ref: ActiveTileRef) => TileHeaderBarProps;
   onEdgeDrop: (path: MosaicPath, edge: TileDropEdge, ref: ActiveTileRef) => void;
+  onCenterDrop: (path: MosaicPath, ref: ActiveTileRef) => void;
 }
 
 /** One leaf of the tree: its own header stack, its own tile bodies, its own
- *  focus pointer, and the four zones that split it. */
+ *  focus pointer, the four zones that split it and the center that stacks. */
 const TilePane: React.FC<TilePaneProps> = ({
   sessionId,
   paneId,
@@ -165,6 +174,7 @@ const TilePane: React.FC<TilePaneProps> = ({
   occupants,
   headerProps,
   onEdgeDrop,
+  onCenterDrop,
 }) => {
   const key = activeTileKey(sessionId, paneId);
   const activeTile = useAtomValue(activeTileAtomFamily(key));
@@ -220,6 +230,10 @@ const TilePane: React.FC<TilePaneProps> = ({
           onDrop={ref => onEdgeDrop(path, edge, ref)}
         />
       ))}
+      <TileDropZone
+        edge={CENTER_ZONE}
+        onDrop={ref => onCenterDrop(path, ref)}
+      />
     </div>
   );
 };
@@ -309,6 +323,21 @@ export const TiledRegion: React.FC<TiledRegionProps> = React.memo(({ sessionId }
     store.set(activeTileAtomFamily(activeTileKey(sessionId, paneId)), ref);
   }, [tree, occupantsByPane, tilePanes, setTree, setTilePanes, store, sessionId]);
 
+  // Stacking is only a reassignment: the tile joins the target pane's header
+  // stack and the tree keeps the shape it had. The pane the tile came from may
+  // now be empty, which the sweep below collapses exactly as a drag-out does.
+  const handleCenterDrop = useCallback((path: MosaicPath, ref: ActiveTileRef) => {
+    const target = getNodeAtPath(tree, path);
+    if (typeof target !== 'string') return;
+    const occupying = occupantsByPane.get(target) ?? [];
+    // Dropped back on the pane it already occupies: focus it and leave the
+    // assignment alone, so its body is never torn down and refetched.
+    if (!occupying.some(t => t.kind === ref.kind && t.id === ref.id)) {
+      setTilePanes({ ...tilePanes, [tilePaneKey(ref)]: target });
+    }
+    store.set(activeTileAtomFamily(activeTileKey(sessionId, target)), ref);
+  }, [tree, occupantsByPane, tilePanes, setTilePanes, store, sessionId]);
+
   // A pane emptied by its last tile closing - or by that tile being dragged
   // out - is removed, which is what collapses the split back onto its sibling.
   // The root leaf is exempt: when it empties the region unmounts entirely.
@@ -356,8 +385,9 @@ export const TiledRegion: React.FC<TiledRegionProps> = React.memo(({ sessionId }
       occupants={occupantsByPane.get(paneId) ?? []}
       headerProps={headerProps}
       onEdgeDrop={handleEdgeDrop}
+      onCenterDrop={handleCenterDrop}
     />
-  ), [sessionId, occupantsByPane, headerProps, handleEdgeDrop]);
+  ), [sessionId, occupantsByPane, headerProps, handleEdgeDrop, handleCenterDrop]);
 
   // Resizes and the library's own normalization arrive here; dropping them
   // would silently revert every split handle the user drags.

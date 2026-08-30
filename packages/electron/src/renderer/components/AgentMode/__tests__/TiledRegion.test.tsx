@@ -71,7 +71,7 @@ function renderRegion(store = seededStore()) {
         `.tiled-region-leaf[data-pane-id="${paneId}"] .tile-header-bar`,
       ),
     ).map(h => h.dataset.dragId),
-    dropTile: (dragId: string, paneId: string, edge: 'top' | 'bottom' | 'left' | 'right') => {
+    dropTile: (dragId: string, paneId: string, edge: 'top' | 'bottom' | 'left' | 'right' | 'center') => {
       const header = result.container.querySelector<HTMLElement>(`.tile-header-bar[data-drag-id="${dragId}"]`)!;
       const zone = result.container.querySelector<HTMLElement>(
         `.tiled-region-leaf[data-pane-id="${paneId}"] .tiled-region-drop-zone[data-drop-edge="${edge}"]`,
@@ -250,6 +250,42 @@ describe('TiledRegion', () => {
     expect(tilesIn('pane-3')).toEqual(['agent-b']);
     expect(tilesIn('pane-2')).toEqual(['agent-a']);
     expect(tilesIn('root')).toEqual(['task-1']);
+  });
+
+  // The other half of the drop gesture: the center stacks where the edges
+  // split, so the tree must come out of it byte-identical.
+  it('stacks the dragged tile into the target pane on a center drop, leaving the tree alone', async () => {
+    const { store, dropTile, tree, tilesIn } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await open(store, { kind: 'teammate', id: 'agent-b' });
+    await act(async () => { dropTile('agent-a', 'root', 'left'); });
+    const split = tree();
+
+    await act(async () => { dropTile('agent-b', 'pane-2', 'center'); });
+
+    expect(tree()).toEqual(split);
+    expect(tilesIn('pane-2')).toEqual(['agent-a', 'agent-b']);
+    expect(tilesIn('root')).toEqual(['task-1']);
+    // Focus follows the tile into its new pane, not the pane it left.
+    expect(store.get(activeTileAtomFamily(activeTileKey(SESSION, 'pane-2'))))
+      .toEqual({ kind: 'teammate', id: 'agent-b' });
+  });
+
+  it('only refocuses when a tile is center-dropped on the pane it already occupies', async () => {
+    const { store, dropTile, tree, tilesIn } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await waitFor(() => expect(getTeammateTranscript).toHaveBeenCalledTimes(1));
+
+    await act(async () => { dropTile('agent-a', 'root', 'center'); });
+
+    expect(tree()).toBe('root');
+    expect(tilesIn('root')).toEqual(['agent-a', 'task-1']);
+    expect(store.get(activeTileAtomFamily(activeTileKey(SESSION, 'root'))))
+      .toEqual({ kind: 'teammate', id: 'agent-a' });
+    // The body it was already showing must not be torn down and refetched.
+    expect(getTeammateTranscript).toHaveBeenCalledTimes(1);
   });
 
   it('collapses the split back onto the sibling when a split-created pane loses its last tile', async () => {

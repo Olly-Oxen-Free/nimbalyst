@@ -54,10 +54,10 @@
   overflow: hidden;
 }
 
-/* Edge drop zones: the outer 28% of each side of a pane splits it, the middle
-   is left for the center drop. They only exist while a header drag is running -
-   the library puts `-dragging` on the mosaic root for exactly this - so they
-   never intercept a click on a header or a transcript. */
+/* Drop zones: the outer 28% of each side of a pane splits it, and the middle
+   the four of them leave uncovered stacks instead. They only exist while a
+   header drag is running - the library puts `-dragging` on the mosaic root for
+   exactly this - so they never intercept a click on a header or a transcript. */
 .tiled-region-drop-zone {
   position: absolute;
   z-index: 1;
@@ -96,6 +96,12 @@
   bottom: 0;
   left: 28%;
   height: 28%;
+}
+
+/* Exactly what the four edges leave over, so no point in the pane is dead and
+   none is claimed twice. */
+.tiled-region-drop-zone-center {
+  inset: 28%;
 }
 
 /* The stack of one `TileHeaderBar` per tile occupying this pane. A pane with a
