@@ -17,6 +17,7 @@
  */
 
 import { atom } from 'jotai';
+import type { MosaicNode } from 'react-mosaic-component';
 import { atomFamily } from '../debug/atomFamilyRegistry';
 import { store } from '@nimbalyst/runtime/store';
 import { selectedWorkstreamAtom, type WorkstreamType } from './sessions';
@@ -362,10 +363,9 @@ export interface ActiveTileRef {
 }
 
 /**
- * Placeholder pane id, used until task 4a builds the real multi-pane mosaic
- * tree and threads each pane's own id through. Only the key *shape* matters
- * now: `activeTileAtomFamily` is pane-scoped from the start so splitting never
- * has to migrate it.
+ * The pane a session's mosaic tree starts as: one leaf holding every open tile.
+ * Edge-drops split it, and every pane id after this one is minted by
+ * `TiledRegion`.
  */
 export const ROOT_PANE_ID = 'root';
 
@@ -373,6 +373,34 @@ export const ROOT_PANE_ID = 'root';
 export function activeTileKey(sessionId: string, paneId: string): string {
   return `${sessionId}:${paneId}`;
 }
+
+/** Builds the key identifying one tile in `tilePaneAtomFamily`. */
+export function tilePaneKey(ref: ActiveTileRef): string {
+  return `${ref.kind}:${ref.id}`;
+}
+
+/**
+ * Per-session mosaic tree of pane ids. Splitting is react-mosaic's own
+ * recursive node model at any depth, so nothing here caps or flattens it.
+ *
+ * In-memory only, like the open-tile lists: tile layout is not persisted across
+ * an app restart.
+ */
+export const paneTreeAtomFamily = atomFamily((_sessionId: string) =>
+  atom<MosaicNode<string>>(ROOT_PANE_ID)
+);
+
+/**
+ * Per-session map of `tilePaneKey(ref)` -> pane id, written when an edge-drop
+ * moves a tile into a newly created pane.
+ *
+ * A tile with no entry - and a tile whose pane the tree no longer contains,
+ * which is what a collapsed split leaves behind - occupies the tree's first
+ * leaf. So opening a tile never has to know the tree's shape.
+ */
+export const tilePaneAtomFamily = atomFamily((_sessionId: string) =>
+  atom<Record<string, string>>({})
+);
 
 /**
  * Per-(session, pane) pointer at the open tile that is currently frontmost.

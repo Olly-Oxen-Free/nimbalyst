@@ -17,8 +17,11 @@ vi.mock('@nimbalyst/runtime/ui/AgentTranscript/components/RichTranscriptView', (
 
 import { TiledRegion } from '../TiledRegion';
 import {
+  activeTileAtomFamily,
+  activeTileKey,
   openOrFocusTaskTileAtom,
   openOrFocusTeammateTileAtom,
+  paneTreeAtomFamily,
   sessionTasksAtom,
   sessionTeammatesAtom,
 } from '../../../store/atoms/agentMode';
@@ -38,6 +41,7 @@ function seededStore() {
     metadata: {
       currentTeammates: [
         { agentId: 'agent-a', name: 'code-reviewer', teamName: 'squad', agentType: 'general-purpose', status: 'running', model: 'sonnet-4' },
+        { agentId: 'agent-b', name: 'test-writer', teamName: 'squad', agentType: 'general-purpose', status: 'running' },
       ],
       currentTasks: [
         { taskId: 'task-1', description: 'db-migration', status: 'running', startedAt: 0, toolCount: 0, tokenCount: 0, durationMs: 0 },
@@ -60,6 +64,42 @@ function renderRegion(store = seededStore()) {
     headers: () => Array.from(result.container.querySelectorAll<HTMLElement>('.tile-header-bar')),
     panes: () => Array.from(result.container.querySelectorAll<HTMLElement>('.tiled-region-pane')),
     visiblePane: () => result.container.querySelector<HTMLElement>('.tiled-region-pane[style*="flex"]'),
+    tree: () => store.get(paneTreeAtomFamily(SESSION)),
+    /** The tiles occupying one leaf of the tree, in header order. */
+    tilesIn: (paneId: string) => Array.from(
+      result.container.querySelectorAll<HTMLElement>(
+        `.tiled-region-leaf[data-pane-id="${paneId}"] .tile-header-bar`,
+      ),
+    ).map(h => h.dataset.dragId),
+    dropTile: (dragId: string, paneId: string, edge: 'top' | 'bottom' | 'left' | 'right') => {
+      const header = result.container.querySelector<HTMLElement>(`.tile-header-bar[data-drag-id="${dragId}"]`)!;
+      const zone = result.container.querySelector<HTMLElement>(
+        `.tiled-region-leaf[data-pane-id="${paneId}"] .tiled-region-drop-zone[data-drop-edge="${edge}"]`,
+      )!;
+      // react-dnd's HTML5 backend reads the drag through these events, so the
+      // drop has to travel the same route the user's would.
+      const dataTransfer = stubDataTransfer();
+      fireEvent.dragStart(header, { dataTransfer });
+      fireEvent.dragEnter(zone, { dataTransfer });
+      fireEvent.dragOver(zone, { dataTransfer });
+      fireEvent.drop(zone, { dataTransfer });
+    },
+  };
+}
+
+/** jsdom has no DataTransfer, and the HTML5 backend calls into it on dragStart. */
+function stubDataTransfer() {
+  const data: Record<string, string> = {};
+  return {
+    dropEffect: 'move',
+    effectAllowed: 'all',
+    files: [],
+    items: [],
+    types: [] as string[],
+    setData: (key: string, value: string) => { data[key] = value; },
+    getData: (key: string) => data[key] ?? '',
+    clearData: () => {},
+    setDragImage: () => {},
   };
 }
 
@@ -160,6 +200,89 @@ describe('TiledRegion', () => {
       fireEvent.click(headers()[0].querySelector('.tile-header-bar-close')!);
     });
     expect(region()).toBeNull();
+  });
+
+  // Left/right put the panes side by side ('row'); top/bottom stack them
+  // ('column'); the dropped-on edge decides which side the new pane takes.
+  it.each([
+    ['left', 'row', ['pane-2', 'root']],
+    ['right', 'row', ['root', 'pane-2']],
+    ['top', 'column', ['pane-2', 'root']],
+    ['bottom', 'column', ['root', 'pane-2']],
+  ] as const)('dropping a header on the %s edge splits the pane %s', async (edge, direction, children) => {
+    const { store, dropTile, tree, tilesIn } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+
+    await act(async () => { dropTile('agent-a', 'root', edge); });
+
+    expect(tree()).toEqual({ type: 'split', direction, children });
+    expect(tilesIn('pane-2')).toEqual(['agent-a']);
+    expect(tilesIn('root')).toEqual(['task-1']);
+    // The new pane's own focus pointer, not the origin pane's, which still
+    // aims at what it was showing.
+    expect(store.get(activeTileAtomFamily(activeTileKey(SESSION, 'pane-2'))))
+      .toEqual({ kind: 'teammate', id: 'agent-a' });
+  });
+
+  // The split has to happen at the dropped-on pane's own path, so a pane that
+  // is already a child of a split nests one level deeper rather than joining
+  // its parent's children. One split cannot tell those two apart; two can.
+  it('splits a pane that is itself the child of a split, nesting three levels deep', async () => {
+    const { store, dropTile, tree, tilesIn } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await act(async () => { dropTile('agent-a', 'root', 'left'); });
+
+    await open(store, { kind: 'teammate', id: 'agent-b' });
+    expect(tilesIn('root')).toEqual(['task-1', 'agent-b']);
+
+    await act(async () => { dropTile('agent-b', 'pane-2', 'top'); });
+
+    expect(tree()).toEqual({
+      type: 'split',
+      direction: 'row',
+      children: [
+        { type: 'split', direction: 'column', children: ['pane-3', 'pane-2'] },
+        'root',
+      ],
+    });
+    expect(tilesIn('pane-3')).toEqual(['agent-b']);
+    expect(tilesIn('pane-2')).toEqual(['agent-a']);
+    expect(tilesIn('root')).toEqual(['task-1']);
+  });
+
+  it('collapses the split back onto the sibling when a split-created pane loses its last tile', async () => {
+    const { store, dropTile, headers, tree, tilesIn } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await act(async () => { dropTile('agent-a', 'root', 'left'); });
+
+    const closeAgentA = headers()
+      .find(h => h.dataset.dragId === 'agent-a')!
+      .querySelector('.tile-header-bar-close')!;
+    await act(async () => { fireEvent.click(closeAgentA); });
+
+    expect(tree()).toBe('root');
+    expect(tilesIn('root')).toEqual(['task-1']);
+  });
+
+  // The collapse can take the root leaf away, so a tile opened afterwards has
+  // no pane it was ever assigned to and must not vanish.
+  it('lands a newly opened tile in the surviving pane after the root pane collapsed away', async () => {
+    const { store, dropTile, headers, tree, tilesIn } = renderRegion();
+    await open(store, { kind: 'teammate', id: 'agent-a' });
+    await open(store, { kind: 'task', id: 'task-1' });
+    await act(async () => { dropTile('task-1', 'root', 'left'); });
+
+    const closeAgentA = headers()
+      .find(h => h.dataset.dragId === 'agent-a')!
+      .querySelector('.tile-header-bar-close')!;
+    await act(async () => { fireEvent.click(closeAgentA); });
+    expect(tree()).toBe('pane-2');
+
+    await open(store, { kind: 'teammate', id: 'agent-b' });
+    expect(tilesIn('pane-2')).toEqual(['task-1', 'agent-b']);
   });
 
   it('renders a tile the sidebar opened through the older toggle atom', async () => {

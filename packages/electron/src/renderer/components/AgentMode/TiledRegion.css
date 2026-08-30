@@ -46,11 +46,56 @@
 }
 
 .tiled-region-leaf {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 0;
   overflow: hidden;
+}
+
+/* Edge drop zones: the outer 28% of each side of a pane splits it, the middle
+   is left for the center drop. They only exist while a header drag is running -
+   the library puts `-dragging` on the mosaic root for exactly this - so they
+   never intercept a click on a header or a transcript. */
+.tiled-region-drop-zone {
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.mosaic.-dragging .tiled-region-drop-zone {
+  pointer-events: auto;
+}
+
+.tiled-region-drop-zone-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 28%;
+}
+
+.tiled-region-drop-zone-right {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 28%;
+}
+
+/* Inset past the side zones so a corner reads as a side split, matching how
+   niri resolves an ambiguous corner drop. */
+.tiled-region-drop-zone-top {
+  top: 0;
+  right: 28%;
+  left: 28%;
+  height: 28%;
+}
+
+.tiled-region-drop-zone-bottom {
+  right: 28%;
+  bottom: 0;
+  left: 28%;
+  height: 28%;
 }
 
 /* The stack of one `TileHeaderBar` per tile occupying this pane. A pane with a
