@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from 'react';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
-import { Provider, createStore } from 'jotai';
+import { Provider, createStore, useSetAtom } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Narrow mock only - the transcript view is the one thing in the tile bodies
@@ -24,6 +24,7 @@ vi.mock('../../UnifiedAI/AIInput', () => ({
 }));
 
 import { TiledRegion } from '../TiledRegion';
+import { SubAgentChipRow } from '../SubAgentChipRow';
 import {
   activeTileAtomFamily,
   activeTileKey,
@@ -458,5 +459,53 @@ describe('TiledRegion', () => {
     });
 
     expect(headers().map(h => h.dataset.dragId)).toEqual(['agent-a']);
+  });
+
+  // `SessionTranscript` composes exactly this pair: the region beside the main
+  // thread, and `SubAgentChipRow` kept where it always was - directly above the
+  // compose bar - as the opener into it. Its two chip handlers are thin writers
+  // over the same atoms, so the seam worth covering is the id space crossing
+  // from a chip to a reachable tile header, which neither component's own test
+  // can see on its own.
+  describe('composed with the chip row as SessionTranscript composes them', () => {
+    const Composition: React.FC = () => {
+      const openTeammateTile = useSetAtom(openOrFocusTeammateTileAtom);
+      const openTaskTile = useSetAtom(openOrFocusTaskTileAtom);
+      return (
+        <>
+          <TiledRegion sessionId={SESSION} />
+          <SubAgentChipRow
+            sessionId={SESSION}
+            onTeammateClick={agentId => openTeammateTile({ sessionId: SESSION, agentId })}
+            onTaskClick={taskId => openTaskTile({ sessionId: SESSION, taskId })}
+          />
+        </>
+      );
+    };
+
+    it('opens a tile of either kind from its chip, and keeps the chip row alongside', async () => {
+      const { container } = render(
+        <Provider store={seededStore()}>
+          <Composition />
+        </Provider>,
+      );
+      const chips = () => Array.from(container.querySelectorAll<HTMLElement>('.sub-agent-chip'));
+      const chip = (label: string) => chips().find(c => c.textContent?.includes(label))!;
+      const headers = () => Array.from(container.querySelectorAll<HTMLElement>('.tile-header-bar'))
+        .map(h => h.dataset.dragId);
+
+      // Chips before any tile: the row is the opener, the region is not there yet.
+      expect(chips()).toHaveLength(3);
+      expect(container.querySelector('.tiled-region')).toBeNull();
+
+      await act(async () => { fireEvent.click(chip('code-reviewer')); });
+      expect(headers()).toEqual(['agent-a']);
+
+      await act(async () => { fireEvent.click(chip('db-migration')); });
+      expect(headers()).toEqual(['agent-a', 'task-1']);
+
+      // Opening a tile does not take the opener away.
+      expect(chips()).toHaveLength(3);
+    });
   });
 });
