@@ -3,11 +3,14 @@ import test from 'node:test';
 
 import {
   COLLAB_BUNDLE_FORBIDDEN_DEPENDENCIES,
+  applyExtensionSdkExemption,
   findEagerEntryFiles,
+  findEntryExclusiveModuleIds,
   findBundledSingletons,
   findEmbeddedLaneViolations,
   findEntrySeparationViolations,
   findPublicTypeLeaks,
+  findTrackersUiPersonalLaneViolations,
 } from '../check-collab-bundle.mjs';
 import { findBrowserDependencyViolations } from '../browser-bundle-graph.mjs';
 
@@ -42,15 +45,17 @@ test('allows the draggable block handle into the browser bundle', () => {
   assert.deepEqual(violations, []);
 });
 
-test('fails loudly when React, Lexical, or Yjs is bundled', () => {
+test('fails loudly when React, Lexical, RevoGrid, or Yjs is bundled', () => {
   const violations = findBundledSingletons([
     { id: '/repo/node_modules/react/index.js', external: false },
     { id: '/repo/node_modules/@lexical/yjs/LexicalYjs.mjs', external: false },
+    { id: '/repo/node_modules/@revolist/react-datagrid/dist/react-datagrid.js', external: false },
+    { id: '/repo/node_modules/@revolist/revogrid/dist/index.js?v=one', external: false },
     { id: '/repo/node_modules/yjs/dist/yjs.mjs', external: false },
     { id: 'react', external: true },
   ]);
 
-  assert.deepEqual(violations.map(({ name }) => name), ['React', 'Lexical', 'Yjs']);
+  assert.deepEqual(violations.map(({ name }) => name), ['React', 'Lexical', 'RevoGrid', 'Yjs']);
 });
 
 test('fails loudly when Jotai or the runtime store resolves through two embedded lanes', () => {
@@ -62,6 +67,52 @@ test('fails loudly when Jotai or the runtime store resolves through two embedded
   ]);
 
   assert.deepEqual(violations.map(({ name }) => name), ['Jotai', 'runtime store']);
+});
+
+test('exempts the extension SDK for the canvas entry alone', () => {
+  const report = {
+    chunks: [
+      {
+        fileName: 'canvas.js', name: 'canvas', isEntry: true,
+        imports: ['chunks/shared.js'], dynamicImports: [], exports: [],
+        modules: ['/repo/packages/extension-sdk/dist/useCollaborativeEditor.js'],
+      },
+      {
+        fileName: 'editor.js', name: 'editor', isEntry: true,
+        imports: ['chunks/shared.js'], dynamicImports: [], exports: [], modules: [],
+      },
+      {
+        fileName: 'chunks/shared.js', name: 'shared', isEntry: false,
+        imports: [], dynamicImports: [], exports: [], modules: [],
+      },
+    ],
+  };
+  const sdkHits = [
+    '/repo/packages/extension-sdk/dist/useCollaborativeEditor.js',
+    '/repo/packages/extension-sdk/dist/index.js',
+  ];
+  const violations = [
+    { name: 'Electron', hits: ['electron'] },
+    { name: 'extension SDK leakage', hits: sdkHits },
+  ];
+
+  // The canvas-exclusive module is dropped; the one it shares with `editor` is
+  // not, and no other category is touched.
+  assert.deepEqual(
+    applyExtensionSdkExemption(violations, findEntryExclusiveModuleIds(report, ['canvas'])),
+    [
+      { name: 'Electron', hits: ['electron'] },
+      { name: 'extension SDK leakage', hits: ['/repo/packages/extension-sdk/dist/index.js'] },
+    ],
+  );
+
+  // The same module reached from a second entry stops being canvas-exclusive.
+  report.chunks[1].modules.push('/repo/packages/extension-sdk/dist/useCollaborativeEditor.js');
+  assert.deepEqual(
+    applyExtensionSdkExemption(violations, findEntryExclusiveModuleIds(report, ['canvas']))
+      .find(({ name }) => name === 'extension SDK leakage').hits,
+    sdkHits,
+  );
 });
 
 test('keeps editor and docs-ui dependency closures separate', () => {
@@ -81,6 +132,12 @@ test('keeps editor and docs-ui dependency closures separate', () => {
           '/repo/node_modules/jotai/esm/index.mjs',
         ],
       },
+      {
+        fileName: 'trackers-ui.js', name: 'trackers-ui', isEntry: true,
+        imports: [], dynamicImports: [], exports: [], modules: [
+          '/repo/packages/collab-client/src/trackers-ui/grid/TrackerGridSurface.tsx',
+        ],
+      },
     ],
   };
   assert.deepEqual(findEntrySeparationViolations(cleanReport), []);
@@ -97,6 +154,42 @@ test('keeps editor and docs-ui dependency closures separate', () => {
     findEntrySeparationViolations(cleanReport),
     ['docs-ui entry pulls the editor/codec graph'],
   );
+  cleanReport.chunks[1].modules.pop();
+
+  // Tracker item bodies mount through the shared `editor` entry; a Lexical
+  // graph appearing here means a second editor integration was written.
+  cleanReport.chunks[2].modules.push('/repo/packages/runtime/src/collab-lexical/index.ts');
+  assert.deepEqual(
+    findEntrySeparationViolations(cleanReport),
+    ['trackers-ui entry pulls the editor/codec graph'],
+  );
+  cleanReport.chunks[2].modules.pop();
+
+  // The star and the dot are host-supplied slots. If either module is back in
+  // the browser closure, someone restored a static import.
+  cleanReport.chunks[2].modules.push(
+    '/repo/packages/runtime/src/readReceipts/trackerUnreadAtoms.ts',
+    '/repo/packages/runtime/src/plugins/TrackerPlugin/components/TrackerFavoriteStar.tsx',
+    '/repo/packages/runtime/src/sync/CollabV3Sync.ts',
+    '/repo/packages/electron/src/main/services/StytchAuthService.ts',
+  );
+  assert.deepEqual(findEntrySeparationViolations(cleanReport), [
+    'trackers-ui entry pulls the personal lane (read-receipt / unread lane): '
+    + '/repo/packages/runtime/src/readReceipts/trackerUnreadAtoms.ts',
+    'trackers-ui entry pulls the personal lane (favorite star): '
+    + '/repo/packages/runtime/src/plugins/TrackerPlugin/components/TrackerFavoriteStar.tsx',
+    'trackers-ui entry pulls the personal lane (personal sync transport and key derivation): '
+    + '/repo/packages/runtime/src/sync/CollabV3Sync.ts',
+    'trackers-ui entry pulls the personal lane (personal JWT acquisition): '
+    + '/repo/packages/electron/src/main/services/StytchAuthService.ts',
+  ]);
+});
+
+test('the trackers-ui personal-lane gate spares the shared team JWT brand', () => {
+  assert.deepEqual(findTrackersUiPersonalLaneViolations([
+    '/repo/packages/runtime/src/auth/jwtScopes.ts',
+    '/repo/packages/collab-client/src/trackers-ui/board/TrackerBoardCard.tsx',
+  ]), []);
 });
 
 test('eager entry closure follows static imports but stops at dynamic imports', () => {

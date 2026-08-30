@@ -149,7 +149,7 @@ export interface ToolCall {
 
 /**
  * OpenAI function-calling shaped tool definition threaded to extension-agent
- * providers so their tool loops (e.g. gemini-antigravity) can present the host's
+ * providers so their tool loops (e.g. Gemini) can present the host's
  * meta-agent tools as JSON in the model prompt. Built-in providers ignore this
  * — they discover the same tools over an SSE MCP server instead. Optional and
  * additive everywhere it appears so no built-in provider path is affected.
@@ -198,7 +198,7 @@ export interface Message {
  * Add new providers here -- the type, runtime array, and exhaustiveness
  * checks all derive from this one definition.
  */
-export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'claude-code-cli', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'ollama', 'opencode', 'copilot-cli'] as const;
+export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'claude-code-cli', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'ollama', 'opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent'] as const;
 
 export type AIProviderType = typeof AI_PROVIDER_TYPES[number];
 
@@ -217,8 +217,34 @@ export function assertExhaustiveProvider(provider: never): never {
   throw new Error(`Unhandled provider: ${provider}`);
 }
 
-export function isAgentProvider(provider: string | null | undefined): provider is 'claude-code' | 'claude-code-cli' | 'openai-codex' | 'openai-codex-acp' | 'opencode' | 'copilot-cli' {
-  return provider === 'claude-code' || provider === 'claude-code-cli' || provider === 'openai-codex' || provider === 'openai-codex-acp' || provider === 'opencode' || provider === 'copilot-cli';
+export type AgentProviderType =
+  | 'claude-code'
+  | 'claude-code-cli'
+  | 'openai-codex'
+  | 'openai-codex-acp'
+  | 'opencode'
+  | 'copilot-cli'
+  | 'grok-build'
+  | 'cursor-agent'
+  // Keeps its original contribution id from the years it shipped as an
+  // extension: the id is persisted on every existing Gemini session row, and
+  // re-keying it would orphan that history for a cosmetic gain.
+  | 'antigravity-gemini-agent';
+
+const AGENT_PROVIDER_TYPES: ReadonlySet<string> = new Set<AgentProviderType>([
+  'claude-code',
+  'claude-code-cli',
+  'openai-codex',
+  'openai-codex-acp',
+  'opencode',
+  'copilot-cli',
+  'grok-build',
+  'cursor-agent',
+  'antigravity-gemini-agent',
+]);
+
+export function isAgentProvider(provider: string | null | undefined): provider is AgentProviderType {
+  return !!provider && AGENT_PROVIDER_TYPES.has(provider);
 }
 
 /**
@@ -573,6 +599,7 @@ export interface StreamChunk {
   isBedrockToolError?: boolean; // True when error is a Bedrock tool search error
   isServerError?: boolean; // True when error is a 500/internal server error (Claude may be down)
   isCodexAuthRequired?: boolean; // True when a Codex app-server session was blocked because the user is not signed in to OpenAI
+  isProcessCrash?: boolean; // True when the agent subprocess died from a native fault (#1361), so the turn must settle as errored despite the follow-up 'complete'
   isComplete?: boolean;
   config?: unknown; // For stream_edit_start
   usage?: {
@@ -581,6 +608,14 @@ export interface StreamChunk {
     total_tokens: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
+  };
+  // Structured `/context` report from the agent SDK (0.3.241+), when the binary
+  // attaches one. Set only on the `complete` chunk of a /context turn; the
+  // rendered markdown remains the fallback for older binaries.
+  contextReport?: {
+    totalTokens: number;
+    contextWindow: number;
+    categories?: TokenUsageCategory[];
   };
   // Per-model usage breakdown from SDK (available on 'complete' chunks from claude-code)
   modelUsage?: Record<string, {

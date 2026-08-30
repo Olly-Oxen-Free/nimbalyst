@@ -33,6 +33,7 @@ import type { TutorialEntryPoint, TutorialStartResult, TutorialStatusResult } fr
 import type {
   OpenCodeModelCatalogIpcResponse,
   OpenCodeModelCatalogRefreshRequest,
+  OpenCodeModelCatalogRequest,
 } from '../shared/openCodeModelCatalog.ts';
 import type {
   OpenCodeAgentCatalogIpcResponse,
@@ -602,6 +603,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAIModels: () => ipcRenderer.invoke('ai:getModels'),
   // Aliases for consistency with component naming
   aiGetSettings: () => ipcRenderer.invoke('ai:getSettings'),
+  aiGetHeadlessAgentAvailability: () => ipcRenderer.invoke('ai:getHeadlessAgentAvailability'),
   aiSaveSettings: (settings: any) => ipcRenderer.invoke('ai:saveSettings', settings),
   aiTestConnection: (provider: string, workspacePath?: string) =>
     ipcRenderer.invoke('ai:testConnection', provider, workspacePath),
@@ -609,8 +611,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   aiGetAllModels: () => ipcRenderer.invoke('ai:getAllModels'),
   aiClearModelCache: () => ipcRenderer.invoke('ai:clearModelCache'),
   aiRefreshSessionProvider: (sessionId: string) => ipcRenderer.invoke('ai:refreshSessionProvider', sessionId),
-  openCodeModelCatalogGet: (): Promise<OpenCodeModelCatalogIpcResponse> =>
-    ipcRenderer.invoke('opencode-model-catalog:get'),
+  openCodeModelCatalogGet: (
+    request: OpenCodeModelCatalogRequest
+  ): Promise<OpenCodeModelCatalogIpcResponse> =>
+    ipcRenderer.invoke('opencode-model-catalog:get', request),
   openCodeModelCatalogRefresh: (
     request: OpenCodeModelCatalogRefreshRequest
   ): Promise<OpenCodeModelCatalogIpcResponse> =>
@@ -632,6 +636,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // CLI management
   cliCheckInstallation: (tool: string) => ipcRenderer.invoke('cli:checkInstallation', tool),
+  cliGetInstallStrategy: (tool: string) => ipcRenderer.invoke('cli:getInstallStrategy', tool),
   cliInstall: (tool: string, options: any) => ipcRenderer.invoke('cli:install', tool, options),
   cliUninstall: (tool: string) => ipcRenderer.invoke('cli:uninstall', tool),
   cliUpgrade: (tool: string) => ipcRenderer.invoke('cli:upgrade', tool),
@@ -650,7 +655,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('ai:error', handler);
     return () => ipcRenderer.removeListener('ai:error', handler);
   },
-  onAIApplyDiff: (callback: (data: { replacements: any[], resultChannel: string, targetFilePath?: string }) => void) => {
+  onAIApplyDiff: (callback: (data: { replacements: any[], resultChannel: string, targetFilePath?: string, workspacePath?: string, agent?: { sessionId: string; sessionName: string } }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('ai:applyDiff', handler);
     return () => ipcRenderer.removeListener('ai:applyDiff', handler);
@@ -731,7 +736,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   // MCP Server operations
-  onMcpApplyDiff: (callback: (data: { replacements: any[], resultChannel: string }) => void) => {
+  onMcpApplyDiff: (callback: (data: { replacements: any[], resultChannel: string, targetFilePath?: string, workspacePath?: string, agent?: { sessionId: string; sessionName: string } }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('mcp:applyDiff', handler);
     return () => ipcRenderer.removeListener('mcp:applyDiff', handler);
@@ -741,12 +746,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('mcp:streamContent', handler);
     return () => ipcRenderer.removeListener('mcp:streamContent', handler);
   },
-  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string }) => void) => {
+  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string, workspacePath?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('mcp:readCollabDoc', handler);
     return () => ipcRenderer.removeListener('mcp:readCollabDoc', handler);
   },
-  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; error?: string }) => {
+  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; error?: string; code?: string }) => {
     ipcRenderer.send(resultChannel, result);
   },
   onMcpReadCollabDocComments: (callback: (data: any) => void) => {
@@ -767,6 +772,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendMcpCollabDocCommentResult: (
     resultChannel: string,
     result: { success: boolean; result?: unknown; code?: string; error?: string },
+  ) => {
+    ipcRenderer.send(resultChannel, result);
+  },
+  // Project Canvas working-set declaration (agent presence on a board).
+  onMcpCanvasWorkingSet: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('mcp:canvasWorkingSet', handler);
+    return () => ipcRenderer.removeListener('mcp:canvasWorkingSet', handler);
+  },
+  sendMcpCanvasWorkingSetResult: (
+    resultChannel: string,
+    result: {
+      success: boolean;
+      published?: boolean;
+      nodeIds?: string[];
+      code?: string;
+      error?: string;
+    },
   ) => {
     ipcRenderer.send(resultChannel, result);
   },
@@ -1682,6 +1705,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   analytics: {
     allowedToSendAnalytics: () => ipcRenderer.invoke('analytics:allowed'),
     getDistinctId: () => ipcRenderer.invoke('analytics:get-distinct-id'),
+    getReleaseAttribution: () => ipcRenderer.invoke('analytics:get-release-attribution'),
     optIn: () => ipcRenderer.invoke('analytics:opt-in'),
     optOut: () => ipcRenderer.invoke('analytics:opt-out'),
     setSessionId: (sessionId: string) => ipcRenderer.invoke('analytics:set-session-id', sessionId),

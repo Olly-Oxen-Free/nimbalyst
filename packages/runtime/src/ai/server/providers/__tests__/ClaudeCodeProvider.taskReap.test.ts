@@ -1,6 +1,7 @@
 // @vitest-environment node
 /**
- * abort() must reap background sub-agent tasks (NIM-2458).
+ * Every path that kills a query must reap its background sub-agent tasks
+ * (NIM-2458, #1269).
  *
  * A background Task/Bash sub-agent runs inside the SDK subprocess. abort()
  * kills that subprocess, so the task's terminal `task_notification` can never
@@ -8,6 +9,10 @@
  * `result` sees hasRunningTasks() === true and defers teardown to the drain
  * loop — the session stays 'running' and its queued prompts stall until the
  * drain grace expires. Observed as a ~5 minute stall on 2026-08-04.
+ *
+ * interruptCurrentTurn() leaves the same wreckage: the streaming loop breaks on
+ * the interrupt, so no terminal notification can land afterwards, and the drain
+ * that would otherwise reap never runs because an interrupt is not an abort.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -37,7 +42,21 @@ type ProviderInternals = {
   hasRunningTasks: () => boolean;
   handleSystemTask: (subtype: string, chunk: any, sessionId: string | undefined) => void;
   reapStalledSubagentTasks: (staleMs: number, sessionId: string | undefined) => void;
+  leadQuery: unknown;
 };
+
+function seedTasks(state: ProviderInternals): void {
+  state.activeTasks.set('bkxaizroy', {
+    taskId: 'bkxaizroy',
+    description: 'Block until suite finishes',
+    status: 'running',
+  });
+  state.activeTasks.set('done', {
+    taskId: 'done',
+    description: 'Already finished',
+    status: 'completed',
+  });
+}
 
 function internals(provider: ClaudeCodeProvider): ProviderInternals {
   return provider as unknown as ProviderInternals;
@@ -47,16 +66,7 @@ describe('ClaudeCodeProvider background task reaping', () => {
   it('marks tasks orphaned by abort() stopped so the next turn does not defer teardown', () => {
     const provider = new ClaudeCodeProvider();
     const state = internals(provider);
-    state.activeTasks.set('bkxaizroy', {
-      taskId: 'bkxaizroy',
-      description: 'Block until suite finishes',
-      status: 'running',
-    });
-    state.activeTasks.set('done', {
-      taskId: 'done',
-      description: 'Already finished',
-      status: 'completed',
-    });
+    seedTasks(state);
     // Parked on a permission prompt is still alive: it must be reaped like a
     // running task, not mistaken for settled and left 'blocked' forever.
     state.activeTasks.set('waiting', {
@@ -73,6 +83,22 @@ describe('ClaudeCodeProvider background task reaping', () => {
     expect(state.activeTasks.get('bkxaizroy')?.status).toBe('stopped');
     expect(state.activeTasks.get('waiting')?.status).toBe('stopped');
     // A task that already settled keeps its own terminal status.
+    expect(state.activeTasks.get('done')?.status).toBe('completed');
+  });
+
+  it('marks tasks orphaned by interruptCurrentTurn() stopped', async () => {
+    const provider = new ClaudeCodeProvider();
+    const state = internals(provider);
+    const interrupt = vi.fn(async () => {});
+    state.leadQuery = { interrupt };
+    seedTasks(state);
+
+    const outcome = await provider.interruptCurrentTurn();
+
+    expect(outcome.method).toBe('interrupt');
+    expect(interrupt).toHaveBeenCalledTimes(1);
+    expect(state.hasRunningTasks()).toBe(false);
+    expect(state.activeTasks.get('bkxaizroy')?.status).toBe('stopped');
     expect(state.activeTasks.get('done')?.status).toBe('completed');
   });
 });

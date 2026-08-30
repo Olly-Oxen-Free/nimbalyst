@@ -16,6 +16,7 @@ import {
   ORG_PROJECT_WALK_DISMISSED_SETTING_KEY,
 } from '../../shared/orgProjectWalk';
 import { normalizeCodexProviderConfig, omitModelsField } from '@nimbalyst/runtime/ai/server/utils/modelConfigUtils';
+import { planWorkstreamStatePrune } from './workstreamStatePrune';
 import type { OpenCodeModelCatalogCache } from '@nimbalyst/runtime/ai/server';
 
 // Theme can be a built-in theme or an extension theme ID (format: "extensionId:themeId")
@@ -195,8 +196,18 @@ interface AppStoreSchema {
     // path retained as an escape hatch.
     transport?: 'sdk' | 'app-server';
   };
-  /** Live provider.list catalog, keyed by OpenCode binary + auth identity. */
+  /**
+   * Legacy single-slot catalog from before per-workspace storage (#1382). Read
+   * once for the workspace it belongs to, never written; new writes go to
+   * openCodeModelCatalogCaches.
+   */
   openCodeModelCatalogCache?: OpenCodeModelCatalogCache;
+  /**
+   * Live provider.list catalog per workspace, each keyed by OpenCode binary +
+   * auth identity. OpenCode resolves providers from project config, so one
+   * project's discovery is not an answer for another.
+   */
+  openCodeModelCatalogCaches?: Record<string, OpenCodeModelCatalogCache>;
   // Unified agent workflow registry source settings
   agentWorkflowSources?: {
     workspaceClaudeCompatibilityEnabled?: boolean;
@@ -263,6 +274,10 @@ interface AppStoreSchema {
   spellcheckLanguages?: string[];
   // System tray icon
   showTrayIcon?: boolean;
+  // macOS menu bar fleet-status strip, independent of the icon itself.
+  // A wide item is a real risk of overflowing under the notch on a laptop, so
+  // it can be turned off without losing the tray icon and its panel.
+  showTrayStrip?: boolean;
   // Advanced: V8 heap memory limit in MB (default: 4096 = 4GB)
   // Increase if you experience OOM crashes with large sessions
   maxHeapSizeMB?: number;
@@ -713,6 +728,103 @@ function getWorkspaceStore(): Store<Record<string, WorkspaceState>> {
   return _workspaceStore;
 }
 
+/**
+ * Read-through cache over the workspace store's on-disk JSON.
+ *
+ * `conf` has no cache: its `get store()` runs `readFileSync` + `JSON.parse`
+ * on *every* `.get()`. That is ~19ms of synchronous main-thread time against
+ * a 7.5MB `workspace-settings.json`, and `getWorkspaceState` sits on the hot
+ * path for team resolution and document sync (see `getLocalOrgBinding`), so
+ * the cost lands in the event loop dozens of times per user action.
+ *
+ * The main process is the only writer of this file within a userData dir --
+ * each dev instance gets its own -- so a process-local cache cannot go stale.
+ * Every write goes through `writeWorkspaceEntry`, which keeps the two in step.
+ */
+let _workspaceStoreCache: Record<string, WorkspaceState> | null = null;
+
+function readWorkspaceStore(): Record<string, WorkspaceState> {
+  if (!_workspaceStoreCache) {
+    _workspaceStoreCache = getWorkspaceStore().store ?? {};
+  }
+  return _workspaceStoreCache;
+}
+
+function writeWorkspaceEntry(key: string, value: WorkspaceState): void {
+  getWorkspaceStore().set(key, value);
+  // Populate rather than invalidate: the next read is almost always for the
+  // key just written, and re-reading would pay the full parse again.
+  readWorkspaceStore()[key] = value;
+}
+
+/**
+ * Drop the cache so the next read comes from disk. For tests and for any
+ * path that mutates the file outside `writeWorkspaceEntry`.
+ */
+export function invalidateWorkspaceStoreCache(): void {
+  _workspaceStoreCache = null;
+}
+
+/**
+ * Workspaces still carrying legacy offline collab edits in their settings.
+ *
+ * `collabPendingUpdates` predates `CollabDocumentReplicaStore`; the migration
+ * off it only ran when the specific document was reopened, so blobs for
+ * documents nobody revisited sat here for months inflating every read and
+ * write of the settings file. This lets a startup pass find them all.
+ */
+export function listLegacyPendingUpdateWorkspaces(): Array<{
+  workspacePath: string;
+  pending: Record<string, { mergedUpdateBase64: string; updatedAt: number }>;
+}> {
+  const out: Array<{
+    workspacePath: string;
+    pending: Record<string, { mergedUpdateBase64: string; updatedAt: number }>;
+  }> = [];
+
+  for (const state of Object.values(readWorkspaceStore())) {
+    const pending = state?.collabPendingUpdates;
+    if (!pending || Object.keys(pending).length === 0) continue;
+    if (!state.workspacePath) continue;
+    out.push({ workspacePath: state.workspacePath, pending });
+  }
+
+  return out;
+}
+
+/**
+ * Evict per-workstream UI state for sessions that no longer exist.
+ *
+ * Entries accumulated one per workstream and were never removed, so the
+ * settings file carried thousands of them. `conf` rewrites the entire file on
+ * every `set`, so the dead entries were paid for on each persist. Callers pass
+ * the live session ids; an empty set is treated as no-information and prunes
+ * nothing (see `planWorkstreamStatePrune`).
+ */
+export function pruneWorkstreamStates(
+  liveSessionIds: ReadonlySet<string>
+): { workspacesTouched: number; entriesRemoved: number } {
+  let workspacesTouched = 0;
+  let entriesRemoved = 0;
+
+  for (const [key, state] of Object.entries(readWorkspaceStore())) {
+    const plan = planWorkstreamStatePrune(
+      state?.workstreamStates as Record<string, unknown> | undefined,
+      liveSessionIds
+    );
+    if (plan.remove.length === 0) continue;
+
+    const next = cloneWorkspaceState(state);
+    for (const id of plan.remove) delete (next.workstreamStates ?? {})[id];
+    writeWorkspaceEntry(key, next);
+
+    workspacesTouched++;
+    entriesRemoved += plan.remove.length;
+  }
+
+  return { workspacesTouched, entriesRemoved };
+}
+
 const DEFAULT_TAB_MANAGER_STATE: TabManagerState = {
   tabs: [],
   activeTabId: null,
@@ -888,10 +1000,10 @@ function cloneWorkspaceState(state: WorkspaceState): WorkspaceState {
 
 function ensureWorkspaceState(path: string): WorkspaceState {
   const key = workspaceKey(path);
-  const raw = getWorkspaceStore().get(key);
+  const raw = readWorkspaceStore()[key];
   const normalized = normalizeWorkspaceState(raw, path);
   if (!raw) {
-    getWorkspaceStore().set(key, cloneWorkspaceState(normalized));
+    writeWorkspaceEntry(key, cloneWorkspaceState(normalized));
   }
   return normalized;
 }
@@ -899,7 +1011,7 @@ function ensureWorkspaceState(path: string): WorkspaceState {
 function persistWorkspaceState(path: string, state: WorkspaceState): WorkspaceState {
   const key = workspaceKey(path);
   const next = cloneWorkspaceState({ ...state, lastUpdated: Date.now() });
-  getWorkspaceStore().set(key, next);
+  writeWorkspaceEntry(key, next);
   return next;
 }
 
@@ -1133,7 +1245,7 @@ export function updateWorkspaceState(
  */
 export function getTakenLocalKeyPrefixes(excludeWorkspacePath?: string): string[] {
   const excludeKey = excludeWorkspacePath ? workspaceKey(excludeWorkspacePath) : null;
-  const all = getWorkspaceStore().store ?? {};
+  const all = readWorkspaceStore();
   return Object.entries(all)
     .filter(([key]) => key.startsWith('ws:') && key !== excludeKey)
     .map(([, state]) => state?.localKeyPrefix)
@@ -1350,7 +1462,7 @@ export function getAIProviderOverrides(workspacePath: string): AIProviderOverrid
  * `apiKeys`). Separate from the `app-settings` store exported as `store`.
  */
 let _aiSettingsStore: Store<Record<string, unknown>> | null = null;
-function getAiSettingsStore(): Store<Record<string, unknown>> {
+export function getAiSettingsStore(): Store<Record<string, unknown>> {
   if (!_aiSettingsStore) {
     _aiSettingsStore = new Store<Record<string, unknown>>({ name: 'ai-settings' });
   }
@@ -1637,6 +1749,14 @@ export function setShowTrayIcon(show: boolean): void {
   getAppStore().set('showTrayIcon', show);
 }
 
+export function isShowTrayStrip(): boolean {
+  return getAppStore().get('showTrayStrip', true);
+}
+
+export function setShowTrayStrip(show: boolean): void {
+  getAppStore().set('showTrayStrip', show);
+}
+
 // Completion Sound Settings
 export function isCompletionSoundEnabled(): boolean {
   return getAppStore().get('completionSoundEnabled', true);
@@ -1784,12 +1904,39 @@ export function setDefaultAIModel(model: string): void {
   getAppStore().set('defaultAIModel', model);
 }
 
-export function getOpenCodeModelCatalogCache(): OpenCodeModelCatalogCache | null {
-  return getAppStore().get('openCodeModelCatalogCache') ?? null;
+/**
+ * Keep a bounded number of workspaces' catalogs. Each entry is a full
+ * provider.list result, so an unbounded map would grow with every project the
+ * user ever discovers in; the least recently refreshed is evicted.
+ */
+const MAX_OPENCODE_MODEL_CATALOG_WORKSPACES = 20;
+
+export function getOpenCodeModelCatalogCache(
+  workspacePath: string
+): OpenCodeModelCatalogCache | null {
+  const byWorkspace = getAppStore().get('openCodeModelCatalogCaches') ?? {};
+  const stored = byWorkspace[workspacePath];
+  if (stored) return stored;
+
+  // Installs that discovered before per-workspace storage have one global slot.
+  // Honor it for the workspace it was actually recorded against (#1382).
+  const legacy = getAppStore().get('openCodeModelCatalogCache');
+  return legacy?.workspacePath === workspacePath ? legacy : null;
 }
 
 export function setOpenCodeModelCatalogCache(cache: OpenCodeModelCatalogCache): void {
-  getAppStore().set('openCodeModelCatalogCache', cache);
+  const byWorkspace = { ...(getAppStore().get('openCodeModelCatalogCaches') ?? {}) };
+  byWorkspace[cache.workspacePath] = cache;
+
+  const entries = Object.entries(byWorkspace);
+  if (entries.length > MAX_OPENCODE_MODEL_CATALOG_WORKSPACES) {
+    entries.sort(([, a], [, b]) => b.refreshedAt - a.refreshedAt);
+    for (const [staleWorkspacePath] of entries.slice(MAX_OPENCODE_MODEL_CATALOG_WORKSPACES)) {
+      delete byWorkspace[staleWorkspacePath];
+    }
+  }
+
+  getAppStore().set('openCodeModelCatalogCaches', byWorkspace);
 }
 
 // Default Effort Level Settings (Opus 4.6 adaptive reasoning)
@@ -2880,7 +3027,7 @@ export function runMigrations(currentVersion: string): void {
   // rather than having it silently reappear. Flag-guarded so it runs once.
   if (!getAppStore().get('gutterButtonsMigratedToGlobal')) {
     try {
-      const workspaces = getWorkspaceStore().store;
+      const workspaces = readWorkspaceStore();
       const union = new Set<string>(getAppStore().get('hiddenGutterItems') ?? []);
       for (const state of Object.values(workspaces ?? {})) {
         for (const id of state?.hiddenGutterButtons ?? []) {

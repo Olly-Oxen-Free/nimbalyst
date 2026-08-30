@@ -42,10 +42,12 @@ import {
 import type { FeedbackRequestServiceState } from '@nimbalyst/collab-client/feedback';
 import { FeedbackRespondAskField } from './FeedbackRespondAskField';
 import type { FeedbackOptionPreviewRenderer } from './FeedbackRespondOptionCards';
+import type { FeedbackArtifactDetailRenderer } from './FeedbackArtifactDetailPopover';
 import {
   FeedbackArtifactSubjects,
   type FeedbackArtifactActionResolver,
   type FeedbackSubjectOpener,
+  type FeedbackSubjectPreviewRenderer,
 } from './FeedbackArtifactSubjects';
 import {
   FEEDBACK_RESPOND_BLOCKED_MESSAGES,
@@ -88,6 +90,17 @@ export interface FeedbackRequestRespondProps {
   discussion?: React.ReactNode;
   /** Per-option artifact previews, when the embedding surface has them. */
   renderOptionPreview?: FeedbackOptionPreviewRenderer;
+  /**
+   * Paints what the request is *about*, as distinct from the artifacts bound to
+   * one ask's options. Absent leaves the subject list as text rows.
+   */
+  renderSubjectPreview?: FeedbackSubjectPreviewRenderer;
+  /**
+   * Paints one artifact full-size for the detail popover. Supplied means expand
+   * opens the popover in place; absent means expand opens a tab, as it did
+   * before the popover existed.
+   */
+  renderArtifactDetail?: FeedbackArtifactDetailRenderer;
   /**
    * Opens a subject or a bound artifact. Host-supplied because the mechanics
    * differ per host -- a tab in the desktop app, a route in the browser -- and
@@ -137,6 +150,8 @@ export const FeedbackRequestRespond: React.FC<FeedbackRequestRespondProps> = ({
   host,
   discussion,
   renderOptionPreview,
+  renderSubjectPreview,
+  renderArtifactDetail,
   onOpenSubject,
   resolveArtifactAction,
   now,
@@ -279,6 +294,7 @@ export const FeedbackRequestRespond: React.FC<FeedbackRequestRespondProps> = ({
         <FeedbackArtifactSubjects
           subjects={request.subjects}
           onOpen={onOpenSubject}
+          renderPreview={renderSubjectPreview}
           resolveAction={resolveArtifactAction}
         />
 
@@ -297,8 +313,11 @@ export const FeedbackRequestRespond: React.FC<FeedbackRequestRespondProps> = ({
               answer={draft?.answers[ask.id]}
               disabled={isSubmitting || request.lifecycle.status !== 'open'}
               renderOptionPreview={renderOptionPreview}
-              // A bound artifact opens exactly the way a subject does; there is
-              // no second mechanism, and no host has to supply two callbacks.
+              renderArtifactDetail={renderArtifactDetail}
+              // Now the popover's escalation rather than what expand does: the
+              // tab is where you go to comment on or edit an artifact, one step
+              // past looking at it. Still the same opener a subject row uses --
+              // there is no second mechanism, and no host supplies two.
               onExpandArtifact={onOpenSubject}
               resolveArtifactAction={resolveArtifactAction}
               onChange={(answer) => handleAnswer(ask.id, answer)}

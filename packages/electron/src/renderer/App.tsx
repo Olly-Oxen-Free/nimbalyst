@@ -150,6 +150,7 @@ import { initWindowFullScreenListener } from './store/listeners/windowFullScreen
 import { initThemeFallbackListener } from './store/listeners/themeFallbackListeners';
 import { initTrackerSyncListeners } from './store/listeners/trackerSyncListeners';
 import { initPullRequestListeners } from './store/listeners/pullRequestListeners';
+import { initGithubIssueListeners } from './store/listeners/githubIssueListeners';
 import { initReadReceiptListeners } from './store/listeners/readReceiptListeners';
 import { initWorktreeListeners } from './store/listeners/worktreeListeners';
 import { initBlitzListeners } from './store/listeners/blitzListeners';
@@ -188,13 +189,11 @@ import { registerTrackerLinkPlugin } from './plugins/registerTrackerLinkPlugin';
 import { registerAIChatPlugin } from './plugins/registerAIChatPlugin';
 import { registerTrackerPlugin } from './plugins/registerTrackerPlugin';
 import { registerSearchReplacePlugin } from './plugins/registerSearchReplacePlugin';
-import { registerMockupPlugin } from './plugins/registerMockupPlugin';
 import { registerEmbedFrame } from './components/EmbedFrame';
 import { registerExtensionSystem, setExtensionWorkspacePath } from './plugins/registerExtensionSystem';
 import { SettingsView } from './components/Settings/SettingsView';
 import type { SettingsCategory } from './components/Settings/SettingsSidebar';
 import { loadCustomTrackers } from './services/CustomTrackerLoader';
-import { MockupPickerMenuHost } from './components/MockupPickerMenu';
 import { ExtensionHostComponents } from './components/ExtensionHostComponents';
 // ClaudeCommandsToast removed - commands now provided via extension-based claude plugins
 import { UpdateToast } from './components/UpdateToast';
@@ -214,6 +213,7 @@ import {
   electronStorageBackend,
   initializeElectronStorageBackend,
 } from './extensions/panels';
+import { registerBuiltinCustomEditors } from './components/CustomEditors/registerBuiltinCustomEditors';
 import { setStorageBackend, getExtensionEditorAPI } from '@nimbalyst/runtime';
 import { store, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 import { extensionPanelAIContextAtom } from './store/atoms/extensionPanels';
@@ -313,7 +313,6 @@ if (!pluginsRegistered) {
   registerTrackerPlugin(null); // Load built-in trackers now, custom trackers loaded in AppLayout
   registerAIChatPlugin();
   registerSearchReplacePlugin(); // Search/replace bar in fixed tab header
-  registerMockupPlugin(); // Mockup embedding support
   registerEmbedFrame(); // Inline embeds of extension editors in markdown docs
   pluginsRegistered = true;
 }
@@ -333,6 +332,10 @@ export default function App() {
 
   // Register custom editors and extensions based on settings
   useEffect(() => {
+    // Core editors first and synchronously, so a file type owned by the app
+    // (`.canvas`) is claimed even while extension discovery is still running.
+    registerBuiltinCustomEditors();
+
     const registerCustomEditors = async () => {
       try {
         // Set up storage backend for extensions BEFORE loading extensions
@@ -402,6 +405,7 @@ export default function App() {
     const cleanupTrackerSync = initTrackerSyncListeners();
     const cleanupWorktree = initWorktreeListeners();
     const cleanupPullRequest = initPullRequestListeners();
+    const cleanupGithubIssue = initGithubIssueListeners();
     const cleanupReadReceipts = initReadReceiptListeners();
     const cleanupBlitz = initBlitzListeners();
     const cleanupUpdate = initUpdateListeners();
@@ -447,6 +451,7 @@ export default function App() {
       cleanupTrackerSync?.();
       cleanupWorktree?.();
       cleanupPullRequest?.();
+      cleanupGithubIssue?.();
       cleanupReadReceipts?.();
       cleanupBlitz?.();
       cleanupUpdate?.();
@@ -2163,6 +2168,7 @@ export default function App() {
         const sessionId = await dispatchCreateNewSession({
           title: `Commit: ${commitFiles.length} ${commitFiles.length === 1 ? 'file' : 'files'}`,
           mode: 'agent',
+          launchSource: 'commit_flow',
         });
 
         if (!sessionId) {
@@ -3090,7 +3096,6 @@ export default function App() {
       {/* UnifiedOnboarding is now managed by DialogProvider via useOnboarding hook */}
       {/* ClaudeCommandsToast removed - commands now via extension-based plugins */}
       <ErrorToastContainer />
-      <MockupPickerMenuHost />
       <ExtensionHostComponents />
       <ExtensionPermissionPrompt />
       <UpdateToast />

@@ -26,10 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Task sub-agents (the model's automatic parallel dispatch) now show their live output too — hover a chip for a quick peek, click the message that spawned it to expand its transcript inline, or click the chip to pop it out into its own pane beside the main conversation. The spawn card in the transcript stays a compact one-line summary — showing the agent's type, model, and live status like a teammate's card — until you click it, instead of dumping its full output inline.
 - A teammate that recently finished, failed, or was abandoned when Nimbalyst closed can now be revived and messaged again, picking up where it left off — a teammate you stopped yourself needs an explicit confirmation first.
 - A workspace can now hold an idle teammate open for a configurable grace period before it shuts down, so a follow-up message sent right after it finishes reaches it instead of a fresh revival.
+- The macOS menu bar shows your session fleet at a glance, and names a session for a few seconds whenever it starts, finishes, blocks or fails.
+- Animations can show a spinning indicator for a running or loading state.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
 - Panes can now be resized with draggable dividers, split and nested arbitrarily by dragging headers, stacked by dropping one onto another, and all use the app's unified message box.
+- An animation plays inline in the agent transcript when an agent creates or edits it, as a click-to-activate stage rather than a plain file row.
+- In the tracker table the Key cell is the open button: click it for the detail pane, or its expand icon to open the document. Clicking any other cell just selects it, and double-click always means edit.
 
 ### Fixed
 <!-- Bug fixes go here -->
@@ -38,6 +42,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A finished teammate now shows as Completed with its real tool-call count after you stop the session, instead of a false Error with zero tools, and the Teammates panel shows each teammate's model.
 - Asking Claude to spawn a named agent now correctly creates an addressable teammate you can message directly, instead of silently falling back to an anonymous one-shot sub-agent.
 - A teammate's wake-up message, shutdown handling, and its own live thinking and tool calls no longer show as "You" or clutter your mainline conversation — they collapse into one expandable card you can open from the Teammates menu as well as the chip, reviving a teammate that had shut down cleanly no longer leaves it confused about being asked to shut down again, and a teammate that simply finished its work can now be revived and messaged again too.
+- The session model picker loads ahead of opening and uses cached results instead of blocking on provider discovery.
+- Typing in a dialog while the tracker table is open no longer edits the selected cell.
+- A tracker item's body is no longer cleared when the item's metadata syncs with your team.
+
+### Removed
+<!-- Removed features go here -->
+
+## [0.75.5] - 2026-08-28
+
+
+### Added
+<!-- New features go here -->
+- Grok Build and Cursor Agent as coding agents, each with settings, model picker, edited-file tracking and diff review.
+- AI sessions can read and edit a shared document without it being open in a tab, including mockups, drawings and data models.
+
+### Changed
+<!-- Changes to existing functionality go here -->
+- Gemini is a built-in coding agent rather than an extension, with edited-file tracking and a model list from your account.
+
+### Fixed
+<!-- Bug fixes go here -->
+- Reopening a Gemini session shows the tool calls it made instead of only the conversation.
+- "Accept all" no longer refuses an AI edit by claiming the file changed on disk.
+- Documents with a scalar status key in frontmatter render the frontmatter card instead of falling back to the raw text editor (#1392).
+
+### Removed
+<!-- Removed features go here -->
+
+## [0.75.4] - 2026-08-28
+
+
+### Added
+<!-- New features go here -->
+- Author step-based technical animations in `.anim.json` files, with a live stage, scrubbable timeline, retiming, frames that draw real product UI under a palette the document owns, and MP4 or GIF export.
+- An AI session can now build a Project Canvas board for you from a description, placing cards that reference real workspace files and shared documents.
+- Animation and Project Canvas are now installable from the Extensions marketplace.
+- A feedback request now previews the mockups it is about, not only the ones bound to individual options, for both the recipient and the author reading results.
+- The author of a feedback request can open the session that composed it from the request's results.
+
+### Changed
+<!-- Changes to existing functionality go here -->
+- Project Canvas gains two-finger pan, Cmd+wheel zoom, click to select and double-click to activate, card resizing, and cards for existing files and shared documents.
+- A feedback request now shows where its mockups will be published before you send, and puts them in a Feedback requests folder without opening a share dialog for each one.
+- Tips in a new session's empty panel now rotate, so you work through the set over time instead of meeting the same card every launch.
+
+### Fixed
+<!-- Bug fixes go here -->
+- Images attached to a Claude Code session reach the model again; since 0.75.1 every one was dropped without warning.
+- Codex web search steps now finish in the transcript instead of sitting unresolved with empty arguments.
+- Pressing Cmd+F while the find bar is already open now returns focus to the search field instead of closing the bar.
+- iOS: tapping a notification now opens the session it was about, including on iPad and before that session has finished syncing to the device.
+- A session no longer keeps showing "waiting for your response" once you have typed a new instruction instead of answering the question it asked.
+- A mockup already shared with your team now reaches the recipient of a feedback request as the shared document, not a file path from the sender's machine.
+- Sending a feedback request now happens once: the card stays sent when you scroll away and back, and pressing send again no longer creates a second request.
+- A document link pasted into a team message or a shared document now becomes the document it names; links sent before this stay as text until you paste them again.
+- Working out which organization your projects belong to no longer runs a git command per project each time it is checked, which could block the app for a second or more.
+- A screenshot the AI takes with an explicit light or dark theme now shows an extension's editor working, instead of an error state where the extension could not reach its own tools.
+
+### Removed
+<!-- Removed features go here -->
+
+## [0.75.3] - 2026-08-27
+
+
+### Added
+<!-- New features go here -->
+- Work your team's shared trackers from the web console in list, table, board, timeline and tag board, with search, filtering, grouping, column choice, inline editing, comments and drag-and-drop, converging live with the desktop app.
+- Invite people to your organization from the web console, see who has not accepted yet, and resend or revoke a pending invitation.
+- Open anything in the web console with Cmd+K, right-click a tracker row for its actions, and pick from the full set of Nimbalyst themes.
+- A tracker now shows who else is viewing it.
+- A feedback request comparing mockups now shows the designs themselves: preview every option, open one full size, and vote without leaving the request.
+- A session that orchestrates other sessions can interrupt one to deliver an instruction immediately, instead of waiting for its current turn to finish.
+- Project Canvas: an infinite canvas where every card is the real editor (markdown, mockup, spreadsheet, drawing, mindmap) live and editable in place. Drag a file or shared document from the sidebar onto the board, with sticky notes, frames, arrows, snapping, team comments and presence, agent activity, and revision pinning to compare. Works in the desktop app and the web console, and saves as an open `.canvas` file that reviews as a diff.
+
+### Changed
+<!-- Changes to existing functionality go here -->
+- The web console now reads as Nimbalyst rather than a separate admin tool, with the desktop app's header, navigation and controls, and a layout that holds up on a phone.
+- The web console's Requests inbox now also carries mentions, replies, tracker comments and document discussions, each row saying what it is about rather than repeating the sender.
+- Mockups and data models embedded in a document now render as the live editor instead of a saved screenshot, and existing embeds convert on open.
+- Mockup project files open as a read-only preview with a "Convert to canvas" action, writing a new `.canvas` file beside the untouched original that holds the real MockupLM editor for each screen.
+- Editing many tracker rows at once — pasting a range, or changing status or priority on a multi-row selection — now applies as a single update instead of one per row.
+- Quick open now finds a tracker by its issue key or number and puts it at the top, instead of only ever ranking trackers by meaning.
+- AI sessions take less disk: Nimbalyst stops recording progress counters and duplicate screenshots it never displays, and clearing old tool output now prunes existing sessions too (about 1 GB of a 5.6 GB database on one measured install).
+- The Claude Code CLI provider is off unless you turn it on, and is no longer labelled "Subscription"; the Claude Agent, now marked recommended, already runs on your Claude subscription.
+
+### Fixed
+<!-- Bug fixes go here -->
+- Code in the AI transcript no longer picks up stray backslashes before dollar signs, so a shell command you copy out of it still runs.
+- A scheduled automation whose schedule was hand-edited into a shape Nimbalyst didn't expect no longer stops running for good; it repairs what it can and names what you need to fix.
+- A tracker type now shows the same colour and icon everywhere it appears; decisions and features were drawn differently in the AI transcript than in the tracker itself.
+- Searching quick open's trackers no longer closes the whole dialog with an error when any tracker item has no title.
+- The inbox now names who sent each message instead of showing your teammates as "Unknown member".
+- Saved views shared with your team no longer go missing from the tracker sidebar on startup.
+- Sending a queued prompt while a background sub-agent is running no longer leaves the session stuck on "Thinking..." or later claims a sub-agent was interrupted when none was.
+- Nimbalyst no longer removes items from your team's tracker when it can't tell which of your trackers are shared; it now holds off and tells you instead of assuming they were made private.
+- Tracker items stuck on their way to your team now sync, including in projects you aren't focused on, and items on a no-longer-shared tracker stop being retried on every reconnect.
+- Settings can now edit a built-in tracker type you have already customised; the edit button silently did nothing for those types.
+- On a large database, the startup backup no longer stalls the app for about a minute and then reports failure when it had actually succeeded.
+- Nimbalyst no longer freezes for seconds at a time during startup, while an AI session edits files, or while opening shared documents, switching projects, loading sessions, or resizing panes.
+- OpenCode models you discover now show up in the session model picker and stay in Settings, instead of falling back to a fixed handful of built-in models; each project keeps its own list.
+- Hiding a model in Settings now takes effect in the session model picker for OpenCode, Codex and Copilot, which previously ignored the setting.
+- The web console now asks the server what you may do with a shared document instead of inferring it from your first edit, so commenters are no longer told they are read-only and viewers are no longer allowed to type.
+
+### Removed
+<!-- Removed features go here -->
+- The `/datamodel` and `/Mockup` slash commands; embed either in a document the same way as any other file, by putting a link to it on its own line.
+
+## [0.75.2] - 2026-08-24
+
+
+### Added
+<!-- New features go here -->
+- Commit with AI can stage individual hunks of a file, so parallel sessions editing the same file each commit only their own lines.
+- Browse and triage GitHub issues beside pull requests, keeping your investigation status and notes local until you decide to adopt an issue as a tracker item.
+
+### Changed
+<!-- Changes to existing functionality go here -->
+- Codex sessions now run on the 0.149.1 Codex release.
+
+### Fixed
+<!-- Bug fixes go here -->
+- Updated bundled dependencies to pick up published security fixes, including ones affecting the auto-updater and extension installation.
+- Claude sessions on Windows no longer crash at start; if the agent process does die, Nimbalyst now says why and retries once instead of ending the turn on a bare exit code.
+- Shared Home now shows who created and last edited each document instead of labelling your teammates "Unknown".
+- Discarding old tool output now reclaims the gigabytes it previously reported as nothing, and says how much of the database its estimate actually sampled.
+- An automation no longer overwrites a report the agent wrote itself, which had been silently replacing finished output with the session's closing message.
+- Commit with AI now pre-selects the hunks your session actually wrote, instead of opening with every change in the file checked.
 
 ### Removed
 <!-- Removed features go here -->

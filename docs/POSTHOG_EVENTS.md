@@ -52,6 +52,18 @@ Nimbalyst uses PostHog for anonymous usage analytics with two tracking contexts:
 
 All events include `$session_id` property automatically. Dev users are marked with `is_dev_user: true` via `$set_once`.
 
+### Global event properties
+
+Stamped on every event by both processes — main in `AnalyticsService.sendEvent`, renderer via `posthog.register`. Do not add these to individual call sites.
+
+| Property | Values | Why |
+| --- | --- | --- |
+| `nimbalyst_version` | app version | Release attribution |
+| `release_channel` | `stable` / `alpha` | Separates alpha cohorts from stable in any funnel |
+| `build_type` | `official` / `dev` / `local` | Per-event, unlike the `is_dev_user` person property, which is `$set_once` and sticky forever — once a user runs a dev build, every later official-build event of theirs is indistinguishable from a dev one unless the build type is on the event |
+
+The renderer resolves both from the main process rather than re-deriving them from env vars, so the two sides can never disagree.
+
 ## Events Catalog
 
 ### File Operations
@@ -130,10 +142,27 @@ All events include `$session_id` property automatically. Dev users are marked wi
 
 ### AI Chat & Sessions
 
+#### Session launch context
+
+`create_ai_session` carries where a session came from. The union lives in `packages/electron/src/shared/analytics/sessionLaunch.ts`; `initiator` is derived from `launchSource` through one exhaustive map rather than passed alongside it, so the two can never disagree.
+
+| `initiator` | `launchSource` values |
+| --- | --- |
+| `app` | `app_startup`, `tab_restore`, `workstream_convert`, `unknown` |
+| `user` | `new_session_button`, `launch_popup`, `session_history`, `tray`, `workspace_welcome`, `starter_prompt`, `slash_command`, `worktree`, `commit_flow`, `issue_panel`, `pull_request_panel`, `canvas`, `mobile`, `cli` |
+| `agent` | `meta_agent`, `workstream_child`, `blitz`, `automation` |
+
+`unknown` maps to `app`, not `user`. An uninstrumented path is far more likely to be one the app took on its own, and under-counting deliberate launches is the honest failure.
+
+**Not yet wired, so they will read zero:** `app_startup`, `tab_restore`, `workspace_welcome`, `starter_prompt`, `slash_command`, `blitz`, `automation`, `mobile`, `cli`. The mobile worktree path in `AIService` writes through `AISessionsRepository.create` directly and emits no `create_ai_session` at all, which is pre-existing.
+
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
-| `create_ai_session` | `AIService.ts:1860`<br/>`SessionHandlers.ts:323, 672` | User creates new AI chat session | `provider`<br/>`is_worktree_session` (boolean)<br/>`is_workstream_child` (boolean)<br/>`is_meta_agent_session` (boolean) | v0.45.25 (2025-11-14) | v0.52.14: Added is_worktree_session and is_workstream_child properties<br/>(pending release): Also emitted from SessionHandlers so Files and Agent mode session creation paths are tracked<br/>(pending release): Added is_meta_agent_session property |
+| `create_ai_session` | `sessionLaunchAnalytics.ts` (single emitter; called from `AIService.ts` and `SessionHandlers.ts`) | An agent session is created | `provider`<br/>`is_worktree_session` (boolean)<br/>`is_workstream_child` (boolean)<br/>`is_meta_agent_session` (boolean)<br/>`launchSource` (enum, see below)<br/>`initiator` (`user` \| `app` \| `agent`, derived from `launchSource`)<br/>`isFirstEverSession` (boolean)<br/>`sessionOrdinalBucket` (`1` \| `2-4` \| `5-9` \| `10+`)<br/>`hadPrefilledPrompt` (boolean) | v0.45.25 (2025-11-14) | v0.52.14: Added is_worktree_session and is_workstream_child properties<br/>(pending release): Also emitted from SessionHandlers so Files and Agent mode session creation paths are tracked<br/>(pending release): Added is_meta_agent_session property<br/>(pending release): Added launch context; consolidated the two drifted emitters into one |
 | `ai_message_sent` | `AIService.ts:1822` | User sends message in AI chat | `provider`<br/>`hasDocumentContext`<br/>`hasAttachments`<br/>`contentMode` (files/agent/unknown)<br/>`sessionMode` (optional, planning/agent)<br/>`fileExtension` (optional, when document open)<br/>`usedSlashCommand` (optional)<br/>`slashCommandName` (optional)<br/>`slashCommandPackageId` (optional) | v0.45.25 (2025-11-14) | v0.47.2 (2025-12-10): Added usedSlashCommand, slashCommandName, slashCommandPackageId properties<br/>(pending release as of 5698aa25): Added fileExtension property<br/>(pending release): Added sessionMode property |
+| `ai_message_submit_attempted` | `SessionTranscript.tsx`<br/>`SessionLaunchPopup.tsx` | User presses send. Fires at the composer **before every guard**, so it is the denominator for the send funnel — including the Claude CLI path, which returns before `ai:sendMessage` | `surface` (transcript/launch_popup)<br/>`provider`<br/>`promptLengthBucket` (short/medium/long, same scale as `ai_message_sent`)<br/>`isFirstMessageInSession`<br/>`sessionMode` | (pending release as of 9e36920c2) |  |
+| `ai_send_blocked` | `SessionTranscript.tsx`<br/>`SessionLaunchPopup.tsx`<br/>`MessageStreamingHandler.ts` | A send terminated without reaching a provider. One emitter per call path: main reports everything downstream of `ai:sendMessage`, the renderer reports its own guards and stays silent on IPC rejection so blocks are never double-counted | `surface`<br/>`reason` (closed enum: empty_draft, no_session_data, queued_cli_not_ready, cli_submit_failed, queued_while_loading, mode_switch_failed, slash_command_only, slash_command_clear, ipc_error, duplicate_prompt, no_session_id, no_workspace, session_not_found, session_mismatch, no_provider, no_api_key)<br/>`provider` | (pending release as of 9e36920c2) |  |
+| `composer_state_reported` | `SessionTranscript.tsx` | What the composer offered when a session opened. Once per session, not per render | `surface`<br/>`sendEnabled`<br/>`disabledReason` (none/no_provider_selected/no_models_available/session_loading/workspace_untrusted/unknown)<br/>`providerSelected`<br/>`modelSelected`<br/>`provider` | (pending release as of 9e36920c2) |  |
 | `ai_message_queued` | `AIService.ts:2517, 640` | User queues message while AI is busy processing | `provider`<br/>`source` (local/mobile)<br/>`hasDocumentContext`<br/>`hasAttachments`<br/>`fileExtension` (optional, local only when document open) | (pending release as of f891af91) | (pending release as of 5698aa25): Added fileExtension property |
 | `ai_response_received` | `MessageStreamingHandler.ts:1913, 2477` | AI provider returns response | `provider`<br/>`responseType` (text/tool_use/error)<br/>`toolsUsed`<br/>`usedChartTool`<br/>`responseTime`<br/>`chunkCount` (0-9, 10-49, 50-99, 100+, success only)<br/>`totalLength` (0-99, 100-499, 500-999, 1000+, success only) | v0.45.25 (2025-11-14) | (pending release): Merged `ai_response_streamed` fields (`chunkCount`, `totalLength`) into this event to remove the 1:1 duplicate |
 | `ai_stream_interrupted` | `AIService.ts:1024, 1483` | AI streaming stops prematurely | `provider`<br/>`chunksReceived`<br/>`reason` (error/user_cancel)<br/>`errorCategory` (resume_mismatch/stream_closed/network/auth/timeout/rate_limit/overloaded/unknown, only when reason=error) | v0.45.25 (2025-11-14) | (pending release): Added `errorCategory` so NIM-838 resume-mismatch and other Claude Code failures can be separated from the generic error bucket |
@@ -150,7 +179,7 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | `ask_user_question_answered` | `SessionTranscript.tsx:1081` | User answers an AskUserQuestion prompt from Claude | `numQuestions` (number of questions answered) | (pending release) |  |
 | `mobile_push_requested` | `mobilePushRequest.ts` | Desktop asks the sync server to notify the user's phone, and the server acknowledges | `reason` (session_complete/cli_turn_complete/agent_error/awaiting_human/notify_urgent/unspecified)<br/>`forced` (boolean)<br/>`accepted` (boolean)<br/>`attemptedCount`<br/>`deliveredCount`<br/>`rejection` (no_registered_tokens/rate_limited/suppressed_active_device/unknown_session/provider_error/no_ack/null) | (pending release) |  |
 | `ask_user_question_cancelled` | `SessionTranscript.tsx:1087` | User cancels an AskUserQuestion prompt | None | (pending release) |  |
-| `git_commit_proposal_response` | `GitCommitConfirmationWidget.tsx:600, 672` | User responds to AI-generated git commit proposal | `action` (committed/cancelled/error)<br/>`file_count` (1-5/6-10/11-20/20+)<br/>`success` (boolean, for committed only) | (pending release) |  |
+| `git_commit_proposal_response` | `GitCommitConfirmationWidget.tsx:600, 672` | User responds to AI-generated git commit proposal | `action` (committed/cancelled/error)<br/>`file_count` (1-5/6-10/11-20/20+)<br/>`success` (boolean, for committed only)<br/>`partial_files` (count of files staged as a hunk subset)<br/>`hunks_deselected` (count of hunks left out across those files) | (pending release) | (pending release): Added partial_files and hunks_deselected for hunk-level staging |
 
 ### Claude Code (MCP)
 
@@ -193,7 +222,7 @@ The canonical property allowlists live in `packages/electron/src/shared/analytic
 | Shared-document lifecycle | `collab_document_created`, `collab_document_opened`, `collab_document_first_edited`, `collab_document_action`, `collab_operation_failed` | Creation orchestrator, successful tab open/reuse, first local Yjs mutation, or accepted document action |
 | Shared-folder lifecycle | `collab_folder_created`, `collab_folder_renamed`, `collab_folder_moved`, `collab_folder_deleted`, `collab_folder_link_copied` | Accepted folder mutation or successful link copy |
 | Shared trackers | `tracker_item_clicked`, `tracker_table_sort`, `tracker_item_mutated`, `tracker_item_scope_changed`, `tracker_mutation_rejected` | Tracker service mutation, explicit view interaction, or sync-rejection seam |
-| Collaboration health | `collab_sync_attempt_completed`, `collab_outbox_replay_completed`, `collab_share_asset_migration_completed`, `collab_server_mutation_rejected` | Coalesced client-observed terminal attempt or replay/migration/rejection outcome |
+| Collaboration health | `collab_sync_attempt_completed`, `collab_outbox_replay_completed`, `collab_share_asset_migration_completed`, `collab_server_mutation_rejected`, `tracker_drain_aborted` | Coalesced client-observed terminal attempt or replay/migration/rejection outcome; the drain abort fires when the reconnect drain refuses to run on an unresolved sharing policy |
 
 Common Teams properties are low-cardinality subsets of `surface`, `entryPoint`, `source`, `outcome`, `errorCategory`, `actorType`, `callerRole` (`owner`, `admin`, `member`, `viewer`, or `unknown`), `documentType`, `editorCategory`, `collaborationScope`, `resourceType`, `connectionPath`, `encryptionMode`, `durationCategory`, and the defined count/retry buckets. Event-specific enums and permitted fields are enforced by the shared contract.
 
@@ -392,7 +421,7 @@ The `known_error` event uses an `errorId` property to identify specific error co
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
 | `user_created` | `index.ts:736` | Very first app launch only (launchCount === 1) - fires once per user | `$set_once: first_seen_version` | (pending release) |  |
-| `nimbalyst_session_start` | `AnalyticsService.ts:154` | Application starts (sent even for opted-out users) | `$session_id`<br/>`has_git_installed`<br/>`$set: nimbalyst_version`<br/>`$set: cpu_arch`<br/>`$set_once: is_dev_user`<br/>`$set_once: is_dev_install` | v0.45.25 (2025-11-14) |  |
+| `nimbalyst_session_start` | `AnalyticsService.ts:154` | Application starts (sent even for opted-out users) | `$session_id`<br/>`has_git_installed`<br/>`nimbalyst_version`<br/>`release_channel`<br/>`build_type`<br/>`launch_number` (1/2/3-5/6-20/20+)<br/>`days_since_install` (0/1/2-7/8-30/31-90/90+)<br/>`$set: nimbalyst_version`<br/>`$set: cpu_arch`<br/>`$set_once: is_dev_user`<br/>`$set_once: is_dev_install` | v0.45.25 (2025-11-14) | (pending release as of 9e36920c2): Stamped `nimbalyst_version` as an **event** property (it was `$set`-only, so this event could not be attributed to a release), and added `release_channel`, `build_type`, `launch_number`, `days_since_install` |
 | `analytics_opt_out` | `AnalyticsService.ts:89` | User opts out of analytics in settings | None | v0.45.25 (2025-11-14) |  |
 | `first_launch_claude_check` | `index.ts:114` | Very first app launch only - checks if Claude Code is installed | `hasClaudeInstalled` (boolean) | v0.47.2 (2025-12-10) |  |
 | `quit_confirmation_shown` | `index.ts:757` | User attempts quit with active AI session | `reason` (active_ai_session) | v0.45.25 (2025-11-14) |  |

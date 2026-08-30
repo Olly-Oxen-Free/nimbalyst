@@ -22,6 +22,7 @@ import {
   ClaudeCodeProvider,
   OpenAICodexProvider,
   OpenCodeProvider,
+  GeminiAntigravityProvider,
 } from '@nimbalyst/runtime/ai/server';
 import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
@@ -33,7 +34,12 @@ import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/transcr
 import { createRawMessageStoreAdapter } from '../TranscriptMigrationAdapters';
 import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
 import { reconcileClaudeCodeModels } from './claudeCodeModelReconcile';
-import { isModelEnabled } from './modelEnablementFilter';
+import { isModelEnabled, resolveProviderEnabled } from './modelEnablementFilter';
+import {
+  getCachedHeadlessAgentAvailability,
+  refreshHeadlessAgentAvailability,
+  type HeadlessAgentId,
+} from './headlessAgentAvailability';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { parseContextUsageMessage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
@@ -68,7 +74,8 @@ import { logger } from '../../utils/logger';
 import { getSettingsService } from '../SettingsService';
 import { subscribeProviderSettingsInvalidation } from './providerSettingsCacheInvalidation';
 import { windowStates, findWindowByWorkspace, getWindowId, createWindow, isAppQuitting } from '../../window/WindowManager';
-import { resolveActiveWorkspacePathForWindowId } from '../../window/windowState';
+import { getWindowIdForWindow, resolveActiveWorkspacePathForWindowId } from '../../window/windowState';
+import { resolveSenderWorkspacePath } from '../../window/captureWindowWorkspace';
 import { sessionFileTracker } from '../SessionFileTracker';
 import { extractFilePath } from './tools/extractFilePath';
 import { handleBackendTool } from '../../mcp/tools/backendToolHandler';
@@ -77,6 +84,7 @@ import { resolveBackendWorkspacePath } from '../../mcp/mcpWorkspaceResolver';
 import { toolCallMatcher, unwrapShellCommand } from '../ToolCallMatcher';
 import { workspaceFileEditAttributionService } from '../WorkspaceFileEditAttributionService';
 import {AnalyticsService} from "../analytics/AnalyticsService.ts";
+import { trackCreateAiSession } from '../analytics/sessionLaunchAnalytics';
 import { FeatureUsageService, FEATURES } from "../FeatureUsageService.ts";
 import { historyManager } from '../../HistoryManager';
 import { addGitignoreBypass } from '../../file/WorkspaceEventBus';
@@ -209,6 +217,15 @@ function scheduleMobileSettingsSync(): void {
       syncSettingsToMobile(apiKeys['openai']);
     }).catch(() => { /* sync manager may not be available */ });
   }, 500);
+}
+
+export interface InterruptCurrentTurnResult {
+  success: boolean;
+  error?: string;
+  /** How the turn was stopped; absent when `success` is false. */
+  method?: 'interrupt' | 'abort' | 'terminal-ctrl-c';
+  /** True when the session was forced idle because no completion event could arrive. */
+  forcedIdle?: boolean;
 }
 
 export class AIService {
@@ -520,6 +537,80 @@ export class AIService {
     return outcome.kind === 'dispatched';
   }
 
+  /**
+   * Interrupt the current turn (graceful when possible) so queued prompts are
+   * processed sooner. Providers that support a true mid-stream interrupt
+   * (Claude Code) wrap up cleanly; others fall back to abort() via the
+   * BaseAIProvider default. Returns `method` so the caller can distinguish.
+   *
+   * Defensive cleanup runs before the interrupt: clear the in-memory
+   * sessionsProcessingQueue guard and unwedge any rows stuck in 'executing' via
+   * sweepExecutingForSession (delivery-aware -- already delivered prompts are
+   * marked completed, not rolled back, so a follow-up queue drive doesn't
+   * re-send the same input -- NIM-615).
+   */
+  public async interruptCurrentTurn(sessionId: string): Promise<InterruptCurrentTurnResult> {
+    if (!sessionId) {
+      throw new Error('Session ID is required to interrupt');
+    }
+
+    const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+    const session = await AISessionsRepository.get(sessionId);
+    if (!session) {
+      return { success: false, error: 'Session not found' };
+    }
+
+    if (session.provider === 'claude-code-cli') {
+      const terminalManager = getTerminalSessionManager();
+      if (!terminalManager.isTerminalActive(sessionId)) {
+        return { success: false, error: 'No active terminal for session' };
+      }
+
+      terminalManager.writeToTerminal(sessionId, '\x03');
+      logger.main.info(`[AIService] Interrupted claude-code-cli terminal for session ${sessionId}`);
+      return { success: true, method: 'terminal-ctrl-c' };
+    }
+
+    const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
+    if (!provider) {
+      return { success: false, error: 'No active provider for session' };
+    }
+
+    this.sessionsProcessingQueue.delete(sessionId);
+    try {
+      const { getQueuedPromptsStore } = await import('../RepositoryManager');
+      const queueStore = getQueuedPromptsStore();
+      const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
+      if (completed > 0 || failed > 0 || rolledBack > 0) {
+        logger.main.info(
+          `[AIService] interruptCurrentTurn: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
+        );
+        await this.publishQueueStateToSync(sessionId);
+      }
+    } catch (sweepErr) {
+      logger.main.error('[AIService] interruptCurrentTurn: sweepExecutingForSession failed:', sweepErr);
+    }
+
+    const result = await provider.interruptCurrentTurn();
+    logger.main.info(`[AIService] Interrupted current turn for session ${sessionId} (method=${result.method})`);
+
+    // A session stuck at running/streaming with no turn behind it -- because
+    // there never was one, or because `method: 'abort'` just destroyed it --
+    // would otherwise defer the follow-up queue drive on a `session:completed`
+    // that can never arrive (NIM-2434, NIM-2512).
+    const stateManager = getSessionStateManager();
+    const forcedIdle = await clearStuckRunningState(
+      {
+        getSessionState: (id) => stateManager.getSessionState(id),
+        interruptSession: (id) => stateManager.interruptSession(id),
+        logWarn: (message) => logger.main.warn(message),
+      },
+      { sessionId, hadActiveTurn: result.hadActiveTurn, method: result.method },
+    );
+
+    return { success: true, method: result.method, forcedIdle };
+  }
+
   public async respondToInteractivePrompt(params: {
     sessionId: string;
     promptId: string;
@@ -807,6 +898,11 @@ export class AIService {
       case 'lmstudio':
         return 'not-required';
       case 'ollama':
+        return 'not-required';
+      case 'antigravity-gemini-agent':
+        // Rides the user's existing Antigravity / ~/.gemini login. Nimbalyst
+        // holds no key for it, and deliberately reads no env var -- see the
+        // standing rule in CLAUDE.md.
         return 'not-required';
       default:
         return globalApiKeys[provider];
@@ -1685,7 +1781,7 @@ export class AIService {
     // instance on this session; the first one that exists tells us the type.
     const providerCandidates = request.provider
       ? [request.provider]
-      : ['claude-code', 'openai-codex', 'openai-codex-acp', 'opencode'];
+      : ['claude-code', 'openai-codex', 'openai-codex-acp', 'opencode', 'grok-build', 'cursor-agent'];
 
     let instance: AIProvider | undefined;
     let resolvedType: string | null = request.provider ?? null;
@@ -1761,7 +1857,11 @@ export class AIService {
         if (chunk.type === 'text') {
           contextResponse += chunk.content || '';
         } else if (chunk.type === 'complete') {
-          const parsedUsage = parseContextUsageMessage(contextResponse);
+          // Prefer the SDK's structured twin of the report when the binary
+          // attaches one (agent-SDK 0.3.241+): it carries exact token counts
+          // where the markdown is rendered to three significant figures, and it
+          // does not depend on the CLI's table layout staying byte-stable.
+          const parsedUsage = chunk.contextReport ?? parseContextUsageMessage(contextResponse);
 
           if (parsedUsage) {
             // Get current session to preserve cumulative tokens
@@ -1976,6 +2076,16 @@ export class AIService {
           case 'copilot-cli':
             // Copilot uses its own CLI auth (copilot auth login), no API key needed
             break;
+          case 'grok-build':
+          case 'cursor-agent':
+            // Both authenticate through their own CLI login (`grok login`,
+            // `cursor-agent login`). No API key, and deliberately no env-var
+            // fallback -- see the standing rule in CLAUDE.md.
+            break;
+          case 'antigravity-gemini-agent':
+            // Signs in through the Antigravity app; the language server
+            // consumes that login. No API key, no env fallback.
+            break;
           case 'lmstudio':
             // LMStudio doesn't need an API key, just the base URL
             break;
@@ -2176,10 +2286,15 @@ export class AIService {
       // the index for pendingExecution flags. We do NOT call watchSession() here because
       // it creates a WebSocket connection per session, causing performance issues.
 
-      this.analytics.sendEvent('create_ai_session', {
+      // Was a second, drifted copy of the SessionHandlers emitter -- it omitted
+      // `is_meta_agent_session`, so meta-agent sessions created through this
+      // path were counted as ordinary ones. Both now go through one function.
+      trackCreateAiSession({
         provider,
-        is_worktree_session: !!session.worktreeId,
-        is_workstream_child: !!session.parentSessionId,
+        worktreeId: session.worktreeId,
+        parentSessionId: session.parentSessionId,
+        agentRole: (session as { agentRole?: string }).agentRole,
+        launchSource: (session as { launchSource?: string }).launchSource,
       });
       return session;
     });
@@ -3131,78 +3246,43 @@ export class AIService {
       return { success: true };
     });
 
-    // Interrupt the current turn (graceful when possible) so queued prompts
-    // are processed sooner. Providers that support a true mid-stream interrupt
-    // (Claude Code) wrap up cleanly; others fall back to abort() via the
-    // BaseAIProvider default. Returns { method } so the renderer can
-    // distinguish the two paths.
-    //
-    // Defensive cleanup runs before the interrupt: clear the in-memory
-    // sessionsProcessingQueue guard and unwedge any PGLite rows stuck in
-    // 'executing' via sweepExecutingForSession (delivery-aware -- already
-    // delivered prompts are marked completed, not rolled back, so the
-    // follow-up ai:triggerQueueProcessing doesn't re-send the same input
-    // -- NIM-615).
-    safeHandle('ai:interruptCurrentTurn', async (_event, sessionId: string) => {
-      if (!sessionId) {
-        throw new Error('Session ID is required to interrupt');
+    safeHandle('ai:interruptCurrentTurn', (_event, sessionId: string) =>
+      this.interruptCurrentTurn(sessionId)
+    );
+
+    /**
+     * Effective on/off state for the agents whose default is decided by
+     * detection rather than a constant.
+     *
+     * The renderer needs this at hydration: its own default table cannot tell
+     * "user turned it off" from "never touched", so without this the settings
+     * toggle would render OFF while the model picker showed the provider ON.
+     * Awaits any in-flight probe so the answer is deterministic rather than
+     * whatever the cache happened to hold.
+     */
+    safeHandle('ai:getHeadlessAgentAvailability', async () => {
+      await refreshHeadlessAgentAvailability();
+      const providerSettings = this.getNormalizedProviderSettings() as Record<string, any>;
+      const agents: HeadlessAgentId[] = ['grok-build', 'cursor-agent', 'antigravity-gemini-agent'];
+      const result: Record<string, {
+        installed: boolean;
+        signedIn: boolean;
+        defaultEnabled: boolean;
+        effectiveEnabled: boolean;
+        /** Resolved binary, so a panel can show WHERE it found the tool. */
+        executablePath?: string;
+      }> = {};
+      for (const agent of agents) {
+        const availability = getCachedHeadlessAgentAvailability(agent);
+        result[agent] = {
+          installed: availability.installed,
+          signedIn: availability.signedIn,
+          defaultEnabled: availability.installed && availability.signedIn,
+          effectiveEnabled: resolveProviderEnabled(agent, providerSettings[agent]),
+          executablePath: availability.executablePath,
+        };
       }
-
-      const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
-      const session = await AISessionsRepository.get(sessionId);
-      if (!session) {
-        return { success: false, error: 'Session not found' };
-      }
-
-      if (session.provider === 'claude-code-cli') {
-        const terminalManager = getTerminalSessionManager();
-        if (!terminalManager.isTerminalActive(sessionId)) {
-          return { success: false, error: 'No active terminal for session' };
-        }
-
-        terminalManager.writeToTerminal(sessionId, '\x03');
-        logger.main.info(`[AIService] Interrupted claude-code-cli terminal for session ${sessionId}`);
-        return { success: true, method: 'terminal-ctrl-c' };
-      }
-
-      const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
-      if (!provider) {
-        return { success: false, error: 'No active provider for session' };
-      }
-
-      this.sessionsProcessingQueue.delete(sessionId);
-      try {
-        const { getQueuedPromptsStore } = await import('../RepositoryManager');
-        const queueStore = getQueuedPromptsStore();
-        const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-        if (completed > 0 || failed > 0 || rolledBack > 0) {
-          logger.main.info(
-            `[AIService] interruptCurrentTurn: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-          );
-          await this.publishQueueStateToSync(sessionId);
-        }
-      } catch (sweepErr) {
-        logger.main.error('[AIService] interruptCurrentTurn: sweepExecutingForSession failed:', sweepErr);
-      }
-
-      const result = await provider.interruptCurrentTurn();
-      logger.main.info(`[AIService] Interrupted current turn for session ${sessionId} (method=${result.method})`);
-
-      // A session stuck at running/streaming with no turn behind it -- because
-      // there never was one, or because `method: 'abort'` just destroyed it --
-      // would otherwise defer the follow-up queue drive on a `session:completed`
-      // that can never arrive (NIM-2434, NIM-2512).
-      const stateManager = getSessionStateManager();
-      const forcedIdle = await clearStuckRunningState(
-        {
-          getSessionState: (id) => stateManager.getSessionState(id),
-          interruptSession: (id) => stateManager.interruptSession(id),
-          logWarn: (message) => logger.main.warn(message),
-        },
-        { sessionId, hadActiveTurn: result.hadActiveTurn, method: result.method },
-      );
-
-      return { success: true, method: result.method, forcedIdle };
+      return result;
     });
 
     // Deliver a message to a specific Teammate directly from the UI (a
@@ -3587,6 +3667,15 @@ export class AIService {
             // Copilot uses its own CLI auth, no API key needed
             apiKey = 'not-required';
             break;
+          case 'grok-build':
+          case 'cursor-agent':
+            // CLI login only; no API key to test.
+            apiKey = 'not-required';
+            break;
+          case 'antigravity-gemini-agent':
+            // Antigravity app login only; no API key to test.
+            apiKey = 'not-required';
+            break;
           case 'lmstudio':
             // LMStudio doesn't need an API key, just test the connection
             apiKey = 'not-required';
@@ -3598,6 +3687,21 @@ export class AIService {
           default:
             return { success: false, error: `Unknown provider: ${provider}` };
         }
+      }
+
+      // Gemini's connectivity probe is the presence of the Antigravity install.
+      // Deliberately NOT a live turn: the alternative is spawning a ~120MB
+      // language server from a settings button, and a signed-out user would
+      // still pass an install check either way -- sign-in cannot be read
+      // without a keychain prompt (see headlessAgentAvailability.ts). So the
+      // check answers exactly what it can, and says so when it fails.
+      if (provider === 'antigravity-gemini-agent') {
+        return GeminiAntigravityProvider.isInstalled()
+          ? { success: true, provider }
+          : {
+            success: false,
+            error: GeminiAntigravityProvider.NOT_INSTALLED_MESSAGE,
+          };
       }
 
       // Extension-agent providers: skip the per-provider connectivity probes
@@ -3612,7 +3716,8 @@ export class AIService {
       try {
         // For OpenAI, just try to list models as a connection test
         if (provider === 'openai') {
-          const models = await ModelRegistry.getModelsForProvider('openai', apiKey);
+          // OpenAI's model list is account-scoped, not project-scoped.
+          const models = await ModelRegistry.getModelsForProvider('openai', undefined, apiKey);
           return { success: models.length > 0, provider };
         }
 
@@ -3785,10 +3890,15 @@ export class AIService {
     });
 
     // Get ALL available models for configuration UI
-    safeHandle('ai:getAllModels', async () => {
+    safeHandle('ai:getAllModels', async (event) => {
       // Clear cache to get fresh models
       ModelRegistry.clearCache();
 
+      // Settings lists OpenCode's discovered models as checkboxes, so this read
+      // is scoped to the sending window's project too -- see ai:getModels.
+      const workspacePath = resolveActiveWorkspacePathForWindowId(
+        getWindowIdForWindow(BrowserWindow.fromWebContents(event.sender)),
+      ) ?? undefined;
       const providerSettings = this.getNormalizedProviderSettings() as Record<AIProviderType, any>;
       const apiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
 
@@ -3796,12 +3906,21 @@ export class AIService {
       const enabledSet = new Set<AIProviderType>();
       if (providerSettings['claude']?.enabled === true && !!apiKeys['anthropic']) enabledSet.add('claude');
       if (providerSettings['claude-code']?.enabled !== false) enabledSet.add('claude-code');
-      // Include the subscription CLI (on by default) so its variants render as
-      // checkboxes in the settings panel even before the user touches the toggle.
-      if (providerSettings['claude-code-cli']?.enabled !== false) enabledSet.add('claude-code-cli');
+      // The terminal-CLI provider is off until the user opts in, so its variants
+      // only need fetching once the settings toggle is on.
+      if (resolveProviderEnabled('claude-code-cli', providerSettings['claude-code-cli'])) enabledSet.add('claude-code-cli');
       if (providerSettings['openai']?.enabled === true && !!apiKeys['openai']) enabledSet.add('openai');
       if (providerSettings['openai-codex']?.enabled === true) enabledSet.add('openai-codex');
       if (providerSettings['opencode']?.enabled === true) enabledSet.add('opencode');
+      // Without these the model picker stays empty for an enabled provider:
+      // the catalog is only fetched for ids in this set. Both default to
+      // "on if their CLI is installed and signed in", so they must go through
+      // resolveProviderEnabled rather than reading the flag directly.
+      if (resolveProviderEnabled('grok-build', providerSettings['grok-build'])) enabledSet.add('grok-build');
+      if (resolveProviderEnabled('cursor-agent', providerSettings['cursor-agent'])) enabledSet.add('cursor-agent');
+      if (resolveProviderEnabled('antigravity-gemini-agent', providerSettings['antigravity-gemini-agent'])) {
+        enabledSet.add('antigravity-gemini-agent');
+      }
       if (providerSettings['lmstudio']?.enabled === true) enabledSet.add('lmstudio');
       if (providerSettings['ollama']?.enabled === true) enabledSet.add('ollama');
 
@@ -3810,7 +3929,7 @@ export class AIService {
         lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234',
         ollama_url: providerSettings['ollama']?.baseUrl || 'http://localhost:11434'
       };
-      const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledSet);
+      const allModels = await ModelRegistry.getAllModels(modelsConfig, workspacePath, enabledSet);
 
       // Append extension-contributed agent provider models (see ai:getModels).
       for (const agentEntry of getAgentProviderRegistry().list()) {
@@ -3995,8 +4114,15 @@ export class AIService {
     });
 
     // Get ENABLED models for actual use
-    safeHandle('ai:getModels', async () => {
+    safeHandle('ai:getModels', async (event) => {
       // console.log('[AIService] ai:getModels called - fetching enabled models');
+      // OpenCode resolves its provider set from project config, so this listing
+      // is workspace-scoped even though every other provider is global. Resolve
+      // the sender's project rather than threading a path through nine renderer
+      // call sites -- same approach TrackerSchemaService takes for #1178.
+      const workspacePath = resolveActiveWorkspacePathForWindowId(
+        getWindowIdForWindow(BrowserWindow.fromWebContents(event.sender)),
+      ) ?? undefined;
       const providerSettings = this.getNormalizedProviderSettings() as Record<AIProviderType, any>;
       const apiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
       const claudeCodeSettings = providerSettings['claude-code'] || {};
@@ -4020,9 +4146,10 @@ export class AIService {
           hiddenModels: claudeCodeSettings.hiddenModels
         },
         'claude-code-cli': {
-          // Genuine `claude` CLI on the user's subscription. On by default (like
-          // `claude-code`); no API key required — the CLI uses its own login.
-          enabled: providerSettings['claude-code-cli']?.enabled !== false,
+          // Genuine `claude` CLI in a terminal. Off by default — it's a workflow
+          // preference, not the way to use a Claude subscription. No API key
+          // required; the CLI uses its own login.
+          enabled: resolveProviderEnabled('claude-code-cli', providerSettings['claude-code-cli']),
           models: providerSettings['claude-code-cli']?.models,
           hiddenModels: providerSettings['claude-code-cli']?.hiddenModels
         },
@@ -4031,21 +4158,47 @@ export class AIService {
           models: providerSettings['openai']?.models,
           hiddenModels: providerSettings['openai']?.hiddenModels
         },
+        // These four each authenticate through their own CLI or config, so no
+        // API key is required -- but they still need models/hiddenModels
+        // forwarded, or hiding a model in Settings does nothing to the session
+        // picker (#1382).
         'openai-codex': {
-          // Codex SDK uses its own auth (codex auth login), API key is optional
           enabled: providerSettings['openai-codex']?.enabled === true,
+          models: providerSettings['openai-codex']?.models,
+          hiddenModels: providerSettings['openai-codex']?.hiddenModels
         },
         'openai-codex-acp': {
-          // Codex ACP uses the codex-acp binary directly; API key is optional
           enabled: providerSettings['openai-codex-acp']?.enabled === true,
+          models: providerSettings['openai-codex-acp']?.models,
+          hiddenModels: providerSettings['openai-codex-acp']?.hiddenModels
         },
         'opencode': {
-          // OpenCode uses its own config, API key is optional
           enabled: providerSettings['opencode']?.enabled === true,
+          models: providerSettings['opencode']?.models,
+          hiddenModels: providerSettings['opencode']?.hiddenModels
         },
         'copilot-cli': {
-          // Copilot uses its own CLI auth (copilot auth login), no API key needed
           enabled: providerSettings['copilot-cli']?.enabled === true,
+          models: providerSettings['copilot-cli']?.models,
+          hiddenModels: providerSettings['copilot-cli']?.hiddenModels
+        },
+        'grok-build': {
+          enabled: resolveProviderEnabled('grok-build', providerSettings['grok-build']),
+          models: providerSettings['grok-build']?.models,
+          hiddenModels: providerSettings['grok-build']?.hiddenModels
+        },
+        'cursor-agent': {
+          enabled: resolveProviderEnabled('cursor-agent', providerSettings['cursor-agent']),
+          models: providerSettings['cursor-agent']?.models,
+          hiddenModels: providerSettings['cursor-agent']?.hiddenModels
+        },
+        'antigravity-gemini-agent': {
+          enabled: resolveProviderEnabled(
+            'antigravity-gemini-agent',
+            providerSettings['antigravity-gemini-agent'],
+          ),
+          models: providerSettings['antigravity-gemini-agent']?.models,
+          hiddenModels: providerSettings['antigravity-gemini-agent']?.hiddenModels
         },
         'lmstudio': {
           enabled: providerSettings['lmstudio']?.enabled === true,
@@ -4070,7 +4223,7 @@ export class AIService {
         lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234',
         ollama_url: providerSettings['ollama']?.baseUrl || 'http://localhost:11434'
       };
-      const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledProviderSet);
+      const allModels = await ModelRegistry.getAllModels(modelsConfig, workspacePath, enabledProviderSet);
 
       // const claudeCodeModels = allModels.filter(m => m.provider === 'claude-code');
       // console.log('[AIService] ai:getModels - claude-code models from registry:',
@@ -4361,12 +4514,17 @@ export class AIService {
       }
 
       // Resolve the workspace: explicit arg wins, else the window's active
-      // project (honors the project rail selection in Multi-Project mode).
+      // project (honors the project rail selection in Multi-Project mode), else
+      // the offscreen mount's workspace when the sender is the hidden screenshot
+      // capture window, which WindowManager never registers.
       let workspacePath = options?.workspacePath;
       if (!workspacePath) {
         const browserWindow = BrowserWindow.fromWebContents(event.sender);
         const windowId = browserWindow ? getWindowId(browserWindow) : null;
-        workspacePath = resolveActiveWorkspacePathForWindowId(windowId) ?? undefined;
+        workspacePath = resolveSenderWorkspacePath({
+          windowId,
+          webContentsId: event.sender?.id,
+        });
       }
       if (!workspacePath) {
         throw new Error('No workspace path available for backend tool call');
@@ -4417,7 +4575,8 @@ export class AIService {
           : undefined;
 
         try {
-          const models = await ModelRegistry.getModelsForProvider(provider, apiKey, baseUrl);
+          // CHAT_PROVIDERS above is claude/openai/lmstudio -- none project-scoped.
+          const models = await ModelRegistry.getModelsForProvider(provider, undefined, apiKey, baseUrl);
           const enabledModelIds = settings?.models as string[] | undefined;
 
           for (const model of models) {
@@ -4708,7 +4867,7 @@ export class AIService {
       } else {
         // Try to find this model across providers
         for (const p of CHAT_PROVIDERS) {
-          const models = await ModelRegistry.getModelsForProvider(p);
+          const models = await ModelRegistry.getModelsForProvider(p, undefined);
           if (models.some(m => m.id === options.model)) {
             providerType = p;
             modelId = options.model;

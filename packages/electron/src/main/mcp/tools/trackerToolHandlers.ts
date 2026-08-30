@@ -59,6 +59,7 @@ import {
   resolveTrackerRowByReference,
 } from './trackerToolItemAccess';
 import { handleTrackerPublicationUpdate } from './trackerPublicationTool';
+import { handleGithubIssueOverlayCreate } from './githubIssueOverlayTool';
 import {
   bodyWriteFailure,
   DESTRUCTIVE_CONFIRM_PARAM_DESCRIPTION,
@@ -1754,6 +1755,19 @@ export async function handleTrackerCreate(
     const humanOnly = rejectHumanOnlyStatus(args, args.type);
     if (humanOnly) return humanOnly;
 
+    const issueOverlayResult = await handleGithubIssueOverlayCreate(
+      args,
+      workspacePath,
+      Boolean(sessionId && args.linkSession === true),
+      {
+        linkSession: (itemId) =>
+          handleTrackerLinkSession({ trackerId: itemId }, sessionId, workspacePath),
+        notifyAdded: (itemId) => notifyTrackerItemAdded(workspacePath, itemId),
+        notifyUpdated: (itemId) => notifyTrackerItemUpdated(workspacePath, itemId),
+      },
+    );
+    if (issueOverlayResult) return issueOverlayResult;
+
     const { getDatabase } = await import("../../database/initialize");
     const db = getDatabase();
 
@@ -1949,10 +1963,9 @@ export async function handleTrackerCreate(
 
     // Route the description through the canonical body path so it shows up
     // in the editor when the item is opened. The initial INSERT above sets
-    // `content` for backward compatibility, but for shared trackers the
-    // metadata-sync ack (`applyRemoteItem`) clobbers it to NULL because the
-    // wire payload carries no body field. Without this block, `body_version`
-    // stays at 0, `tracker_body_cache` is never populated, and the live
+    // `content` for backward compatibility, but that column alone is not
+    // enough: without this block `body_version` stays at 0,
+    // `tracker_body_cache` is never populated, and the live
     // DocumentRoom Y.Doc is never seeded -- so the collaborative editor
     // mounts empty. This mirrors `ElectronDocumentService.updateTrackerItemContent`
     // inline so we do not depend on `documentServices` having an entry for

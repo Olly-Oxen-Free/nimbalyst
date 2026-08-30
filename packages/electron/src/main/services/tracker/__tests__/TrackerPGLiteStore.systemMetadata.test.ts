@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { EncryptedTrackerItemEnvelope, TrackerItemPayload } from '@nimbalyst/runtime/sync';
+import type { TrackerItemEnvelope, TrackerItemPayload } from '@nimbalyst/runtime/sync';
 import { SQLiteDatabase } from '../../../database/sqlite/SQLiteDatabase';
 import { TrackerPGLiteStore } from '../TrackerPGLiteStore';
 
@@ -55,7 +55,7 @@ function payload(): TrackerItemPayload {
   };
 }
 
-function envelope(syncId = 1): EncryptedTrackerItemEnvelope {
+function envelope(syncId = 1): TrackerItemEnvelope {
   return {
     itemId: 'bug-1',
     syncId,
@@ -69,6 +69,46 @@ function envelope(syncId = 1): EncryptedTrackerItemEnvelope {
 
 function parseData(value: unknown): Record<string, unknown> {
   return typeof value === 'string' ? JSON.parse(value) : value as Record<string, unknown>;
+}
+
+const BODY = 'The body a user typed into the tracker editor.';
+
+/** JSONB comes back parsed on PGLite and as raw text on SQLite. */
+function readBody(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * The body has no wire representation at all -- the metadata envelope carries
+ * only a `bodyVersion` pointer, and `payloadToRecord` always emits
+ * `content: undefined`. So an ack that wrote the `content` column could only
+ * ever write NULL over whatever the user had typed.
+ */
+async function expectBodySurvivesMetadataAck(
+  db: { query<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }> },
+  store: TrackerPGLiteStore,
+) {
+  await store.applyRemoteItem(envelope(), payload());
+  // Mirrors the real body write in ElectronDocumentService.updateTrackerItemContent.
+  await db.query(
+    'UPDATE tracker_items SET content = $1::jsonb, body_version = 1 WHERE id = $2',
+    [JSON.stringify(BODY), 'bug-1'],
+  );
+
+  const ack = payload();
+  ack.bodyVersion = 1;
+  await store.applyRemoteItem(envelope(2), ack);
+
+  const result = await db.query<{ content: unknown }>(
+    'SELECT content FROM tracker_items WHERE id = $1',
+    ['bug-1'],
+  );
+  expect(readBody(result.rows[0].content)).toBe(BODY);
 }
 
 async function expectSystemCollections(db: { query<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }> }) {
@@ -147,6 +187,10 @@ describe('TrackerPGLiteStore system metadata projection (PGLite)', () => {
     expect(data.comments).toEqual([...COMMENTS, SECOND_COMMENT]);
     expect(data.activity).toEqual([...ACTIVITY, SECOND_ACTIVITY]);
   });
+
+  it('does not let a metadata ack erase the item body', async () => {
+    await expectBodySurvivesMetadataAck(db as any, store);
+  });
 });
 
 describe('TrackerPGLiteStore system metadata projection (SQLite)', () => {
@@ -201,5 +245,9 @@ describe('TrackerPGLiteStore system metadata projection (SQLite)', () => {
     const data = parseData(result.rows[0].data);
     expect(data.comments).toEqual([...COMMENTS, SECOND_COMMENT]);
     expect(data.activity).toEqual([...ACTIVITY, SECOND_ACTIVITY]);
+  });
+
+  it('does not let a metadata ack erase the item body', async () => {
+    await expectBodySurvivesMetadataAck(db as any, store);
   });
 });

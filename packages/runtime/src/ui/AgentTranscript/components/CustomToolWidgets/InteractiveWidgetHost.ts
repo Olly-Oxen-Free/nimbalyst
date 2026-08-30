@@ -8,6 +8,12 @@
  * This interface lives in runtime so widgets can use it without Electron-specific dependencies.
  */
 
+import type React from 'react';
+import type { FeedbackAskArtifact } from '@nimbalyst/collab-protocol';
+import type { HunkSelection } from '../../../git/unifiedDiffModel';
+
+export type { HunkSelection };
+
 // ============================================================
 // AskUserQuestion Types
 // ============================================================
@@ -33,8 +39,49 @@ export interface RequestUserInputResponse {
 // Feedback Request Types
 // ============================================================
 
-import type { FeedbackComposeSendPayload } from './feedback/feedbackComposeDraft';
-export type { FeedbackComposeSendPayload };
+import type {
+  FeedbackComposeDestination,
+  FeedbackComposeSendPayload,
+} from './feedback/feedbackComposeDraft';
+export type { FeedbackComposeDestination, FeedbackComposeSendPayload };
+
+/**
+ * Declared with protocol types rather than imported from `collab-client`,
+ * which depends on this package and cannot be depended on back. Structurally
+ * identical to that package's `FeedbackOptionPreviewRenderer`, so one host
+ * implementation satisfies both surfaces.
+ */
+export type FeedbackComposeArtifactRenderer = (
+  entry: { id: string; label: string },
+  artifact: FeedbackAskArtifact,
+) => React.ReactNode;
+
+/** One entry the compose popover can step to. */
+export interface FeedbackComposeArtifactEntry {
+  entryId: string;
+  artifact: FeedbackAskArtifact;
+  label: string;
+}
+
+export interface FeedbackComposeArtifactPopoverProps {
+  entries: readonly FeedbackComposeArtifactEntry[];
+  activeEntryId: string;
+  onActiveEntryChange(entryId: string): void;
+  onDismiss(): void;
+  /** The card the popover grew from, so it anchors where the click landed. */
+  anchor: HTMLElement | null;
+}
+
+/**
+ * Opens one artifact full-size, in place.
+ *
+ * Same reason the renderer above is injected: the popover lives in
+ * `collab-client`, which depends on this package, so this package cannot
+ * import it. The Electron host can, and does.
+ */
+export type FeedbackComposeArtifactPopoverRenderer = (
+  props: FeedbackComposeArtifactPopoverProps,
+) => React.ReactNode;
 
 export interface FeedbackRequestSendResult {
   success: boolean;
@@ -135,6 +182,50 @@ export interface InteractiveWidgetHost {
    */
   feedbackRequestSend?(payload: FeedbackComposeSendPayload): Promise<FeedbackRequestSendResult>;
 
+  /**
+   * Ask the author which team-files folder this request's subjects land in.
+   *
+   * Resolves null when the picker is dismissed, which leaves the draft's
+   * destination exactly as it was -- dismissing a picker is not a choice.
+   *
+   * Optional like the rest of this section. Without it the compose surface
+   * still names the destination it will use; it just has no way to change it,
+   * and publishing falls back to asking per subject at send time. The folder
+   * index lives in the Electron renderer and has no mobile counterpart, which
+   * is why this is a host method and not a tree rendered in this package.
+   */
+  pickFeedbackDestination?(current: {
+    folderId: string | null;
+    /** How many subjects are being placed, so the picker can say so. */
+    subjectCount: number;
+  }): Promise<FeedbackComposeDestination | null>;
+
+  /**
+   * Paint one artifact bound to an ask entry, so the author can see what they
+   * are about to send rather than a label for it.
+   *
+   * Optional for the same reason `feedbackRequestSend` is: the compose surface
+   * renders a complete, honest draft without it, and a host that cannot reach
+   * the custom-editor registry simply shows the titled placeholder. It also
+   * keeps this package free of a dependency on the editor registry, which lives
+   * in the Electron renderer and has no mobile counterpart.
+   *
+   * Returning nullish is a supported answer -- "I can paint artifacts, and this
+   * one has nothing to show" -- and lands on the same placeholder.
+   */
+  renderFeedbackArtifactPreview?: FeedbackComposeArtifactRenderer;
+
+  /**
+   * Opens a bound artifact full-size from the compose surface.
+   *
+   * A 128px card scaled from a 1000px design is a *recognition* aid and
+   * nothing more -- a dark mockup at that size is a dark smudge. Reviewing a
+   * draft means being able to look at what you are about to send, so the card
+   * needs a way in. Optional, like everything else here: without it the card
+   * still shows its preview and simply cannot be opened.
+   */
+  renderFeedbackArtifactPopover?: FeedbackComposeArtifactPopoverRenderer;
+
   /** Discard a drafted feedback request without sending it. */
   feedbackRequestCancel?(draftId: string): Promise<void>;
 
@@ -189,7 +280,13 @@ export interface InteractiveWidgetHost {
   gitCommit(
     proposalId: string,
     files: string[],
-    message: string
+    message: string,
+    /**
+     * Desktop-only. Files listed here are staged down to the named hunks
+     * instead of whole. Mobile has no local working tree, so it never sends
+     * this and every file goes in whole.
+     */
+    hunkSelections?: HunkSelection[]
   ): Promise<{ success: boolean; commitHash?: string; commitDate?: string; error?: string; pending?: boolean }>;
 
   /**
@@ -204,6 +301,14 @@ export interface InteractiveWidgetHost {
    * (e.g. mobile, where the working tree is not local).
    */
   gitFileDiff?(filePath: string): Promise<{ unifiedDiff: string; isBinary: boolean } | null>;
+
+  /**
+   * Unified diff of what *this session* changed in a file, from its own
+   * pre-edit snapshot to its post-edit content. Distinct from `gitFileDiff`,
+   * which is HEAD vs the working tree and therefore includes sibling sessions'
+   * edits. Returns null when the session has no snapshot baseline for the file.
+   */
+  sessionFileDiff?(filePath: string): Promise<{ unifiedDiff: string } | null>;
 
   /**
    * Persisted size of the diff peek popover, or null to use the default.

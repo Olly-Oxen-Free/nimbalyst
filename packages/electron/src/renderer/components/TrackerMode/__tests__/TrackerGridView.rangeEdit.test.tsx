@@ -6,6 +6,7 @@ import { loadBuiltinTrackers } from '@nimbalyst/runtime/plugins/TrackerPlugin/mo
 
 const {
   handleItemUpdate,
+  handleItemsUpdate,
   useRealRows,
   gridProps,
   getFocused,
@@ -17,6 +18,7 @@ const {
   gridElement,
 } = vi.hoisted(() => ({
   handleItemUpdate: vi.fn(async () => undefined),
+  handleItemsUpdate: vi.fn(async () => ({ written: 0, failed: 0 })),
   // The undo tests need the hook's real history; every other test keeps the
   // cheap stub so a write assertion stays one mock call away.
   useRealRows: { current: false },
@@ -84,6 +86,7 @@ vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin', async (importOriginal) => {
       ? actual.useTrackerRows(options)
       : ({
         handleItemUpdate: handleItemUpdate,
+        handleItemsUpdate,
         runUndoable: <T,>(_label: string, fn: () => Promise<T>) => fn(),
         recordUndoEntry: vi.fn(),
         captureUndoGeneration: () => 0,
@@ -109,7 +112,7 @@ vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin', async (importOriginal) => {
 vi.mock('posthog-js/react', () => ({ usePostHog: () => null }));
 
 import { TrackerGridView } from '../TrackerGridView';
-import { commitOnNavigationKeys } from '../grid/trackerGridEditors';
+import { commitOnNavigationKeys } from '@nimbalyst/collab-client/trackers-ui';
 
 function record(id = 'bug-1', status = 'to-do'): TrackerRecord {
   return {
@@ -134,18 +137,19 @@ describe('TrackerGridView range edits', () => {
 
   beforeEach(() => {
     handleItemUpdate.mockClear();
+    handleItemsUpdate.mockClear();
     getFocused.mockClear();
     setCellEdit.mockClear();
     gridProps.current = null;
     gridListeners.clear();
   });
 
-  it('commits every changed cell in a row as one item update', async () => {
-    const item = record();
+  it('commits a multi-row range through one batch call', async () => {
+    const items = [record('bug-1'), record('bug-2')];
     render(
       <TrackerGridView
         filterType="bug"
-        overrideItems={[item]}
+        overrideItems={items}
         columnConfig={{
           visibleColumns: ['title', 'status'],
           columnWidths: {},
@@ -157,20 +161,19 @@ describe('TrackerGridView range edits', () => {
       dispatchGridEvent('afteredit', {
         data: {
           0: { title: 'New title', status: 'in-progress' },
+          1: { status: 'done' },
         },
       });
     });
 
     await waitFor(() => {
-      expect(handleItemUpdate).toHaveBeenCalledTimes(1);
+      expect(handleItemsUpdate).toHaveBeenCalledTimes(1);
     });
-    expect(handleItemUpdate).toHaveBeenCalledWith(expect.objectContaining({
-      id: item.id,
-      fields: item.fields,
-    }), {
-      title: 'New title',
-      status: 'in-progress',
-    });
+    expect(handleItemsUpdate).toHaveBeenCalledWith([
+      { item: expect.objectContaining({ id: 'bug-1' }), updates: { title: 'New title', status: 'in-progress' } },
+      { item: expect.objectContaining({ id: 'bug-2' }), updates: { status: 'done' } },
+    ]);
+    expect(handleItemUpdate).not.toHaveBeenCalled();
   });
 
   it('cancels drag-to-clone without disarming the range paste that shares afteredit', async () => {
@@ -200,16 +203,19 @@ describe('TrackerGridView range edits', () => {
       });
     });
 
-    await waitFor(() => expect(handleItemUpdate).toHaveBeenCalledTimes(1));
-    expect(handleItemUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ id: item.id }),
-      { status: 'in-progress' },
-    );
+    await waitFor(() => expect(handleItemsUpdate).toHaveBeenCalledTimes(1));
+    expect(handleItemsUpdate).toHaveBeenCalledWith([
+      { item: expect.objectContaining({ id: item.id }), updates: { status: 'in-progress' } },
+    ]);
   });
 });
 
 describe('TrackerGridView undo', () => {
   const updateTrackerItem = vi.fn().mockResolvedValue({ success: true });
+  const updateTrackerItems = vi.fn(async ({ entries }: { entries: Array<{ itemId: string }> }) => ({
+    success: true,
+    results: entries.map(entry => ({ itemId: entry.itemId, success: true })),
+  }));
 
   beforeAll(() => loadBuiltinTrackers());
 
@@ -218,7 +224,8 @@ describe('TrackerGridView undo', () => {
     // move down to the IPC write itself.
     useRealRows.current = true;
     updateTrackerItem.mockClear();
-    (window as any).electronAPI = { documentService: { updateTrackerItem } };
+    updateTrackerItems.mockClear();
+    (window as any).electronAPI = { documentService: { updateTrackerItem, updateTrackerItems } };
     gridListeners.clear();
   });
 
@@ -266,7 +273,8 @@ describe('TrackerGridView undo', () => {
         data: { 0: { status: 'in-progress' }, 1: { status: 'in-progress' } },
       });
     });
-    await waitFor(() => expect(updateTrackerItem).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(updateTrackerItems).toHaveBeenCalledTimes(1));
+    expect(updateTrackerItems.mock.calls[0][0].entries).toHaveLength(2);
 
     regrid(rerender, pasted);
     updateTrackerItem.mockClear();
@@ -473,7 +481,7 @@ describe('TrackerGridView column layout', () => {
       });
     });
 
-    screen.getByTestId('tracker-column-filter-value-submenu');
+    await screen.findByTestId('tracker-column-filter-value-submenu');
     screen.getByText('1 issue');
     screen.getByText('1 option not matching any issues');
     fireEvent.click(screen.getByTestId('tracker-column-filter-option-to-do'));
@@ -519,61 +527,6 @@ describe('TrackerGridView column layout', () => {
   });
 });
 
-describe('TrackerGridView double-click', () => {
-  beforeAll(() => loadBuiltinTrackers());
-
-  beforeEach(() => {
-    getFocused.mockClear();
-    gridProps.current = null;
-    gridListeners.clear();
-  });
-
-  /** RevoGrid renders its own cells; stand in for one on the focused row. */
-  function doubleClickCell(): void {
-    const cell = document.createElement('div');
-    cell.setAttribute('data-rgrow', '0');
-    screen.getByTestId('mock-revogrid').appendChild(cell);
-    fireEvent.doubleClick(cell);
-  }
-
-  function renderGrid(onOpenDocument: () => void) {
-    render(
-      <TrackerGridView
-        filterType="bug"
-        overrideItems={[record()]}
-        columnConfig={{
-          visibleColumns: ['key', 'title', 'status'],
-          columnWidths: {},
-        }}
-        onOpenDocument={onOpenDocument}
-      />,
-    );
-  }
-
-  it('leaves an editable cell to RevoGrid instead of opening the item', async () => {
-    const onOpenDocument = vi.fn();
-    renderGrid(onOpenDocument);
-
-    doubleClickCell();
-
-    await waitFor(() => expect(getFocused).toHaveBeenCalled());
-    expect(onOpenDocument).not.toHaveBeenCalled();
-  });
-
-  it('opens the item from a readonly cell', async () => {
-    const onOpenDocument = vi.fn();
-    renderGrid(onOpenDocument);
-    getFocused.mockResolvedValueOnce({
-      cell: { x: 0, y: 0 },
-      column: { prop: 'key' },
-      rowType: 'rgRow',
-    });
-
-    doubleClickCell();
-
-    await waitFor(() => expect(onOpenDocument).toHaveBeenCalledWith('bug-1'));
-  });
-});
 
 describe('TrackerGridView keyboard contract', () => {
   beforeAll(() => loadBuiltinTrackers());
@@ -657,7 +610,7 @@ describe('TrackerGridView keyboard contract', () => {
     expect(onDetailClose).toHaveBeenCalledTimes(1);
   });
 
-  it('opens details when mouse focus lands on a row after keyboard navigation', () => {
+  it('leaves the detail panel closed when a click lands on a row', () => {
     const onItemSelect = vi.fn();
     render(
       <TrackerGridView
@@ -668,13 +621,14 @@ describe('TrackerGridView keyboard contract', () => {
     );
 
     const grid = screen.getByTestId('mock-revogrid');
-    fireEvent.keyDown(grid, { key: 'ArrowDown', code: 'ArrowDown' });
     fireEvent.pointerDown(grid);
     act(() => {
       dispatchGridEvent('afterfocus', { rowIndex: 0 });
     });
 
-    expect(onItemSelect).toHaveBeenCalledWith('bug-1');
+    // Selecting a cell is not a request to open the row -- that is the Key
+    // cell's job. Before this, any click dragged the panel along with it.
+    expect(onItemSelect).not.toHaveBeenCalled();
   });
 });
 

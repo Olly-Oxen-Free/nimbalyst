@@ -403,7 +403,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   useEffect(() => {
     if (trayNewSessionRequest) {
       setTrayNewSessionRequest(false);
-      void dispatchCreateNewSession(undefined);
+      void dispatchCreateNewSession({ launchSource: 'tray' });
     }
   }, [trayNewSessionRequest, setTrayNewSessionRequest, dispatchCreateNewSession]);
 
@@ -570,7 +570,8 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   // setter identities returned by useSetAtom are stable, so the deps array
   // does not churn.
   useImperativeHandle(ref, () => ({
-    createNewSession: (initialDraft?: string) => dispatchCreateNewSession(initialDraft),
+    createNewSession: (initialDraft?: string) =>
+      dispatchCreateNewSession({ initialDraft, launchSource: 'new_session_button' }),
     createNewWorktreeSession: async (options?: { baseBranch?: string; name?: string }) => {
       await dispatchCreateNewWorktreeSession(options);
     },
@@ -664,7 +665,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
     <div className="agent-mode-empty flex flex-col items-center justify-center h-full gap-4 text-nim-muted">
       <p className="m-0 text-sm">Select a session or create a new one to get started</p>
       <button
-        onClick={() => dispatchCreateNewSession(undefined)}
+        onClick={() => dispatchCreateNewSession({ launchSource: 'new_session_button' })}
         className="agent-mode-new-button py-2 px-4 rounded-md border border-nim-border bg-nim-bg-secondary text-nim cursor-pointer text-sm transition-colors hover:bg-nim-bg-active"
       >
         New Session

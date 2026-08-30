@@ -16,6 +16,7 @@ import { setInteractiveWidgetHost } from '../../../../../store/atoms/interactive
 import { feedbackRecipientDirectoryAtom } from '../../../../../store/atoms/feedbackRecipientDirectory';
 import { clearFeedbackRequestComposeDraft } from '../../../../../store/atoms/feedbackRequestComposeDraft';
 import { FeedbackRequestComposeWidget } from '../feedback/FeedbackRequestComposeWidget';
+import type { FeedbackAskArtifact } from '@nimbalyst/collab-protocol';
 import type { InteractiveWidgetHost } from '../InteractiveWidgetHost';
 
 const SESSION_ID = 'session-compose';
@@ -133,6 +134,32 @@ describe('FeedbackRequestComposeWidget', () => {
     ]);
   });
 
+  it('stays sent after the transcript unmounts and remounts the row', async () => {
+    const toolCallId = 'tc-sent-remount';
+    clearFeedbackRequestComposeDraft(toolCallId);
+    const first = renderWidget(toolCallId);
+    const state = () => screen
+      .getByTestId('feedback-request-compose-widget')
+      .getAttribute('data-state');
+
+    fireEvent.click(screen.getByTestId('feedback-compose-send'));
+    await vi.waitFor(() => expect(state()).toBe('sent'));
+    expect(send).toHaveBeenCalledTimes(1);
+
+    /*
+     * The transcript's virtual scroller unmounts off-screen rows, which is the
+     * whole reason the draft lives in an atom family. Sent-ness has to live
+     * there too: re-seeding a fully sendable draft under a Send button the
+     * author already pressed is how one request becomes three.
+     */
+    first.unmount();
+    renderWidget(toolCallId);
+
+    expect(state()).toBe('sent');
+    expect(screen.queryByTestId('feedback-compose-send')).toBeNull();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the draft on screen when the send fails, so the author can retry', async () => {
     const toolCallId = 'tc-send-failed';
     clearFeedbackRequestComposeDraft(toolCallId);
@@ -182,6 +209,71 @@ describe('FeedbackRequestComposeWidget', () => {
       recipients: [{ userId: 'u-karl', name: 'Karl Reyes' }],
     });
     expect(send.mock.calls[1][0].asks.map((ask: { id: string }) => ask.id)).toEqual(['ask-direction']);
+  });
+
+  it('carries the destination the author picked into the send payload', async () => {
+    const toolCallId = 'tc-destination';
+    clearFeedbackRequestComposeDraft(toolCallId);
+    const pick = vi.fn().mockResolvedValue({ folderId: 'f-mockups', path: 'Design/Mockups' });
+    setInteractiveWidgetHost(SESSION_ID, {
+      ...makeHost(send),
+      pickFeedbackDestination: pick,
+    } as unknown as InteractiveWidgetHost);
+    renderWidget(toolCallId, {
+      subjects: [
+        {
+          ref: { orgId: 'org-1', kind: 'file', sourceId: 'direction-a' },
+          label: 'direction-a.mockup.html',
+          shared: false,
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByTestId('feedback-compose-change-destination'));
+    await screen.findByText('Design / Mockups');
+    expect(pick).toHaveBeenCalledWith({ folderId: null, subjectCount: 1 });
+
+    fireEvent.click(screen.getByTestId('feedback-compose-send'));
+    fireEvent.click(await screen.findByTestId('feedback-compose-publish-confirm'));
+    expect(send.mock.calls[0][0].destination).toEqual({
+      folderId: 'f-mockups',
+      path: 'Design/Mockups',
+    });
+  });
+
+  it('names the destination but cannot change it when the host has no picker', () => {
+    const toolCallId = 'tc-destination-no-host';
+    clearFeedbackRequestComposeDraft(toolCallId);
+    renderWidget(toolCallId, {
+      subjects: [
+        {
+          ref: { orgId: 'org-1', kind: 'file', sourceId: 'direction-a' },
+          label: 'direction-a.mockup.html',
+          shared: false,
+        },
+      ],
+    });
+
+    // Still honest about where it goes; just no way to change it from here.
+    screen.getByTestId('feedback-compose-destination');
+    expect(screen.queryByTestId('feedback-compose-change-destination')).toBeNull();
+  });
+
+  it('hides the destination when nothing being published lands in a folder', () => {
+    const toolCallId = 'tc-destination-tracker';
+    clearFeedbackRequestComposeDraft(toolCallId);
+    renderWidget(toolCallId, {
+      subjects: [
+        {
+          ref: { orgId: 'org-1', kind: 'tracker', sourceId: 'item-9' },
+          label: 'NIM-9',
+          shared: false,
+        },
+      ],
+    });
+
+    screen.getByTestId('feedback-compose-publish-prompt');
+    expect(screen.queryByTestId('feedback-compose-destination')).toBeNull();
   });
 
   it('renders the nonblocking tool result as an unsent draft for author approval', () => {
@@ -234,5 +326,82 @@ describe('FeedbackRequestComposeWidget', () => {
     fireEvent.click(screen.getByTestId('feedback-compose-send'));
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0].publishSubjectRefs).toEqual([]);
+  });
+});
+
+/**
+ * The author has to be able to see what they are about to send.
+ *
+ * This surface showed flat label rows for a year: an ask could bind a mockup
+ * to every option and compose would render none of them, so the one place you
+ * decide whether to send a comparison was the one place you could not look at
+ * it. Nothing about that was visibly broken -- the rows rendered fine.
+ */
+describe('compose artifact previews', () => {
+  const ARTIFACT_ASK = {
+    asks: [{
+      type: 'singleSelect',
+      id: 'ask-direction',
+      label: 'Direction',
+      description: 'Which of these should we build?',
+      options: [
+        { id: 'a', label: 'A · Split panel' },
+        { id: 'b', label: 'B · Radial' },
+      ],
+      artifacts: [
+        { entryId: 'a', ref: { orgId: 'org-1', kind: 'file', sourceId: 'mockups/a.mockup.html' }, label: 'Split panel' },
+        { entryId: 'b', ref: { orgId: 'org-1', kind: 'file', sourceId: 'mockups/b.mockup.html' }, label: 'Radial' },
+      ],
+    }],
+  };
+
+  it('paints each bound artifact when the host can render one', () => {
+    const painted: string[] = [];
+    setInteractiveWidgetHost(SESSION_ID, {
+      feedbackRequestSend: vi.fn(),
+      feedbackRequestCancel: vi.fn(),
+      renderFeedbackArtifactPreview: (
+        entry: { id: string; label: string },
+        artifact: FeedbackAskArtifact,
+      ) => {
+        painted.push(`${entry.id}:${artifact.ref.sourceId}`);
+        return <div data-testid={`painted-${entry.id}`} />;
+      },
+    } as unknown as InteractiveWidgetHost);
+
+    clearFeedbackRequestComposeDraft('tc-artifacts');
+    // Scoped to this render: the file has no global cleanup, so `screen` also
+    // sees every earlier test's tree.
+    const { container } = renderWidget('tc-artifacts', ARTIFACT_ASK);
+
+    // Each option gets its *own* artifact — binding is by entry id, and getting
+    // that mapping backwards would still render two previews.
+    expect(painted).toEqual([
+      'a:mockups/a.mockup.html',
+      'b:mockups/b.mockup.html',
+    ]);
+    expect(
+      container.querySelectorAll('[data-testid="feedback-compose-option-card"]'),
+    ).toHaveLength(2);
+  });
+
+  it('keeps the plain option rows when the host cannot paint artifacts', () => {
+    // Set explicitly rather than inherited: this describe is a sibling of the
+    // one that owns the shared beforeEach, and "a host with no renderer" is the
+    // precondition under test rather than a default to fall into.
+    setInteractiveWidgetHost(SESSION_ID, {
+      feedbackRequestSend: vi.fn(),
+      feedbackRequestCancel: vi.fn(),
+    } as unknown as InteractiveWidgetHost);
+
+    clearFeedbackRequestComposeDraft('tc-no-renderer');
+    const { container } = renderWidget('tc-no-renderer', ARTIFACT_ASK);
+
+    // A host with no renderer — mobile, or a build with no editor registry —
+    // still shows a complete, readable draft rather than a row of empty frames.
+    expect(
+      container.querySelector('[data-testid="feedback-compose-option-card"]'),
+    ).toBeNull();
+    expect(container.textContent).toContain('A · Split panel');
   });
 });
