@@ -1,0 +1,63 @@
+sources:
+  - url: https://community.obsidian.md/plugins/tasks-caldav-sync
+    note: "Highest-value reference. Bidirectional Obsidian-tasks<->CalDAV sync; explicit three-way diff, per-device sync toggle for loop prevention, manual-default conflict mode, 🆔 emoji-field id embedding."
+  - url: https://github.com/speze88/obsidian-caldav-sync
+    note: "Related CalDAV sync plugin repo; not individually fetched, listed as adjacent prior art to tasks-caldav-sync."
+  - url: https://github.com/josecoelho/obsidian-tasks-caldav
+    note: "Another CalDAV sync plugin repo; not individually fetched."
+  - url: https://www.obsidianstats.com/plugins/nextcloud-tasks
+    note: "One-way-shaped exception: does not copy tasks into the vault, no local cache, avoids sync problems by not duplicating storage. Cited as an architecture class NOT applicable here."
+  - url: https://www.obsidianstats.com/plugins/vikunja-sync
+    note: "Listed but unverified beyond the directory entry; no mechanism detail found in this pass."
+  - url: https://community.obsidian.md/plugins/sync-todoist
+    note: "Sync Todoist plugin listing; HTML-comment id embedding, configurable conflict policy (Obsidian wins / Todoist wins / ask)."
+  - url: https://github.com/o1xhack/obsidian-sync-todoist
+    note: "obsidian-sync-todoist repo; source for HTML-comment id format and conflict-policy detail."
+  - url: https://github.com/bastiaanschonhage/syncist
+    note: "Syncist (Todoist Sync for Obsidian) repo; alternate/successor Todoist sync plugin."
+  - url: https://www.obsidianstats.com/plugins/sync-todoist
+    note: "Obsidian Stats listing for Sync Todoist plugin, corroborates feature summary."
+  - url: https://community.obsidian.md/plugins/obsidian-google-tasks
+    note: "Google Tasks plugin listing; real-time syncing, per-user OAuth credential registration due to quota/security."
+  - url: https://www.morgen.so/google-tasks-obsidian-integration
+    note: "Morgen integration: explicitly hub-and-spoke, not direct two-way Obsidian<->Google-Tasks sync. Cited as a 'looks like two-way sync but isn't' example."
+  - url: https://github.com/obsidian-tasks-group/obsidian-tasks/blob/main/docs/Getting%20Started/Task%20Dependencies.md
+    note: "Tasks plugin 🆔 id field and ⛔ depends-on field documentation. States id uniqueness is intended but NOT enforced by the plugin."
+  - url: https://blacksmithgu.github.io/obsidian-dataview/annotation/metadata-tasks/
+    note: "Dataview metadata-on-tasks docs; confirms Dataview supports Tasks-plugin emoji shorthand only for dates, not priority/recurrence."
+  - url: https://github.com/blacksmithgu/obsidian-dataview/blob/master/docs/docs/annotation/metadata-tasks.md
+    note: "Same content, GitHub source copy."
+  - url: https://blacksmithgu.github.io/obsidian-dataview/annotation/add-metadata/
+    note: "Dataview inline-field bracket syntax [key:: value] general reference."
+  - url: https://github.com/paulmillr/chokidar
+    note: "chokidar file watcher: atomic-write coalescing option (default 100ms window), cross-platform event normalization. Recommended library."
+  - url: https://www.npmjs.com/package/chokidar
+    note: "npm listing corroborating chokidar's atomic option and duplicate-event smoothing behavior."
+  - url: https://github.com/paulmillr/chokidar/issues/144
+    note: "chokidar issue confirming underlying fs.watch emits duplicate change events per file change (root cause chokidar works around)."
+  - url: https://npmtrends.com/@parcel/watcher-vs-chokidar-vs-filespy-vs-nsfw
+    note: "Comparison data used to reject @parcel/watcher for this feature's scale (native addon, only wins at 50k+ files)."
+  - url: https://www.npmjs.com/package/ulid
+    note: "Original ulid package; noted as unmaintained, motivating the ulidx recommendation."
+  - url: https://www.npmjs.com/package/ulidx
+    note: "Maintained ulid fork/replacement; recommended id library, matches Nimbalyst's existing tsk_<ulid> convention."
+  - url: https://www.devstoolsbox.dev/tools/blog/javascript-uuid-guide/
+    note: "2026 UUID v4 vs v7 vs ULID vs NanoID comparison used for id-library tradeoff summary. Unverified authority (blog, not spec) -- used only for general framing, not as a normative source."
+  - url: https://github.com/remarkjs/remark
+    note: "remark monorepo (remark-parse + remark-stringify), unifiedjs markdown AST tooling. Recommended for reading, flagged as a pretty-printer (not byte-exact round-trip) for writing."
+  - url: https://www.npmjs.com/package/remark-stringify
+    note: "remark-stringify docs; confirms it formats 'in a way that works with most markdown parsers' -- i.e. normalizes, does not guarantee byte-identical round-trip."
+  - url: https://unifiedjs.com/explore/package/remark/
+    note: "unifiedjs remark package overview, corroborates mdast AST role."
+  - url: https://tonsky.me/blog/crdt-filesync/
+    note: "Local-first CRDT-over-filesync blog post; used for CRDT/file-sync framing in best-practices.md loop-prevention and CRDT sections. Blog opinion, treated as informative not authoritative."
+  - url: https://github.com/super-productivity/super-productivity/issues/4857
+    note: "Real feature-request thread discussing CRDT for multi-device task sync; corroborates CRDT is considered/discussed but non-trivial to adopt even by an established task app."
+  - url: https://blogs.mulesoft.com/dev-guides/how-to-tutorials/data-synchronizing-made-easy-with-mule-watermarks/
+    note: "Watermark-based change-detection pattern (vs timestamp polling) in an enterprise integration context; used to support the watermark-over-timestamp recommendation."
+
+unverified:
+  - claim: "Vikunja Sync Obsidian plugin's identity/conflict mechanism"
+    reason: "Only a directory listing was found (obsidianstats.com); no README or source inspected. Assume CalDAV-compatible but do not treat as confirmed."
+  - claim: "Specific version numbers for chokidar's atomic-write default timing beyond the commonly cited 100ms"
+    reason: "Corroborated by multiple secondary sources (npm listing, README mirrors) but the canonical GitHub README was not fetched directly in full; treat 100ms default as very likely correct, not independently re-verified against current source in this pass."
