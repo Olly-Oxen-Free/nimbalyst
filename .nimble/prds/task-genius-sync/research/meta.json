@@ -1,0 +1,21 @@
+{
+  "slug": "task-genius-sync",
+  "mode": "feature-init",
+  "started": "2026-09-03",
+  "completed": "2026-09-03",
+  "phases": { "internal": "complete", "external": "complete", "summary": "complete" },
+  "repos": {
+    "nimbalyst": "/home/jayden-eppcohen/Documents/Projects/Software/nimbalyst",
+    "task-genius-fork": "/home/jayden-eppcohen/ProtonDrive/Obsidian/Obsidian.Marvin/.obsidian/plugins/task-genius-fork"
+  },
+  "note": "Cross-repo research: the internal phase covers BOTH codebases, since the feature is a sync between them.",
+  "provenance": {
+    "external": "nimble-researcher agent",
+    "internal": "written directly; the delegated agent produced no artifacts within budget and was stopped"
+  },
+  "not_investigated": [
+    "packages/runtime/src/sync/",
+    "packages/collab-protocol, collab-adapters, collab-client",
+    "packages/cli tracker paths"
+  ]
+}
