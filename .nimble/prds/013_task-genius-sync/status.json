@@ -1,0 +1,12 @@
+{
+  "slug": "task-genius-sync",
+  "status": "draft",
+  "stage": "planned",
+  "created": "2026-09-03",
+  "prd": "PRD_task-genius-sync.md",
+  "tasks": "tasks.yaml",
+  "task_count": 9,
+  "total_complexity": 32,
+  "cross_repo": true,
+  "gate_task": "1a"
+}

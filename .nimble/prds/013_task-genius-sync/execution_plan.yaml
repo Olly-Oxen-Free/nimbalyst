@@ -1,0 +1,69 @@
+prd_slug: "task-genius-sync"
+execution_mode: "feature-branch"
+feature_branch: "feature/task-genius-sync"
+base_branch: "main"
+cadence: "worktree-free-local"   # precedent: PRD 011/012 — no PRs, no gh; commit per task
+cross_repo: true
+
+repo_gates:
+  nimbalyst:
+    source: ".nimble/config.yaml"
+    build: "npm run build"
+    test: "npm run test:prepush"
+    typecheck: "npm run typecheck"
+  task-genius-fork:
+    note: |
+      NOT governed by .nimble/config.yaml. Verify with this repo's own gates and diff the
+      suite against a captured baseline — it has ~39 pre-existing failures, so a raw
+      pass/fail count proves nothing.
+    typecheck: "npx tsc -noEmit -skipLibCheck"
+    test: "npx jest"
+    deploy_after_commit: "cp dist/main.js main.js && cp dist/styles.css styles.css"
+    deploy_reason: |
+      The production build writes to dist/ while Obsidian loads the plugin-root main.js.
+      Committing does not deploy. A task that skips this will appear not to work.
+
+waves:
+  - wave: 1
+    tasks: ["1a"]
+    reason: |
+      Hard gate. The whole architecture rests on a checkbox line round-tripping through
+      nimbalyst's Lexical transformers, and that is unverified. A no-go does not kill the
+      feature but does change tasks 2a and 3b, so nothing may start in parallel with it.
+
+  - wave: 2
+    tasks: ["2a", "2b", "3a", "3b"]
+    reason: |
+      Fully parallel: 2a/2b are in task-genius-fork, 3a/3b are in nimbalyst. Different
+      repositories, so file conflict is impossible. 3b is skipped entirely if 1a said no-go.
+
+  - wave: 3
+    tasks: ["4a", "4b"]
+    reason: |
+      4a needs the configurable tracker path from 3a. 4b needs the parser (2a) and the
+      status mapping (2b). Different repos again, so they run in parallel with each other.
+
+  - wave: 4
+    tasks: ["5a"]
+    reason: |
+      Verification with both applications live on the same files. Everything before this is
+      verified by tests within a single repo; this is the first check of the actual feature.
+
+  - wave: 5
+    tasks: ["5b"]
+    reason: |
+      Documentation follows verification, so it describes observed behaviour rather than
+      intended behaviour — including anything 5a found that behaved badly.
+
+longest_chain: "1a -> 2a -> 4b -> 5a -> 5b"
+
+risks:
+  - risk: "Spike 1a fails"
+    impact: "Tasks 2a and 3b change shape; 3b is dropped"
+    mitigation: "Fallback documented in the PRD — checkbox-less format, completion derived from status:"
+  - risk: "Cross-repo execution is outside nimble's model"
+    impact: "A task-genius-fork task run under nimbalyst's boundaries would verify nothing"
+    mitigation: "Every task carries a `repo` field; per-repo gates are specified above"
+  - risk: "Both applications write the same file concurrently"
+    impact: "Lost edits"
+    mitigation: "Task 3a verifies nimbalyst's write path is atomic; Task Genius already has staleness checks"

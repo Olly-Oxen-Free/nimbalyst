@@ -1,0 +1,302 @@
+metadata:
+  prd_slug: "task-genius-sync"
+  created_at: "2026-09-03T00:00:00Z"
+  total_complexity: 32
+  task_count: 9
+  cross_repo: true
+  repos:
+    nimbalyst: "/home/jayden-eppcohen/Documents/Projects/Software/nimbalyst"
+    task-genius-fork: "/home/jayden-eppcohen/ProtonDrive/Obsidian/Obsidian.Marvin/.obsidian/plugins/task-genius-fork"
+  note: |
+    Tasks carry a `repo` field. Nimble's .nimble/config.yaml (commands, boundaries,
+    pre_pr_checks) governs the nimbalyst repo ONLY. A task-genius-fork task must be
+    verified with that repo's own gates:
+      npx tsc -noEmit -skipLibCheck
+      npx jest            # ~39 pre-existing failures; diff against a captured baseline
+    and deployed after committing:
+      cp dist/main.js main.js && cp dist/styles.css styles.css
+    The production build writes to dist/ while Obsidian loads the plugin-root main.js.
+    A task that skips the copy will appear not to work.
+
+tasks:
+  - id: "1a"
+    title: "SPIKE (GATE): does a checkbox line round-trip through nimbalyst's Lexical tracker transformers?"
+    complexity: 2
+    wave: 1
+    repo: nimbalyst
+    depends_on: []
+    files:
+      - packages/runtime/src/plugins/TrackerPlugin/TrackerItemTransformer.ts
+      - packages/runtime/src/editor/markdown/core-transformers.ts
+      - packages/runtime/src/plugins/TrackerPlugin/__tests__/
+    description: |
+      The whole architecture rests on one line being valid to both parsers:
+
+        - [ ] Fix login #task[id:tsk_01H… status:to-do priority:medium created:2026-09-03]
+
+      Evidence it should work: the tracker import regex is
+      /^(.+?)\s+#([a-z][\w-]*)\[.+?\]$/ (TrackerItemTransformer.ts:79), and CHECK_LIST is
+      in the transformer set (core-transformers.ts:13, spread via CORE_TRANSFORMERS at
+      editor/markdown/index.ts:30), so Lexical should consume the `- [ ]` before the
+      tracker TextMatchTransformer sees the text.
+
+      Transformer ORDERING decides it, and that has not been verified. Write a test that
+      imports the line above through nimbalyst's real transformer set and asserts:
+        (a) a TrackerItemNode is produced,
+        (b) its description is "Fix login" — NOT "[ ] Fix login",
+        (c) id/status/priority/created parse correctly,
+        (d) exporting the node back to markdown round-trips without losing the checkbox.
+
+      Deliverable: the test, plus a written go/no-go in
+      research/internal/spike-1a-checkbox-roundtrip.md.
+
+      NOTHING ELSE STARTS UNTIL THIS RESOLVES.
+
+      If it fails: do not force it. Record why, and switch to the documented fallback —
+      nimbalyst keeps its checkbox-less format and Task Genius reads that form instead,
+      deriving completion from `status:` rather than a checkbox. Then tasks 2a/3b change
+      shape but the architecture does not.
+    acceptance:
+      - "A test exercises the real transformer set, not a hand-rolled regex"
+      - "Go/no-go is written down with the evidence, not just asserted"
+      - "If no-go, the fallback's parser implications are spelled out for 2a and 3b"
+
+  - id: "2a"
+    title: "Task Genius: parse #type[k:v k:v] inline metadata"
+    complexity: 5
+    wave: 2
+    repo: task-genius-fork
+    depends_on: ["1a"]
+    files:
+      - src/dataflow/core/ConfigurableTaskParser.ts
+      - src/types/task.d.ts
+      - src/__tests__/
+    description: |
+      Teach the parser a third metadata format alongside the emoji and dataview formats it
+      already supports. Read `#<type>[k:v k:v …]` and map:
+        id       -> metadata.id        (already the 🆔 / [id:: ] field, free text)
+        status   -> a nimbalyst status string, kept verbatim; mapping to a checkbox char
+                    is task 2b's job, not this one
+        priority -> metadata.priority
+        created  -> metadata.createdDate
+      The `<type>` (task/bug/idea/decision/plan, or a custom type) must be retained —
+      Task Genius has one task kind, so carry it as a tag or a metadata field rather than
+      discarding it.
+
+      Follow the existing structure: the format maps live near ConfigurableTaskParser.ts:795
+      (dataview) and :2079 (emoji). Do not fork a second parser.
+
+      Duplicate ids are possible and must not be assumed away — the Tasks-plugin 🆔
+      convention does not enforce uniqueness and a user can copy a line. Detect duplicates
+      and report them (console + a surfaced count); do not silently pick one.
+
+      Unrecognised keys inside the bracket must round-trip untouched. Nimbalyst may add
+      fields, and Task Genius must not destroy what it does not understand.
+    acceptance:
+      - "A line with #task[...] parses to a Task with id, priority and created populated"
+      - "Unknown keys inside the bracket survive a parse/serialise round-trip"
+      - "Duplicate ids across files are detected and reported, not silently deduped"
+      - "The existing emoji and dataview formats are unaffected — full suite diffed against baseline"
+
+  - id: "2b"
+    title: "Task Genius: configurable nimbalyst-status ↔ checkbox-mark mapping"
+    complexity: 3
+    wave: 2
+    repo: task-genius-fork
+    depends_on: ["1a"]
+    files:
+      - src/types/fork-settings.ts
+      - src/common/setting-definition.ts
+      - src/components/features/settings/ForkSettingsTab.ts
+      - src/__tests__/
+    description: |
+      Both status vocabularies are user-extensible — nimbalyst's come from
+      .nimbalyst/trackers/*.yaml per type, Task Genius's from configurable `taskStatuses`.
+      A static mapping table cannot cover user-defined states, so the mapping must be
+      configurable.
+
+      Provide a default mapping for the built-in nimbalyst statuses and a settings UI to
+      edit it. An unmapped status must degrade visibly (render the task, mark the status
+      unknown) rather than silently becoming " " — silently normalising a status the user
+      defined is worse than showing it as unrecognised.
+
+      This task defines the mapping only. Applying it on write is task 4b.
+    acceptance:
+      - "Default mapping covers nimbalyst's built-in statuses"
+      - "Mapping is editable in settings and persists"
+      - "An unmapped status is surfaced, not silently coerced"
+
+  - id: "3a"
+    title: "Nimbalyst: make the tracker folder point at a vault path"
+    complexity: 5
+    wave: 2
+    repo: nimbalyst
+    depends_on: ["1a"]
+    files:
+      - packages/runtime/src/plugins/TrackerPlugin/models/ModelLoader.ts
+      - packages/electron/src/main/services/tracker/
+      - packages/electron/src/main/types/workspace.ts
+    description: |
+      Today tracker files live at `nimbalyst-local/tracker/{type}s.md`. Make that location
+      configurable per workspace so it can be a folder inside the Obsidian vault.
+
+      Resolve open question 2 from the research first: does the tracker path support an
+      arbitrary absolute path, or only a workspace-relative one? The answer determines
+      whether this is a config change or a path-resolution change.
+
+      Verify the write path is safe for a file another application may also be writing.
+      Task Genius writes atomically with a staleness check
+      (src/dataflow/api/taskLineWrite.ts); nimbalyst's tracker writer needs at least atomic
+      replace. If it does a naive read-modify-write, say so and fix it here — this is the
+      one place where "both apps write the same file" becomes real.
+
+      Also check whether packages/runtime/src/sync/ or packages/collab-* is relevant
+      (research open question 1, not investigated). Record the answer either way.
+    acceptance:
+      - "A workspace can point its tracker folder at an arbitrary path"
+      - "Tracker items written there are indexed normally by the tracker DB/widget"
+      - "The write path is atomic; the finding is recorded either way"
+      - "Open questions 1 and 2 from research are answered in writing"
+
+  - id: "3b"
+    title: "Nimbalyst: emit a checkbox in the tracker item line"
+    complexity: 3
+    wave: 2
+    repo: nimbalyst
+    depends_on: ["1a"]
+    files:
+      - packages/runtime/src/plugins/TrackerPlugin/TrackerItemTransformer.ts
+      - packages/extensions/planning/claude-plugin/commands/track.md
+    description: |
+      Change the emitted item format from
+
+        - Fix login #task[id:… status:… …]
+      to
+        - [ ] Fix login #task[id:… status:… …]
+
+      so a Task Genius parse sees a real task. The checkbox mark derives from `status:`;
+      `status:` remains authoritative on the nimbalyst side.
+
+      Gated on 1a. If the spike said no-go, SKIP THIS TASK — the fallback keeps the
+      checkbox-less format and pushes the work into 2a instead. Do not do both.
+
+      Update the /track command documentation to match whatever format ships. That file is
+      the user-facing spec for the syntax.
+    acceptance:
+      - "Newly created items carry a checkbox whose mark reflects status"
+      - "Existing checkbox-less items still parse (no migration required to keep working)"
+      - "track.md documents the shipped format"
+
+  - id: "4a"
+    title: "Binding table: nimbalyst workspace → vault folder + Task Genius project"
+    complexity: 5
+    wave: 3
+    repo: nimbalyst
+    depends_on: ["3a"]
+    files:
+      - packages/electron/src/main/types/workspace.ts
+      - packages/electron/src/main/services/tracker/
+      - packages/electron/src/renderer/components/
+    description: |
+      The user-facing feature behind "link projects in nimbalyst to projects in Task Genius".
+
+      A table mapping each nimbalyst workspace to a vault folder and a Task Genius project
+      string. The binding does double duty: it decides WHERE nimbalyst writes (hence what
+      becomes visible in Obsidian at all) and HOW those items group in Task Genius views.
+
+      Chosen over a name convention because that breaks silently on rename, and over
+      folder-derived projects because those force vault layout to mirror workspaces forever.
+
+      The TG project string is written into each item as a field the Task Genius parser
+      reads as `metadata.project` (task 2a carries unknown keys through, so a `project:`
+      key inside the bracket is the natural carrier — confirm with 2a's implementation).
+
+      Note: TgProject.readonly does NOT gate writes (no reference to it in
+      src/dataflow/api/WriteAPI.ts). It is a UI hint about inline editing of the project
+      assignment. An earlier planning concern that it would block write-back was wrong.
+    acceptance:
+      - "A workspace can be bound to a vault folder and a TG project string"
+      - "Items written by that workspace land in the bound folder and carry the project"
+      - "Renaming a workspace or a TG project does not silently break the binding"
+      - "An unbound workspace writes to its default location and is not synced"
+
+  - id: "4b"
+    title: "Task Genius: completion write-back — checkbox toggle updates status:"
+    complexity: 5
+    wave: 3
+    repo: task-genius-fork
+    depends_on: ["2a", "2b"]
+    files:
+      - src/dataflow/api/WriteAPI.ts
+      - src/dataflow/api/taskLineWrite.ts
+      - src/__tests__/
+    description: |
+      The single write in this feature, and the only genuinely new logic.
+
+      Ticking a nimbalyst-backed task in Obsidian must update BOTH the checkbox mark and
+      the `status:` value inside the #type[...] bracket, so the line stays coherent for
+      whichever parser reads it next. `status:` is authoritative on the nimbalyst side, so
+      it cannot be left stale.
+
+      Everything else is read-only. Edits to title, priority or dates on a nimbalyst-backed
+      task must be REJECTED, mirroring the posture the GitHub issue sync already enforces —
+      see the non-completion guards in performUpdateTaskStatus and performUpdateTask, and
+      isGithubIssueTask/updateGithubIssueTask for the shape to copy.
+
+      Write through the existing atomic path (writeTaskLine / applyTaskLineChange), which
+      already refuses a stale write. Do NOT add a second write mechanism.
+
+      Decide and document whether these writes participate in the Agenda undo stack
+      (src/pages/blockEditHistory.ts). Either answer is defensible; leaving it undecided is not.
+    acceptance:
+      - "Toggling the checkbox updates both the mark and status: in one atomic write"
+      - "A stale write is refused and surfaced, not clobbered"
+      - "Non-completion edits to a nimbalyst-backed task are rejected with a clear message"
+      - "The undo-participation decision is recorded in the code, not left implicit"
+
+  - id: "5a"
+    title: "End-to-end verification with both apps running"
+    complexity: 3
+    wave: 4
+    repo: both
+    depends_on: ["4a", "4b"]
+    files: []
+    description: |
+      Every prior task is verified by tests in one repo. This one verifies the thing the
+      user actually asked for, with both applications open on the same files.
+
+      Walk it: create a programming task in nimbalyst -> confirm it appears in Obsidian in
+      the bound project -> tick it in Obsidian -> confirm nimbalyst shows it complete ->
+      confirm a personal habit task elsewhere in the vault never appears in nimbalyst.
+
+      Then the failure cases, which matter more: edit the same item in both apps
+      simultaneously; delete an item in nimbalyst while Obsidian has it open; duplicate a
+      line in Obsidian to produce two items with one id.
+
+      Record what actually happened, including anything that behaved badly. A finding here
+      is worth more than a green checkmark.
+    acceptance:
+      - "The happy path is confirmed with both apps live, not simulated"
+      - "The habit-task exclusion is confirmed by observation"
+      - "Concurrent edit, delete-while-open and duplicate-id are each exercised and their real behaviour recorded"
+
+  - id: "5b"
+    title: "Document the shared format and its constraints"
+    complexity: 1
+    wave: 5
+    repo: both
+    depends_on: ["5a"]
+    files:
+      - packages/extensions/planning/claude-plugin/commands/track.md
+    description: |
+      The two products now share a file format, which means a change to it on either side
+      is a breaking change on the other. That coupling was accepted deliberately and needs
+      to be written down where someone will find it.
+
+      Document the line grammar, which side owns which field, the checkbox↔status: rule,
+      and the deploy step for the Task Genius side. Add the equivalent note to the fork's
+      fork-docs/ (dated spec convention, as with the GitHub issue sync).
+    acceptance:
+      - "The shared grammar is documented in both repos"
+      - "Field ownership and the checkbox↔status rule are explicit"
+      - "The dist/ -> plugin-root deploy step is stated for the Task Genius side"
