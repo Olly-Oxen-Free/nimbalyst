@@ -1,3 +1,4 @@
+import { SAVED_CREDENTIAL } from '../../../../shared/providerCredentials';
 import React, { useState, useEffect } from 'react';
 import { useAtomValue } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
@@ -137,6 +138,7 @@ export function ProjectAIProvidersPanel({ workspacePath, workspaceName }: Projec
       await window.electronAPI.invoke('ai:saveProjectTrackerAutomation', workspacePath, trackerAutomationOverride);
       await window.electronAPI.invoke('ai:saveProjectTrackerLaunchPromptTemplate', workspacePath, trackerLaunchPromptTemplateOverride);
       setHasChanges(false);
+      await loadSettings();
     } catch (error) {
       console.error('Failed to save project AI settings:', error);
     } finally {
@@ -382,7 +384,8 @@ export function ProjectAIProvidersPanel({ workspacePath, workspaceName }: Projec
                               type="password"
                               className="api-key-input nim-input font-mono text-[13px]"
                               placeholder={globalApiKeys[provider.apiKeyField] ? 'Using global key...' : 'Enter API key...'}
-                              value={override?.apiKey || ''}
+                              value={override?.apiKey === SAVED_CREDENTIAL ? '' : override?.apiKey || ''}
+                              onFocus={(e) => e.target.select()}
                               onChange={(e) => handleApiKeyChange(provider.id, e.target.value)}
                             />
                           </div>

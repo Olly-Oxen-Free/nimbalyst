@@ -1,9 +1,11 @@
 import * as path from 'path';
 import * as fs from 'fs';
-import simpleGit, { SimpleGit } from 'simple-git';
+import type { SimpleGit } from 'simple-git';
+import { simpleGitReadOnly } from '../services/gitReadOnly';
 import { BrowserWindow } from 'electron';
 import { logger } from '../utils/logger';
 import { clearGitStatusCache } from '../ipc/GitStatusHandlers';
+import { clearGitFactsCache } from '../utils/gitUncommittedFiles';
 
 type NativeFileWatchListener = (curr: fs.Stats, prev: fs.Stats) => void;
 
@@ -12,12 +14,26 @@ interface NativeFileWatcher {
   listener: NativeFileWatchListener;
 }
 
+interface PendingWatcherStart {
+  cancelled: boolean;
+  promise: Promise<void>;
+}
+
 interface WatcherEntry {
   refWatcher: NativeFileWatcher;
   indexWatcher: NativeFileWatcher;
+  headWatcher: NativeFileWatcher;
   lastCommitHash: string;
   currentBranch: string;
+  /** Where refs/heads lives — the shared parent dir for a worktree. */
+  commonDir: string;
   git: SimpleGit;
+  /**
+   * The workspace this repo was registered under, which is not the repo path
+   * once a project spans several folders. Git status is routed by repo, but
+   * pending reviews are workspace-scoped, so the two must not be conflated.
+   */
+  owningWorkspace: string;
 }
 
 /**
@@ -151,6 +167,8 @@ async function resolveGitDirs(workspacePath: string): Promise<GitDirInfo | null>
 export class GitRefWatcher {
   // Map<workspacePath, WatcherEntry>
   private watchers = new Map<string, WatcherEntry>();
+  private pendingStarts = new Map<string, PendingWatcherStart>();
+  private workspaceOwners = new Map<string, Set<string>>();
 
   // Debounce index changes to avoid rapid fire during staging operations
   private indexDebounceTimers = new Map<string, NodeJS.Timeout>();
@@ -176,18 +194,49 @@ export class GitRefWatcher {
   }
 
   /**
-   * Start watching a workspace for git state changes
+   * Start watching a repo for git state changes.
+   *
+   * `owningWorkspace` is the workspace this repo was registered under. It
+   * differs from `workspacePath` whenever the repo lives in an attached folder
+   * or below a container root, and it is what pending-review updates must be
+   * attributed to. Defaults to the repo itself for single-root callers.
+   * `projectPath` tracks lifetime separately: worktree review events still use
+   * the worktree path, while closing its parent project releases its watcher.
    */
-  async start(workspacePath: string): Promise<void> {
+  async start(workspacePath: string, owningWorkspace?: string, projectPath = owningWorkspace ?? workspacePath): Promise<void> {
+    const owners = this.workspaceOwners.get(workspacePath) ?? new Set<string>();
+    owners.add(projectPath);
+    this.workspaceOwners.set(workspacePath, owners);
     // Already watching this workspace
     if (this.watchers.has(workspacePath)) {
       logger.main.debug('[GitRefWatcher] Already watching workspace:', path.basename(workspacePath));
       return;
     }
 
+    const pending = this.pendingStarts.get(workspacePath);
+    if (pending) return pending.promise;
+
+    // Publish before the first filesystem/Git await so concurrent callers
+    // share one startup and stop() can retire it before handles exist.
+    const startup: PendingWatcherStart = { cancelled: false, promise: Promise.resolve() };
+    this.pendingStarts.set(workspacePath, startup);
+    startup.promise = this.startWatching(workspacePath, owningWorkspace, startup).finally(() => {
+      if (this.pendingStarts.get(workspacePath) === startup) {
+        this.pendingStarts.delete(workspacePath);
+      }
+    });
+    return startup.promise;
+  }
+
+  private async startWatching(
+    workspacePath: string,
+    owningWorkspace: string | undefined,
+    startup: PendingWatcherStart,
+  ): Promise<void> {
     try {
       // Resolve the git directories (handles worktrees where .git is a file)
       const gitDirs = await resolveGitDirs(workspacePath);
+      if (startup.cancelled) return;
 
       if (!gitDirs) {
         // Not a git repository
@@ -197,7 +246,8 @@ export class GitRefWatcher {
 
       const { gitDir, commonDir } = gitDirs;
 
-      const git: SimpleGit = simpleGit(workspacePath);
+      // HEAD moves on every rebase step; this status must not lock the index.
+      const git: SimpleGit = simpleGitReadOnly(workspacePath);
 
       // Pre-flight: get current branch + HEAD hash. Both can fail on a
       // fresh-init repo with zero commits ("fatal: your current branch X
@@ -208,6 +258,7 @@ export class GitRefWatcher {
       let lastCommitHash: string;
       try {
         const status = await git.status();
+        if (startup.cancelled) return;
         if (!status.current) {
           // Not on a branch (detached HEAD) - skip watching
           logger.main.info('[GitRefWatcher] Skipping detached HEAD workspace:', workspacePath);
@@ -216,6 +267,7 @@ export class GitRefWatcher {
         currentBranch = status.current;
 
         const log = await git.log({ maxCount: 1 });
+        if (startup.cancelled) return;
         lastCommitHash = log.latest?.hash || '';
       } catch (preflightError) {
         const msg = preflightError instanceof Error
@@ -263,12 +315,30 @@ export class GitRefWatcher {
         },
       );
 
+      // Watch HEAD for branch switches. Without this the ref watcher above
+      // stays pinned to whichever branch was current at start(), so after a
+      // checkout no commit on the new branch is ever detected — no
+      // auto-approve, no `git:commit-detected`, no cache invalidation (#1403).
+      const headPath = path.join(gitDir, 'HEAD');
+      const headWatcher = watchGitFile(
+        headPath,
+        async () => {
+          await this.handleHeadChange(workspacePath);
+        },
+        (error) => {
+          logger.main.error('[GitRefWatcher] HEAD watcher error:', error);
+        },
+      );
+
       this.watchers.set(workspacePath, {
         refWatcher,
         indexWatcher,
+        headWatcher,
         lastCommitHash,
         currentBranch,
+        commonDir,
         git,
+        owningWorkspace: owningWorkspace ?? workspacePath,
       });
 
       logger.main.info('[GitRefWatcher] Started watching:', {
@@ -286,10 +356,17 @@ export class GitRefWatcher {
    * Stop watching a workspace
    */
   async stop(workspacePath: string): Promise<void> {
+    this.workspaceOwners.delete(workspacePath);
+    const pending = this.pendingStarts.get(workspacePath);
+    if (pending) {
+      pending.cancelled = true;
+      this.pendingStarts.delete(workspacePath);
+    }
     const entry = this.watchers.get(workspacePath);
     if (entry) {
       unwatchGitFile(entry.refWatcher);
       unwatchGitFile(entry.indexWatcher);
+      unwatchGitFile(entry.headWatcher);
       this.watchers.delete(workspacePath);
 
       // Clear any pending debounce timer
@@ -303,6 +380,15 @@ export class GitRefWatcher {
     }
   }
 
+  /** Release active and pending watchers with no remaining consumer. */
+  async pruneUnused(isNeeded: (repoPath: string, owners: ReadonlySet<string>) => boolean): Promise<void> {
+    const stops: Promise<void>[] = [];
+    for (const [repoPath, owners] of this.workspaceOwners) {
+      if (!isNeeded(repoPath, owners)) stops.push(this.stop(repoPath));
+    }
+    await Promise.all(stops);
+  }
+
   /**
    * Stop watching all workspaces
    */
@@ -310,7 +396,7 @@ export class GitRefWatcher {
     logger.main.info(`[GitRefWatcher] Stopping all watchers (${this.watchers.size} active)`);
 
     const promises: Promise<void>[] = [];
-    for (const workspacePath of this.watchers.keys()) {
+    for (const workspacePath of new Set([...this.watchers.keys(), ...this.pendingStarts.keys(), ...this.workspaceOwners.keys()])) {
       promises.push(this.stop(workspacePath));
     }
     await Promise.all(promises);
@@ -378,6 +464,7 @@ export class GitRefWatcher {
 
       // Clear git status cache so next query gets fresh data
       clearGitStatusCache(workspacePath);
+      clearGitFactsCache(workspacePath);
 
       // Notify main-process listeners (e.g., CommitTrackerLinker)
       const commitEvent: CommitDetectedEvent = {
@@ -401,9 +488,72 @@ export class GitRefWatcher {
 
       this.emitToAllWindows('git:status-changed', {
         workspacePath,
+        // The watcher is registered per repo, so this IS the repo root. Named
+        // explicitly because a multi-root renderer routes on it: the repo may
+        // sit inside an attached folder, not the workspace path.
+        repoPath: workspacePath,
       });
     } catch (error) {
       logger.main.error('[GitRefWatcher] Error handling ref change:', error);
+    }
+  }
+
+  /**
+   * Handle .git/HEAD changes (branch switches).
+   *
+   * Re-points the branch-ref watcher at the new branch and refreshes cached git
+   * facts. Deliberately does NOT run the auto-approve sweep: the files that
+   * differ between two branch tips are not "files that were just committed",
+   * and retiring their pending reviews on that basis would drop edits the user
+   * never saw. Reconciliation on the read path handles those.
+   */
+  private async handleHeadChange(workspacePath: string): Promise<void> {
+    try {
+      const entry = this.watchers.get(workspacePath);
+      if (!entry) return;
+
+      const status = await entry.git.status();
+      // A stop/restart may have retired this entry while Git was running.
+      // Do not recreate a branch poller that no live entry can release.
+      if (this.watchers.get(workspacePath) !== entry) return;
+      // Detached HEAD (mid-rebase, bisect, checkout of a tag): nothing to
+      // re-point at. Leave the existing watcher alone until HEAD names a branch
+      // again.
+      if (!status.current || status.current === entry.currentBranch) return;
+
+      const previousBranch = entry.currentBranch;
+      const branchRefPath = path.join(entry.commonDir, 'refs/heads', status.current);
+
+      unwatchGitFile(entry.refWatcher);
+      entry.refWatcher = watchGitFile(
+        branchRefPath,
+        async () => {
+          await this.handleRefChange(workspacePath);
+        },
+        (error) => {
+          logger.main.error('[GitRefWatcher] Ref watcher error:', error);
+        },
+      );
+      entry.currentBranch = status.current;
+
+      // Re-baseline the commit hash to the new branch tip, so the next commit
+      // on it is detected as a delta from here rather than diffed against the
+      // old branch.
+      const log = await entry.git.log({ maxCount: 1 });
+      if (this.watchers.get(workspacePath) !== entry) return;
+      entry.lastCommitHash = log.latest?.hash || '';
+
+      logger.main.info('[GitRefWatcher] Branch switch detected, re-pointed ref watcher:', {
+        workspace: path.basename(workspacePath),
+        from: previousBranch,
+        to: status.current,
+      });
+
+      clearGitStatusCache(workspacePath);
+      clearGitFactsCache(workspacePath);
+      this.emitToAllWindows('git:status-changed', { workspacePath, repoPath: workspacePath });
+    } catch (error) {
+      logger.main.error('[GitRefWatcher] Error handling HEAD change:', error);
     }
   }
 
@@ -432,10 +582,15 @@ export class GitRefWatcher {
   private handleIndexChange(workspacePath: string): void {
     // Clear git status cache so next query gets fresh data
     clearGitStatusCache(workspacePath);
+    clearGitFactsCache(workspacePath);
 
     // Emit event to update UI
     this.emitToAllWindows('git:status-changed', {
       workspacePath,
+      // The watcher is registered per repo, so this IS the repo root. Named
+      // explicitly because a multi-root renderer routes on it: the repo may
+      // sit inside an attached folder, not the workspace path.
+      repoPath: workspacePath,
     });
   }
 
@@ -444,10 +599,24 @@ export class GitRefWatcher {
    */
   private async autoApprovePendingReviews(
     workspacePath: string,
-    committedFiles: string[]
+    committedFiles: string[],
+    injectedHistoryManager?: Pick<
+      typeof import('../HistoryManager').historyManager,
+      'getPendingTags' | 'updateTagStatus'
+    >,
   ): Promise<void> {
     try {
-      const { historyManager } = await import('../HistoryManager');
+      const historyManager =
+        injectedHistoryManager ?? (await import('../HistoryManager')).historyManager;
+
+      // Pending reviews are workspace-scoped, but this watcher is keyed by repo.
+      // `updateTagStatus`'s last argument becomes the key of the debounced
+      // `history:pending-count-changed` broadcast, and the renderer matches
+      // sessions on exact workspace equality -- so passing the repo root here
+      // would silently drop the badge refresh for any repo that is not itself
+      // the workspace root.
+      const owningWorkspace =
+        this.watchers.get(workspacePath)?.owningWorkspace ?? workspacePath;
 
       // logger.main.info('[GitRefWatcher] Auto-approving pending reviews for committed files:', {
       //   workspace: path.basename(workspacePath),
@@ -473,7 +642,7 @@ export class GitRefWatcher {
           // });
 
           for (const tag of pendingTags) {
-            await historyManager.updateTagStatus(filePath, tag.id, 'reviewed', workspacePath);
+            await historyManager.updateTagStatus(filePath, tag.id, 'reviewed', owningWorkspace);
             approvedCount++;
           }
         }

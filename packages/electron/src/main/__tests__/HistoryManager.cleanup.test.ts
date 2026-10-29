@@ -19,6 +19,8 @@ vi.mock('../database/PGLiteDatabaseWorker', () => ({
   database: {
     isInitialized: () => true,
     initialize: vi.fn(),
+    // Picks the JSON accessor form the pending-review predicates compile to.
+    getEngine: () => 'pglite',
     query: (...args: unknown[]) => query(...args),
   },
 }));
@@ -86,10 +88,86 @@ describe('HistoryManager.cleanup', () => {
     expect(ageDelete).toBeDefined();
   });
 
+  // A tag could sit in pending-review forever: 3,284 rows on one dev machine,
+  // oldest three months. Read-path reconciliation only reaches files someone
+  // opens again, so the bound is what drains the rest (#1403).
+  describe('pending-review retention', () => {
+    it('retires pending tags past the bound instead of deleting them', async () => {
+      const { HistoryManager } = await import('../HistoryManager');
+      query.mockImplementation(async (sql: string) => {
+        if (normalize(sql).startsWith('select distinct file_path')) {
+          return { rows: [{ file_path: '/stale.md' }] };
+        }
+        return { rows: [] };
+      });
+
+      await new HistoryManager().cleanup();
+
+      const retire = query.mock.calls.find(
+        c => normalize(String(c[0])).startsWith('update') && normalize(String(c[0])).includes('pending-review'),
+      );
+      expect(retire).toBeDefined();
+      expect(normalize(String(retire![0]))).toContain('"reviewed"');
+      // Non-destructive: the row and its baseline survive.
+      expect(
+        sqlCalls().some(s => s.startsWith('delete') && s.includes('pending-review')),
+      ).toBe(false);
+    });
+
+    it('issues no update when nothing is past the bound', async () => {
+      const { HistoryManager } = await import('../HistoryManager');
+
+      await new HistoryManager().cleanup();
+
+      expect(sqlCalls().some(s => s.startsWith('update'))).toBe(false);
+    });
+
+    it('does not take snapshot retention down with it when it fails', async () => {
+      // cleanup() has one catch around everything; without isolation a throw
+      // here skips the age delete and the per-file pruning silently.
+      const { HistoryManager } = await import('../HistoryManager');
+      query.mockImplementation(async (sql: string) => {
+        if (normalize(sql).startsWith('select distinct file_path')) {
+          throw new Error('json predicate exploded');
+        }
+        return { rows: [] };
+      });
+
+      await new HistoryManager().cleanup();
+
+      expect(sqlCalls().some(s => s.startsWith('delete') && s.includes('timestamp <'))).toBe(true);
+    });
+  });
+
   it('survives a failure without throwing', async () => {
     const { HistoryManager } = await import('../HistoryManager');
     query.mockRejectedValue(new Error('worker busy'));
 
     await expect(new HistoryManager().cleanup()).resolves.toBeUndefined();
+  });
+});
+
+describe('HistoryManager startup and snapshot scope', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    query.mockResolvedValue({ rows: [] });
+  });
+
+  it('initialize() does not run retention inline; it is scheduled after first-usable', async () => {
+    const { HistoryManager } = await import('../HistoryManager');
+    await new HistoryManager().initialize();
+    expect(sqlCalls().filter(s => s.startsWith('delete'))).toHaveLength(0);
+  });
+
+  it('never snapshots binary files, which gzip cannot shrink', async () => {
+    const { HistoryManager } = await import('../HistoryManager');
+    const manager = new HistoryManager();
+
+    await manager.createSnapshot('/ws/assets/Logo.PNG', '\u0089PNG\r\n', 'auto-save');
+    await manager.createSnapshot('/ws/demo.gif', 'GIF89a', 'ai-edit');
+    expect(sqlCalls().some(s => s.includes('insert into document_history'))).toBe(false);
+
+    await manager.createSnapshot('/ws/notes.md', '# notes', 'auto-save');
+    expect(sqlCalls().filter(s => s.includes('insert into document_history'))).toHaveLength(1);
   });
 });

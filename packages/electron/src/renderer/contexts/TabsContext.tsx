@@ -23,6 +23,7 @@ import {
   isFeedbackRequestTab,
 } from '../components/FeedbackRequest/feedbackRequestTab';
 import { store as jotaiStore, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
+import { pushTabHistory, stepTabHistory, type PageScroll, type TabHistory, type TabHistoryEntry } from './tabHistory';
 
 export interface TabData {
   id: string;
@@ -32,7 +33,8 @@ export interface TabData {
   isDirty: boolean;
   isPinned: boolean;
   editorState?: any;
-  scrollPosition?: number;
+  /** Where to scroll the page Back or Forward just returned to, once it mounts. */
+  restoreScroll?: PageScroll;
   cursorPosition?: {
     line: number;
     column: number;
@@ -45,10 +47,19 @@ export interface TabData {
    * Resource kind for the tab. Undefined/`'file'` = a disk-backed file
    * (default). `'tracker'` = a tracker item rendered by the workstream host
    * (its `filePath` is a `tracker://<itemId>` resource id, NOT a real path).
+   * `'type'` = a tracker type's page in Pages mode (`type://<typeId>`).
+   * `'personal-page'` = a local personal page in Pages mode
+   * (`personal://<documentId>`), body stored in the local database.
    */
-  kind?: 'file' | 'tracker';
+  kind?: 'file' | 'tracker' | 'type' | 'personal-page';
   /** For tracker tabs: the tracker item id (also encoded in filePath). */
   trackerItemId?: string;
+  /** For type tabs: the tracker type id (also encoded in filePath). */
+  trackerTypeId?: string;
+  /** For personal page tabs: the personal document id (also encoded in filePath). */
+  personalDocumentId?: string;
+  /** What this tab showed before and after its current page (Pages navigates in place). In memory only. */
+  history?: TabHistory;
 }
 
 /**
@@ -64,12 +75,30 @@ export function isTrackerTabPath(filePath: string): boolean {
   return filePath.startsWith(TRACKER_TAB_PREFIX);
 }
 
-/** True when a tab represents a non-filesystem resource (virtual/collab/tracker). */
-function isNonFilesystemTab(filePath: string): boolean {
+/** Prefix for a tracker type's page tab in Pages mode: `type://<typeId>`. */
+export const TYPE_TAB_PREFIX = 'type://';
+
+/** True when a tab filePath identifies a tracker type page (not a real file). */
+export function isTypeTabPath(filePath: string): boolean {
+  return filePath.startsWith(TYPE_TAB_PREFIX);
+}
+
+/** Prefix for a personal page tab in Pages mode: `personal://<documentId>`. */
+export const PERSONAL_PAGE_TAB_PREFIX = 'personal://';
+
+/** True when a tab filePath identifies a personal page (not a real file). */
+export function isPersonalPageTabPath(filePath: string): boolean {
+  return filePath.startsWith(PERSONAL_PAGE_TAB_PREFIX);
+}
+
+/** True when a tab represents a non-filesystem resource (virtual/collab/tracker/type/personal). */
+export function isNonFilesystemTab(filePath: string): boolean {
   return (
     filePath.startsWith('virtual://') ||
     isCollabUri(filePath) ||
-    isTrackerTabPath(filePath)
+    isTrackerTabPath(filePath) ||
+    isTypeTabPath(filePath) ||
+    isPersonalPageTabPath(filePath)
   );
 }
 
@@ -88,6 +117,34 @@ function resolveTabDisplayName(filePath: string, displayName?: string): string {
     : UNRESOLVED_COLLAB_TAB_NAME;
 }
 
+/** The fields a tab derives from what it shows; a tab that navigates re-derives all of them. */
+function tabFieldsForPath(filePath: string, displayName?: string): Pick<
+  TabData,
+  'filePath' | 'fileName' | 'isVirtual' | 'kind' | 'trackerItemId' | 'trackerTypeId' | 'personalDocumentId'
+> {
+  const isTracker = isTrackerTabPath(filePath);
+  const isType = isTypeTabPath(filePath);
+  const isPersonalPage = isPersonalPageTabPath(filePath);
+  // Tracker tabs use the item id as their label fallback; the live title is
+  // resolved by the tab bar from the canonical tracker atom.
+  const fileName = isTracker
+    ? displayName?.trim() || filePath.slice(TRACKER_TAB_PREFIX.length)
+    : isType
+      ? displayName?.trim() || filePath.slice(TYPE_TAB_PREFIX.length)
+      : isPersonalPage
+        ? displayName?.trim() || 'Untitled'
+        : resolveTabDisplayName(filePath, displayName);
+  return {
+    filePath,
+    fileName,
+    isVirtual: filePath.startsWith('virtual://'),
+    kind: isTracker ? 'tracker' : isType ? 'type' : isPersonalPage ? 'personal-page' : 'file',
+    trackerItemId: isTracker ? filePath.slice(TRACKER_TAB_PREFIX.length) : undefined,
+    trackerTypeId: isType ? filePath.slice(TYPE_TAB_PREFIX.length) : undefined,
+    personalDocumentId: isPersonalPage ? filePath.slice(PERSONAL_PAGE_TAB_PREFIX.length) : undefined,
+  };
+}
+
 interface TabsStore {
   tabs: Map<string, TabData>;
   tabOrder: string[];
@@ -99,6 +156,7 @@ interface TabsContextValue {
   // Subscribe to store changes (for useSyncExternalStore)
   subscribe: (callback: () => void) => () => void;
   getSnapshot: () => TabsStore;
+  getIsHydrated: () => boolean;
 
   // Actions (don't trigger re-renders in caller)
   addTab: (
@@ -110,6 +168,15 @@ interface TabsContextValue {
   ) => string | null;
   removeTab: (tabId: string) => void;
   switchTab: (tabId: string) => void;
+  /** Show `filePath` in an existing tab, recording where it was for Back. */
+  navigateTab: (tabId: string, filePath: string, displayName?: string) => void;
+  /**
+   * One step Back (-1) or Forward (1) in a tab's history, passing over (and
+   * dropping) entries `isAvailable` refuses; false when nothing that way is left.
+   */
+  stepTab: (tabId: string, direction: -1 | 1, isAvailable?: (entry: TabHistoryEntry) => boolean) => boolean;
+  /** The tab host reports how far a tab's page is scrolled, so history can return to it. */
+  setPageScrollReader: (reader: ((tabId: string) => PageScroll | undefined) | null) => void;
   updateTab: (tabId: string, updates: Partial<TabData>) => void;
   togglePin: (tabId: string) => void;
   reorderTabs: (fromIndex: number, toIndex: number) => void;
@@ -148,6 +215,7 @@ interface TabsStateSlot {
   snapshot: TabsStore;
   listeners: Set<() => void>;
   tabIdCounter: number;
+  restoreSettled: boolean;
   hasRestored: boolean;
   lastSavedState: string;
   reopening: boolean;
@@ -165,6 +233,7 @@ function createEmptySlot(): TabsStateSlot {
     snapshot: empty,
     listeners: new Set(),
     tabIdCounter: 0,
+    restoreSettled: false,
     hasRestored: false,
     lastSavedState: '',
     reopening: false,
@@ -275,6 +344,7 @@ export function TabsProvider({
   // Identity changes with `slot` so useSyncExternalStore detects the
   // workspace switch and re-renders consumers against the new slot.
   const getSnapshot = useCallback(() => slot.snapshot, [slot]);
+  const getIsHydrated = useCallback(() => disablePersistence || !workspacePath || slot.restoreSettled, [slot, disablePersistence, workspacePath]);
 
   // Generate unique tab ID
   const generateTabId = useCallback((): string => {
@@ -354,23 +424,12 @@ export function TabsProvider({
     }
 
     const tabId = generateTabId();
-    const isTracker = isTrackerTabPath(filePath);
-    // Tracker tabs use the item id as their label fallback; the live title is
-    // resolved by the tab bar from the canonical tracker atom.
-    const fileName = isTracker
-      ? displayName?.trim() || filePath.slice(TRACKER_TAB_PREFIX.length)
-      : resolveTabDisplayName(filePath, displayName);
-
     const newTab: TabData = {
       id: tabId,
-      filePath,
-      fileName,
+      ...tabFieldsForPath(filePath, displayName),
       content,
       isDirty: false,
       isPinned: initialState?.isPinned ?? false,
-      isVirtual: filePath.startsWith('virtual://'),
-      kind: isTracker ? 'tracker' : 'file',
-      trackerItemId: isTracker ? filePath.slice(TRACKER_TAB_PREFIX.length) : undefined,
       contentHash: simpleHash(content),
       contentLoadedAt: new Date()
     };
@@ -402,6 +461,64 @@ export function TabsProvider({
     store.activeTabId = tabId;
     notify();
   }, [notify]);
+
+  // Show another page in an existing tab. TabContent sees the path change and
+  // remounts the tab's editor for it.
+  const showInTab = useCallback((tab: TabData, filePath: string, displayName: string | undefined, history: TabHistory, restoreScroll?: PageScroll): void => {
+    const store = slotRef.current.store;
+    if (window.electronAPI && !isNonFilesystemTab(tab.filePath)) {
+      window.electronAPI.invoke('stop-watching-file', tab.filePath).catch(() => {});
+    }
+    if (window.electronAPI && !isNonFilesystemTab(filePath)) {
+      window.electronAPI.invoke('start-watching-file', filePath).catch(() => {});
+    }
+    store.tabs.set(tab.id, {
+      ...tab,
+      ...tabFieldsForPath(filePath, displayName),
+      content: '',
+      isDirty: false,
+      contentHash: undefined,
+      contentLoadedAt: undefined,
+      history,
+      restoreScroll,
+    });
+    store.activeTabId = tab.id;
+    notify();
+  }, [notify]);
+
+  const pageScrollReaderRef = useRef<((tabId: string) => PageScroll | undefined) | null>(null);
+  const setPageScrollReader = useCallback((reader: ((tabId: string) => PageScroll | undefined) | null) => {
+    pageScrollReaderRef.current = reader;
+  }, []);
+  // The page a tab is leaving, with how far it was scrolled.
+  const leavingEntry = useCallback((tab: TabData): TabHistoryEntry => ({
+    filePath: tab.filePath,
+    fileName: tab.fileName,
+    scroll: pageScrollReaderRef.current?.(tab.id),
+  }), []);
+
+  const navigateTab = useCallback((tabId: string, filePath: string, displayName?: string): void => {
+    const tab = slotRef.current.store.tabs.get(tabId);
+    if (!tab || tab.filePath === filePath) return;
+    showInTab(tab, filePath, displayName, pushTabHistory(tab.history, leavingEntry(tab)));
+  }, [leavingEntry, showInTab]);
+
+  // The tab steps in place even when another tab shows the same page.
+  const stepTab = useCallback((tabId: string, direction: -1 | 1, isAvailable?: (entry: TabHistoryEntry) => boolean): boolean => {
+    const store = slotRef.current.store;
+    const tab = store.tabs.get(tabId);
+    if (!tab) return false;
+    const step = stepTabHistory(tab.history, leavingEntry(tab), direction, isAvailable);
+    if (!step) return false;
+    if (!step.target) {
+      // Only gone pages were that way: drop them so the button disables.
+      store.tabs.set(tab.id, { ...tab, history: step.history });
+      notify();
+      return false;
+    }
+    showInTab(tab, step.target.filePath, step.target.fileName, step.history, step.target.scroll);
+    return true;
+  }, [leavingEntry, notify, showInTab]);
 
   // Update a tab
   // Only notifies subscribers if structural changes occurred (filePath, fileName changed)
@@ -582,19 +699,34 @@ export function TabsProvider({
     // a workspace whose TabsProvider was previously unmounted.
     if (slotState.hasRestored) return;
 
+    let cancelled = false;
     const timer = setTimeout(async () => {
       try {
         const workspaceState = await window.electronAPI!.invoke('workspace:get-state', workspacePath);
+        if (cancelled) return;
         const savedState = workspaceState?.tabs;
 
         if (savedState?.tabs?.length > 0) {
-          slotState.hasRestored = true;
-
           const store = slotState.store;
           const restoredTabs = new Map<string, TabData>();
           const restoredOrder: string[] = [];
+          const liveByPath = new Map<string, TabData>();
+          for (const id of store.tabOrder) {
+            const tab = store.tabs.get(id);
+            if (tab) liveByPath.set(tab.filePath, tab);
+          }
+          const placedLive = new Set<string>();
 
           for (const tabData of savedState.tabs) {
+            // Explicit opens during hydration own their current content and
+            // selection, but take the saved tab's slot and pin.
+            const live = liveByPath.get(tabData.filePath);
+            if (live) {
+              restoredTabs.set(live.id, tabData.isPinned && !live.isPinned ? { ...live, isPinned: true } : live);
+              restoredOrder.push(live.id);
+              placedLive.add(live.id);
+              continue;
+            }
             restoredTabs.set(tabData.id, {
               ...tabData,
               content: '',
@@ -605,10 +737,15 @@ export function TabsProvider({
             restoredOrder.push(tabData.id);
           }
 
+          for (const tab of liveByPath.values()) {
+            if (placedLive.has(tab.id)) continue;
+            restoredTabs.set(tab.id, tab);
+            restoredOrder.push(tab.id);
+          }
           store.tabs = restoredTabs;
           store.tabOrder = restoredOrder;
 
-          if (savedState.closedTabs?.length > 0) {
+          if (savedState.closedTabs?.length > 0 && store.closedTabs.length === 0) {
             store.closedTabs = savedState.closedTabs.map((tabData: any) => ({
               ...tabData,
               content: '',
@@ -621,24 +758,33 @@ export function TabsProvider({
           // Start watching restored filesystem-backed tabs only.
           if (window.electronAPI) {
             for (const tab of restoredTabs.values()) {
-              if (!isNonFilesystemTab(tab.filePath)) {
+              if (!liveByPath.has(tab.filePath) && !isNonFilesystemTab(tab.filePath)) {
                 window.electronAPI.invoke('start-watching-file', tab.filePath).catch(() => {});
               }
             }
           }
 
-          if (savedState.activeTabId && restoredTabs.has(savedState.activeTabId)) {
+          if (!store.activeTabId && savedState.activeTabId && restoredTabs.has(savedState.activeTabId)) {
             store.activeTabId = savedState.activeTabId;
           }
-
-          notify();
         }
+        // Empty workspaces are hydrated too. Pending OS opens must not rely on
+        // there being saved tabs, nor run before restoration has settled.
+        slotState.hasRestored = true;
+        slotState.restoreSettled = true;
+        notify();
       } catch (error) {
+        if (cancelled) return;
         console.error('[TABS] Failed to restore tab state:', error);
+        // Explicit file opens can proceed after a failed read, but keep
+        // hasRestored false so we cannot overwrite unknown persisted tabs.
+        // A later provider remount retries restoration and merges live tabs.
+        slotState.restoreSettled = true;
+        notify();
       }
     }, 500);
 
-    return () => clearTimeout(timer);
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [disablePersistence, workspacePath, notify]);
 
   // Save tabs to storage when they change
@@ -649,7 +795,7 @@ export function TabsProvider({
       const slotState = slotRef.current;
       const store = slotState.store;
 
-      if (!slotState.hasRestored && store.tabs.size === 0) return;
+      if (!slotState.hasRestored) return;
 
       const tabsArray = store.tabOrder
         .map(id => store.tabs.get(id))
@@ -717,9 +863,13 @@ export function TabsProvider({
   const contextValue: TabsContextValue = {
     subscribe,
     getSnapshot,
+    getIsHydrated,
     addTab,
     removeTab,
     switchTab,
+    navigateTab,
+    stepTab,
+    setPageScrollReader,
     updateTab,
     togglePin,
     reorderTabs,
@@ -736,6 +886,12 @@ export function TabsProvider({
       {children}
     </TabsContext.Provider>
   );
+}
+
+export function useTabsHydrated(): boolean {
+  const context = useContext(TabsContext);
+  if (!context) throw new Error('useTabsHydrated must be used within a TabsProvider');
+  return useSyncExternalStore(context.subscribe, context.getIsHydrated);
 }
 
 // Hook to get tabs data (subscribes to changes)
@@ -768,6 +924,8 @@ export function useTabs() {
     addTab: context.addTab,
     removeTab: context.removeTab,
     switchTab: context.switchTab,
+    navigateTab: context.navigateTab,
+    stepTab: context.stepTab,
     updateTab: context.updateTab,
     togglePin: context.togglePin,
     reorderTabs: context.reorderTabs,
@@ -791,6 +949,9 @@ export function useTabsActions() {
     addTab: context.addTab,
     removeTab: context.removeTab,
     switchTab: context.switchTab,
+    navigateTab: context.navigateTab,
+    stepTab: context.stepTab,
+    setPageScrollReader: context.setPageScrollReader,
     updateTab: context.updateTab,
     togglePin: context.togglePin,
     reorderTabs: context.reorderTabs,

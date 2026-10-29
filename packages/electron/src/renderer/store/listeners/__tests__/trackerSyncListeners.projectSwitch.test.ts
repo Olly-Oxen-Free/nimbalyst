@@ -3,6 +3,9 @@ import { store } from '@nimbalyst/runtime/store';
 import { activeWorkspacePathAtom } from '../../atoms/openProjects';
 import { initTrackerPanelLayout, sharedTrackerSavedViewsAtom } from '../../atoms/trackers';
 import { initTrackerSyncListeners } from '../trackerSyncListeners';
+import { trackerItemsMapAtom } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerDataAtoms';
+import type { TrackerRecord } from '@nimbalyst/tracker-core';
+import { mergeLocalWikiRecords } from '../../../services/localWikiTrackerRecords';
 import {
   createDefaultViewDefinition,
   serializeSharedSavedView,
@@ -79,7 +82,7 @@ describe('initTrackerSyncListeners project switch (NIM-668)', () => {
 
     // Initial load resolves through the get-initial-state promise chain.
     await vi.waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith('document-service:tracker-items-list');
+      expect(invoke).toHaveBeenCalledWith('document-service:tracker-items-list', '/ws/A');
     });
 
     const listCallsBeforeSwitch = invoke.mock.calls.filter(
@@ -97,6 +100,26 @@ describe('initTrackerSyncListeners project switch (NIM-668)', () => {
     });
   });
 
+  it('drops the previous project\'s Local wiki items on a switch', async () => {
+    const wikiItem = { id: 'wiki-a', primaryType: 'competitor', typeTags: ['competitor'], source: 'local-wiki', archived: false,
+      syncStatus: 'local', system: { workspace: '/ws/A', createdAt: 'x', updatedAt: 'x' }, fields: { title: 'Acme' } } as TrackerRecord;
+    cleanup = initTrackerSyncListeners();
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('document-service:tracker-items-list', '/ws/A');
+    });
+    mergeLocalWikiRecords('/ws/A', [wikiItem]);
+    expect(store.get(trackerItemsMapAtom).has('wiki-a')).toBe(true);
+
+    store.set(activeWorkspacePathAtom, '/ws/B');
+    expect(store.get(trackerItemsMapAtom).has('wiki-a')).toBe(false);
+    await vi.waitFor(() => {
+      expect(invoke.mock.calls.filter(([channel]) => channel === 'document-service:tracker-items-list').length).toBe(2);
+    });
+    await Promise.resolve();
+    expect(store.get(trackerItemsMapAtom).has('wiki-a')).toBe(false);
+    mergeLocalWikiRecords('/ws/A', []);
+  });
+
   it('clears and reloads shared views for the newly active workspace', async () => {
     store.set(sharedTrackerSavedViewsAtom, [{
       id: 'stale-a',
@@ -106,7 +129,7 @@ describe('initTrackerSyncListeners project switch (NIM-668)', () => {
     }]);
     cleanup = initTrackerSyncListeners();
     await vi.waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith('document-service:tracker-items-list');
+      expect(invoke).toHaveBeenCalledWith('document-service:tracker-items-list', '/ws/A');
     });
 
     store.set(activeWorkspacePathAtom, '/ws/B');
@@ -141,7 +164,7 @@ describe('initTrackerSyncListeners project switch (NIM-668)', () => {
   it('routes an agent body write through the open editor provider before acknowledging it', async () => {
     cleanup = initTrackerSyncListeners();
     await vi.waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith('document-service:tracker-items-list');
+      expect(invoke).toHaveBeenCalledWith('document-service:tracker-items-list', '/ws/A');
       expect(handlers['tracker-body:apply-markdown']).toBeTypeOf('function');
     });
 

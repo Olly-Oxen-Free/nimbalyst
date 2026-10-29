@@ -59,6 +59,7 @@ function createAsyncEventStream(events: any[]): AsyncIterable<any> {
 
 function createMockProtocol(sseEvents: any[] = []) {
   const closeFn = vi.fn();
+  let permissionHost: any;
 
   return {
     platform: 'opencode-sdk',
@@ -80,6 +81,8 @@ function createMockProtocol(sseEvents: any[] = []) {
     }),
     abortSession: vi.fn(),
     cleanupSession: vi.fn(),
+    setPermissionHost: vi.fn((host) => { permissionHost = host; }),
+    getPermissionHost: () => permissionHost,
     _closeFn: closeFn,
   } as any;
 }
@@ -118,6 +121,9 @@ describe('OpenCodeProvider', () => {
     OpenCodeProvider.setMcpConfigLoader(null);
     OpenCodeProvider.setShellEnvironmentLoader(null);
     OpenCodeProvider.setEnhancedPathLoader(null);
+    OpenCodeProvider.setTrustChecker(null);
+    OpenCodeProvider.setPermissionPatternSaver(null);
+    OpenCodeProvider.setPermissionPatternChecker(null);
     OpenCodeProvider.resetCachedSdkSlashCommandsForTests();
     resetOpenCodeModelCatalogForTests();
     configureOpenCodeAgentCatalogForTests();
@@ -513,6 +519,88 @@ describe('OpenCodeProvider', () => {
     const provider = new OpenCodeProvider({ protocol });
 
     expect(provider.getDisplayName()).toBe('OpenCode');
+  });
+
+  it('routes native permission asks through ToolPermissionService with exact reusable scope', async () => {
+    const protocol = createMockProtocol();
+    const permissionService = {
+      requestToolPermission: vi.fn(async () => ({ decision: 'allow', scope: 'session' })),
+      resolvePermission: vi.fn(), rejectAllPending: vi.fn(), clearSessionCache: vi.fn(),
+    } as any;
+    const provider = new OpenCodeProvider({ protocol, permissionService });
+    const signal = new AbortController().signal;
+    const decision = await protocol.getPermissionHost().resolvePermission({
+      id: 'permission-1', sessionId: 'oc-session-1', permission: 'external_directory',
+      patterns: ['/tmp/*'], always: ['/tmp/*'], metadata: { path: '/tmp/scratch.txt' },
+    }, { sessionId: 'nim-session-1', workspacePath: '/workspace', permissionsPath: '/project', signal });
+    expect(decision).toEqual({ decision: 'allow', scope: 'session' });
+    expect(permissionService.requestToolPermission).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'permission-1', sessionId: 'nim-session-1', permissionsPath: '/project',
+      toolName: 'external_directory', pattern: 'OpenCode(external_directory:/tmp/*)',
+      suppressAlwaysAllowRule: false, signal,
+    }));
+    provider.resolveToolPermission('permission-1', { decision: 'allow', scope: 'once' });
+    expect(permissionService.resolvePermission).toHaveBeenCalledWith('permission-1', { decision: 'allow', scope: 'once' });
+  });
+
+  it('emits pending and resolved permission events through the production service wiring', async () => {
+    const patternSaver = vi.fn(async () => {});
+    OpenCodeProvider.setTrustChecker(() => ({ trusted: true, mode: 'ask' }));
+    OpenCodeProvider.setPermissionPatternSaver(patternSaver);
+    OpenCodeProvider.setPermissionPatternChecker(async () => false);
+    const protocol = createMockProtocol();
+    const provider = new OpenCodeProvider({ protocol });
+    const pending = vi.fn();
+    const resolved = vi.fn();
+    provider.on('toolPermission:pending', pending);
+    provider.on('toolPermission:resolved', resolved);
+    const decisionPromise = protocol.getPermissionHost().resolvePermission({
+      id: 'permission-1', sessionId: 'oc-session-1', permission: 'external_directory',
+      patterns: ['/tmp/*'], always: ['/tmp/*'], metadata: {},
+    }, {
+      sessionId: 'nim-session-1', workspacePath: '/workspace', permissionsPath: '/project',
+      signal: new AbortController().signal,
+    });
+    await vi.waitFor(() => expect(pending).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'permission-1', sessionId: 'nim-session-1', workspacePath: '/workspace',
+    })));
+    provider.resolveToolPermission('permission-1', { decision: 'allow', scope: 'always' });
+    await expect(decisionPromise).resolves.toEqual({ decision: 'allow', scope: 'always' });
+    expect(resolved).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'permission-1', response: { decision: 'allow', scope: 'always' },
+    }));
+    expect(patternSaver).toHaveBeenCalledWith('/project', 'OpenCode(external_directory:/tmp/*)');
+  });
+
+  it('writes a result row for a waiting prompt that another "Always" answer settled', async () => {
+    OpenCodeProvider.setTrustChecker(() => ({ trusted: true, mode: 'ask' }));
+    OpenCodeProvider.setPermissionPatternSaver(vi.fn(async () => {}));
+    OpenCodeProvider.setPermissionPatternChecker(async () => false);
+    const protocol = createMockProtocol();
+    const provider = new OpenCodeProvider({ protocol });
+    const logged = vi.spyOn(provider as any, 'logAgentMessageBestEffort').mockResolvedValue(undefined);
+    const pending = vi.fn();
+    provider.on('toolPermission:pending', pending);
+    const ask = (id: string) => protocol.getPermissionHost().resolvePermission({
+      id, sessionId: 'oc-session-1', permission: 'external_directory',
+      patterns: ['/tmp/*'], always: ['/tmp/*'], metadata: {},
+    }, {
+      sessionId: 'nim-session-1', workspacePath: '/workspace', permissionsPath: '/project',
+      signal: new AbortController().signal,
+    });
+    const first = ask('permission-1');
+    const second = ask('permission-2');
+    await vi.waitFor(() => expect(pending).toHaveBeenCalledTimes(2));
+
+    provider.resolveToolPermission('permission-1', { decision: 'allow', scope: 'always' }, 'nim-session-1');
+    await first;
+    await expect(second).resolves.toEqual({ decision: 'allow', scope: 'session' });
+
+    // Without this row the second prompt card would look unanswered after a reload.
+    const releasedRows = logged.mock.calls.filter(([, , content]) => String(content).includes('permission-2'));
+    expect(releasedRows).toHaveLength(1);
+    expect(releasedRows[0][0]).toBe('nim-session-1');
+    expect(JSON.parse(JSON.parse(releasedRows[0][2] as string).result)).toMatchObject({ decision: 'allow', scope: 'session' });
   });
 
   it('streams text chunks from protocol text events', async () => {

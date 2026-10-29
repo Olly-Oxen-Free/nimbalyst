@@ -15,9 +15,13 @@ export interface GroundingStatus {
   chunks?: number;
   denseChunks?: number;
   indexing?: boolean;
-  lastEmbedError?: string | null;
   embedder?: { model?: string } | null;
-  /** Set when ready === false (e.g. missing OpenAI key). */
+  retrieval?: {
+    mode?: 'hybrid' | 'keyword-only';
+    semantic?: { available?: boolean; reason?: string };
+    keyword?: { available?: boolean; source?: string };
+  };
+  /** Diagnostic detail is never copied into the grounding note. */
   error?: string | null;
 }
 
@@ -42,8 +46,9 @@ export const BRAINSTORM_CHOREOGRAPHY =
   'CLAUDE.md and recall for durable facts. Do these BEFORE ask_coding_agent -- ' +
   'they answer in under a second, whereas the coding agent can take minutes. ' +
   'Only fall back to ask_coding_agent when memory returns nothing or the question ' +
-  'truly needs live code inspection. Use remember to store decisions or ' +
-  'preferences worth keeping. ' +
+  'truly needs live code inspection. Use remember to store preferences ' +
+  'worth keeping; record a project decision where the project records ' +
+  'decisions, not only here. ' +
   'Brainstorm loop: when an idea is fleshed out, kick off a plan with ' +
   'submit_agent_prompt phrased as "/design <idea>"; when it finishes, call ' +
   'get_latest_plan and summarize it back so the user can refine it by voice; ' +
@@ -55,24 +60,28 @@ const MAX_FACTS = 8;
 
 function statusLine(status: GroundingStatus): string | null {
   if (status.ready === false) {
-    const reason = status.error ? ` ${status.error}` : '';
     return (
-      'Project-knowledge index is not ready yet.' +
-      reason +
-      ' Searches may return nothing until it is configured/finished — rely on ' +
-      'the conversation for now.'
+      'The local project-knowledge index is unavailable. Use normal workspace ' +
+      'file/text search over project Markdown for grounding.'
     );
   }
   const chunks = status.chunks ?? 0;
+  const keywordOnly =
+    status.retrieval?.mode === 'keyword-only' ||
+    status.retrieval?.semantic?.available === false;
   if (status.indexing) {
-    return `Project-knowledge index is still building (${chunks} chunks so far); search results improve as it finishes.`;
+    return keywordOnly
+      ? `Local keyword project search is still building (${chunks} chunks so far); results improve as it finishes.`
+      : `Project-knowledge index is still building (${chunks} chunks so far); search results improve as it finishes.`;
   }
-  let line = `Project-knowledge index ready: ${chunks} chunks (semantic + keyword search).`;
-  if (status.lastEmbedError) {
-    line +=
-      ' Semantic search is currently degraded (an embedding error occurred) — keyword matches still work.';
+  if (keywordOnly) {
+    return (
+      `Local keyword project search is ready: ${chunks} chunks. Semantic matching ` +
+      'is unavailable; if results are insufficient, use normal workspace ' +
+      'file/text search over project Markdown.'
+    );
   }
-  return line;
+  return `Project-knowledge index ready: ${chunks} chunks (semantic + keyword search).`;
 }
 
 /**

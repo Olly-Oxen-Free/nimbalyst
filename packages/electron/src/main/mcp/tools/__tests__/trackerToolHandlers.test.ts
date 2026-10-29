@@ -1,5 +1,8 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 const {
   mockQuery,
@@ -85,6 +88,7 @@ const {
 vi.mock('../../../database/initialize', () => ({
   getDatabase: () => ({
     query: mockQuery,
+    runTransaction: async (statements: Array<{ sql: string; params: unknown[] }>) => { for (const statement of statements) await mockQuery(statement.sql, statement.params); },
     getEngine: mockGetEngine,
   }),
 }));
@@ -104,6 +108,21 @@ vi.mock('../../../services/TrackerSyncManager', () => ({
   isTrackerSyncConfigured: vi.fn(() => false),
   syncTrackerItem: vi.fn(),
   onTrackerItemApplied: mockOnTrackerItemApplied,
+  // The wire shape, minus the labels CRDT these tests never exercise.
+  trackerItemToPayload: (item: any) => {
+    const record = trackerItemToRecord(item);
+    return {
+      itemId: record.id,
+      primaryType: record.primaryType,
+      archived: record.archived,
+      bodyVersion: 0,
+      fields: { ...record.fields },
+      labels: {},
+      comments: record.system.comments ?? [],
+      activity: record.system.activity ?? [],
+      system: {},
+    };
+  },
 }));
 
 // The wait itself (ack listener, pre-read, timeout) is covered in
@@ -134,6 +153,8 @@ vi.mock('../../../services/TrackerSchemaService', () => {
     writeThroughTeamTrackerSchemaEdit: mockWriteThroughTeamTrackerSchemaEdit,
     getAllTrackerSchemas: mockGetAllTrackerSchemas,
     isBuiltinTrackerSchema: mockIsBuiltinTrackerSchema,
+    applyWorkspacePredicateRegistryInProcess: vi.fn(),
+    applyWorkspaceLabelRegistryInProcess: vi.fn(),
     TrackerTypeExistsError: MockTrackerTypeExistsError,
   };
 });
@@ -148,14 +169,14 @@ vi.mock('../../../window/WindowManager', () => ({
   documentServices: mockDocumentServices,
 }));
 
-vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel', () => ({
+vi.mock('../../../../../../tracker-schema/src/TrackerDataModel', () => ({
   globalRegistry: mockGlobalRegistry,
   getRoleField: (model: any, role: string) => model?.roles?.[role],
 }));
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
   app: {
-    getPath: vi.fn(() => '/tmp'),
+    getPath: (await import('../../../../../test-stubs/privateUserData')).testApp.getPath,
     isPackaged: false,
     getName: vi.fn(() => 'Nimbalyst'),
   },
@@ -166,8 +187,17 @@ vi.mock('electron', () => ({
 // DocumentRoom Y.Doc when description changes, otherwise the body lands
 // only in PGLite + cache and shared `fullDocument` trackers (incident,
 // plan, decision) render blank for every peer.
+const mockInitializeHeadlessBodyMarkdown = vi.hoisted(() => vi.fn(async (..._args: any[]) => {}));
 vi.mock('../../../services/MainBodyDocService', () => ({
   applyHeadlessBodyMarkdown: mockApplyHeadlessBodyMarkdown,
+  initializeHeadlessBodyMarkdown: mockInitializeHeadlessBodyMarkdown,
+}));
+
+// What the recorder keeps is covered in typedPageBodyHistory.test.ts; here we
+// only care that every MCP body write reaches it.
+const mockRecordTypedPageBodySnapshot = vi.hoisted(() => vi.fn(async (..._args: any[]) => true));
+vi.mock('../../../services/tracker/typedPageBodyHistory', () => ({
+  recordTypedPageBodySnapshot: mockRecordTypedPageBodySnapshot,
 }));
 
 // Counter behaviour lives in tracker/__tests__/localKeyAllocator.test.ts; the
@@ -187,6 +217,7 @@ import {
   handleTrackerList,
   handleTrackerListTypes,
   handleTrackerReady,
+  handleWorkRadar,
   handleTrackerUnlinkSession,
   handleTrackerUpdate,
   readLinkedTrackerItemIds,
@@ -201,7 +232,128 @@ import {
   resolveTrackerPromotionEligibility,
   TRACKER_LOCAL_ISSUE_KEY_MESSAGE,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerLifecycle';
-import { READINESS_FILTER_FIELD } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerStatusCategory';
+import { READINESS_FILTER_FIELD } from '@nimbalyst/tracker-schema';
+import { trackerItemToRecord } from '@nimbalyst/runtime/core/TrackerRecord';
+
+describe('work radar activity', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDocumentServices.clear();
+    mockGlobalRegistry.get.mockReturnValue(undefined);
+  });
+
+  it('returns compact issue-scoped actor threads and shared-item signals', async () => {
+    const now = Date.now();
+    const item = {
+      id: 'bug-radar',
+      issueKey: 'NIM-900',
+      type: 'bug',
+      typeTags: ['bug'],
+      title: 'Concurrent fix',
+      status: 'in-review',
+      workspace: '/tmp/ws',
+      module: '',
+      lastIndexed: new Date(now),
+      updated: new Date(now).toISOString(),
+      customFields: {
+        activity: [
+          {
+            id: 'mine',
+            authorIdentity: { email: null, displayName: 'Test User', gitName: null, gitEmail: null },
+            action: 'created',
+            timestamp: now - 3 * 60 * 60 * 1000,
+          },
+          {
+            id: 'theirs',
+            authorIdentity: { email: 'dana@example.com', displayName: 'Dana', gitName: null, gitEmail: null },
+            action: 'status_changed',
+            field: 'status',
+            oldValue: 'in-progress',
+            newValue: 'in-review',
+            timestamp: now - 60 * 60 * 1000,
+          },
+        ],
+      },
+    };
+    mockDocService.listTrackerItems.mockResolvedValue([item]);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleWorkRadar({ issueKey: 'NIM-900', windowHours: 8 }, '/tmp/ws');
+    const payload = JSON.parse(result.content[0]!.text!);
+
+    expect(payload.structured.threads).toHaveLength(2);
+    expect(payload.structured.sameItem).toEqual([
+      expect.objectContaining({ issueKey: 'NIM-900', actors: ['Test User', 'Dana'], kind: 'review' }),
+    ]);
+    expect(payload.structured.waitingOnYou).toEqual([
+      expect.objectContaining({ itemId: 'bug-radar', actor: expect.objectContaining({ displayName: 'Dana' }) }),
+    ]);
+  });
+
+  it('bounds a team-wide radar payload while reporting the full thread count', async () => {
+    const now = Date.now();
+    mockDocService.listTrackerItems.mockResolvedValue(Array.from({ length: 60 }, (_, index) => ({
+      id: `bug-radar-${index}`,
+      issueKey: `NIM-${900 + index}`,
+      type: 'bug',
+      typeTags: ['bug'],
+      title: `Concurrent fix ${index}`,
+      status: 'in-progress',
+      workspace: '/tmp/ws',
+      module: '',
+      lastIndexed: new Date(now),
+      updated: new Date(now - index * 11 * 60 * 1000).toISOString(),
+      customFields: {
+        activity: [{
+          id: `event-${index}`,
+          authorIdentity: { email: 'dana@example.com', displayName: 'Dana', gitName: null, gitEmail: null },
+          action: 'updated',
+          field: 'title',
+          timestamp: now - index * 11 * 60 * 1000,
+        }],
+      },
+    })));
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleWorkRadar({ windowHours: 24 }, '/tmp/ws');
+    const payload = JSON.parse(result.content[0]!.text!);
+
+    expect(payload.structured.totalThreads).toBe(60);
+    expect(payload.structured.threads).toHaveLength(50);
+    expect(payload.structured.truncated).toBe(true);
+  });
+
+  it('adds a recent teammate advisory when reading an item', async () => {
+    const now = Date.now();
+    const item = {
+      id: 'bug-radar',
+      issueKey: 'NIM-900',
+      type: 'bug',
+      typeTags: ['bug'],
+      title: 'Concurrent fix',
+      status: 'in-review',
+      workspace: '/tmp/ws',
+      module: '',
+      lastIndexed: new Date(now),
+      updated: new Date(now).toISOString(),
+      customFields: {
+        activity: [{
+          id: 'theirs',
+          authorIdentity: { email: 'dana@example.com', displayName: 'Dana', gitName: null, gitEmail: null },
+          action: 'commented',
+          timestamp: now - 40 * 60 * 1000,
+        }],
+      },
+    };
+    mockDocService.getTrackerItemById.mockResolvedValue(item);
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+
+    const result = await handleTrackerGet({ id: 'NIM-900' }, '/tmp/ws');
+    const payload = JSON.parse(result.content[0]!.text!);
+
+    expect(payload.summary).toContain('**Radar**: Dana commented');
+  });
+});
 
 describe('handleTrackerList structured records', () => {
   beforeEach(() => {
@@ -886,6 +1038,7 @@ describe('handleTrackerCreate issue-key timing', () => {
   // unpublished item reports its uuid to the agent: it has no team key, and
   // its number was only minted by a later list (NIM.2842).
   it('reports the local number as the ref for an unpublished item', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => type === 'bug' ? { localNumbers: true } : undefined);
     vi.mocked(isTrackerSyncActive).mockReturnValue(false);
     vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
     const numbered = makeRow({
@@ -921,6 +1074,22 @@ describe('handleTrackerCreate issue-key timing', () => {
     // Sync is inactive here, so "publish it" is not advice this workspace can
     // act on and must not appear.
     expect(summary).not.toContain('until it is published');
+  });
+
+  // Local numbers are opt-in per type; a type that says nothing gets none.
+  it('does not number an item whose type has not opted in to local numbers', async () => {
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
+    const plain = makeRow({ id: 'bug_test', workspace: '/tmp/ws', issue_key: null, issue_number: null, local_key: null });
+    mockQuery
+      .mockResolvedValueOnce({ rows: [] })       // INSERT
+      .mockResolvedValueOnce({ rows: [plain] })  // resolve created
+      .mockResolvedValueOnce({ rows: [plain] }); // notifyTrackerItemAdded
+
+    const { structured } = parseResult(await handleTrackerCreate({ type: 'bug', title: 'Plain bug' }, '/tmp/ws'));
+
+    expect(assignLocalKeysToRows).not.toHaveBeenCalled();
+    expect(structured.item.localKey).toBeUndefined();
   });
 
   it('leaves a team draft without any key', async () => {
@@ -1234,6 +1403,67 @@ describe('handleTrackerGet', () => {
     expect(payload.structured.item.issueKeyStatus).toBe('unassigned');
     expect(payload.summary).toContain('This item has no key until it is published.');
   });
+
+  // #1224: an agent that archives an item read it back as active. The archived
+  // column is INTEGER on SQLite and BOOLEAN on PGLite, so both row shapes have
+  // to report the same boolean.
+  it.each([
+    ['SQLite integer', 1],
+    ['PGLite boolean', true],
+  ])('reports an archived item as archived (%s)', async (_label, archived) => {
+    mockDocumentServices.set('/tmp/workspace-a', mockDocService);
+    mockDocService.getTrackerItemById.mockResolvedValueOnce(rowToTrackerItem(makeRow({
+      archived,
+      archived_at: '2026-09-01T00:00:00.000Z',
+    })));
+
+    const result = await handleTrackerGet({ id: 'bug_internal' }, '/tmp/workspace-a');
+
+    expect(result.isError).toBe(false);
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.item.archived).toBe(true);
+    expect(payload.structured.item.archivedAt).toBe('2026-09-01T00:00:00.000Z');
+  });
+
+  // #1224: comments are written to `data.comments` by tracker_add_comment and
+  // land in customFields, where the internal-key filter dropped them -- so an
+  // agent could never read back a comment it had just posted.
+  it('reads back a comment posted through tracker_add_comment', async () => {
+    mockDocumentServices.set('/tmp/workspace-a', mockDocService);
+    mockDocService.getTrackerItemById.mockResolvedValueOnce(rowToTrackerItem(makeRow({
+      data: JSON.stringify({
+        title: 'Scoped bug',
+        status: 'to-do',
+        comments: [{
+          id: 'comment_1',
+          authorIdentity: { displayName: 'Test User' },
+          body: 'Repro confirmed on main',
+          createdAt: 1756684800000,
+          updatedAt: null,
+          deleted: false,
+        }],
+      }),
+    })));
+
+    const result = await handleTrackerGet({ id: 'bug_internal' }, '/tmp/workspace-a');
+
+    expect(result.isError).toBe(false);
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.item.comments).toHaveLength(1);
+    expect(payload.structured.item.comments[0].body).toBe('Repro confirmed on main');
+  });
+
+  it('omits archived metadata and comments when the item has none', async () => {
+    mockDocumentServices.set('/tmp/workspace-a', mockDocService);
+    mockDocService.getTrackerItemById.mockResolvedValueOnce(rowToTrackerItem(makeRow({ archived: 0 })));
+
+    const result = await handleTrackerGet({ id: 'bug_internal' }, '/tmp/workspace-a');
+
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.item.archived).toBe(false);
+    expect(payload.structured.item.archivedAt).toBeUndefined();
+    expect(payload.structured.item.comments).toBeUndefined();
+  });
 });
 
 describe('tracker schema tools', () => {
@@ -1269,6 +1499,17 @@ describe('tracker schema tools', () => {
         idPrefix: 'INC',
         idFormat: 'ulid',
         fields: [{ name: 'severity', type: 'select' }],
+      },
+      // Waiting on `claim`, which this workspace never installed: not offered.
+      {
+        type: 'citation',
+        displayName: 'Citation',
+        displayNamePlural: 'Citations',
+        modes: { inline: true, fullDocument: false },
+        idPrefix: 'cit',
+        idFormat: 'ulid',
+        fields: [],
+        hiddenUntilType: 'claim',
       },
     ]);
 
@@ -1310,6 +1551,44 @@ describe('tracker schema tools', () => {
       activity: [expect.objectContaining({ action: 'schema_updated' })],
       warning: expect.stringContaining("team's copy will overwrite it"),
     });
+  });
+
+  it('reports vocabulary it already wrote when the type half of the call then fails', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-define-type-'));
+    try {
+      mockUpsertWorkspaceTrackerSchema.mockRejectedValue(new Error('Type \'library\' extends unknown type \'technology\''));
+      const result = await handleTrackerDefineType({
+        predicates: [{ id: 'built-on', label: 'built on', subjectKinds: ['*'], valueShape: 'entity', direction: 'directed' }],
+        schema: { type: 'library', extends: 'technology' },
+      }, workspace);
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('extends unknown type');
+      expect(result.content[0].text).toContain('Merged into .nimbalyst/predicates.yaml');
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses the retired `labels` argument without touching an existing labels.yaml', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-define-type-'));
+    try {
+      const labelsFile = path.join(workspace, '.nimbalyst', 'labels.yaml');
+      fs.mkdirSync(path.dirname(labelsFile), { recursive: true });
+      fs.writeFileSync(labelsFile, 'labels:\n  - id: feature\n    label: Feature\n');
+      const result = await handleTrackerDefineType({
+        predicates: [{ id: 'built-on', label: 'built on', subjectKinds: ['*'], valueShape: 'entity', direction: 'directed' }],
+        labels: { labels: [{ id: 'capability', label: 'Capability' }] },
+      }, workspace);
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('`labels` is no longer supported');
+      expect(fs.readFileSync(labelsFile, 'utf-8')).toBe('labels:\n  - id: feature\n    label: Feature\n');
+      // Refused before any vocabulary was written.
+      expect(fs.existsSync(path.join(workspace, '.nimbalyst', 'predicates.yaml'))).toBe(false);
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   it('defines a custom tracker type through the schema service', async () => {
@@ -1722,9 +2001,8 @@ describe('handleTrackerCreate session linking', () => {
     });
     mockQuery
       .mockResolvedValueOnce({ rows: [] }) // INSERT
-      .mockResolvedValueOnce({ rows: [createdRow] }) // resolve created
-      .mockResolvedValueOnce({ rows: [{ body_version: 1 }] }) // UPDATE content + body_version
       .mockResolvedValueOnce({ rows: [] }) // INSERT tracker_body_cache
+      .mockResolvedValueOnce({ rows: [createdRow] }) // resolve created
       .mockResolvedValueOnce({ rows: [createdRow] }); // notifyTrackerItemAdded
   }
 
@@ -1827,7 +2105,7 @@ describe('handleTrackerCreate session linking', () => {
     expect(data.createdByAgent).toBe(false);
   });
 
-  it('seeds body cache and the live Y.Doc when creating with a description', async () => {
+  it('seeds the body cache without team traffic for personal creation', async () => {
     setupCreateQueueWithDescription();
 
     const result = await handleTrackerCreate(
@@ -1837,12 +2115,6 @@ describe('handleTrackerCreate session linking', () => {
     );
 
     expect(result.isError).toBe(false);
-
-    const updateContentSql = mockQuery.mock.calls.find(
-      (c) => /UPDATE tracker_items[\s\S]+SET content[\s\S]+body_version/.test(String(c[0])),
-    );
-    expect(updateContentSql).toBeDefined();
-    expect(String(updateContentSql![0])).toMatch(/RETURNING body_version/);
 
     const cacheInsert = mockQuery.mock.calls.find(
       (c) => /INSERT INTO tracker_body_cache/.test(String(c[0])),
@@ -1854,19 +2126,25 @@ describe('handleTrackerCreate session linking', () => {
       JSON.stringify('Created body text'),
     ]);
 
-    expect(mockApplyHeadlessBodyMarkdown).toHaveBeenCalledTimes(1);
-    expect(mockApplyHeadlessBodyMarkdown).toHaveBeenCalledWith(
-      '/tmp/ws',
-      'bug_test',
-      'Created body text',
-    );
+    expect(mockApplyHeadlessBodyMarkdown).not.toHaveBeenCalled();
+    expect(mockInitializeHeadlessBodyMarkdown).not.toHaveBeenCalled();
+    // A Personal typed page created by an agent has history from its first body.
+    expect(mockRecordTypedPageBodySnapshot).toHaveBeenCalledWith('bug_test', 'bug', 'Created body text');
+  });
+
+  it('persists an explicitly empty create body instead of treating it as omitted', async () => {
+    setupCreateQueueWithDescription();
+    const result = await handleTrackerCreate({ id: 'bug_test', type: 'bug', title: 'Empty body', description: '' }, '/tmp/ws', undefined);
+    expect(result.isError).toBe(false);
+    const cache = mockQuery.mock.calls.find(([sql]) => /INSERT INTO tracker_body_cache/.test(String(sql)));
+    expect(cache?.[1]).toEqual(['bug_test', 1, JSON.stringify('')]);
   });
 
   it('reports partial success when a shared create cannot store the collaborative body', async () => {
     setupCreateQueueWithDescription();
     vi.mocked(shouldSyncTrackerItem).mockReturnValue(true);
     vi.mocked(isTrackerSyncActive).mockReturnValue(false);
-    mockApplyHeadlessBodyMarkdown.mockResolvedValueOnce(false);
+    mockInitializeHeadlessBodyMarkdown.mockRejectedValueOnce(new Error('No acknowledgment'));
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     try {
@@ -1889,7 +2167,7 @@ describe('handleTrackerCreate session linking', () => {
       expect(payload.summary).toContain('body was not stored in collaborative tracker content');
       expect(errorSpy).toHaveBeenCalledWith(
         '[MCP Server] tracker_create collaborative body write failed:',
-        { itemId: 'bug_test', workspacePath: '/tmp/ws' },
+        expect.objectContaining({ itemId: 'bug_test', workspacePath: '/tmp/ws' }),
       );
     } finally {
       errorSpy.mockRestore();
@@ -2202,6 +2480,7 @@ describe('handleTrackerUpdate description / collab body', () => {
       .mockResolvedValueOnce({ rows: [trackerRow] })                          // notifyTrackerItemUpdated read
       .mockResolvedValueOnce({ rows: [trackerRow] })                          // refreshedRow read for sync block
       .mockResolvedValueOnce({ rows: [trackerRow] })                          // postSyncRow read
+      .mockResolvedValueOnce({ rows: [] })                                    // DELETE body-link edges (body has no links)
       .mockResolvedValueOnce({ rows: [{ type_tags: ['bug'] }] });             // re-read type_tags
     return trackerRow;
   }
@@ -2225,6 +2504,21 @@ describe('handleTrackerUpdate description / collab body', () => {
     const payload = JSON.parse(result.content[0].text!);
     expect(payload.structured.action).toBe('validationFailed');
     expect(payload.structured.tool).toBe('tracker_update');
+  });
+
+  it('archives an item that predates a required field, and still refuses a write that clears it', async () => {
+    const decision = makeRow({ id: 'dec_old', type: 'decision', workspace: '/tmp/ws', source: 'native', document_path: '' });
+    mockQuery.mockResolvedValue({ rows: [decision] });
+    mockGlobalRegistry.validate.mockReturnValue({
+      valid: false,
+      errors: [{ field: 'decisionId', message: "Field 'decisionId' is required" }],
+    });
+
+    const archived = await handleTrackerUpdate({ id: 'dec_old', archived: true }, '/tmp/ws');
+    expect(JSON.parse(archived.content[0].text!).structured.action).not.toBe('validationFailed');
+
+    const cleared = await handleTrackerUpdate({ id: 'dec_old', fields: { decisionId: '' } }, '/tmp/ws');
+    expect(JSON.parse(cleared.content[0].text!).structured).toMatchObject({ action: 'validationFailed', errors: [{ field: 'decisionId' }] });
   });
 
   it('clears nested relationship fields with unsetFields and propagates inverse removals (NIM-1305)', async () => {
@@ -2265,6 +2559,9 @@ describe('handleTrackerUpdate description / collab body', () => {
       .mockResolvedValueOnce({ rows: [trackerRow] }) // notifyTrackerItemUpdated read
       .mockResolvedValueOnce({ rows: [trackerRow] }) // refreshedRow read for sync block
       .mockResolvedValueOnce({ rows: [trackerRow] }) // postSyncRow read
+      // The edge projection this handler now writes itself: a DELETE, then no
+      // upsert, because unsetting the field leaves no targets.
+      .mockResolvedValueOnce({ rows: [] }) // DELETE tracker_relationship_index
       .mockResolvedValueOnce({ rows: [{ type_tags: ['product-feature'] }] }); // re-read type_tags
 
     const result = await handleTrackerUpdate(
@@ -2379,6 +2676,10 @@ describe('handleTrackerUpdate description / collab body', () => {
       .mockResolvedValueOnce({ rows: [trackerRow] })
       .mockResolvedValueOnce({ rows: [trackerRow] })
       .mockResolvedValueOnce({ rows: [trackerRow] })
+      // The edge projection this handler now writes itself: a DELETE, then one
+      // upsert for the single target.
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ type_tags: ['product-feature'] }] });
 
     // A bare id string is the uncanonicalized shape an agent may send.
@@ -2449,6 +2750,18 @@ describe('handleTrackerUpdate description / collab body', () => {
       1,
       JSON.stringify('phase 5 body bump'),
     ]);
+  });
+
+  it('keeps the replaced body and the new one in local history', async () => {
+    setupUpdateQueueWithDescription({ content: JSON.stringify('# Hand-written body') });
+
+    const result = await handleTrackerUpdate({ id: 'NIM-1', description: '# Agent body' }, '/tmp/ws');
+
+    expect(result.isError).toBe(false);
+    expect(mockRecordTypedPageBodySnapshot).toHaveBeenCalledTimes(1);
+    expect(mockRecordTypedPageBodySnapshot).toHaveBeenCalledWith('bug_target', 'bug', '# Agent body', {
+      replaced: JSON.stringify('# Hand-written body'),
+    });
   });
 
   it('seeds the body when description arrives via the fields bag (NIM-438)', async () => {
@@ -2539,6 +2852,36 @@ describe('handleTrackerUpdate description / collab body', () => {
       );
     } finally {
       errorSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    { itemId: 'partner-person_target' },
+    { itemId: 'NIM-4275' },
+    {}, { id: null }, { id: '' }, { id: ' \t ' }, { id: 42 },
+  ])('rejects malformed update target %j without touching an unkeyed frontmatter item', async (target) => {
+    const plan = makeItem({ id: 'fm:plan:plans/unrelated.md', issueKey: undefined, source: 'frontmatter' });
+    mockDocumentServices.set('/tmp/ws', mockDocService);
+    mockDocService.getTrackerItemById.mockReset().mockResolvedValue(null);
+    mockDocService.listTrackerItems.mockReset().mockResolvedValue([plan]);
+    mockQuery.mockReset().mockResolvedValue({ rows: [] });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const result = await handleTrackerUpdate({ ...target, status: 'in-progress' }, '/tmp/ws');
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('tracker_update requires a non-empty string id');
+      expect(result.content[0].text).toContain('Use id, not itemId');
+      expect(mockDocService.getTrackerItemById).not.toHaveBeenCalled();
+      expect(mockDocService.listTrackerItems).not.toHaveBeenCalled();
+      expect(mockDocService.ensureTrackerProjection).not.toHaveBeenCalled();
+      expect(mockDocService.updateTrackerItemInFile).not.toHaveBeenCalled();
+      expect(mockDocService.setTrackerItemPublished).not.toHaveBeenCalled();
+      expect(mockQuery).not.toHaveBeenCalled();
+      expect(mockApplyHeadlessBodyMarkdown).not.toHaveBeenCalled();
+      expect(vi.mocked(syncTrackerItem)).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      mockDocService.listTrackerItems.mockResolvedValue([]);
     }
   });
 
@@ -2874,5 +3217,58 @@ describe('handleTrackerCreate schema defaults', () => {
     setupCreateQueue();
     await handleTrackerCreate({ type: 'task', title: 'A task' }, '/tmp/ws');
     expect(insertedData().status).toBe('to-do');
+  });
+});
+
+// Saving first and letting the sync refusal be swallowed told the agent the
+// write succeeded, queued nothing, and left a teammate's next edit to overwrite
+// it. Activity caps do not bound field values or comments.
+describe('agent writes that would make a shared item too large for its room', () => {
+  const huge = 'x'.repeat(300 * 1024);
+  const writes: string[] = [];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    writes.length = 0;
+    mockGlobalRegistry.get.mockReturnValue(undefined);
+    mockGlobalRegistry.validate.mockReturnValue({ valid: true, errors: [] });
+    vi.mocked(getEffectiveTrackerSharingPolicy).mockReturnValue({ sharing: 'team', draftByDefault: false });
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(true);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(true);
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(true);
+    const row = makeRow({ workspace: '/tmp/ws', source: 'native', document_path: '', created: '2026-04-01T00:00:00.000Z', last_indexed: '2026-04-02T00:00:00.000Z' });
+    mockQuery.mockImplementation(async (sql: string) => {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('SELECT')) return { rows: [row] };
+      writes.push(normalized);
+      return { rows: [] };
+    });
+  });
+
+  afterEach(() => {
+    vi.mocked(getEffectiveTrackerSharingPolicy).mockReturnValue({ sharing: 'personal', draftByDefault: false });
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(false);
+    mockQuery.mockReset();
+  });
+
+  function expectRefusedBeforeAnyWrite(result: { isError: boolean; content: Array<{ text?: string }> }) {
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/too large/);
+    expect(writes.filter(sql => sql.includes('tracker_items'))).toEqual([]);
+    expect(syncTrackerItem).not.toHaveBeenCalled();
+  }
+
+  it('tracker_update refuses a field value', async () => {
+    expectRefusedBeforeAnyWrite(await handleTrackerUpdate({ id: 'NIM-1', fields: { notes: huge } }, '/tmp/ws'));
+  });
+
+  it('tracker_create refuses a field value', async () => {
+    expectRefusedBeforeAnyWrite(await handleTrackerCreate({ type: 'bug', title: 'Big', fields: { notes: huge } }, '/tmp/ws'));
+  });
+
+  it('tracker_add_comment refuses a comment body', async () => {
+    expectRefusedBeforeAnyWrite(await handleTrackerAddComment({ trackerId: 'NIM-1', body: huge }, '/tmp/ws'));
   });
 });

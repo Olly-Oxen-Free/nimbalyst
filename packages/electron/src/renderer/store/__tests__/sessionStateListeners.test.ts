@@ -16,6 +16,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { store } from '@nimbalyst/runtime/store';
 import {
+  sessionStoreAtom,
+  setSessionWorkspaceOpenAtom,
   sessionHasPendingInteractivePromptAtom,
   sessionProcessingAtom,
   sessionPendingPromptsAtom,
@@ -24,19 +26,28 @@ import {
   sessionLastActivityAtom,
   sessionListWorkspaceAtom,
   selectedWorkstreamAtom,
+  sessionUnreadAtom,
   type SessionMeta,
 } from '../atoms/sessions';
 import {
+  globalSessionActivityAtom,
   globalSessionTurnActivityAtom,
+  markSessionUnreadAtom,
 } from '../atoms/sessionActivity';
-import { activeWorkspacePathAtom, openProjectsAtom } from '../atoms/openProjects';
+import { windowFocusedAtom } from '../atoms/windowFocus';
+import { activeWorkspacePathAtom, multiProjectModeAtom, openProjectsAtom } from '../atoms/openProjects';
+import { activeExtensionPanelAtom, activeExtensionBottomPanelAtom } from '../atoms/extensionPanels';
+import { resetWindowMode, windowModeAtom } from '../atoms/windowMode';
 import {
   initWorkstreamState,
   setWorkstreamActiveChildAtom,
   workstreamActiveChildAtom,
   workstreamStatesLoadedAtom,
 } from '../atoms/workstreamState';
+import { TranscriptStreamAccumulator } from '../transcriptStreamAccumulator';
+import { sessionViewRetention } from '../sessionViewRetention';
 import { errorNotificationService } from '../../services/ErrorNotificationService';
+import { selectSessionActionAtom } from '../actions/sessionHistoryActions';
 
 function seedRegistry(entries: Array<Partial<SessionMeta> & { id: string }>): void {
   const map = new Map(store.get(sessionRegistryAtom));
@@ -118,6 +129,7 @@ afterEach(() => {
   cleanup?.();
   cleanup = null;
   errorNotificationService.clearAll();
+  resetWindowMode();
   store.set(activeWorkspacePathAtom, null);
   store.set(sessionListWorkspaceAtom, null);
   store.set(openProjectsAtom, []);
@@ -175,6 +187,9 @@ describe('notification click navigation', () => {
     initWorkstreamState(workspacePath);
     store.set(activeWorkspacePathAtom, workspacePath);
     store.set(sessionListWorkspaceAtom, workspacePath);
+    store.set(windowModeAtom, 'agent');
+    store.set(activeExtensionPanelAtom, 'com.nimbalyst.project-graph.graph');
+    store.set(activeExtensionBottomPanelAtom, 'extension.bottom');
     seedRegistry([
       { id: parentId, workspaceId: workspacePath, sessionType: 'workstream' },
       { id: sid, workspaceId: workspacePath, parentSessionId: parentId },
@@ -221,6 +236,8 @@ describe('notification click navigation', () => {
       id: parentId,
     });
     expect(store.get(workstreamActiveChildAtom(parentId))).toBe(sid);
+    expect(store.get(activeExtensionPanelAtom)).toBeNull();
+    expect(store.get(activeExtensionBottomPanelAtom)).toBeNull();
   });
 
   it('fails visibly without selecting a different session when the target is missing', async () => {
@@ -699,6 +716,62 @@ describe('direct prompt events: AskUserQuestion', () => {
     expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
     expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
   });
+
+  // GitHub #1549. A question that is aborted or cancelled never produced an
+  // answer, so nothing cleared this flag: the session kept advertising a widget
+  // the transcript had already terminalized. Cancellation settles the prompt on
+  // the same terms an answer does.
+  it('ai:askUserQuestionCancelled clears pending and removes prompt', () => {
+    const sid = uniqueSessionId('auq-cancel');
+    const qid = 'q-1';
+    const cancelled = handlers.get('ai:askUserQuestionCancelled');
+    expect(cancelled).toBeTypeOf('function');
+
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: qid, questions: [] });
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(true);
+
+    cancelled!({ sessionId: sid, questionId: qid });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
+  });
+
+  // Regression: the resolve handler removed only the settled prompt from the
+  // array but hard-cleared the aggregate flag, so cancelling or answering Q1
+  // stopped the sidebar advertising Q2. The flag has to be recomputed from
+  // what is left.
+  it('keeps the aggregate flag set when a sibling question is still pending', () => {
+    const sid = uniqueSessionId('auq-two');
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: 'q-1', questions: [] });
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: 'q-2', questions: [] });
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(2);
+
+    handlers.get('ai:askUserQuestionCancelled')!({ sessionId: sid, questionId: 'q-1' });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(true);
+    const remaining = store.get(sessionPendingPromptsAtom(sid));
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].promptId).toBe('q-2');
+
+    handlers.get('ai:askUserQuestionCancelled')!({ sessionId: sid, questionId: 'q-2' });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
+  });
+
+  // The array holds every interactive prompt kind, so a question settling must
+  // not clear a tool permission the user has not answered yet.
+  it('keeps the aggregate flag set when a tool permission is still pending', () => {
+    const sid = uniqueSessionId('auq-perm');
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: 'q-1', questions: [] });
+    handlers.get('ai:toolPermission')!({ sessionId: sid, requestId: 'perm-1', request: { toolName: 'Bash' } });
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(2);
+
+    handlers.get('ai:askUserQuestionAnswered')!({ sessionId: sid, questionId: 'q-1' });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(true);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(1);
+  });
 });
 
 describe('direct prompt events: ExitPlanMode', () => {
@@ -750,6 +823,14 @@ describe('direct prompt events: ToolPermission', () => {
 });
 
 describe('direct prompt events: GitCommitProposal', () => {
+  it('does not request user input for a proposal already approved automatically', () => {
+    const sid = uniqueSessionId('gcp-auto');
+    handlers.get('ai:gitCommitProposal')!({ sessionId: sid, proposalId: 'auto-1', autoApproved: true });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
+  });
+
   it('ai:gitCommitProposal sets pending true and pushes prompt', () => {
     const sid = uniqueSessionId('gcp-set');
     const pid = 'gcp-1';
@@ -799,9 +880,11 @@ describe('regression: streaming after a pending prompt', () => {
 describe('workstream sort: child activity bubbles to parent', () => {
   it('session:started for a child bumps the parent workstream\'s turn activity', () => {
     const parentId = uniqueSessionId('ws-parent');
+    const rootId = uniqueSessionId('ws-root');
     const childId = uniqueSessionId('ws-child');
     seedRegistry([
-      { id: parentId, sessionType: 'workstream', childCount: 1 },
+      { id: rootId, childCount: 1 },
+      { id: parentId, parentSessionId: rootId, childCount: 1 },
       { id: childId, parentSessionId: parentId },
     ]);
 
@@ -816,6 +899,7 @@ describe('workstream sort: child activity bubbles to parent', () => {
     const turnsForWs = store.get(globalSessionTurnActivityAtom).get(WS);
     expect(turnsForWs?.get(childId)).toBe(5_000);
     expect(turnsForWs?.get(parentId)).toBe(5_000);
+    expect(turnsForWs?.get(rootId)).toBe(5_000);
   });
 
   it('ai:message-logged for a child bumps only the child\'s relative-time label, not turn-activity', () => {
@@ -961,6 +1045,314 @@ describe('processing reconcile on terminal events', () => {
       await vi.advanceTimersByTimeAsync(700);
 
       expect(store.get(sessionProcessingAtom(child))).toBe(false); // healed via children union
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+
+describe('closed project transcript retention', () => {
+  it('unloads streamed histories on close or completion while preserving an open project', () => {
+    const apply = vi.spyOn(TranscriptStreamAccumulator.prototype, 'apply');
+    const workspacePath = '/ws/cache-cleanup';
+    const ids = ['idle', 'running', 'other'].map(uniqueSessionId);
+    // The open project's session is on screen; unviewed ones are evicted.
+    const releaseOther = sessionViewRetention.acquire(ids[2]);
+    try {
+      for (const [index, sessionId] of ids.entries()) {
+        store.set(sessionStoreAtom(sessionId), { id: sessionId, workspacePath: index === 2 ? '/other' : workspacePath, messages: [] } as any);
+        handlers.get('transcript:event')!({ id: index + 1, sessionId, sequence: 1, createdAt: new Date(), eventType: 'assistant_message', searchableText: 'retained response', payload: {}, parentEventId: null, searchable: true, subagentId: null, provider: 'claude-code', providerToolCallId: null });
+      }
+      const accumulator = apply.mock.instances[0] as TranscriptStreamAccumulator;
+      expect(accumulator.hasPendingFlush(ids[0])).toBe(true);
+      store.set(sessionProcessingAtom(ids[1]), true);
+      store.set(setSessionWorkspaceOpenAtom, { workspacePath, isOpen: false });
+      expect(accumulator.hasPendingFlush(ids[0])).toBe(false);
+      expect(accumulator.hasPendingFlush(ids[1])).toBe(true);
+      expect(accumulator.hasPendingFlush(ids[2])).toBe(true);
+      handlers.get('ai-session-state:event')!({ type: 'session:completed', sessionId: ids[1], workspacePath });
+      expect(accumulator.hasPendingFlush(ids[1])).toBe(false);
+      expect(accumulator.hasPendingFlush(ids[2])).toBe(true);
+    } finally {
+      apply.mockRestore();
+      releaseOther();
+      store.set(setSessionWorkspaceOpenAtom, { workspacePath, isOpen: true });
+      for (const id of ids) store.set(sessionStoreAtom(id), null);
+    }
+  });
+});
+
+// A session left selected in a background window must still report that it
+// finished: "selected" only counts as "being read" while the window is focused.
+// Otherwise the debounced read-sync (hasUnread:false) also clears the tray /
+// menu-bar hint that main set on session:completed.
+describe('unread: selected session in an unfocused window', () => {
+  function selectSession(sessionId: string): void {
+    initWorkstreamState(WS);
+    store.set(selectedWorkstreamAtom(WS), { type: 'session', id: sessionId });
+  }
+
+  function readSyncCalls(sessionId: string): unknown[] {
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    return invoke.mock.calls.filter(
+      ([channel, id, payload]) =>
+        channel === 'ai:updateSessionMetadata' && id === sessionId && payload?.metadata?.hasUnread === false,
+    );
+  }
+
+  afterEach(() => {
+    store.set(windowFocusedAtom, false);
+    store.set(selectedWorkstreamAtom(WS), null);
+  });
+
+  it('marks the selected session unread and skips the read-sync while the window is unfocused', async () => {
+    vi.useFakeTimers();
+    try {
+      const sid = uniqueSessionId('bg-selected');
+      seedRegistry([{ id: sid }]);
+      selectSession(sid);
+      store.set(windowFocusedAtom, false);
+
+      handlers.get('ai:message-logged')!({ sessionId: sid, direction: 'output', workspacePath: WS });
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+      expect(readSyncCalls(sid)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the selected session read and syncs read state while the window is focused', async () => {
+    vi.useFakeTimers();
+    try {
+      const sid = uniqueSessionId('fg-selected');
+      seedRegistry([{ id: sid }]);
+      selectSession(sid);
+      store.set(windowFocusedAtom, true);
+
+      handlers.get('ai:message-logged')!({ sessionId: sid, direction: 'output', workspacePath: WS });
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(store.get(sessionUnreadAtom(sid))).toBe(false);
+      expect(readSyncCalls(sid)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the selected session unread when its window regains focus', () => {
+    const sid = uniqueSessionId('refocus-selected');
+    seedRegistry([{ id: sid }]);
+    selectSession(sid);
+    store.set(windowFocusedAtom, false);
+
+    handlers.get('ai:message-logged')!({ sessionId: sid, direction: 'output', workspacePath: WS });
+    expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+
+    store.set(windowFocusedAtom, true);
+
+    expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+    expect(store.get(globalSessionActivityAtom).get(WS)?.unread.has(sid) ?? false).toBe(true);
+    expect(readSyncCalls(sid)).toHaveLength(0);
+  });
+});
+
+// With the multi-project rail one focused window hosts several projects, and
+// only the one in `activeWorkspacePathAtom` is on screen. A session selected
+// in a hidden rail project is not being read, even though the window has focus.
+describe('unread: selected session in a hidden rail project', () => {
+  const WS_A = '/ws/rail-a';
+  const WS_B = '/ws/rail-b';
+
+  function selectSessionIn(workspacePath: string, sessionId: string): void {
+    initWorkstreamState(workspacePath);
+    store.set(selectedWorkstreamAtom(workspacePath), { type: 'session', id: sessionId });
+  }
+
+  function hasUnreadWrites(sessionId: string): boolean[] {
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    return invoke.mock.calls
+      .filter(([channel, id, payload]) =>
+        channel === 'ai:updateSessionMetadata' && id === sessionId && typeof payload?.metadata?.hasUnread === 'boolean')
+      .map(([, , payload]) => payload.metadata.hasUnread);
+  }
+
+  function isUnreadInActivity(workspacePath: string, sessionId: string): boolean {
+    return store.get(globalSessionActivityAtom).get(workspacePath)?.unread.has(sessionId) ?? false;
+  }
+
+  function logOutput(sessionId: string, workspacePath: string): void {
+    handlers.get('ai:message-logged')!({ sessionId, direction: 'output', workspacePath });
+  }
+
+  // The state a hidden-project answer leaves behind (see the first test of
+  // this block), so a test can measure only what happens afterwards.
+  function seedUnread(sessionId: string, workspacePath: string): void {
+    store.set(sessionUnreadAtom(sessionId), true);
+    store.set(markSessionUnreadAtom, { sessionId, workspacePath });
+    expect(isUnreadInActivity(workspacePath, sessionId)).toBe(true);
+  }
+
+  afterEach(() => {
+    store.set(windowFocusedAtom, false);
+    store.set(multiProjectModeAtom, false);
+    store.set(selectedWorkstreamAtom(WS_A), null);
+    store.set(selectedWorkstreamAtom(WS_B), null);
+  });
+
+  it('marks a session unread when it answers while another rail project is visible in the focused window', async () => {
+    vi.useFakeTimers();
+    try {
+      const sid = uniqueSessionId('rail-hidden');
+      seedRegistry([{ id: sid, workspaceId: WS_A }]);
+      store.set(multiProjectModeAtom, true);
+      selectSessionIn(WS_A, sid);
+      store.set(activeWorkspacePathAtom, WS_B);
+      store.set(windowFocusedAtom, true);
+
+      logOutput(sid, WS_A);
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+      expect(hasUnreadWrites(sid)).toContain(true);
+      expect(hasUnreadWrites(sid)).not.toContain(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a hidden rail project session unread when the window regains focus on another project', () => {
+    const sid = uniqueSessionId('rail-refocus');
+    seedRegistry([{ id: sid, workspaceId: WS_A }]);
+    store.set(multiProjectModeAtom, true);
+    selectSessionIn(WS_A, sid);
+    store.set(activeWorkspacePathAtom, WS_B);
+    store.set(windowFocusedAtom, false);
+
+    logOutput(sid, WS_A);
+    expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+
+    store.set(windowFocusedAtom, true);
+
+    expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+    expect(isUnreadInActivity(WS_A, sid)).toBe(true);
+    expect(hasUnreadWrites(sid)).not.toContain(false);
+  });
+
+  // Only selecting the session reads it -- switching back to its project does not.
+  it('keeps the selected session unread when its rail project becomes visible again', () => {
+    const sid = uniqueSessionId('rail-switch-back');
+    seedRegistry([{ id: sid, workspaceId: WS_A }]);
+    store.set(multiProjectModeAtom, true);
+    selectSessionIn(WS_A, sid);
+    store.set(activeWorkspacePathAtom, WS_B);
+    store.set(windowFocusedAtom, true);
+    seedUnread(sid, WS_A);
+
+    store.set(activeWorkspacePathAtom, WS_A);
+
+    expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+    expect(isUnreadInActivity(WS_A, sid)).toBe(true);
+    expect(hasUnreadWrites(sid)).not.toContain(false);
+  });
+
+  it('marks an unread session read when it is clicked while already selected', async () => {
+    const sid = uniqueSessionId('rail-reclick');
+    seedRegistry([{ id: sid, workspaceId: WS_A }]);
+    store.set(multiProjectModeAtom, true);
+    selectSessionIn(WS_A, sid);
+    store.set(activeWorkspacePathAtom, WS_A);
+    store.set(windowFocusedAtom, true);
+    seedUnread(sid, WS_A);
+
+    await store.set(selectSessionActionAtom, sid);
+
+    expect(store.get(sessionUnreadAtom(sid))).toBe(false);
+    expect(isUnreadInActivity(WS_A, sid)).toBe(false);
+    expect(hasUnreadWrites(sid)).toContain(false);
+  });
+
+  it('does not let a pending read-sync clear the unread state set after the window lost focus', async () => {
+    vi.useFakeTimers();
+    try {
+      const sid = uniqueSessionId('read-sync-race');
+      seedRegistry([{ id: sid, workspaceId: WS_A }]);
+      selectSessionIn(WS_A, sid);
+      store.set(activeWorkspacePathAtom, WS_A);
+      store.set(windowFocusedAtom, true);
+
+      logOutput(sid, WS_A); // read branch: schedules the 5 s read-sync
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      store.set(windowFocusedAtom, false);
+      logOutput(sid, WS_A); // unread branch: hasUnread:true
+      expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(hasUnreadWrites(sid).at(-1)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['focus loss', 'project switch'])('preserves completion after %s with no further output', async (reason) => {
+    vi.useFakeTimers();
+    try {
+      const sid = uniqueSessionId('completion-read-sync');
+      seedRegistry([{ id: sid, workspaceId: WS_A }]);
+      selectSessionIn(WS_A, sid);
+      store.set(activeWorkspacePathAtom, WS_A);
+      store.set(windowFocusedAtom, true);
+      logOutput(sid, WS_A);
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      if (reason === 'focus loss') store.set(windowFocusedAtom, false);
+      else store.set(activeWorkspacePathAtom, WS_B);
+      handlers.get('ai-session-state:event')!({ type: 'session:completed', sessionId: sid, workspacePath: WS_A });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(store.get(sessionUnreadAtom(sid))).toBe(true);
+      expect(isUnreadInActivity(WS_A, sid)).toBe(true);
+      expect(hasUnreadWrites(sid)).toEqual([true]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rechecks visibility when a pending read-sync fires without further events', async () => {
+    vi.useFakeTimers();
+    try {
+      const sid = uniqueSessionId('timer-visibility');
+      seedRegistry([{ id: sid, workspaceId: WS_A }]);
+      selectSessionIn(WS_A, sid);
+      store.set(activeWorkspacePathAtom, WS_A);
+      store.set(windowFocusedAtom, true);
+      logOutput(sid, WS_A);
+      store.set(windowFocusedAtom, false);
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(hasUnreadWrites(sid)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the selected session read in single-project mode while its project is visible and focused', async () => {
+    vi.useFakeTimers();
+    try {
+      const sid = uniqueSessionId('single-visible');
+      seedRegistry([{ id: sid, workspaceId: WS_A }]);
+      selectSessionIn(WS_A, sid);
+      store.set(activeWorkspacePathAtom, WS_A);
+      store.set(windowFocusedAtom, true);
+
+      logOutput(sid, WS_A);
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(store.get(sessionUnreadAtom(sid))).toBe(false);
+      expect(hasUnreadWrites(sid)).toEqual([false]);
     } finally {
       vi.useRealTimers();
     }

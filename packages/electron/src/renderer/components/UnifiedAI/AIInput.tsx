@@ -1,23 +1,20 @@
 import React, { useRef, useEffect, KeyboardEvent, useState, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
+import { shouldAcceptPromptSuggestion } from './promptSuggestionKeys';
 import { GenericTypeahead, TypeaheadOption } from '../Typeahead/GenericTypeahead';
 import { extractTriggerMatch, getSlashTypeaheadScope, insertAtTrigger, type SlashTypeaheadScope, TriggerMatch } from '../Typeahead/typeaheadUtils';
 import { buildSlashCommandOptions, fetchSlashCommandEntries, type SlashCommandEntry } from '../Typeahead/slashCommandAutocomplete';
-import { readClipboard, encodeMarkdownLinkPath, type ChatAttachment } from '@nimbalyst/runtime';
+import { readClipboard, isEmptyPaste, encodeMarkdownLinkPath, type ChatAttachment } from '@nimbalyst/runtime';
+import { usePastedImage } from './usePastedImage';
 import type { TokenUsageCategory } from '@nimbalyst/runtime/ai/server/types';
 import type { EffortLevel, ThinkingMode } from '../../utils/modelUtils';
 import { AttachmentPreviewList } from '../AgenticCoding/AttachmentPreviewList';
-import { ModeTag, AIMode } from './ModeTag';
-import { ModelSelector } from './ModelSelector';
-import { EffortLevelSelector } from './EffortLevelSelector';
-import { ThinkingModeSelector } from './ThinkingModeSelector';
-import { OpenCodeRoleSelector } from './OpenCodeRoleSelector';
+import type { AIMode } from './ModeTag';
+import { AIInputControls } from './AIInputControls';
 import { registerPendingVoiceCommandSetter } from './VoiceModeButton.tsx';
 import { PendingVoiceCommand } from './PendingVoiceCommand';
 import { pendingVoiceCommandAtom, voiceActiveSessionIdAtom, type PendingVoiceCommand as PendingVoiceCommandType } from '../../store/atoms/voiceModeState';
-import { ContextUsageDisplay } from './ContextUsageDisplay';
-import { ActionPromptsDropdown } from './ActionPromptsDropdown';
-import type { ActionPrompt } from '../../store/atoms/actionPrompts';
+import type { ActionPrompt, ActionPickerSettings } from '../../store/atoms/actionPrompts';
 import { SelectionChips } from './SelectionChips';
 import {
   MemoryPromptIndicator,
@@ -35,6 +32,7 @@ import {
   sessionRegistryAtom,
 } from '../../store';
 import { useAIInputUndo } from '../../hooks/useAIInputUndo';
+import { errorNotificationService } from '../../services/ErrorNotificationService';
 import type { AIInputSnapshot } from '../../store/atoms/aiInputUndo';
 import { parseCommandTokens, type CommandToken } from './commandPills/parseCommandTokens';
 import { parseMentionTokens } from './commandPills/parseMentionTokens';
@@ -47,7 +45,7 @@ export interface AIInputRef {
   textarea: HTMLTextAreaElement | null;
 }
 
-interface AIInputProps {
+export interface AIInputProps {
   value: string;
   onChange: (value: string) => void;
   onSend: (message?: string) => void;
@@ -55,7 +53,13 @@ interface AIInputProps {
   disabled?: boolean;
   isLoading?: boolean;
   placeholder?: string;
+  /** Predicted next prompt. Shown in place of the placeholder; Tab on an empty draft fills it in. */
+  promptSuggestion?: string | null;
   workspacePath?: string;
+  /** Host catalogs replace local file/command discovery for remote sessions. */
+  remoteSession?: boolean;
+  remoteFiles?: string[];
+  remoteCommands?: SlashCommandEntry[];
   sessionId?: string;
 
   // History navigation support (from ChatInput)
@@ -106,6 +110,8 @@ interface AIInputProps {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
     contextWindow?: number;
     categories?: TokenUsageCategory[];
     currentContext?: {
@@ -122,6 +128,7 @@ interface AIInputProps {
 
   // Mockup annotation indicator support
   currentFilePath?: string;
+  currentFileName?: string;
 
   // Test ID for E2E testing
   testId?: string;
@@ -163,8 +170,12 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     onCancel,
     disabled,
     isLoading,
+    promptSuggestion,
     placeholder = "Type your message... (Enter to send, Shift+Enter for new line, @ for files, @@ for sessions, / for commands)",
     workspacePath,
+    remoteSession = false,
+    remoteFiles,
+    remoteCommands,
     sessionId,
     onNavigateHistory,
     attachments = [],
@@ -194,6 +205,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     onQueue,
     queueCount = 0,
     currentFilePath,
+    currentFileName,
     testId,
     onLaunchActionInNewSession,
   }, ref) => {
@@ -293,7 +305,10 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     // Replace the draft with an action-prompt body and place the cursor at
     // the end. Pushes a boundary undo snapshot so Cmd+Z restores the prior
     // draft instead of coalescing with the user's next keystroke.
-    const handleActionPromptInsert = useCallback((body: string) => {
+    const handleActionPromptInsert = useCallback((body: string, picker?: ActionPickerSettings) => {
+      // An action that pins a model or effort switches the matching picker.
+      if (picker?.model && onModelChange && picker.model !== currentModel) onModelChange(picker.model);
+      if (picker?.effort && onEffortLevelChange && picker.effort !== effortLevel) onEffortLevelChange(picker.effort);
       pushSnapshot(captureSnapshot(), { boundary: true });
       onChange(body);
       requestAnimationFrame(() => {
@@ -306,14 +321,17 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
           // best-effort cursor placement
         }
       });
-    }, [pushSnapshot, captureSnapshot, onChange]);
+    }, [pushSnapshot, captureSnapshot, onChange, onModelChange, currentModel, onEffortLevelChange, effortLevel]);
 
     // File mention state via Jotai atoms
     // Subscribes directly to atoms instead of receiving props (no prop drilling)
-    const fileMentionOptions = useAtomValue(
+    const localFileMentionOptions = useAtomValue(
       fileMentionOptionsAtom(workspacePath || '')
     );
     const searchFileMention = useSetAtom(searchFileMentionAtom);
+    const fileMentionOptions: TypeaheadOption[] = remoteSession
+      ? (remoteFiles ?? []).filter(path => path.toLowerCase().includes((typeaheadMatch?.query ?? '').toLowerCase())).slice(0, 30).map(path => ({id: path, label: path.split('/').pop() ?? path, description: path, data: {path, name: path}}))
+      : localFileMentionOptions;
 
     // Session mention state via Jotai atoms (for @@ trigger)
     const sessionMentionOptions = useAtomValue(
@@ -501,6 +519,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
 
     // Fetch slash commands from IPC (SDK commands + local commands)
     const fetchSlashCommands = useCallback(async () => {
+      if (remoteSession) { setAllSlashCommands(remoteCommands ?? []); return; }
       if (!enableSlashCommands || !workspacePath) return;
       try {
         const commands = await fetchSlashCommandEntries({
@@ -513,7 +532,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         console.error('[AIInput] Failed to load slash commands:', error);
         setAllSlashCommands([]);
       }
-    }, [workspacePath, sessionId, enableSlashCommands, currentProvider, provider]);
+    }, [workspacePath, sessionId, enableSlashCommands, currentProvider, provider, remoteSession, remoteCommands]);
 
     // Fetch on mount and when workspace/session changes
     useEffect(() => {
@@ -608,7 +627,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
       // @@ (session mentions) must be checked alongside @ (file mentions)
       const triggers: string[] = [];
       if (workspacePath) triggers.push('@@');
-      if (workspacePath) triggers.push('@');
+      if (workspacePath && (!remoteSession || remoteFiles)) triggers.push('@');
       if (enableSlashCommands) triggers.push('/');
 
       if (triggers.length === 0) {
@@ -644,7 +663,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         const timerId = setTimeout(() => {
           if (match.trigger === '@@' && workspacePath) {
             searchSessionMention({ workspacePath, query: match.query, excludeSessionId: sessionId });
-          } else if (match.trigger === '@' && workspacePath) {
+          } else if (match.trigger === '@' && workspacePath && !remoteSession) {
             searchFileMention({ workspacePath, query: match.query });
           }
         }, 150); // 150ms debounce - fast enough to feel instant, slow enough to skip intermediate keystrokes
@@ -689,7 +708,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         // Re-evaluate typeahead trigger when cursor moves via click/select
         // (The main typeahead effect only triggers on value changes)
         const triggers: string[] = [];
-        if (workspacePath) triggers.push('@');
+        if (workspacePath && (!remoteSession || remoteFiles)) triggers.push('@');
         if (enableSlashCommands) triggers.push('/');
         if (triggers.length > 0) {
           const match = extractTriggerMatch(value, pos, triggers);
@@ -729,7 +748,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     // Detect memory mode trigger (# as first character, Claude Code provider only)
     useEffect(() => {
       // If content starts with '#', check if it came from a paste operation
-      if (shouldActivateMemoryMode(value, provider)) {
+      if (!remoteSession && shouldActivateMemoryMode(value, provider)) {
         // Don't activate memory mode if this '#' content was pasted
         if (pastedHashContentRef.current) {
           return;
@@ -892,6 +911,14 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         return;
       }
 
+      // Tab accepts the predicted next prompt into an empty draft; Enter then sends it as usual.
+      // After the typeahead block above so Tab inside a typeahead still selects its option.
+      if (promptSuggestion && shouldAcceptPromptSuggestion(e, { promptSuggestion, value, isLoading })) {
+        e.preventDefault();
+        onChange(promptSuggestion);
+        return;
+      }
+
       // Handle Shift+Tab to toggle plan mode (only for Claude Code provider)
       if (e.key === 'Tab' && e.shiftKey && provider === 'claude-code' && onModeChange && mode) {
         e.preventDefault();
@@ -1033,6 +1060,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
       // past this paste/drop -- we drop the result on resolve.
       const undoCountAtStart = getUndoCount();
       pasteUndoCountRef.current.set(processingId, undoCountAtStart);
+      setProcessingAttachments(prev => [...prev, { id: processingId, filename: file.name }]);
 
       try {
         const validation = await window.electronAPI.invoke('attachment:validate', {
@@ -1042,14 +1070,12 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         });
 
         if (!validation.valid) {
+          setProcessingAttachments(prev => prev.filter(p => p.id !== processingId));
           pasteUndoCountRef.current.delete(processingId);
           console.error('[AIInput] File validation failed:', validation.error);
-          alert(validation.error || 'Invalid file');
+          errorNotificationService.showError('Attachment Rejected', validation.error || 'Invalid file');
           return;
         }
-
-        // Add to processing state before starting compression
-        setProcessingAttachments(prev => [...prev, { id: processingId, filename: file.name }]);
 
         const arrayBuffer = await file.arrayBuffer();
         const uint8Array = new Uint8Array(arrayBuffer);
@@ -1076,19 +1102,24 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         if (result.success && result.attachment) {
           onAttachmentAdd(result.attachment);
           const reference = `@${file.name} `;
-          onChange(value + (value ? ' ' : '') + reference);
+          const currentValue = textareaRef.current?.value ?? value;
+          onChange(currentValue + (currentValue ? ' ' : '') + reference);
         } else {
           console.error('[AIInput] Failed to save attachment:', result.error);
-          alert(result.error || 'Failed to save attachment');
+          errorNotificationService.showError('Attachment Failed', result.error || 'Failed to save attachment');
         }
       } catch (error) {
         // Remove from processing state on error
         setProcessingAttachments(prev => prev.filter(p => p.id !== processingId));
         pasteUndoCountRef.current.delete(processingId);
         console.error('[AIInput] Error handling file attachment:', error);
-        alert('Failed to attach file');
+        errorNotificationService.showError('Attachment Failed', 'Failed to attach file');
       }
     }, [onAttachmentAdd, sessionId, value, onChange, getUndoCount]);
+
+    const attachPastedImage = usePastedImage({
+      sessionId, getUndoCount, captureSnapshot, pushSnapshot, handleFileAttachment, setProcessingAttachments,
+    });
 
     // Drag and drop handlers
     const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -1146,7 +1177,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
 
       // Handle file mention drops from file tree or files-edited sidebar
       const fileMentionPath = e.dataTransfer.getData('application/x-nimbalyst-file-mention');
-      if (fileMentionPath) {
+      if (fileMentionPath && !remoteSession) {
         // The drag source may give either an absolute path (file tree) or a
         // workspace-relative path (files-edited sidebar). Derive both so we can
         // build a markdown link that includes the absolute target.
@@ -1214,13 +1245,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
             e.preventDefault();
             const file = item.getAsFile();
             if (file) {
-              // Generate unique filename for pasted images (clipboard gives generic "image.png")
-              const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-              const ext = file.type.split('/')[1] || 'png';
-              const uniqueName = `pasted-image-${timestamp}.${ext}`;
-              const renamedFile = new File([file], uniqueName, { type: file.type });
-              pushSnapshot(captureSnapshot(), { boundary: true });
-              await handleFileAttachment(renamedFile);
+              await attachPastedImage(file);
             }
             return; // Exit early after handling image
           }
@@ -1229,7 +1254,15 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
 
       // Get pasted text for further processing
       const pastedText = e.clipboardData.getData('text');
-      if (!pastedText) return;
+      if (!pastedText) {
+        // Under WSL an image copied in Windows arrives as an empty text entry
+        // (WSLg passes only text to Linux apps); ask the host for the image.
+        if (onAttachmentAdd && isEmptyPaste(e.clipboardData)) {
+          e.preventDefault();
+          await attachPastedImage();
+        }
+        return;
+      }
 
       // Handle large text pastes as attachments (keeps transcript clean)
       if (onAttachmentAdd && sessionId) {
@@ -1261,7 +1294,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
       // Note: ordinary in-line text pastes fall through to the textarea's
       // native paste, which fires onChange and is recorded by the typing
       // path (with coalescing).
-    }, [onAttachmentAdd, handleFileAttachment, provider, value, onChange, sessionId, pushSnapshot, captureSnapshot]);
+    }, [onAttachmentAdd, handleFileAttachment, attachPastedImage, provider, value, onChange, sessionId, pushSnapshot, captureSnapshot]);
 
     // Handle attachment removal
     const handleRemoveAttachment = useCallback((attachmentId: string) => {
@@ -1383,82 +1416,39 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
             Each chip has an × so the user can drop it from the next prompt. */}
         <SelectionChips
           currentFilePath={currentFilePath}
+          currentFileName={currentFileName}
         />
 
         {/* Inline controls row - hidden in memory mode */}
         {!isMemoryMode && (onModeChange || onModelChange || readOnlyModel || workspacePath || (tokenUsage && provider === 'claude-code')) && (
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-          }}>
-{onModeChange && provider === 'claude-code' && mode && <ModeTag mode={mode} onModeChange={onModeChange} />}
-
-            {(onModelChange || (readOnlyModel && currentModel)) && (
-              <span style={{ display: 'inline-flex' }}>
-                <ModelSelector
-                  currentModel={currentModel || ''}
-                  onModelChange={(modelId) => {
-                    onModelChange?.(modelId);
-                    textareaRef.current?.focus();
-                  }}
-                  sessionHasMessages={sessionHasMessages}
-                  currentProvider={currentProvider}
-                  readOnly={!onModelChange && readOnlyModel}
-                  readOnlyTitle={readOnlyModelTitle}
-                  openRequest={modelPickerOpenRequest}
-                  onKeyboardDismiss={() => textareaRef.current?.focus()}
-                />
-              </span>
-            )}
-            {onOpenCodeRoleChange && workspacePath && (
-              <OpenCodeRoleSelector
-                workspacePath={workspacePath}
-                role={openCodeRole}
-                onRoleChange={onOpenCodeRoleChange}
-                currentModel={currentModel}
-                onModelChange={onModelChange}
-                turnActive={isLoading}
-              />
-            )}
-            {showEffortLevel && onEffortLevelChange && effortLevel && (
-              <EffortLevelSelector
-                level={effortLevel}
-                onLevelChange={onEffortLevelChange}
-                disabled={reasoningControlsDisabled}
-                disabledTitle={reasoningControlsDisabledTitle}
-              />
-            )}
-            {showThinkingToggle && onThinkingModeChange && thinkingMode && (
-              <ThinkingModeSelector
-                mode={thinkingMode}
-                onModeChange={onThinkingModeChange}
-                disabled={reasoningControlsDisabled}
-                disabledTitle={reasoningControlsDisabledTitle}
-              />
-            )}
-            {workspacePath && (
-              <HelpTooltip testId="action-prompts-dropdown">
-                <span style={{ display: 'inline-flex' }}>
-                  <ActionPromptsDropdown
-                    workspacePath={workspacePath}
-                    onInsert={handleActionPromptInsert}
-                    onLaunchNewSession={onLaunchActionInNewSession}
-                  />
-                </span>
-              </HelpTooltip>
-            )}
-            {/* Show token usage for all providers - displays "--" if no data yet */}
-            <ContextUsageDisplay
-              provider={currentProvider ?? provider}
-              inputTokens={tokenUsage?.inputTokens || 0}
-              outputTokens={tokenUsage?.outputTokens || 0}
-              totalTokens={tokenUsage?.totalTokens || 0}
-              contextWindow={tokenUsage?.contextWindow || 0}
-              categories={tokenUsage?.categories}
-              currentContext={tokenUsage?.currentContext}
-            />
-          </div>
+          <AIInputControls
+            onModeChange={onModeChange}
+            provider={provider}
+            mode={mode}
+            onModelChange={onModelChange}
+            readOnlyModel={readOnlyModel}
+            currentModel={currentModel}
+            sessionHasMessages={sessionHasMessages}
+            currentProvider={currentProvider}
+            readOnlyModelTitle={readOnlyModelTitle}
+            onOpenCodeRoleChange={onOpenCodeRoleChange}
+            workspacePath={workspacePath}
+            openCodeRole={openCodeRole}
+            isLoading={isLoading}
+            showEffortLevel={showEffortLevel}
+            onEffortLevelChange={onEffortLevelChange}
+            effortLevel={effortLevel}
+            reasoningControlsDisabled={reasoningControlsDisabled}
+            reasoningControlsDisabledTitle={reasoningControlsDisabledTitle}
+            showThinkingToggle={showThinkingToggle}
+            onThinkingModeChange={onThinkingModeChange}
+            thinkingMode={thinkingMode}
+            onLaunchActionInNewSession={onLaunchActionInNewSession}
+            tokenUsage={tokenUsage}
+            modelPickerOpenRequest={modelPickerOpenRequest}
+            focusInput={() => textareaRef.current?.focus()}
+            onActionInsert={handleActionPromptInsert}
+          />
         )}
 
         {/* Input container with drag/drop support */}
@@ -1513,7 +1503,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
             onPaste={handlePaste}
             onFocus={() => setIsFocused(true)}
             onBlur={() => setIsFocused(false)}
-            placeholder={placeholder}
+            placeholder={promptSuggestion && !value && !isLoading ? promptSuggestion : placeholder}
             disabled={disabled}
             rows={1}
             style={{
@@ -1598,7 +1588,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
           />
         )}
 
-        {pillPopover && (
+        {pillPopover && !remoteSession && (
           <CommandPillPopover
             command={pillPopover.command}
             rect={pillPopover.rect}

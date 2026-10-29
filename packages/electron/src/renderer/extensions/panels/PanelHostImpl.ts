@@ -5,8 +5,16 @@
  * Handles communication between panels and the host application.
  */
 
+import type { ComponentType } from 'react';
+import { createElement } from 'react';
 import type { PanelHost, PanelAIContext, ExtensionStorage, ExtensionFileStorage, ExtensionDataAccess, ExecOptions, ExecResult } from '@nimbalyst/runtime';
+import type { PanelHostComponents, PanelPanes, PanelPaneSide, PanelSessionTranscriptProps } from '@nimbalyst/extension-sdk';
+import { store } from '@nimbalyst/runtime/store';
 import { ExtensionFileStorageImpl } from './ExtensionFileStorageImpl';
+import { setPanelGutterBadge } from './panelGutterBadges';
+import { addPanelPaneToggleHandler, setPanelPanes } from './panelPanes';
+import { workspaceRootPathsAtom } from '../../store/atoms/fileTree';
+import { isPathInWorkspace } from '../../../shared/pathUtils';
 
 // ============================================================================
 // Types
@@ -25,6 +33,29 @@ export interface PanelHostOptions {
   onOpenPanel: (panelId: string) => void;
   onClose: () => void;
   onThemeChange: (callback: (theme: string) => void) => () => void;
+
+  /**
+   * Host transcript component, passed only when the extension may see agent
+   * sessions (manifest `permissions.ai`). Injected rather than imported so this
+   * module stays free of the transcript's import graph.
+   */
+  sessionTranscript?: ComponentType<SessionTranscriptBindings & PanelSessionTranscriptProps>;
+}
+
+interface SessionTranscriptBindings {
+  workspacePath: string;
+  onOpenFile: (path: string) => void;
+}
+
+/** Bind the host's workspace and file-open path so the panel passes only a session id. */
+function createPanelHostComponents(
+  Transcript: ComponentType<SessionTranscriptBindings & PanelSessionTranscriptProps>,
+  bindings: SessionTranscriptBindings,
+): PanelHostComponents {
+  const SessionTranscript = (props: PanelSessionTranscriptProps) =>
+    createElement(Transcript, { ...props, ...bindings });
+  SessionTranscript.displayName = 'PanelHost.SessionTranscript';
+  return { SessionTranscript };
 }
 
 // ============================================================================
@@ -101,6 +132,7 @@ class PanelHostImpl implements PanelHost {
   readonly storage: ExtensionStorage;
   readonly files: ExtensionFileStorage;
   readonly data: ExtensionDataAccess;
+  readonly components?: PanelHostComponents;
 
   private _theme: string;
   private _isSettingsOpen = false;
@@ -135,10 +167,35 @@ class PanelHostImpl implements PanelHost {
     if (options.aiSupported) {
       this.ai = new PanelAIContextImpl();
     }
+
+    if (options.sessionTranscript) {
+      this.components = createPanelHostComponents(options.sessionTranscript, {
+        workspacePath: options.workspacePath,
+        onOpenFile: (path) => this.onOpenFile(path),
+      });
+    }
   }
 
   get theme(): string {
     return this._theme;
+  }
+
+  /**
+   * Every root of the workspace, primary first. Read live from the atom the
+   * explorer already maintains rather than captured at construction, so a
+   * panel open across an attach or detach sees the current set.
+   *
+   * Falls back to the primary root alone before the explorer has published --
+   * a panel that mounts early gets the single-folder answer, never an empty
+   * list it would have to special-case.
+   */
+  getWorkspaceFolders(): string[] {
+    const roots = store.get(workspaceRootPathsAtom);
+    return roots.length > 0 && roots[0] === this.workspacePath ? roots : [this.workspacePath];
+  }
+
+  getPrimaryFolderPath(): string {
+    return this.workspacePath;
   }
 
   get isSettingsOpen(): boolean {
@@ -173,11 +230,17 @@ class PanelHostImpl implements PanelHost {
   }
 
   onWorkspaceEvent(event: string, callback: (data: unknown) => void): () => void {
-    const workspacePath = this.workspacePath;
     const unsub = window.electronAPI.on(event, (data: unknown) => {
-      // Filter to events for this workspace
+      // Filter to events for this workspace. Watchers are registered per repo,
+      // so a repo inside an attached folder names itself rather than the
+      // primary root -- match against every root or those events are dropped
+      // and the panel never refreshes for the attached repo.
       const d = data as Record<string, unknown> | undefined;
-      if (d?.workspacePath && d.workspacePath !== workspacePath) return;
+      const eventPath = d?.workspacePath;
+      if (typeof eventPath === 'string' && eventPath) {
+        const roots = this.getWorkspaceFolders();
+        if (!roots.some((root) => isPathInWorkspace(eventPath, root))) return;
+      }
       callback(data);
     });
     this.eventCleanups.push(unsub);
@@ -206,6 +269,30 @@ class PanelHostImpl implements PanelHost {
         exitCode: -1,
       };
     }
+  }
+
+  callBackendTool(toolName: string, args?: Record<string, unknown>): Promise<unknown> {
+    // callerExtensionId comes from the host, never from panel code: main uses
+    // it to refuse tools that another extension's backend module registered.
+    return window.electronAPI.invoke('extensions:ai-call-backend-tool', {
+      toolName,
+      args: args ?? {},
+      workspacePath: this.workspacePath,
+      callerExtensionId: this.extensionId,
+    });
+  }
+
+  setGutterBadge(value: number | null, options?: { tone?: 'default' | 'warning' }): void {
+    // Deliberately not cleared in dispose(): the badge must outlive the panel.
+    setPanelGutterBadge(this.panelId, value, options?.tone ?? 'default');
+  }
+
+  setPanes(panes: PanelPanes | null): void {
+    setPanelPanes(this.panelId, panes);
+  }
+
+  onPaneToggle(callback: (side: PanelPaneSide) => void): () => void {
+    return addPanelPaneToggleHandler(this.panelId, callback);
   }
 
   /**

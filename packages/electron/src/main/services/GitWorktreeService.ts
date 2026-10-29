@@ -12,18 +12,33 @@
  * - This design ensures consistent diff output across all platforms
  */
 
-import simpleGit, { SimpleGit } from 'simple-git';
+import type { SimpleGit } from 'simple-git';
+import { createGit } from './gitClient';
 import { simpleGitWithHookEnv } from './gitEnv';
+import { validateGitCwd, validateGitOperand } from './gitOperandValidation';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ulid } from 'ulid';
 import log from 'electron-log/main';
 import { getUntrackedFilesInDirectories } from '../utils/gitUtils';
-import { GIT_INHERITED_ENV_UNSAFE } from './gitInheritedEnvUnsafe';
+import { sanitizeGitRepositoryEnv } from './gitRepositoryEnv';
 import { gitOperationLock } from './GitOperationLock';
+import { getGitOperationLogService, recordGitActivity } from './GitOperationLogService';
 import { SessionCommitService } from './SessionCommitService';
+import { historyManager } from '../HistoryManager';
 
 const logger = log.scope('GitWorktreeService');
+
+/**
+ * simple-git rooted at `baseDir`, without the repository-selection variables a
+ * git hook exports (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ...). Those override
+ * the working directory, so an inherited GIT_DIR would make `worktree add`,
+ * `worktree remove --force` and `branch -D` act on the hook's repository instead
+ * of `baseDir`'s. Commit, merge and rebase get the same scrub from gitEnv.ts.
+ */
+function gitFor(baseDir: string): SimpleGit {
+  return createGit(baseDir, {}, sanitizeGitRepositoryEnv(process.env));
+}
 
 /**
  * Thrown when a workspace's git repository has no commits yet, so HEAD
@@ -176,7 +191,7 @@ export class GitWorktreeService {
       }
 
       // Check 3: git rev-parse --is-inside-work-tree succeeds
-      const git: SimpleGit = simpleGit(worktreePath);
+      const git: SimpleGit = gitFor(worktreePath);
       try {
         const isWorkTree = await git.revparse(['--is-inside-work-tree']);
         if (isWorkTree.trim() !== 'true') {
@@ -243,7 +258,15 @@ export class GitWorktreeService {
 
     // Use centralized lock to prevent concurrent worktree operations
     return gitOperationLock.withLock(workspacePath, 'createWorktree', () =>
-      this.createWorktreeImpl(workspacePath, options)
+      recordGitActivity(
+        getGitOperationLogService(),
+        workspacePath,
+        // The final name is generated inside the impl when not supplied; the
+        // entry's output line below names the worktree that was actually made.
+        ['worktree', 'add', options.name ?? '(generated name)'],
+        () => this.createWorktreeImpl(workspacePath, options),
+        (worktree) => `Created worktree ${worktree.path} on ${worktree.branch}`,
+      )
     );
   }
 
@@ -254,7 +277,7 @@ export class GitWorktreeService {
     logger.info('Creating worktree', { workspacePath, options });
 
     // Ensure this is a git repository
-    const git: SimpleGit = simpleGit(workspacePath);
+    const git: SimpleGit = gitFor(workspacePath);
     const isRepo = await git.checkIsRepo();
     if (!isRepo) {
       throw new Error(`Not a git repository: ${workspacePath}`);
@@ -354,7 +377,7 @@ export class GitWorktreeService {
 
     // logger.info('Getting worktree status', { worktreePath, baseBranchOverride });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = gitFor(worktreePath);
 
     try {
       // git.status() already provides the current branch via .current,
@@ -390,9 +413,16 @@ export class GitWorktreeService {
         commitsBehind = behind || 0;
         commitsAhead = ahead || 0;
 
-        // Check if branch is merged (use -a to include remote tracking branches)
-        const mergedBranches = await git.raw(['branch', '-a', '--merged', baseBranch]);
-        isMerged = mergedBranches.includes(currentBranch);
+        // Exact match on local branches, since archiving skips its warning when
+        // this is true: createWorktree's -N dedupe puts `worktree/x` next to
+        // `worktree/x-1`, a merged remote-tracking ref says nothing about unpushed
+        // commits, and a detached worktree arrives here as `HEAD`. `*` marks the
+        // current branch, `+` one checked out in another worktree; color and
+        // column config would reshape the lines.
+        const mergedBranches = await git.raw(['branch', '--no-color', '--no-column', '--merged', baseBranch]);
+        isMerged = mergedBranches
+          .split('\n')
+          .some(line => line.trim().replace(/^[*+] /, '') === currentBranch);
 
         // Use git cherry to find truly unique commits (by patch content, not hash)
         // This handles cases where commits were rebased and have different hashes
@@ -447,7 +477,12 @@ export class GitWorktreeService {
 
     // Use centralized lock on workspace to prevent concurrent worktree operations
     return gitOperationLock.withLock(workspacePath, 'deleteWorktree', () =>
-      this.deleteWorktreeImpl(worktreePath, workspacePath)
+      recordGitActivity(
+        getGitOperationLogService(),
+        workspacePath,
+        ['worktree', 'remove', worktreePath],
+        () => this.deleteWorktreeImpl(worktreePath, workspacePath),
+      )
     );
   }
 
@@ -457,13 +492,13 @@ export class GitWorktreeService {
   private async deleteWorktreeImpl(worktreePath: string, workspacePath: string): Promise<void> {
     logger.info('Deleting worktree', { worktreePath, workspacePath });
 
-    const git: SimpleGit = simpleGit(workspacePath);
+    const git: SimpleGit = gitFor(workspacePath);
     let branchName: string | null = null;
 
     // Step 1: Get the branch name before removing (best effort)
     if (fs.existsSync(worktreePath)) {
       try {
-        const worktreeGit: SimpleGit = simpleGit(worktreePath);
+        const worktreeGit: SimpleGit = gitFor(worktreePath);
         branchName = await worktreeGit.revparse(['--abbrev-ref', 'HEAD']);
         logger.info('Found branch for worktree', { branchName });
       } catch (error) {
@@ -510,6 +545,20 @@ export class GitWorktreeService {
     }
 
     logger.info('Worktree directory confirmed deleted', { worktreePath });
+
+    // Step 4b: Retire pending AI reviews for files that lived in this worktree.
+    // Their paths can never resolve again, so the tags would sit pending
+    // forever, inflating the pending counts (#1403). This marks them reviewed;
+    // the rows and their baselines stay in document_history.
+    try {
+      const { count } = await historyManager.clearAllPending(worktreePath);
+      if (count > 0) {
+        logger.info('Retired pending AI reviews for removed worktree', { worktreePath, count });
+      }
+    } catch (error) {
+      // Never let history bookkeeping fail a worktree removal that succeeded.
+      logger.warn('Failed to retire pending reviews for removed worktree', { error, worktreePath });
+    }
 
     // Step 5: Delete the branch if we found it (best effort, don't fail if this doesn't work)
     if (branchName && branchName !== 'HEAD') {
@@ -582,7 +631,7 @@ export class GitWorktreeService {
 
     // logger.info('Listing worktrees', { workspacePath });
 
-    const git: SimpleGit = simpleGit(workspacePath);
+    const git: SimpleGit = gitFor(workspacePath);
 
     try {
       // Get worktree list in porcelain format
@@ -709,7 +758,7 @@ export class GitWorktreeService {
     if (!fs.existsSync(gitMeta)) {
       throw new Error(`Not a git repository: ${workspacePath}`);
     }
-    const git: SimpleGit = simpleGit(workspacePath);
+    const git: SimpleGit = gitFor(workspacePath);
     try {
       await git.raw(['rev-parse', '--verify', 'HEAD']);
     } catch {
@@ -751,7 +800,7 @@ export class GitWorktreeService {
 
     // logger.info('Getting all branch names', { workspacePath });
 
-    const git: SimpleGit = simpleGit(workspacePath);
+    const git: SimpleGit = gitFor(workspacePath);
 
     try {
       // Get all local branches
@@ -843,7 +892,7 @@ export class GitWorktreeService {
       throw new Error('repoPath is required');
     }
 
-    const git: SimpleGit = simpleGit(repoPath);
+    const git: SimpleGit = gitFor(repoPath);
     return this.getCurrentBranch(git);
   }
 
@@ -893,7 +942,7 @@ export class GitWorktreeService {
     // logger.info('Checking git state', { repoPath });
 
     const gitDir = path.join(repoPath, '.git');
-    const git: SimpleGit = simpleGit(repoPath);
+    const git: SimpleGit = gitFor(repoPath);
 
     try {
       const status = await git.status();
@@ -953,7 +1002,7 @@ export class GitWorktreeService {
 
     logger.info('Checking for potential stash conflicts', { repoPath });
 
-    const git: SimpleGit = simpleGit(repoPath);
+    const git: SimpleGit = gitFor(repoPath);
 
     try {
       // Get status to check for conflicted files
@@ -1019,7 +1068,7 @@ export class GitWorktreeService {
 
     logger.info('Getting file diff', { worktreePath, filePath, baseBranchOverride });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = gitFor(worktreePath);
 
     try {
       // Use provided base branch (from database) or fall back to inferring
@@ -1199,7 +1248,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
 
     // logger.info('Getting worktree commits', { worktreePath, baseBranchOverride });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = gitFor(worktreePath);
 
     try {
       // Get current branch and base branch
@@ -1356,7 +1405,13 @@ ${newLines.map(line => '+' + line).join('\n')}`;
 
     // Use centralized lock to prevent concurrent commit/staging operations
     const commit = await gitOperationLock.withLock(worktreePath, 'commitChanges', () =>
-      this.commitChangesImpl(worktreePath, message, files)
+      recordGitActivity(
+        getGitOperationLogService(),
+        worktreePath,
+        ['commit', '-m', message],
+        () => this.commitChangesImpl(worktreePath, message, files),
+        (result) => `[${result.hash.slice(0, 7)}] ${result.message}`,
+      )
     );
 
     if (sessionId && commit.hash) {
@@ -1461,7 +1516,15 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     }
 
     // Use centralized lock to prevent concurrent merge/rebase/squash operations
-    return gitOperationLock.withLock(mainRepoPath, 'mergeToMain', () => this.mergeToMainImpl(worktreePath, mainRepoPath));
+    return gitOperationLock.withLock(mainRepoPath, 'mergeToMain', () =>
+      recordGitActivity(
+        getGitOperationLogService(),
+        mainRepoPath,
+        ['merge', worktreePath],
+        () => this.mergeToMainImpl(worktreePath, mainRepoPath),
+        (result) => result.message,
+      )
+    );
   }
 
   /**
@@ -1826,7 +1889,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     conflictingFiles?: string[];
     conflictingCommits?: { ours: string[]; theirs: string[] };
   }> {
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = gitFor(worktreePath);
 
     try {
       // Get the current branch
@@ -1955,15 +2018,19 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     untrackedFiles?: string[];
     stashWarning?: boolean;
   }> {
-    if (!worktreePath) {
-      throw new Error('worktreePath is required');
-    }
-    if (!baseBranch) {
-      throw new Error('baseBranch is required');
-    }
+    validateGitCwd(worktreePath, 'worktreePath');
+    validateGitOperand(baseBranch, 'baseBranch');
 
     // Use lock to prevent concurrent merge/rebase/squash operations
-    return gitOperationLock.withLock(worktreePath, 'rebaseFromBase', () => this.rebaseFromBaseImpl(worktreePath, baseBranch));
+    return gitOperationLock.withLock(worktreePath, 'rebaseFromBase', () =>
+      recordGitActivity(
+        getGitOperationLogService(),
+        worktreePath,
+        ['rebase', baseBranch],
+        () => this.rebaseFromBaseImpl(worktreePath, baseBranch),
+        (result) => result.message,
+      )
+    );
   }
 
   /**
@@ -2263,19 +2330,16 @@ ${newLines.map(line => '+' + line).join('\n')}`;
 
     // logger.info('Getting changed files', { worktreePath });
 
-    // The unsafe flags are required because the .env() below makes simple-git
-    // scan the supplied (trusted, process-owned) environment for vars like
-    // GIT_EDITOR and otherwise refuse to spawn git at all.
-    const git: SimpleGit = simpleGit(worktreePath, { unsafe: GIT_INHERITED_ENV_UNSAFE });
+    // GIT_OPTIONAL_LOCKS=0 is the environment equivalent of the
+    // `--no-optional-locks` flag simple-git gives no way to pass: it stops
+    // this read-only status from refreshing (and so locking) `.git/index`,
+    // where it would contend with concurrent git writers (NIM-2285).
+    const git: SimpleGit = createGit(worktreePath, {}, { ...sanitizeGitRepositoryEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
 
     try {
       // Get only uncommitted changes from git status
       // This shows files that need to be staged/committed, not the full branch diff.
-      // GIT_OPTIONAL_LOCKS=0 is the environment equivalent of the
-      // `--no-optional-locks` flag simple-git gives no way to pass: it stops
-      // this read-only status from refreshing (and so locking) `.git/index`,
-      // where it would contend with concurrent git writers (NIM-2285).
-      const gitStatus = await git.env({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }).status();
+      const gitStatus = await git.status();
 
       const changedFiles: Array<{ path: string; status: 'added' | 'modified' | 'deleted'; staged: boolean }> = [];
 
@@ -2359,7 +2423,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
 
     logger.info('Checking if commits exist on other branches', { worktreePath, commitCount: commitHashes.length });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = gitFor(worktreePath);
 
     try {
       // Get current branch
@@ -2416,7 +2480,14 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     }
 
     // Use lock to prevent concurrent merge/rebase/squash operations
-    return gitOperationLock.withLock(worktreePath, 'squashCommits', () => this.squashCommitsImpl(worktreePath, commitHashes, message));
+    return gitOperationLock.withLock(worktreePath, 'squashCommits', () =>
+      recordGitActivity(
+        getGitOperationLogService(),
+        worktreePath,
+        ['reset', '--soft', `HEAD~${commitHashes.length}`],
+        () => this.squashCommitsImpl(worktreePath, commitHashes, message),
+      )
+    );
   }
 
   /**
@@ -2532,7 +2603,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
       throw new Error('worktreePath is required');
     }
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = gitFor(worktreePath);
     const result = await git.raw(['clean', '-Xdn']);
 
     if (!result.trim()) return [];
@@ -2556,7 +2627,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     return gitOperationLock.withLock(worktreePath, 'cleanGitignoredFiles', async () => {
       logger.info('Cleaning gitignored files from worktree', { worktreePath });
 
-      const git: SimpleGit = simpleGit(worktreePath);
+      const git: SimpleGit = gitFor(worktreePath);
 
       // Dry-run to get the full list
       const dryRun = await git.raw(['clean', '-Xdn']);

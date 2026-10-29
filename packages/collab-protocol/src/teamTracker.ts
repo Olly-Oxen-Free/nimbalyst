@@ -308,6 +308,13 @@ export interface TrackerSchemaMutationRequestMessage {
   schemaType: string;
   /** Null for delete (tombstone). */
   encryptedPayload: string | null;
+  /**
+   * Create the type only if the room has no live definition of it; refused
+   * with `schemaExists` otherwise. A re-send of the exact payload the room
+   * already holds is accepted. Send only to a room whose schema bootstrap
+   * advertised `schemaCreateOnly`: an older room ignores the field and upserts.
+   */
+  createOnly?: boolean;
 }
 
 export interface TrackerSyncRequestMessage {
@@ -320,6 +327,8 @@ export interface TrackerSyncRequestMessage {
 }
 
 export interface TrackerMutationRequestMessage {
+  /** Server revision seen when this edit was queued; required for recovered items. */
+  expectedSyncId?: number;
   type: 'trackerMutation';
   clientMutationId: string;
   itemId: string;
@@ -443,6 +452,8 @@ export interface TrackerSchemaSyncResponseMessage {
   schemas: TrackerSchemaEnvelope[];
   cursorSyncId: SyncId;
   hasMore: boolean;
+  /** The room honors `createOnly` on schema mutations. Absent from older rooms. */
+  schemaCreateOnly?: boolean;
 }
 
 export interface TrackerSchemaDeltaMessage {
@@ -477,6 +488,7 @@ export interface TrackerDeltaMessage {
 }
 
 export type TrackerMutationRejectCode =
+  | 'recoveryConflict'
   | 'staleKeyEpoch'
   | 'rotationLocked'
   | 'forbidden'
@@ -497,7 +509,16 @@ export type TrackerMutationRejectCode =
    * closed, so adding a member cannot break one.
    */
   | 'adminRequired'
-  | 'malformed';
+  /** A create-only schema mutation named a type the room already defines. */
+  | 'schemaExists'
+  | 'malformed'
+  /**
+   * The room threw while applying the mutation, so nothing was written.
+   * Temporary: the same payload may succeed on a later attempt. Lets the
+   * server answer a specific mutation instead of sending a bare
+   * `trackerError` that names none.
+   */
+  | 'serverError';
 
 export interface TrackerMutationAckMessage {
   type: 'trackerMutationAck';

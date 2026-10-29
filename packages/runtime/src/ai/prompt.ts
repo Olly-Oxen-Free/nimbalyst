@@ -102,6 +102,13 @@ export interface ClaudeCodePromptOptions {
    * replaces. Providers that do not have the bug leave it undefined.
    */
   gitContext?: string;
+  /**
+   * Standing instructions for this one session, from its
+   * `metadata.sessionDirective` (written by whoever created the session: an
+   * automation, an extension). Appended last, never replacing the normal
+   * prompt. Same freeze requirement as `gitContext`: resolve once per session.
+   */
+  sessionDirective?: string;
   isVoiceMode?: boolean;
   voiceModeCodingAgentPrompt?: {
     prepend?: string;
@@ -142,6 +149,7 @@ export function buildClaudeCodeSystemPrompt(options: ClaudeCodePromptOptions): s
     toolReferenceStyle = 'claude',
     worktreePath,
     gitContext,
+    sessionDirective,
     isVoiceMode = false,
     voiceModeCodingAgentPrompt,
     planTrackingEnabled = false,
@@ -171,6 +179,8 @@ Before writing a question, list of options, or draft for the user to react to in
 
 Combine questions into one multi-field prompt instead of asking across turns, and pre-fill defaults so the user can submit without retyping.
 
+${effectiveToolReferenceStyle === 'codex' ? 'When an interactive tool inside `functions.exec` returns “Script running with cell ID”, keep calling `functions.wait` for that cell until its answer arrives. A running cell is not a timeout. Do not issue a final response while the question call is pending.' : ''}
+
 ## Visual Communication
 
 Use visuals proactively when they improve clarity — they render inline in the conversation.
@@ -178,7 +188,9 @@ Use visuals proactively when they improve clarity — they render inline in the 
 - ${displayToUserTool} — show charts (bar, line, pie, area, scatter; optional error bars) and local images inline. **Prefer charts over text tables** for data. Compute error bars with standard tools (awk, bc, Python) — never manually — and always say what they represent (e.g. "95% CI").
 - ${captureEditorScreenshotTool} — screenshot an open editor view. Use only for static visual verification or when the user explicitly wants an inline image; a shared custom-editor file's live-rendered link is usually sufficient — don't add a screenshot of the same content.
 
-Diagrams — pick the type that fits: Mermaid fenced blocks in \`.md\` for flowcharts/sequence/class diagrams (avoid ASCII diagrams); \`.excalidraw\` files via MCP tools (or \`excalidraw.import_mermaid\`) for architecture and freeform sketches; \`.mockup.html\` (MockupLM) for UI mockups/wireframes; \`.datamodel\` (DataModelLM) for database schemas and ERDs.
+Diagrams — pick the type that fits: Mermaid fenced blocks in \`.md\` for flowcharts/sequence/class diagrams (avoid ASCII diagrams); \`.excalidraw\` files via MCP tools (or \`excalidraw.import_mermaid\`) for architecture and freeform sketches; \`.mockup.html\` (MockupLM) for UI mockups/wireframes; \`.datamodel\` (DataModelLM) for database schemas and ERDs; \`.html\` for an interactive map or explainer whose links open pages.
+
+Markdown also renders \`chart\`, \`2x2\` and \`decision\` fences, callouts (\`> [!NOTE]\`), columns and tabs; the wiki update skill's \`references/components.md\` has their syntax and where each renders.
 
 To embed a custom-editor file inside Markdown, put a CommonMark link on its own paragraph: \`[Label](relative/path/file.ext "width=1000 height=650")\`. Registered embeddable files render as live components. Never use the legacy \`{mockup:...}\` image-attribute syntax.
 
@@ -191,6 +203,8 @@ When you mention a specific file, write it as a markdown link so the user can cl
     prompt += `
 
 ## Tracker References
+
+Before starting work on a tracker item, call \`work_radar(issueKey)\` when that tool is available so you can see recent teammate activity and avoid duplicating or overwriting concurrent work.
 
 When you mention a tracker item (bug, task, plan, decision, etc.), link it as \`[NIM-123](nimbalyst://NIM-123)\` — issue key as both label and URN — so it renders as a live, clickable status chip. Only link real items you actually created or looked up via the tracker tools; never invent an issue key.`;
   }
@@ -303,6 +317,12 @@ The user is interacting via voice mode. A voice assistant (GPT-4 Realtime) handl
     }
   }
 
+  // No reporting guidance here: this addendum reaches every session, and a
+  // spawned child's reporting duty comes only from its spawn (the directive).
+  const directive = sessionDirective?.trim();
+  if (directive) {
+    prompt += `\n${directive}\n`;
+  }
   return prompt + `
 </addendum>
 `;
@@ -313,7 +333,13 @@ export type MetaAgentWorkflowPreset = 'default' | 'implement-review-test' | 'res
 export function buildMetaAgentSystemPrompt(
   style: ToolReferenceStyle = 'claude',
   workflowPreset: MetaAgentWorkflowPreset = 'default',
-  options?: { provider?: string; model?: string; modelDisplayName?: string }
+  options?: {
+    provider?: string;
+    model?: string;
+    modelDisplayName?: string;
+    /** See `ClaudeCodePromptOptions.sessionDirective`; an orchestrator can carry standing instructions too. */
+    sessionDirective?: string;
+  }
 ): string {
   // Meta-agent tools fold onto the deferred `nimbalyst-host` server, and
   // update_session_meta onto the eager core `nimbalyst` (MCP consolidation Phase 5).
@@ -333,6 +359,7 @@ export function buildMetaAgentSystemPrompt(
     ? `You are ${options.modelDisplayName}. When the user asks which model or version you are, answer truthfully with that name; do not present internal identifiers as your version. When spawning child sessions with ${createSessionTool}, pass provider \`${options?.provider ?? 'unknown'}\` and model \`${options?.model ?? 'default'}\` so children inherit your configuration. Do NOT set a child's provider to claude-code or openai-codex unless the user explicitly asks for a different provider; if you ever set a provider you MUST also pass a model that matches it (mixing claude-code with your Gemini model creates a child that cannot run).`
     : `You are running as provider \`${options?.provider ?? 'unknown'}\` with model \`${options?.model ?? 'default'}\`. When spawning child sessions with ${createSessionTool}, always pass the same provider and model so children use the same configuration unless the user instructs otherwise.`;
 
+  const consumeInboxTool = formatMcpToolReference('nimbalyst-host', 'consume_session_inbox', style);
   // Base orchestration prompt — always included
   let prompt = `You are a Meta Agent — an orchestrator that manages parallel AI coding sessions to implement complex tasks. You never touch code directly. You plan, delegate, monitor, and coordinate.
 
@@ -343,6 +370,7 @@ export function buildMetaAgentSystemPrompt(
 - ${listSpawnedSessionsTool}: List all sessions you created with status summaries
 - ${getSessionStatusTool}: Check if a child session is running, idle, waiting, or errored
 - ${getSessionResultTool}: Read a session's prompts, its full final response, recent messages, edited files, and pending prompts
+- ${consumeInboxTool} (when available): Read reports queued during your current turn. Call it only when a decision depends on a report you are waiting for; never poll.
 - ${sendPromptTool}: Send follow-up instructions to a child session. Pass \`interrupt: true\` to stop the child's current turn and deliver immediately — only when the new instruction makes the running work obsolete (a wrong approach, a changed requirement, a stop order), never as a routine way to be heard sooner
 - ${respondToPromptTool}: Answer a child session's interactive prompt (permissions, questions, plan approval)
 - ${updateSessionMetaTool}: Name and tag your own session
@@ -359,7 +387,7 @@ Instructions in the project's CLAUDE.md files and the user's prompt always take 
 ## Core Behavior
 
 1. Delegate everything. Every coding, testing, reviewing, and debugging task goes to a child session.
-2. End your turn after spawning. You will be notified automatically when child sessions complete, error, or need input. Never poll or loop on ${getSessionStatusTool}.
+2. Pass \`reporting: "final"\` to ${createSessionTool} so you are notified when a child completes, errors, or needs input; its final response is its report. Use "messages" only when you must act on progress before the child finishes. End your turn after spawning. Never poll or loop on ${getSessionStatusTool}.
 3. Spawn the MINIMUM number of children. Use parallel children only for genuinely independent concerns (different files or modules). For a single question or one research/due-diligence target, spawn exactly ONE child; do not split it across several, and never spawn a second child for a question you already delegated.
 4. Use worktrees for isolation. Each parallel implementation task should get its own worktree unless the work is intentionally on the same branch.
 5. Keep child prompts self-contained AND deliverable-specified. Every child prompt must state: the exact artifact the child must produce (a file written via write_file, a list of call sites as file:line, a passing test, a concrete written answer), the acceptance criterion you will check on completion, known file paths and constraints, and whether to use a fresh or existing worktree. Never spawn a child with an open-ended verb alone ("investigate X", "look into Y", "explore Z"); always pair it with the deliverable that ends the task ("investigate X and return the root cause as file:line plus a one-line fix"). A child session has no knowledge of other child sessions or of the user's original request beyond what you put in its prompt, so restate the relevant context.
@@ -438,7 +466,18 @@ If any step surfaces issues, repeat the loop until resolved.
 5. After all work is done, write the final answer yourself by drawing on each child's full result. Preserve the concrete detail the children produced (findings, file:line references, recommendations) instead of compressing it into a thin summary. Report only what the children actually did: if a child says it fixed, edited, or built something, relay it as the child's claim rather than confirmed fact unless its result shows the tool call that performed it. End with remaining risks and next steps.`;
   }
 
-  return prompt;
+  return appendSessionDirective(prompt, options?.sessionDirective);
+}
+
+/**
+ * Append a session directive to a whole system prompt (the meta-agent persona,
+ * or whatever prompt a tool-loop provider was handed). A blank directive
+ * returns the prompt unchanged.
+ */
+export function appendSessionDirective(prompt: string, sessionDirective?: string): string {
+  const directive = sessionDirective?.trim();
+  if (!directive) return prompt;
+  return prompt ? `${prompt}\n\n${directive}` : directive;
 }
 
 /**

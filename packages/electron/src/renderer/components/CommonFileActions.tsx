@@ -18,6 +18,7 @@ import {
 import { useAtomValue } from 'jotai';
 import { useFileActions } from '../hooks/useFileActions';
 import { workspaceHasTeamAtom } from '../store/atoms/collabDocuments';
+import { personalPageSupportsType } from '../services/personalPageTypes';
 import { isCollabUri } from '@nimbalyst/collab-protocol';
 import { getCollaborativeDocumentTypeCatalog } from '../services/CollaborativeDocumentTypeCatalog';
 import { askShareToTeam, shareFileToTeam } from '../services/shareToTeamFlow';
@@ -36,6 +37,13 @@ interface CommonFileActionsProps {
   showIcons?: boolean;
   /** Render items as <button> elements instead of <div> (default false) */
   useButtons?: boolean;
+  /**
+   * The target is a folder. Folders have no document type, so asking the
+   * catalog whether one is registered for them produces a file-extension
+   * message about something that is not a file -- which is what made "Share to
+   * Team" look broken on every folder. They get the folder promote instead.
+   */
+  isDirectory?: boolean;
 }
 
 export function CommonFileActions({
@@ -47,6 +55,7 @@ export function CommonFileActions({
   iconSize = 18,
   showIcons = true,
   useButtons = false,
+  isDirectory = false,
 }: CommonFileActionsProps) {
   const actions = useFileActions(filePath, fileName);
   const hasTeam = useAtomValue(workspaceHasTeamAtom);
@@ -56,10 +65,18 @@ export function CommonFileActions({
     documentTypeCatalog.getSnapshot,
     documentTypeCatalog.getSnapshot,
   );
-  const shareability = useMemo(
-    () => documentTypeCatalog.resolveShareability(fileName),
-    [catalogRevision, documentTypeCatalog, fileName],
+  const shareability = useMemo<
+    { state: 'ready'; descriptor?: { documentType: string } } | { state: 'unsupported'; reason: string }
+  >(
+    () => (isDirectory
+      ? { state: 'ready' }
+      : documentTypeCatalog.resolveShareability(fileName)),
+    [catalogRevision, documentTypeCatalog, fileName, isDirectory],
   );
+  // A folder copies to Team only; a file of any type but code can always go to Personal.
+  const canCopyToPersonal = !isDirectory
+    && shareability.state === 'ready'
+    && personalPageSupportsType(shareability.descriptor?.documentType ?? 'markdown');
   /**
    * Ask, then share. Both halves live in `shareToTeamFlow` so the feedback-request
    * compose path drives the same dialog and the same publish rather than a
@@ -67,10 +84,17 @@ export function CommonFileActions({
    */
   const openShareToTeamDialog = useCallback(async () => {
     if (shareability.state !== 'ready') return;
+    if (isDirectory) {
+      const { shareFolderToTeamFromContextMenu } = await import(
+        '../services/shareFolderToTeamFlow'
+      );
+      await shareFolderToTeamFromContextMenu({ folderPath: filePath, folderName: fileName });
+      return;
+    }
     const ask = await askShareToTeam({ filePath, fileName });
     if (ask.status !== 'answered') return;
     await shareFileToTeam({ filePath, fileName, answers: ask.answers });
-  }, [filePath, fileName, shareability]);
+  }, [filePath, fileName, isDirectory, shareability]);
 
   const Item = useButtons ? 'button' : 'div';
 
@@ -127,9 +151,10 @@ export function CommonFileActions({
         </Item>
       )}
 
-      {/* Team workspaces always explain catalog eligibility. Unsupported
-          types stay visible but cannot open the promotion dialog. */}
-      {hasTeam && !isCollabUri(filePath) && (
+      {/* Copy to Wiki: Team when the project has one, Personal for markdown
+          with or without a team. Unsupported types stay visible (with a team)
+          but cannot open the dialog. */}
+      {(hasTeam || canCopyToPersonal) && !isCollabUri(filePath) && (
         <Item
           className={`${menuItemClass} ${shareability.state === 'ready' ? '' : 'opacity-55 cursor-not-allowed'}`}
           aria-disabled={shareability.state !== 'ready'}
@@ -140,9 +165,11 @@ export function CommonFileActions({
             onClose();
           }}
         >
-          {showIcons && <MaterialSymbol icon="group" size={iconSize} />}
+          {showIcons && (
+            <MaterialSymbol icon={isDirectory ? 'drive_folder_upload' : 'group'} size={iconSize} />
+          )}
           <span className="min-w-0 flex-1">
-            <span className="block">Share to Team</span>
+            <span className="block">{isDirectory ? 'Share Folder to Team' : 'Copy to Wiki...'}</span>
             {shareability.state === 'unsupported' && (
               <span className="block text-[11px] leading-snug text-nim-disabled mt-0.5">
                 {shareability.reason}

@@ -1,6 +1,8 @@
+import { handleConsumeSessionInbox } from './tools/consumeSessionInbox';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { connectMcpTransport } from "./connectMcpTransport";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -17,6 +19,7 @@ import { workspaceToWindowMap } from "./mcpWorkspaceResolver";
 import { requireMcpAuth } from "./mcpAuth";
 import { getAllowedClipOrigin, hasAllowedClipContentType } from "./clipRequestGuards";
 import { withTrackerSchemaWorkspace } from "../services/tracker/trackerSchemaScope";
+import { logger } from "../utils/logger";
 
 // Extracted modules
 import {
@@ -27,7 +30,7 @@ import {
   registerWorkspaceMappingForConnection,
   ExtensionToolDefinition,
 } from "./mcpWorkspaceResolver";
-import { handleBackendTool, isBackendTool } from "./tools/backendToolHandler";
+import { filterBackendToolsForSession, handleBackendTool, isBackendTool } from "./tools/backendToolHandler";
 import { setBackendToolsChangeNotifier } from "./backendToolRegistry";
 
 // Tool handlers + schemas
@@ -52,10 +55,15 @@ import {
 } from "./tools/canvasWorkingSetToolHandlers";
 import {
   handleCreateSharedDoc,
+  handleImportFileToPages,
   handleCreateSharedFolder,
   handleMoveSharedItem,
   handleRenameSharedItem,
   handleDeleteSharedItem,
+  handleListPages,
+  handleSearchPages,
+  handleSetPageType,
+  handleSetPageFields,
   getCollabIndexToolSchemas,
 } from "./tools/collabIndexToolHandlers";
 import {
@@ -70,6 +78,7 @@ import {
 import {
   handleTrackerList,
   handleTrackerReady,
+  handleWorkRadar,
   handleTrackerGet,
   handleTrackerListTypes,
   handleTrackerDefineType,
@@ -431,9 +440,11 @@ function createSharedMcpServer(
       );
       // Backend-module-registered tools (executed by the module, not the
       // renderer) live in a parallel registry; merge them in for this endpoint.
-      const backendTools = await getAvailableBackendTools(
-        workspacePath,
-        currentFilePath
+      // This server serves one Nimbalyst session, so owned-sessions tools are
+      // filtered for that session here (the registry itself is per workspace).
+      const backendTools = await filterBackendToolsForSession(
+        await getAvailableBackendTools(workspacePath, currentFilePath),
+        sessionId
       );
       allTools = [
         ...selectExtensionToolsForEndpoint(extensionTools, endpoint.extensionShortName),
@@ -504,18 +515,16 @@ function createSharedMcpServer(
   // abort signal so a cancelled call tears its waiter down (#1341).
   server.setRequestHandler(CallToolRequestSchema, withTrackerSchemaWorkspace(workspacePath, async (request: any, extra: any) => {
     const { name, arguments: args } = request.params;
-    if (request.params._meta) {
-      console.log(
-        `[MCP Server] Tool called: ${name}, _meta:`,
-        JSON.stringify(request.params._meta)
-      );
-    }
+    logger.mcp.debug(`[MCP Server] Tool called: ${name}`);
 
     // Strip MCP server prefix if present
     const toolName = name.replace(/^mcp__nimbalyst__/, "");
 
     try {
       switch (toolName) {
+        case 'consume_session_inbox':
+          if (extra.requestId === undefined) throw new Error('Inbox request identity is required');
+          return handleConsumeSessionInbox(sessionId, request);
         case "applyDiff":
           return handleApplyDiff(args, sessionId, workspacePath);
 
@@ -554,6 +563,9 @@ function createSharedMcpServer(
         case "createSharedFolder":
           return handleCreateSharedFolder(args, workspacePath);
 
+        case "importFileToPages":
+          return handleImportFileToPages(args, workspacePath);
+
         case "moveSharedItem":
           return handleMoveSharedItem(args, workspacePath);
 
@@ -562,6 +574,18 @@ function createSharedMcpServer(
 
         case "deleteSharedItem":
           return handleDeleteSharedItem(args, workspacePath);
+
+        case "listPages":
+          return handleListPages(args, workspacePath);
+
+        case "searchPages":
+          return handleSearchPages(args, workspacePath);
+
+        case "setPageType":
+          return handleSetPageType(args, workspacePath);
+
+        case "setPageFields":
+          return handleSetPageFields(args, workspacePath);
 
         case "findOrgMembers":
           return handleFindOrgMembers(args, workspacePath);
@@ -605,6 +629,9 @@ function createSharedMcpServer(
 
         case "tracker_ready":
           return handleTrackerReady(args, workspacePath);
+
+        case "work_radar":
+          return handleWorkRadar(args, workspacePath);
 
         case "tracker_get":
           return handleTrackerGet(args, workspacePath);
@@ -699,7 +726,10 @@ function createSharedMcpServer(
           if (workspacePath) {
             const resolvedBackendWs = await resolveBackendWorkspacePath(workspacePath);
             if (isBackendTool(toolName, resolvedBackendWs)) {
-              return handleBackendTool(toolName, name, args, resolvedBackendWs);
+              return handleBackendTool(toolName, name, args, resolvedBackendWs, {
+                sessionId: sessionId ?? null,
+                caller: "agent",
+              });
             }
           }
           return handleExtensionTool(toolName, name, args, sessionId, workspacePath);
@@ -715,6 +745,28 @@ function createSharedMcpServer(
 }
 
 // ---- HTTP Transport Helpers ----
+
+/**
+ * The MCP Streamable HTTP spec requires an Accept header naming both
+ * `application/json` and `text/event-stream`; the SDK's transport 406s any
+ * request missing either ("Not Acceptable: Client must accept both...").
+ *
+ * Not every MCP client sends one. Antigravity's `call_mcp_tool` bridge does
+ * not, and every tool call it makes is rejected before reaching a handler --
+ * observed live, logged only as `[MCP:nimbalyst] Server error`, which gives a
+ * user nothing to act on. This is a loopback server that can always answer
+ * with either content type, so correcting a noncompliant header costs nothing
+ * and beats failing a client whose request shape we do not control.
+ *
+ * Groundwork for connecting Antigravity to these endpoints, but the leniency
+ * stands on its own for any client with the same gap.
+ */
+export function ensureMcpAcceptHeader(accept: string | undefined): string {
+  if (accept?.includes("application/json") && accept.includes("text/event-stream")) {
+    return accept;
+  }
+  return "application/json, text/event-stream";
+}
 
 function getMcpSessionIdHeader(req: IncomingMessage): string | undefined {
   const headerValue = req.headers["mcp-session-id"];
@@ -876,6 +928,12 @@ async function tryCreateServer(port: number): Promise<any> {
         // this connection serves. null for non-/mcp paths (handled below).
         const mcpEndpoint = resolveMcpEndpoint(pathname);
 
+        // See ensureMcpAcceptHeader: not every MCP client sends an Accept
+        // header the SDK's transport will take.
+        if (isMcpEndpoint(pathname)) {
+          req.headers.accept = ensureMcpAcceptHeader(req.headers.accept);
+        }
+
         // Handle SSE GET request to establish connection
         if (isMcpEndpoint(pathname) && req.method === "GET") {
           // Streamable HTTP GET (session established, uses Mcp-Session-Id header)
@@ -960,20 +1018,18 @@ async function tryCreateServer(port: number): Promise<any> {
             serversByWorkspace.get(workspacePath)!.add(server);
           }
 
-          server
-            .connect(transport)
-            .then(() => {
-              transport.onclose = () => {
-                clearInterval(keepaliveInterval);
-                activeTransports.delete(transport.sessionId);
-                if (sessionId) {
-                  serverByNimbalystSession.delete(sessionId);
-                }
-                if (workspacePath) {
-                  serversByWorkspace.get(workspacePath)?.delete(server);
-                }
-              };
-            })
+          // The close handler goes in before connect(), or it replaces the
+          // wrapper that aborts in-flight tool handlers when the stream drops.
+          connectMcpTransport(server, transport, () => {
+            clearInterval(keepaliveInterval);
+            activeTransports.delete(transport.sessionId);
+            if (sessionId) {
+              serverByNimbalystSession.delete(sessionId);
+            }
+            if (workspacePath) {
+              serversByWorkspace.get(workspacePath)?.delete(server);
+            }
+          })
             .catch((error) => {
               console.error("[MCP Server] Connection error:", error);
               clearInterval(keepaliveInterval);

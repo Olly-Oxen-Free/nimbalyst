@@ -1,10 +1,15 @@
+// @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import {
   hasRunningTasks,
   shouldDeferTeardownForSubagents,
+  resolvePromptEndDelay,
+  resolveShellDrainMs,
+  DEFAULT_SHELL_DRAIN_MS,
   shouldExitDrain,
   classifyDrainOutcome,
   shouldSettleTaskFromToolResult,
+  shouldRecordTerminalNotification,
   mapTaskUpdatedPatchStatus,
   shouldApplyTaskUpdatedStatus,
   isNotificationFlushResult,
@@ -12,6 +17,7 @@ import {
   shouldContinueWithTaskResults,
   buildTaskResultContinuationMessage,
   findStalledTasks,
+  summarizeBackgroundWait,
 } from '../subagentDrain';
 
 describe('shouldSettleTaskFromToolResult', () => {
@@ -27,9 +33,12 @@ describe('shouldSettleTaskFromToolResult', () => {
     expect(shouldSettleTaskFromToolResult(task, ack)).toBe(false);
   });
 
-  it('never settles a local_bash task from a tool_result, whatever the content', () => {
+  // Updated for GitHub #1493: task TYPE is not evidence of backgroundness. The
+  // CLI tracks foreground Bash calls as local_bash too, so with no flag the
+  // acknowledgement text is what decides -- real output settles the task.
+  it('settles a local_bash with no flag when the result is real output', () => {
     const task = { taskType: 'local_bash', status: 'running' };
-    expect(shouldSettleTaskFromToolResult(task, 'exit code 0')).toBe(false);
+    expect(shouldSettleTaskFromToolResult(task, 'exit code 0')).toBe(true);
   });
 
   it('does not settle a backgrounded sub-agent (task_updated is_backgrounded)', () => {
@@ -86,6 +95,77 @@ describe('shouldSettleTaskFromToolResult', () => {
   it('settles on non-string content for a foreground sub-agent', () => {
     const task = { taskType: 'local_agent', status: 'running' };
     expect(shouldSettleTaskFromToolResult(task, [{ type: 'text', text: 'done' }])).toBe(true);
+  });
+
+  // Regression: GitHub #1493. The SDK tracks EVERY Bash call as a local_bash
+  // task, not just backgrounded ones, and reports foregroundness on
+  // task_started as is_backgrounded:false. Refusing to settle on taskType
+  // alone left a foreground shell "running" and then had the provider stamp
+  // isBackgrounded on it, so its terminal notification produced a bogus
+  // "background task(s) you launched have settled" continuation turn.
+  it('settles a foreground local_bash whose tool_result carries real output', () => {
+    const task = { taskType: 'local_bash', isBackgrounded: false, status: 'running' };
+    expect(shouldSettleTaskFromToolResult(task, 'exit code 0\nbuild ok')).toBe(true);
+  });
+
+  it('settles a foreground local_bash whose output arrives as content blocks', () => {
+    const task = { taskType: 'local_bash', isBackgrounded: false, status: 'running' };
+    expect(shouldSettleTaskFromToolResult(task, [{ type: 'text', text: 'ok' }])).toBe(true);
+  });
+
+  // The flag can be stale: a shell launched in the foreground and moved to the
+  // background returns the launch acknowledgement before any task_updated
+  // patch lands. The acknowledgement text still wins.
+  it('does not settle a local_bash marked foreground when the result is a launch acknowledgement', () => {
+    const task = { taskType: 'local_bash', isBackgrounded: false, status: 'running' };
+    const ack =
+      'Command running in background with ID: b0hywzbc1. Output is being written to: /tmp/tasks/b0hywzbc1.output.';
+    expect(shouldSettleTaskFromToolResult(task, ack)).toBe(false);
+  });
+
+  // Older CLIs omit is_backgrounded entirely. The launch-acknowledgement
+  // fallback is what has to carry NIM-1470 there.
+  it('refuses a local_bash with no flag on its launch acknowledgement', () => {
+    const task = { taskType: 'local_bash', status: 'running' };
+    expect(
+      shouldSettleTaskFromToolResult(task, 'Command running in background with ID: b0hywzbc1.'),
+    ).toBe(false);
+  });
+});
+
+describe('shouldRecordTerminalNotification', () => {
+  it('records everything still running at the lead result while draining', () => {
+    expect(shouldRecordTerminalNotification({ taskType: 'local_agent' }, true)).toBe(true);
+    expect(shouldRecordTerminalNotification({ taskType: 'local_bash', isBackgrounded: false }, true)).toBe(true);
+  });
+
+  // A shell launched in the foreground and auto-backgrounded gets promoted at
+  // the tool_result (the acknowledgement is the evidence), never via a patch.
+  // That promotion is what has to carry it into the notification gate.
+  it('records a local_bash promoted by its launch acknowledgement', () => {
+    expect(shouldRecordTerminalNotification({ taskType: 'local_bash', isBackgrounded: true }, false)).toBe(true);
+  });
+
+  it('records a backgrounded task off the drain path (#1410)', () => {
+    expect(shouldRecordTerminalNotification({ taskType: 'local_agent', isBackgrounded: true }, false)).toBe(true);
+  });
+
+  it('ignores a foreground sub-agent off the drain path', () => {
+    expect(shouldRecordTerminalNotification({ taskType: 'local_agent' }, false)).toBe(false);
+  });
+
+  // Regression: GitHub #1493. Admitting every local_bash turned each ordinary
+  // foreground Bash call into a queued "background task settled" continuation
+  // turn once the CLI started reporting shell tasks for foreground commands.
+  it('ignores a local_bash the SDK reported as foreground', () => {
+    expect(shouldRecordTerminalNotification({ taskType: 'local_bash', isBackgrounded: false }, false)).toBe(false);
+  });
+
+  // Type alone is not evidence. An unpromoted local_bash ran in the foreground
+  // and its output is already inline; a continuation would be a second, paid
+  // turn reporting something the model has seen.
+  it('ignores a local_bash with no background evidence at all', () => {
+    expect(shouldRecordTerminalNotification({ taskType: 'local_bash' }, false)).toBe(false);
   });
 });
 
@@ -331,6 +411,71 @@ describe('shouldDeferTeardownForSubagents', () => {
   });
 });
 
+describe('resolvePromptEndDelay', () => {
+  const WINDOWS = { idle: 30_000, subagent: 300_000, shell: 1_800_000 };
+
+  it('uses the short idle window when nothing is running', () => {
+    expect(resolvePromptEndDelay([], WINDOWS)).toBe(30_000);
+    expect(
+      resolvePromptEndDelay(
+        [{ status: 'completed', taskType: 'local_bash' }, { status: 'stopped' }],
+        WINDOWS,
+      ),
+    ).toBe(30_000);
+  });
+
+  it('uses the sub-agent stall window for running sub-agents', () => {
+    expect(resolvePromptEndDelay([{ status: 'running' }], WINDOWS)).toBe(300_000);
+    expect(
+      resolvePromptEndDelay([{ status: 'running', taskType: 'agent' }], WINDOWS),
+    ).toBe(300_000);
+  });
+
+  // Regression: GitHub #1355. A local_bash task streams no chunks while it runs,
+  // so it never reset the grace timer and the 5-minute sub-agent window killed
+  // every background shell that outran it.
+  it('uses the long shell window for a running background shell', () => {
+    expect(
+      resolvePromptEndDelay([{ status: 'running', taskType: 'local_bash' }], WINDOWS),
+    ).toBe(1_800_000);
+  });
+
+  it('takes the max so a stalled sub-agent cannot cut short a live shell', () => {
+    expect(
+      resolvePromptEndDelay(
+        [{ status: 'running' }, { status: 'running', taskType: 'local_bash' }],
+        WINDOWS,
+      ),
+    ).toBe(1_800_000);
+  });
+
+  it('ignores a settled shell so it stops holding the stream open', () => {
+    expect(
+      resolvePromptEndDelay(
+        [{ status: 'completed', taskType: 'local_bash' }, { status: 'running' }],
+        WINDOWS,
+      ),
+    ).toBe(300_000);
+  });
+});
+
+describe('resolveShellDrainMs', () => {
+  it('defaults to 30 minutes', () => {
+    expect(resolveShellDrainMs({})).toBe(DEFAULT_SHELL_DRAIN_MS);
+    expect(DEFAULT_SHELL_DRAIN_MS).toBe(1_800_000);
+  });
+
+  it('honors a positive override', () => {
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: '5000' })).toBe(5000);
+  });
+
+  it('falls back on a non-numeric or non-positive override', () => {
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: 'soon' })).toBe(DEFAULT_SHELL_DRAIN_MS);
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: '0' })).toBe(DEFAULT_SHELL_DRAIN_MS);
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: '-1' })).toBe(DEFAULT_SHELL_DRAIN_MS);
+  });
+});
+
 describe('shouldExitDrain', () => {
   it('exits once draining and all sub-agents have resolved', () => {
     expect(shouldExitDrain(true, true, false)).toBe(true);
@@ -375,5 +520,19 @@ describe('classifyDrainOutcome', () => {
     expect(
       classifyDrainOutcome({ wasDraining: true, hasRunningTasks: true, cause: 'interrupted' }),
     ).toEqual({ markStopped: true, autoContinue: false });
+  });
+});
+
+describe('summarizeBackgroundWait', () => {
+  const tasks = [
+    { taskId: 'a', description: 'Run the gates', taskType: 'local_bash', status: 'running', startedAt: 100 },
+    { taskId: 'b', description: 'Research', status: 'completed', startedAt: 50 },
+  ];
+
+  it('lists running tasks only once the lead turn is draining', () => {
+    expect(summarizeBackgroundWait(false, tasks)).toEqual([]);
+    expect(summarizeBackgroundWait(true, tasks)).toEqual([
+      { taskId: 'a', description: 'Run the gates', taskType: 'local_bash', startedAt: 100 },
+    ]);
   });
 });

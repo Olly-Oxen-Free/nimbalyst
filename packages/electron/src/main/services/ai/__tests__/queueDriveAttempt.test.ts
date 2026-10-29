@@ -47,6 +47,19 @@ describe('runQueueDriveAttempt', () => {
     });
   });
 
+  // A Claude Code turn that has answered but is draining a background shell
+  // holds both the chain guard and the running state for up to 30 minutes.
+  // Its live query can take the follow-up, so the prompt must not wait.
+  it('dispatches into a turn that is only draining background tasks', async () => {
+    const deps = createDeps({
+      isChainActive: vi.fn(() => true),
+      isSessionBusy: vi.fn(() => true),
+      canDispatchIntoDrain: vi.fn(() => true),
+    });
+
+    expect(await run(deps, 'renderer-trigger')).toEqual({ kind: 'dispatched', promptId: 'p1' });
+  });
+
   it.each([
     ['a queued chain is already running', { isChainActive: vi.fn(() => true) }],
     ['the session is mid-turn', { isSessionBusy: vi.fn(() => true) }],
@@ -55,6 +68,33 @@ describe('runQueueDriveAttempt', () => {
 
     expect(await run(deps)).toEqual({ kind: 'deferred', reason: 'session-busy' });
     expect(deps.resolveWindow).not.toHaveBeenCalled();
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  // NIM-7512: a turn blocked on a question reports `waiting_for_input`, and if it
+  // went straight to the tool call it never set `isStreaming`, so it looked idle.
+  // Dispatching then started a human turn that superseded the question.
+  it('holds the queue while the turn waits on an unanswered question, even into a drain', async () => {
+    const deps = createDeps({
+      isAwaitingUserInput: vi.fn(() => true),
+      canDispatchIntoDrain: vi.fn(() => true),
+    });
+
+    expect(await run(deps, 'renderer-trigger')).toEqual({ kind: 'deferred', reason: 'session-busy' });
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('lets an explicit send-now go out past an unanswered question', async () => {
+    const deps = createDeps({ isAwaitingUserInput: vi.fn(() => true) });
+
+    expect(await run(deps, 'send-now')).toEqual({ kind: 'dispatched', promptId: 'p1' });
+  });
+
+  // #1682: a prompt landing mid-commit makes the SDK report a rejection while the commit lands.
+  it('holds even a send-now while a commit proposal call is in flight', async () => {
+    const deps = createDeps({ isCommitProposalInFlight: vi.fn(() => true), canDispatchIntoDrain: vi.fn(() => true) });
+
+    expect(await run(deps, 'send-now')).toEqual({ kind: 'deferred', reason: 'session-busy' });
     expect(deps.dispatch).not.toHaveBeenCalled();
   });
 

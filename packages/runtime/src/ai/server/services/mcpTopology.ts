@@ -131,11 +131,13 @@ export const HOST_TOOLS: readonly string[] = [
   'appearance_set_theme',
   'appearance_set_completion_sound',
   'appearance_set_spellcheck',
+  'appearance_set_spellcheck_languages',
   'ai_set_default_model',
   'ai_set_preferred_language',
   'analytics_set_enabled',
   'features_toggle',
   'extension_set_enabled',
+  'extensions_list',
   'sync_set_for_project',
   'workspace_create',
   // Keeps `workspace_open` (consistent with workspace_create / workspace_set_trust);
@@ -144,11 +146,13 @@ export const HOST_TOOLS: readonly string[] = [
   'workspace_set_trust',
   // Session-context (was nimbalyst-session-context)
   'get_session_summary',
+  'get_session_coaching_signals',
   'get_workstream_overview',
   'get_workstream_edited_files',
   'list_recent_sessions',
   'schedule_wakeup',
   'update_session_board',
+  'list_citable_inputs',
   // Child-session orchestration (was nimbalyst-meta-agent)
   'create_session',
   'spawn_session',
@@ -174,6 +178,7 @@ export const HOST_TOOLS: readonly string[] = [
 export const TRACKER_TOOLS: readonly string[] = [
   'tracker_list',
   'tracker_ready',
+  'work_radar',
   'tracker_get',
   'tracker_get_by_urn',
   'tracker_create',
@@ -214,12 +219,17 @@ export const SITUATIONAL_TOOLS: readonly string[] = [
   // project canvas presence: an attention declaration, never a lock
   'declareCanvasWorkingSet',
   'releaseCanvasWorkingSet',
-  // shared-index (first-class shared folders + documents) management
+  // Pages: the Team and Personal page trees
   'createSharedDoc',
   'createSharedFolder',
+  'importFileToPages',
   'moveSharedItem',
   'renameSharedItem',
   'deleteSharedItem',
+  'listPages',
+  'searchPages',
+  'setPageType',
+  'setPageFields',
   // read-only organization/resource discovery for cross-user collaboration
   'findOrgMembers',
   'getResourceSharingStatus',

@@ -1,8 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { getFolderContents } from '../FileTree';
+// @vitest-environment node
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { stat } from 'fs/promises';
+import { getFolderContents, listFolderFilesRecursive } from '../FileTree';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+
+vi.mock('fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('fs/promises')>();
+    return { ...actual, stat: vi.fn(actual.stat) };
+});
 
 describe('FileTree All Files Mode', () => {
     let tempDir: string;
@@ -13,6 +20,16 @@ describe('FileTree All Files Mode', () => {
 
     afterEach(() => {
         fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it('discards a scan cancelled while directory I/O is pending', async () => {
+        fs.mkdirSync(path.join(tempDir, 'nested'));
+        fs.writeFileSync(path.join(tempDir, 'nested', 'document.md'), '# test');
+        const controller = new AbortController();
+        const scan = getFolderContents(tempDir, 0, controller.signal);
+        controller.abort();
+        expect(await scan).toEqual([]);
+        expect((await getFolderContents(tempDir))[0].children).toHaveLength(1);
     });
 
     it('should return all folders including those without known file extensions', async () => {
@@ -53,6 +70,54 @@ describe('FileTree All Files Mode', () => {
 
         // Verify we got 8 items total
         expect(result.length).toBe(8);
+    });
+
+    it('marks a folder past the depth limit as unread rather than empty', async () => {
+        // d1/.../d10: the walk lists d9 inside d8 but does not read it.
+        const chain = Array.from({ length: 10 }, (_, i) => `d${i + 1}`);
+        fs.mkdirSync(path.join(tempDir, ...chain), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, ...chain, 'deep.ts'), '');
+
+        let level = await getFolderContents(tempDir);
+        const seen: Array<{ name: string; truncated: boolean }> = [];
+        while (level.length > 0) {
+            const dir = level[0];
+            seen.push({ name: dir.name, truncated: dir.childrenTruncated === true });
+            level = dir.children ?? [];
+        }
+
+        expect(seen.find((entry) => entry.truncated)?.name).toBe('d9');
+        expect(seen.filter((entry) => entry.truncated)).toHaveLength(1);
+    });
+
+    it('applies the per-directory cap to the sorted list, not to raw readdir order', async () => {
+        const names = Array.from({ length: 250 }, (_, i) => `a-${String(i + 1).padStart(3, '0')}.md`);
+        // Create in reverse so the first entries returned by readdir are the ones that sort last.
+        for (const name of [...names].reverse()) fs.writeFileSync(path.join(tempDir, name), '');
+        fs.writeFileSync(path.join(tempDir, 'zz-last.md'), '');
+        fs.mkdirSync(path.join(tempDir, 'zz-dir'));
+
+        const result = await getFolderContents(tempDir);
+
+        expect(result).toHaveLength(200);
+        // Directories sort first, so the late-named folder survives the cap.
+        expect(result[0].name).toBe('zz-dir');
+        expect(result.slice(1).map(item => item.name)).toEqual(names.slice(0, 199));
+    });
+
+    it('sorts symlinks by target type but never stats a link that cannot make the cap', async () => {
+        for (let i = 1; i <= 201; i++) fs.mkdirSync(path.join(tempDir, `d-${String(i).padStart(3, '0')}`));
+        fs.symlinkSync(path.join(tempDir, 'd-001'), path.join(tempDir, 'a-link'));
+        fs.symlinkSync(path.join(tempDir, 'd-001'), path.join(tempDir, 'zz-link'));
+        vi.mocked(stat).mockClear();
+
+        const result = await getFolderContents(tempDir);
+
+        expect(result).toHaveLength(200);
+        expect(result[0]).toMatchObject({ name: 'a-link', type: 'directory' });
+        expect(result.map(item => item.name)).not.toContain('zz-link');
+        // Only a-link could land inside the cap; zz-link sorts after d-199 even as a directory.
+        expect(vi.mocked(stat).mock.calls.map(([p]) => path.basename(String(p)))).toEqual(['a-link']);
     });
 
     it('should return empty folders', async () => {
@@ -133,6 +198,45 @@ describe('FileTree All Files Mode', () => {
         expect(names).not.toContain('node_modules');
         expect(names).not.toContain('.git');
         expect(names).not.toContain('.venv');
+    });
+});
+
+describe('listFolderFilesRecursive', () => {
+    let tempDir: string;
+
+    beforeEach(() => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'filetree-recursive-'));
+    });
+
+    afterEach(() => {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it('returns folder-relative paths at any depth and prunes excluded directories', async () => {
+        fs.mkdirSync(path.join(tempDir, 'a', 'b', 'c'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'node_modules'));
+        fs.writeFileSync(path.join(tempDir, 'root.md'), '');
+        fs.writeFileSync(path.join(tempDir, 'a', 'one.md'), '');
+        fs.writeFileSync(path.join(tempDir, 'a', 'b', 'c', 'deep.md'), '');
+        fs.writeFileSync(path.join(tempDir, 'node_modules', 'ignored.md'), '');
+
+        const result = await listFolderFilesRecursive(tempDir);
+
+        expect(result.files).toEqual(['a/b/c/deep.md', 'a/one.md', 'root.md']);
+        expect(result.truncated).toBe(false);
+    });
+
+    it('reports truncation rather than silently dropping files past the cap', async () => {
+        // The sidebar walk caps at 200 per directory with no signal. A share
+        // promote that dropped files without saying so would look complete.
+        for (let index = 0; index < 12; index += 1) {
+            fs.writeFileSync(path.join(tempDir, `file-${index}.md`), '');
+        }
+
+        const result = await listFolderFilesRecursive(tempDir, { limit: 5 });
+
+        expect(result.files).toHaveLength(5);
+        expect(result.truncated).toBe(true);
     });
 });
 

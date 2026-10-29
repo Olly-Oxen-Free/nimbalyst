@@ -26,18 +26,21 @@ import {
   useRole,
 } from '@floating-ui/react';
 import { windowControlsClearance } from '../../../ui/floating/windowControlsClearance';
-import { MaterialSymbol } from '../../../ui';
-import type { FieldDefinition } from '../models/TrackerDataModel';
+import { MaterialSymbol } from '../../../ui/icons/MaterialSymbol';
+import type { FieldDefinition } from '@nimbalyst/tracker-schema';
 import {
   TrackerFieldEditor,
   formatDateTimeDisplay,
   type TeamMemberOption,
 } from './TrackerFieldEditor';
 import type { RelationshipCandidate } from './RelationshipFieldEditor';
+import type { CitationInspectorHost } from './CitationInspector';
 import { CollectionPickerPopover } from './CollectionPickerPopover';
+import { TrackerFieldChoiceList, teamMemberChoices, type TrackerFieldChoice } from './TrackerFieldChoiceList';
 import { isCollectionRelationshipField } from '../models/trackerCollections';
 import { UserAvatar } from './UserAvatar';
-import { formatTrackerFieldLabel, isTrackerFieldEmpty } from './trackerFieldLayout';
+import { isTrackerFieldEmpty, shouldLabelTrackerField, trackerFieldDisplayLabel } from './trackerFieldLayout';
+import { labelRefDisplayNames } from './labelRefValue';
 import './TrackerFieldPills.css';
 
 /** Default prefix for the `data-testid`s this component emits. */
@@ -46,24 +49,9 @@ const DEFAULT_TEST_ID_BASE = 'tracker-field';
 /** How long a text-like edit sits before it is written through. */
 const TEXT_SAVE_DEBOUNCE_MS = 500;
 
-/**
- * Field types whose value never says which field it belongs to. A date reads
- * "May 29, 2026" and a URL reads "drive.google.com" whether it is the shoot
- * date or the delivery date, the brief or the final cut — so a schema with two
- * of them produces two chips a reader can only tell apart by opening them
- * (#1166). These carry their label in the chip; select and boolean values are
- * already their own label, and text and number chips read as themselves.
- */
-const SELF_ANONYMOUS_FIELD_TYPES = new Set([
-  'date',
-  'datetime',
-  'url',
-  'user',
-  'relationship',
-  'reference',
-]);
-
 export interface TrackerFieldPillsProps {
+  /** Label otherwise anonymous values; preserve compact document headers by default. */
+  labelFields?: boolean;
   /** Fields to render, already ordered — see `useTrackerFieldLayout`. */
   fields: FieldDefinition[];
   /** Current field values, keyed by field name. */
@@ -74,6 +62,8 @@ export interface TrackerFieldPillsProps {
   teamMembers?: TeamMemberOption[];
   /** Relationship targets, keyed by field name. */
   relationshipCandidates?: Map<string, RelationshipCandidate[]>;
+  /** Item lookup and exact-revision read for `citation` chips. */
+  citationHost?: CitationInspectorHost;
   /** Persist one field. Called with the field name and its next value. */
   onSave: (fieldName: string, value: unknown) => void | Promise<void>;
   /** Open a related tracker item (relationship chip click-through). */
@@ -84,6 +74,14 @@ export interface TrackerFieldPillsProps {
    * existing collections.
    */
   onCreateCollection?: (title: string, type: string) => Promise<RelationshipCandidate | null>;
+  /**
+   * Fields whose value was carried over rather than chosen for this item —
+   * they render with a distinct treatment. The quick-create popup's rapid-fire
+   * loop reuses the previous item's priority/assignee/milestone, and a run that
+   * silently inherits `critical` from the first item is the failure this marking
+   * exists to prevent.
+   */
+  carriedFieldNames?: ReadonlySet<string>;
   /** Extra class on the chip row for surface-specific layout. */
   className?: string;
   /**
@@ -94,14 +92,18 @@ export interface TrackerFieldPillsProps {
 }
 
 export interface TrackerFieldPillProps {
+  labelFields?: boolean;
   field: FieldDefinition;
   value: unknown;
   editable: boolean;
   teamMembers?: TeamMemberOption[];
   relationshipCandidates?: RelationshipCandidate[];
+  citationHost?: CitationInspectorHost;
   onOpenItem?: (itemId: string) => void;
   onCreateCollection?: (title: string, type: string) => Promise<RelationshipCandidate | null>;
   onSave: (fieldName: string, value: unknown) => void | Promise<void>;
+  /** See `TrackerFieldPillsProps.carriedFieldNames`. */
+  carried?: boolean;
   testIdBase?: string;
 }
 
@@ -143,7 +145,11 @@ function fieldDisplayValue(
   teamMembers: TeamMemberOption[],
   relationshipCandidates?: RelationshipCandidate[],
 ): string {
-  if (isTrackerFieldEmpty(value)) return formatTrackerFieldLabel(field.name);
+  if (isTrackerFieldEmpty(value)) return trackerFieldDisplayLabel(field);
+  if (field.type === 'label-ref') {
+    const names = labelRefDisplayNames(value);
+    return names.length <= 2 ? names.join(', ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
+  }
   if (field.type === 'select') {
     return field.options?.find((option) => option.value === value)?.label ?? String(value);
   }
@@ -159,13 +165,19 @@ function fieldDisplayValue(
   if (field.type === 'relationship' || field.type === 'reference') {
     return relationshipLabel(value, relationshipCandidates);
   }
+  if (field.type === 'citation') {
+    // Citations are plural by definition; the chip says how many and the
+    // inspector behind it says what they are.
+    const entries = Array.isArray(value) ? value : [value];
+    return entries.length === 1 ? '1 citation' : `${entries.length} citations`;
+  }
   if (field.type === 'date' || field.type === 'datetime') {
     return formatDateTimeDisplay(value).display;
   }
   if (field.type === 'boolean') return value ? 'Yes' : 'No';
   if (field.type === 'url' && typeof value === 'object') {
     const url = value as { label?: unknown; url?: unknown };
-    return String(url.label ?? url.url ?? formatTrackerFieldLabel(field.name));
+    return String(url.label ?? url.url ?? trackerFieldDisplayLabel(field));
   }
   return String(value);
 }
@@ -177,7 +189,9 @@ function fieldIcon(field: FieldDefinition, value: unknown): string {
   }
   if (field.type === 'user') return 'person';
   if (field.type === 'array') return 'label';
+  if (field.type === 'label-ref') return 'sell';
   if (field.type === 'relationship' || field.type === 'reference') return 'link';
+  if (field.type === 'citation') return 'format_quote';
   if (field.type === 'date' || field.type === 'datetime') return 'calendar_today';
   if (field.type === 'boolean') return value ? 'check_box' : 'check_box_outline_blank';
   if (field.type === 'number') return 'numbers';
@@ -196,14 +210,17 @@ export const TrackerFieldPopoverHeader: React.FC<{
 );
 
 export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
+  labelFields = false,
   field,
   value,
   editable,
   teamMembers,
   relationshipCandidates,
+  citationHost,
   onOpenItem,
   onCreateCollection,
   onSave,
+  carried = false,
   testIdBase = DEFAULT_TEST_ID_BASE,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -223,10 +240,10 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
   // and starting a new one are the whole job, and the generic relationship
   // typeahead does neither well.
   const isCollectionField = isCollectionRelationshipField(field);
-  const label = formatTrackerFieldLabel(field.name);
+  const label = trackerFieldDisplayLabel(field);
   const displayValue = fieldDisplayValue(field, localValue, members, relationshipCandidates);
   // An empty chip already reads as its label, so only a filled one needs one.
-  const showLabel = !empty && SELF_ANONYMOUS_FIELD_TYPES.has(field.type);
+  const showLabel = shouldLabelTrackerField(field, localValue, labelFields);
 
   useEffect(() => {
     if (!hasPendingSaveRef.current) {
@@ -303,25 +320,16 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
     void onSave(field.name, nextValue);
   }, [field.name, onSave]);
 
-  const directChoices = useMemo(() => {
+  const directChoices = useMemo((): TrackerFieldChoice[] => {
     if (field.type === 'select') {
       return (field.options ?? []).map((option) => ({
         value: option.value,
         label: option.label,
         icon: option.icon,
         color: option.color,
-        avatarIdentity: undefined as string | undefined,
       }));
     }
-    if (field.type === 'user') {
-      return members.map((member) => ({
-        value: member.email,
-        label: member.name ?? member.email,
-        icon: 'person',
-        color: undefined,
-        avatarIdentity: member.name ?? member.email,
-      }));
-    }
+    if (field.type === 'user') return teamMemberChoices(members);
     return [];
   }, [field.options, field.type, members]);
 
@@ -337,7 +345,7 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
         ref={floating.refs.setReference}
         {...getReferenceProps()}
         type="button"
-        className={`tracker-field-pill ${empty ? 'tracker-field-pill-empty' : 'tracker-field-pill-set'}${showLabel ? ' tracker-field-pill-labeled' : ''}`}
+        className={`tracker-field-pill ${empty ? 'tracker-field-pill-empty' : 'tracker-field-pill-set'}${showLabel ? ' tracker-field-pill-labeled' : ''}${carried ? ' tracker-field-pill-carried' : ''}`}
         disabled={!editable}
         onClick={() => {
           if (togglesDirectly) {
@@ -403,52 +411,13 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
                 testIdBase={`${testIdBase}-collection-picker`}
               />
             ) : directChoiceField ? (
-              <div
-                className="tracker-field-choice-list"
-                data-testid={`${testIdBase}-choices-${field.name}`}
-              >
-                {!field.required && (
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={empty}
-                    className={empty
-                      ? 'tracker-field-choice tracker-field-choice-selected'
-                      : 'tracker-field-choice'}
-                    onClick={() => handleDirectChange('')}
-                  >
-                    <MaterialSymbol icon="remove" size={15} />
-                    <span className="tracker-field-choice-label">None</span>
-                  </button>
-                )}
-                {directChoices.map((choice) => {
-                  const selected = choice.value === localValue;
-                  return (
-                    <button
-                      key={choice.value}
-                      type="button"
-                      role="option"
-                      aria-selected={selected}
-                      className={selected
-                        ? 'tracker-field-choice tracker-field-choice-selected'
-                        : 'tracker-field-choice'}
-                      onClick={() => handleDirectChange(choice.value)}
-                    >
-                      {choice.avatarIdentity ? (
-                        <UserAvatar identity={choice.avatarIdentity} size={16} />
-                      ) : (
-                        <MaterialSymbol
-                          icon={choice.icon ?? 'circle'}
-                          size={15}
-                          style={choice.color ? { color: choice.color } : undefined}
-                        />
-                      )}
-                      <span className="tracker-field-choice-label">{choice.label}</span>
-                      {selected && <MaterialSymbol icon="check" size={15} />}
-                    </button>
-                  );
-                })}
-              </div>
+              <TrackerFieldChoiceList
+                choices={directChoices}
+                value={localValue}
+                allowNone={!field.required}
+                onPick={handleDirectChange}
+                testId={`${testIdBase}-choices-${field.name}`}
+              />
             ) : (
               <TrackerFieldEditor
                 field={field}
@@ -456,6 +425,7 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
                 onChange={handleChange}
                 teamMembers={members}
                 relationshipCandidates={relationshipCandidates}
+                citationHost={citationHost}
                 onOpenRelationship={onOpenItem}
                 showLabel={false}
               />
@@ -468,14 +438,17 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
 };
 
 export const TrackerFieldPills: React.FC<TrackerFieldPillsProps> = ({
+  labelFields = false,
   fields,
   values,
   editable = true,
   teamMembers,
   relationshipCandidates,
+  citationHost,
   onSave,
   onOpenItem,
   onCreateCollection,
+  carriedFieldNames,
   className,
   testIdBase = DEFAULT_TEST_ID_BASE,
 }) => {
@@ -488,15 +461,18 @@ export const TrackerFieldPills: React.FC<TrackerFieldPillsProps> = ({
     >
       {fields.map((field) => (
         <TrackerFieldPill
+          labelFields={labelFields}
           key={field.name}
           field={field}
           value={values[field.name]}
           editable={editable}
           teamMembers={teamMembers}
           relationshipCandidates={relationshipCandidates?.get(field.name)}
+          citationHost={citationHost}
           onOpenItem={onOpenItem}
           onCreateCollection={onCreateCollection}
           onSave={onSave}
+          carried={carriedFieldNames?.has(field.name) ?? false}
           testIdBase={testIdBase}
         />
       ))}

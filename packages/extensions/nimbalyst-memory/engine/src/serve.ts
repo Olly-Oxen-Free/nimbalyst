@@ -11,12 +11,12 @@
  *   NIMBALYST_MEMORY_DB            shadow-index path (default: <root>/.nimbalyst-memory/index.db)
  *   NIMBALYST_MEMORY_FACTS_DIR     facts dir, relative (default: nimbalyst-local/voice-memory)
  *   NIMBALYST_MEMORY_CONFIG        path to a JSON config file (overrides sources/factsDir/chunk)
- *   NIMBALYST_MEMORY_EMBEDDER      "openai" | "local" (default: openai)
- *   NIMBALYST_MEMORY_OPENAI_KEY    OpenAI API key (required for the openai embedder)
+ *   NIMBALYST_MEMORY_EMBEDDER      "sparse" | "openai" | "local" (default: sparse)
+ *   NIMBALYST_MEMORY_OPENAI_KEY    explicit value for the openai embedder
  *   NIMBALYST_MEMORY_OPENAI_MODEL  default: text-embedding-3-small
  *   NIMBALYST_MEMORY_OPENAI_DIMS   default: 1536
  *   NIMBALYST_MEMORY_OPENAI_BASEURL  optional OpenAI-compatible base URL
- *   NIMBALYST_MEMORY_LOCAL_MODEL   default: Xenova/bge-m3
+ *   NIMBALYST_MEMORY_LOCAL_MODEL   default: Xenova/bge-small-en-v1.5
  *   NIMBALYST_BETTER_SQLITE3_NATIVE  optional native-binding path (ABI portability)
  */
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -25,19 +25,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { MemoryEngine } from './engine.js';
 import { createEmbedder, type EmbedderConfig } from './embedders/factory.js';
 import { createMcpServer } from './mcp/server.js';
-import type { EngineConfig, SourceSet } from './types.js';
+import { defaultSources } from './sources.js';
+import type { EngineConfig } from './types.js';
 
 const log = (msg: string) => process.stderr.write(`[memory-engine] ${msg}\n`);
-
-function defaultSources(factsDir: string): SourceSet[] {
-  return [
-    { sourceClass: 'design', include: ['design/**/*.md'] },
-    { sourceClass: 'docs', include: ['docs/**/*.md'] },
-    { sourceClass: 'plans', include: ['nimbalyst-local/plans/**/*.md'] },
-    { sourceClass: 'claude', include: ['CLAUDE.md', '**/CLAUDE.md'] },
-    { sourceClass: 'facts', include: [`${factsDir}/**/*.md`] },
-  ];
-}
 
 function buildConfig(): EngineConfig {
   const root = path.resolve(process.env.NIMBALYST_MEMORY_ROOT || process.cwd());
@@ -47,7 +38,7 @@ function buildConfig(): EngineConfig {
   );
   mkdirSync(path.dirname(dbPath), { recursive: true });
 
-  let sources = defaultSources(factsDir);
+  let sources = defaultSources(factsDir, root);
   let chunk: EngineConfig['chunk'];
   const configFile = process.env.NIMBALYST_MEMORY_CONFIG;
   if (configFile) {
@@ -71,20 +62,33 @@ function buildConfig(): EngineConfig {
 }
 
 function buildEmbedderConfig(): EmbedderConfig {
-  const kind = (process.env.NIMBALYST_MEMORY_EMBEDDER || 'openai').toLowerCase();
+  // Keyword-only is the default, but an explicitly-set provider key is itself a
+  // configuration choice: honour it rather than silently serving keyword-only.
+  const defaultKind = process.env.NIMBALYST_MEMORY_OPENAI_KEY ? 'openai' : 'sparse';
+  const kind = (process.env.NIMBALYST_MEMORY_EMBEDDER || defaultKind).toLowerCase();
+  if (kind === 'sparse') {
+    return { kind: 'sparse' };
+  }
   if (kind === 'local') {
     return { kind: 'local', model: process.env.NIMBALYST_MEMORY_LOCAL_MODEL };
   }
-  const apiKey = process.env.NIMBALYST_MEMORY_OPENAI_KEY || '';
-  return {
-    kind: 'openai',
-    apiKey,
-    model: process.env.NIMBALYST_MEMORY_OPENAI_MODEL,
-    dims: process.env.NIMBALYST_MEMORY_OPENAI_DIMS
-      ? Number(process.env.NIMBALYST_MEMORY_OPENAI_DIMS)
-      : undefined,
-    baseUrl: process.env.NIMBALYST_MEMORY_OPENAI_BASEURL,
-  };
+  if (kind === 'openai') {
+    const apiKey = process.env.NIMBALYST_MEMORY_OPENAI_KEY;
+    if (!apiKey) {
+      log('optional semantic matching is unavailable; using local keyword retrieval');
+      return { kind: 'sparse' };
+    }
+    return {
+      kind: 'openai',
+      apiKey,
+      model: process.env.NIMBALYST_MEMORY_OPENAI_MODEL,
+      dims: process.env.NIMBALYST_MEMORY_OPENAI_DIMS
+        ? Number(process.env.NIMBALYST_MEMORY_OPENAI_DIMS)
+        : undefined,
+      baseUrl: process.env.NIMBALYST_MEMORY_OPENAI_BASEURL,
+    };
+  }
+  throw new Error(`Unknown embedder kind: ${kind}`);
 }
 
 async function main(): Promise<void> {

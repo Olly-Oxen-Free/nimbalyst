@@ -4,12 +4,16 @@
  * attaches to a set of globs (e.g. "design", "docs", "facts"); the engine never
  * interprets it.
  */
+import type { SourceRoot } from './roots.js';
 
 /** A heading-aware slice of a markdown document, ready to embed and store. */
 export interface Chunk {
   /** Stable within a (sourcePath): `${sourcePath}#${ordinal}`. */
   id: string;
-  /** Path relative to the engine root, POSIX-separated. */
+  /**
+   * POSIX path relative to the primary engine root, or `@<rootId>/<rel>` for a
+   * source set with its own root. Unique across roots — see `roots.ts`.
+   */
   sourcePath: string;
   /** Free-form caller tag for the source set this file belongs to. */
   sourceClass: string;
@@ -29,11 +33,35 @@ export interface Chunk {
    */
   refType: string;
   /**
-   * Opaque, openable identifier for the entity (e.g. a tracker id, a session id,
-   * or — for `'doc-file'` — the file's `sourcePath`).
+   * Opaque, openable identifier for the entity (e.g. a tracker id, a session
+   * id, or — for `'doc-file'` — the file's `sourcePath`). A file under a
+   * non-primary root carries its ABSOLUTE path instead: it is not reachable by
+   * joining the workspace path, which is how callers resolve a relative one.
    */
   refId: string;
+  /**
+   * Retrieval granularity of this row (amendment A2 of the memory-v3 plan).
+   *
+   * `'chunk'` — a heading-aware slice, the unit everything already used.
+   * `'page'` — one row covering the source's first `PAGE_VECTOR_BYTES`, stored
+   * alongside its chunks so a whole-document embedding can act as a THIRD
+   * fusion arm. It is never a replacement: this corpus contains documents far
+   * past any embedding window, so the tail of a long page is simply not
+   * represented and chunk rows remain the only complete coverage.
+   *
+   * Absent on rows written before the column existed; treat as `'chunk'`.
+   */
+  granularity?: ChunkGranularity;
 }
+
+export type ChunkGranularity = 'chunk' | 'page';
+
+/**
+ * How much of a source the page-level vector covers. The amendment proposes
+ * ~8 KB, which is also the soft page-size limit discussed for authored memory
+ * pages, and comfortably inside a typical embedding context window.
+ */
+export const PAGE_VECTOR_BYTES = 8192;
 
 /** A chunk as persisted, carrying its embedding + provenance. */
 export interface StoredChunk extends Chunk {
@@ -96,12 +124,25 @@ export interface Embedder {
 /** One indexable source set: a class tag plus the globs that feed it. */
 export interface SourceSet {
   sourceClass: string;
-  /** Glob patterns relative to root (fast-glob syntax). */
+  /** Glob patterns relative to this set's root (fast-glob syntax). */
   include: string[];
+  /**
+   * Optional root these globs resolve against, for content that does not live
+   * under `EngineConfig.root` (e.g. the harness memory directory in the user's
+   * home). Omit for the primary root — the common case.
+   *
+   * A non-primary root changes the shape of every `sourcePath` derived from it:
+   * it is prefixed `@<rootId>/`, because relative-to-root alone stops being
+   * unique once there is more than one root. See `roots.ts`.
+   */
+  root?: SourceRoot;
 }
 
 export interface EngineConfig {
-  /** Absolute root the engine indexes and resolves relative paths against. */
+  /**
+   * Absolute PRIMARY root. Bare relative `sourcePath`s resolve against it, and
+   * it is the root for every source set that does not declare its own.
+   */
   root: string;
   /** Absolute path to the SQLite shadow-index file. Rebuildable; deletable. */
   dbPath: string;
@@ -149,6 +190,36 @@ export interface SearchHit {
    * come from one or both. Omitted only by callers that don't compute it.
    */
   signals?: { dense: boolean; sparse: boolean };
+  /**
+   * Raw per-arm scores, before RRF. `score` above is a fused RANK reciprocal
+   * and is not comparable across queries, so it cannot carry a threshold.
+   * Duplicate detection needs the dense cosine to decide "close enough to
+   * warn". Absent for an arm that did not surface this hit.
+   */
+  similarity?: { cosine?: number; bm25?: number };
+}
+
+/** Stable retrieval capability data returned by status and search tools. */
+export interface RetrievalCapabilities {
+  mode: 'hybrid' | 'keyword-only';
+  semantic: {
+    available: boolean;
+    reason?: 'optional-embedding-provider-unavailable';
+  };
+  keyword: {
+    available: true;
+    source: 'local-project-index';
+  };
+}
+
+export interface ProjectSearchResponse {
+  chunks: SearchHit[];
+  capabilities: RetrievalCapabilities;
+  fallback: {
+    used: boolean;
+    kind: 'local-keyword-index';
+    hint: string;
+  };
 }
 
 /** A single fact, parsed from its markdown file + frontmatter. */

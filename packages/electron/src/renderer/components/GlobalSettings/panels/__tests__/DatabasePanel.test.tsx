@@ -1,31 +1,102 @@
 // @vitest-environment jsdom
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { Provider } from 'jotai';
 
 vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({
   MaterialSymbol: ({ icon }: { icon: string }) => <span data-icon={icon} />,
 }));
 
+vi.mock('../../../../dialogs/requestConfirmation', () => ({ requestConfirmation: vi.fn() }));
+
+import { store } from '@nimbalyst/runtime/store';
+import { requestConfirmation } from '../../../../dialogs/requestConfirmation';
 import { DatabasePanel } from '../DatabasePanel';
+import type { MigrationOperationSnapshot } from '../../../../../shared/migrationOperation';
+import { hydrateMigrationOperation, refreshDbRecoveryState } from '../../../../store/listeners/dbMigrationListeners';
+import {
+  dbMigrationOperationAtom,
+  dbMigratedCopiesAtom,
+  dbMigrationBlockedAtom,
+  dbRecoveryCandidatesAtom,
+  dbRecoveryOfferAtom,
+  type MigratedCopyView,
+  type MigrationBlockedState,
+  type RecoveryCandidateView,
+} from '../../../../store/atoms/dbMigration';
 
 type Backend = 'pglite' | 'sqlite';
 
-function installMigrationApi(activeBackend: Backend) {
+interface RecoveryFixtures {
+  historyRowsQuarantined?: number;
+  operation?: MigrationOperationSnapshot;
+  candidates?: RecoveryCandidateView[];
+  migratedCopies?: MigratedCopyView[];
+  migrationBlocked?: MigrationBlockedState | null;
+}
+
+function candidate(overrides: Partial<RecoveryCandidateView> = {}): RecoveryCandidateView {
+  return {
+    id: 'artifact:pglite-db.backup-2026-08-21T04-11-02-004Z',
+    name: 'pglite-db.backup-2026-08-21T04-11-02-004Z',
+    path: '/u/pglite-db.backup-2026-08-21T04-11-02-004Z',
+    sizeBytes: 512 * 1024 * 1024,
+    sizeBucket: 'under-1gb',
+    createdAt: '2026-08-21T04:11:02.004Z',
+    verdict: 'recovery_recommended',
+    reasonCode: 'live_empty_on_established_install',
+    mayOfferProactively: true,
+    factsFingerprint: 'fp-abc',
+    restoreAvailable: true,
+    restoreUnavailableReason: null,
+    ...overrides,
+  };
+}
+
+function installMigrationApi(activeBackend: Backend, recovery: RecoveryFixtures = {}) {
   const invoke = vi.fn(async (channel: string) => {
     if (channel === 'db:migration:get-status') {
       return {
         success: true,
         activeBackend,
+        historyRowsQuarantined: recovery.historyRowsQuarantined,
+        operation: recovery.operation,
         pgliteDirExists: activeBackend === 'pglite',
         sqliteDirExists: activeBackend === 'sqlite',
-        migratedDirs: [],
+        migratedDirs: (recovery.migratedCopies ?? []).map((c) => c.name),
+        migrationBlocked: recovery.migrationBlocked ?? null,
         running: false,
         runningDryRun: false,
       };
     }
     if (channel === 'db:migration:dry-run-status') {
       return { success: true, available: false };
+    }
+    if (channel === 'db:recovery:list-candidates') {
+      return {
+        success: true,
+        activeBackend,
+        live: {
+          backend: activeBackend,
+          path: '/u/pglite-db',
+          sizeBytes: 3 * 1024 * 1024,
+          sizeBucket: 'under-32mb',
+        },
+        candidates: recovery.candidates ?? [],
+      };
+    }
+    if (channel === 'db:recovery:list-migrated') {
+      return { success: true, activeBackend, copies: recovery.migratedCopies ?? [] };
+    }
+    if (channel === 'db:recovery:recover') {
+      return { success: true, outcome: { ok: true } };
+    }
+    if (channel === 'db:migration:clear-block' || channel === 'db:recovery:delete-migrated') {
+      return { success: true };
+    }
+    if (channel === 'db:migration:rollback') {
+      return { success: true, restoredFrom: '/u/pglite-db.migrated' };
     }
     if (channel === 'db:migration:dry-run') {
       return { success: false, error: 'not expected in this test' };
@@ -36,7 +107,30 @@ function installMigrationApi(activeBackend: Backend) {
   return invoke;
 }
 
+function renderPanel() {
+  return render(
+    <Provider store={store}>
+      <DatabasePanel />
+    </Provider>,
+  );
+}
+
+function resetRecoveryAtoms() {
+  store.set(dbMigrationOperationAtom, null);
+  store.set(dbRecoveryCandidatesAtom, []);
+  store.set(dbRecoveryOfferAtom, null);
+  store.set(dbMigratedCopiesAtom, []);
+  store.set(dbMigrationBlockedAtom, null);
+}
+
 describe('DatabasePanel dry-run eligibility', () => {
+  it('shows the durable partial-history warning after restart without an operation snapshot', async () => {
+    installMigrationApi('sqlite', { historyRowsQuarantined: 2 });
+    render(<Provider store={store}><DatabasePanel /></Provider>);
+    expect(await screen.findByText(/Migration completed with 2 document-history entries omitted/)).toBeTruthy();
+    expect(screen.getByText(/original data is retained in a local recovery record/)).toBeTruthy();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -77,5 +171,190 @@ describe('DatabasePanel dry-run eligibility', () => {
     await screen.findByText('SQLite (new)');
     screen.getByText(/No further\s+migration is needed/i);
     expect(screen.queryByRole('button', { name: 'Migrate to SQLite' })).toBeNull();
+  });
+});
+
+describe('recovery candidates', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRecoveryAtoms();
+  });
+
+  afterEach(() => {
+    cleanup();
+    delete (window as any).electronAPI;
+  });
+
+  // The whole point of the verdict vocabulary: an ambiguous candidate is
+  // visible but never raised as a recommendation, and two recommendations are
+  // a choice we do not make for the user.
+  it('only raises a proactive offer for a single candidate cleared for one', async () => {
+    installMigrationApi('pglite', {
+      candidates: [candidate({ verdict: 'needs_review', mayOfferProactively: false })],
+    });
+    await refreshDbRecoveryState();
+    expect(store.get(dbRecoveryOfferAtom)).toBeNull();
+    expect(store.get(dbRecoveryCandidatesAtom)).toHaveLength(1);
+
+    installMigrationApi('pglite', {
+      candidates: [
+        candidate({ id: 'artifact:a', name: 'a' }),
+        candidate({ id: 'artifact:b', name: 'b' }),
+      ],
+    });
+    await refreshDbRecoveryState();
+    expect(store.get(dbRecoveryOfferAtom)).toBeNull();
+
+    installMigrationApi('pglite', { candidates: [candidate()] });
+    await refreshDbRecoveryState();
+    expect(store.get(dbRecoveryOfferAtom)?.id).toBe(candidate().id);
+  });
+
+  it('will not restore until the user acknowledges what the confirmation named', async () => {
+    const invoke = installMigrationApi('pglite', { candidates: [candidate()] });
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Review restoring this copy/i }));
+
+    const confirm = await screen.findByRole('button', { name: /Restore from this copy/i });
+    fireEvent.click(confirm);
+    expect(invoke).not.toHaveBeenCalledWith('db:recovery:recover', expect.anything());
+
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('button', { name: /Restore from this copy/i }));
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('db:recovery:recover', {
+        candidateId: candidate().id,
+        // The user consented to the facts they were shown, not to whatever
+        // the facts happen to be by the time the transaction runs.
+        expectedFingerprint: 'fp-abc',
+      });
+    });
+  });
+});
+
+describe('migration blocked state', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRecoveryAtoms();
+  });
+
+  afterEach(() => {
+    cleanup();
+    delete (window as any).electronAPI;
+  });
+
+  it('clears a durable refusal through the migration handler', async () => {
+    const invoke = installMigrationApi('pglite', {
+      migrationBlocked: {
+        reasonCode: 'backup_dwarfs_live',
+        facts: {},
+        factsFingerprint: 'fp-blocked',
+        blockedAt: '2026-08-21T04:11:02.004Z',
+        assessmentVersion: 1,
+      },
+    });
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Clear this and re-check/i }));
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('db:migration:clear-block');
+    });
+  });
+});
+
+describe('preserved PGLite copies', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRecoveryAtoms();
+  });
+
+  afterEach(() => {
+    cleanup();
+    delete (window as any).electronAPI;
+  });
+
+  // Deleting the rollback source is the one action on this panel that destroys
+  // a copy outright, so it carries the acknowledgement the main-process guard
+  // requires rather than relying on the guard to reject an unacknowledged one.
+  it('deletes a rollback source only after an explicit acknowledgement', async () => {
+    const copy: MigratedCopyView = {
+      name: 'pglite-db.migrated-2026-08-19T09-00-00-000Z',
+      path: '/u/pglite-db.migrated-2026-08-19T09-00-00-000Z',
+      sizeBytes: 900 * 1024 * 1024,
+      createdAt: '2026-08-19T09:00:00.000Z',
+      isRollbackSource: true,
+    };
+    const invoke = installMigrationApi('sqlite', { migratedCopies: [copy] });
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole('button', { name: /^Delete this copy$/i }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /Delete permanently/i }));
+    expect(invoke).not.toHaveBeenCalledWith('db:recovery:delete-migrated', expect.anything());
+
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('button', { name: /Delete permanently/i }));
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('db:recovery:delete-migrated', {
+        name: copy.name,
+        acknowledgedRollbackLoss: true,
+      });
+    });
+  });
+
+  it('restores the preserved PGLite only after the confirmation is accepted', async () => {
+    const copy: MigratedCopyView = {
+      name: 'pglite-db.migrated-2026-08-19T09-00-00-000Z',
+      path: '/u/pglite-db.migrated-2026-08-19T09-00-00-000Z',
+      sizeBytes: 900 * 1024 * 1024,
+      createdAt: '2026-08-19T09:00:00.000Z',
+      isRollbackSource: true,
+    };
+    const invoke = installMigrationApi('sqlite', { migratedCopies: [copy] });
+    renderPanel();
+    const restore = await screen.findByRole('button', { name: /Restore from preserved PGLite/i });
+
+    vi.mocked(requestConfirmation).mockResolvedValueOnce(false);
+    fireEvent.click(restore);
+    await waitFor(() => expect(requestConfirmation).toHaveBeenCalledTimes(1));
+    expect(invoke).not.toHaveBeenCalledWith('db:migration:rollback');
+
+    vi.mocked(requestConfirmation).mockResolvedValueOnce(true);
+    fireEvent.click(restore);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('db:migration:rollback'));
+  });
+});
+
+
+describe('migration operation hydration', () => {
+  beforeEach(resetRecoveryAtoms);
+  afterEach(() => { cleanup(); resetRecoveryAtoms(); delete (window as any).electronAPI; });
+  it('shows the retained successful result when Settings mounts after completion', async () => {
+    installMigrationApi('pglite', { operation: { id: 'complete', revision: 8, kind: 'dry-run', status: 'succeeded', response: { success: true, result: {
+      summary: { totalRowsCopied: 123, tablesCopied: [{ name: 'ai_sessions', rows: 123 }], durationMs: 100, foreignKeyViolations: 0, integrityCheck: 'ok', spotCheckCount: 1 },
+      dryRunDir: '/tmp/copy', sqliteFileBytes: 100, pgliteDirBytes: 200,
+    } } } });
+    renderPanel();
+    await screen.findAllByText('Rows copied');
+    screen.getAllByText('123');
+  });
+
+  it('rehydrates running progress after remount and ignores an older status response', async () => {
+    const operation: MigrationOperationSnapshot = { id: 'dry-1', revision: 5, kind: 'dry-run', status: 'running', progress: { currentTable: 'ai_sessions', tableRowsCopied: 20, tableRowsExpected: 100 }, phase: { phase: 'copying' } };
+    const invoke = installMigrationApi('pglite', { operation });
+    const first = renderPanel();
+    await screen.findByRole('button', { name: 'Running dry run...' });
+    first.unmount();
+    renderPanel();
+    await screen.findByRole('button', { name: 'Running dry run...' });
+    screen.getByText('ai_sessions');
+    await act(async () => { hydrateMigrationOperation({ ...operation, revision: 6, status: 'cancelled', response: { success: false, error: 'Cancelled after read settlement' } }); });
+    await screen.findByText(/Cancelled after read settlement/);
+    await act(async () => { hydrateMigrationOperation(operation); });
+    expect(store.get(dbMigrationOperationAtom)?.revision).toBe(6);
+    expect(invoke).not.toHaveBeenCalledWith('db:migration:dry-run');
   });
 });

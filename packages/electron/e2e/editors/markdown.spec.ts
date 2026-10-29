@@ -107,13 +107,19 @@ test.beforeAll(async () => {
     '# Source Mode Test\n\nOriginal content.\n',
     'utf8'
   );
+  // NIM-5359 (plan item 1h): source mode entered while an AI review is pending.
+  await fs.writeFile(
+    path.join(workspaceDir, 'source-mode-diff-test.md'),
+    '# Source Mode Diff\n\nGENERATION Zeroth\n\nStable trailing paragraph.\n',
+    'utf8'
+  );
   await fs.writeFile(
     path.join(workspaceDir, 'dual-attach-diff.md'),
     '# Dual Attach Diff\n\nFirst paragraph baseline content.\n\nSecond paragraph baseline content.\n',
     'utf8'
   );
 
-  electronApp = await launchElectronApp({ workspace: workspaceDir });
+  electronApp = await launchElectronApp({ workspace: workspaceDir, mainPath: process.env.NIMBALYST_E2E_MAIN_PATH });
   page = await electronApp.firstWindow();
   await page.waitForLoadState('domcontentloaded');
   await waitForAppReady(page);
@@ -243,38 +249,72 @@ test('edited content is saved when tab is closed', async () => {
   expect(savedContent).toContain(marker);
 });
 
-// Skip: File watcher tests for markdown are flaky - needs investigation
-test.skip('external file change auto-reloads when editor is clean', async () => {
+test('external changes reconcile without native notifications (#1499)', async () => {
+  test.setTimeout(60_000);
   const mdPath = path.join(workspaceDir, 'external-change-test.md');
   const externalContent = '# Modified Externally\n\nThis was modified outside the editor.\n';
-
-  // Open the markdown file
   await openFileFromTree(page, 'external-change-test.md');
-
-  // Wait for Lexical editor to load
-  await page.waitForSelector(ACTIVE_EDITOR_SELECTOR, { timeout: TEST_TIMEOUTS.EDITOR_LOAD });
-  await page.waitForTimeout(500);
-
-  // Verify no dirty indicator (editor is clean)
-  const tabElement = getTabByFileName(page, 'external-change-test.md');
-  await expect(tabElement.locator(PLAYWRIGHT_TEST_SELECTORS.tabDirtyIndicator))
-    .toHaveCount(0);
-
-  // Verify original content
-  const editor = page.locator(ACTIVE_EDITOR_SELECTOR);
+  const tabEditor = page.locator(`${PLAYWRIGHT_TEST_SELECTORS.tabEditor}[data-file-path="${mdPath}"]`);
+  const editor = tabEditor.locator(PLAYWRIGHT_TEST_SELECTORS.contentEditable);
   await expect(editor).toContainText('External Change Test');
-
-  // Modify file externally
-  await fs.writeFile(mdPath, externalContent, 'utf8');
-
-  // Wait for file watcher to detect and reload
-  await page.waitForTimeout(1500);
-
-  // Verify editor shows new content (no conflict dialog)
-  await expect(editor).toContainText('Modified Externally', { timeout: 5000 });
-  await expect(editor).not.toContainText('External Change Test');
-
-  // Close the tab to clean up
+  // Suppress native editor notifications only in this isolated app.
+  await electronApp.evaluate(({ BrowserWindow }) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      const contents = window.webContents as any;
+      const original = contents.send.bind(contents);
+      contents.__nativeSend1499 = original;
+      contents.send = (channel: string, ...args: unknown[]) => {
+        if (channel !== 'file-changed-on-disk') original(channel, ...args);
+      };
+    }
+  });
+  try {
+    await fs.writeFile(`${mdPath}.replacement`, externalContent, 'utf8');
+    await fs.rename(`${mdPath}.replacement`, mdPath);
+    await expect(editor).toContainText('Modified Externally', { timeout: 10_000 });
+    await expect(editor).not.toContainText('External Change Test');
+    // Cross an autosave interval before checking bytes: a refresh alone is insufficient.
+    await page.waitForTimeout(2500);
+    expect(await fs.readFile(mdPath, 'utf8')).toBe(externalContent);
+    await openFileFromTree(page, 'copy-test.md');
+    await expect(editor).toBeHidden();
+    const backgroundContent = '# Background disk version\n\nUpdated while another tab is active.\n';
+    await fs.writeFile(mdPath, backgroundContent, 'utf8');
+    await expect(editor).toContainText('Background disk version', { timeout: 10_000 });
+    await getTabByFileName(page, 'external-change-test.md').click();
+    await expect(editor).toBeVisible();
+    await editor.click();
+    await page.keyboard.press('End');
+    await page.keyboard.type(' LOCAL UNSAVED');
+    const newer = '# Newer disk version\n\nExternal content to preserve.\n';
+    await fs.writeFile(mdPath, newer, 'utf8');
+    await page.evaluate(() => window.electronAPI.invoke('file:reconcile-open'));
+    await expect(tabEditor.locator(PLAYWRIGHT_TEST_SELECTORS.autosaveConflictBanner)).toBeVisible();
+    await expect(editor).toContainText('LOCAL UNSAVED');
+    await page.waitForTimeout(2500);
+    expect(await fs.readFile(mdPath, 'utf8')).toBe(newer);
+    await tabEditor.locator(PLAYWRIGHT_TEST_SELECTORS.autosaveConflictReload).click();
+    await expect(editor).toContainText('Newer disk version');
+    await expect(tabEditor.locator(PLAYWRIGHT_TEST_SELECTORS.autosaveConflictBanner)).toHaveCount(0);
+    await tabEditor.locator(PLAYWRIGHT_TEST_SELECTORS.editorMoreActions).click();
+    await page.locator(PLAYWRIGHT_TEST_SELECTORS.editorDropdownItem, { hasText: 'Toggle Source Mode' }).click();
+    const source = tabEditor.locator(PLAYWRIGHT_TEST_SELECTORS.monacoViewLines);
+    await expect(source).toContainText('Newer disk version');
+    const sourceContent = '# Changed in source mode\n\nStill observed.\n';
+    await fs.writeFile(mdPath, sourceContent, 'utf8');
+    await page.evaluate(() => window.electronAPI.invoke('file:reconcile-open'));
+    await expect(source).toContainText('Changed in source mode');
+    await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getFocusedWindow()?.webContents.send('file-save'));
+    await page.waitForTimeout(2500);
+    expect(await fs.readFile(mdPath, 'utf8')).toBe(sourceContent);
+  } finally {
+    await electronApp.evaluate(({ BrowserWindow }) => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        const contents = window.webContents as any;
+        if (contents.__nativeSend1499) { contents.send = contents.__nativeSend1499; delete contents.__nativeSend1499; }
+      }
+    });
+  }
   await closeTabByFileName(page, 'external-change-test.md');
 });
 
@@ -828,6 +868,124 @@ test('source-mode toggle does not silently overwrite external disk changes', asy
   await page.waitForTimeout(200);
 
   await closeTabByFileName(page, 'source-mode-test.md');
+});
+
+// ===========================================================================
+// NIM-5359 (plan item 1h) -- source mode during a pending AI review.
+//
+// Today source mode is undefined behaviour in the diff lifecycle:
+// `checkAndApplyPendingDiffs` returns early on `sourceMode` (TabEditor.tsx:681)
+// but `sourceMode` is NOT in the diff-subscription effect's dependencies, so
+// the attachment stays registered as a generation recipient while presenting
+// nothing, and its save path is not blocked.
+//
+// Phase 6 defines it: while source mode is active the attachment is not a
+// presenter and its saves are blocked whenever the model has a pending diff;
+// the model stays `awaiting-presenter`, replaces its target with each newer
+// serialized disk generation, and publishes the latest generation immediately
+// on mode exit.
+// ===========================================================================
+test('source mode blocks saving during a pending review and replays the latest generation on exit', async () => {
+  test.setTimeout(120_000);
+  const mdPath = path.join(workspaceDir, 'source-mode-diff-test.md');
+  const gen = (marker: string) =>
+    `# Source Mode Diff\n\nGENERATION ${marker}\n\nStable trailing paragraph.\n`;
+  await fs.writeFile(mdPath, gen('Zeroth'), 'utf8');
+
+  await openFileFromTree(page, 'source-mode-diff-test.md');
+  await page.waitForSelector(ACTIVE_EDITOR_SELECTOR, { timeout: TEST_TIMEOUTS.EDITOR_LOAD });
+  await page.waitForTimeout(400);
+
+  await page.evaluate(async ({ wp, fp, content }) => {
+    await window.electronAPI.history.createTag(
+      wp, fp, 'source-mode-diff-tag', content, 'source-mode-diff-session', 'tool-source-mode-diff',
+    );
+  }, { wp: workspaceDir, fp: mdPath, content: gen('Zeroth') });
+  await page.waitForTimeout(200);
+
+  // C1: review goes live in the rich editor.
+  await fs.writeFile(mdPath, gen('Foxtrot'), 'utf8');
+  await expect(page.locator(PLAYWRIGHT_TEST_SELECTORS.unifiedDiffHeader)).toBeVisible({ timeout: 5000 });
+
+  // Enter source mode with the review still pending.
+  const tabEditor = page.locator('.tab-editor[data-file-path$="source-mode-diff-test.md"]');
+  await tabEditor.locator('button[title="More actions"]').click();
+  await page.waitForTimeout(150);
+  await page.locator('button.dropdown-item', { hasText: 'Toggle Source Mode' }).click();
+  await expect(page.locator('.monaco-markdown-toolbar')).toBeVisible({ timeout: 5000 });
+
+  // Source mode presents no inline diff, but it is not a resolution: the tag
+  // stays pending while the agent keeps writing.
+  await fs.writeFile(mdPath, gen('Juliett'), 'utf8');
+  await page.waitForTimeout(800);
+  await fs.writeFile(mdPath, gen('Whiskey'), 'utf8');
+  await page.waitForTimeout(2000);
+
+  const pendingInSource: Array<{ id: string }> = await page.evaluate(
+    (fp) => window.electronAPI.history.getPendingTags(fp), mdPath,
+  );
+  expect(pendingInSource.map((t) => t.id)).toContain('source-mode-diff-tag');
+
+  // A save from source mode must be refused while the review is pending --
+  // raw source editing cannot save across an unresolved agent write.
+  await page.locator('.monaco-code-editor .view-lines').click();
+  await page.keyboard.type('\ntyped in source mode\n');
+  await page.waitForTimeout(300);
+  // Same two-step read as e2e/editors/monaco.spec.ts: the global monaco API is
+  // not always exposed in this window, so fall back to the rendered view lines.
+  const readSourceBuffer = () => page.evaluate(() => {
+    const editors = (window as any).monaco?.editor?.getEditors?.();
+    if (editors?.length) return editors[0].getValue() as string;
+    const wrapper = document.querySelector('.monaco-code-editor');
+    return Array.from(wrapper?.querySelectorAll('.view-line') ?? [])
+      .map((line) => line.textContent || '')
+      .join('\n')
+      .replace(/\u00A0/g, ' ');
+  });
+  // The premise of everything below: these bytes exist only in this buffer.
+  expect(await readSourceBuffer()).toContain('typed in source mode');
+  await electronApp.evaluate(({ BrowserWindow }) => {
+    BrowserWindow.getFocusedWindow()?.webContents.send('file-save');
+  });
+  await page.waitForTimeout(1500);
+  expect(await fs.readFile(mdPath, 'utf-8')).toBe(gen('Whiskey'));
+
+  // Leaving source mode reloads from disk, so those unsaved bytes exist nowhere
+  // else. They may not be destroyed on the user's behalf: the toggle asks, and
+  // declining keeps both the buffer and source mode exactly as they are
+  // (NIM-5359, finding 3).
+  const exitSourceMode = async () => {
+    await tabEditor.locator('button[title="More actions"]').click();
+    await page.waitForTimeout(150);
+    // The same menu item reads "Exit Source Mode" once source mode is active.
+    await page.locator('button.dropdown-item', { hasText: 'Exit Source Mode' }).click();
+  };
+
+  await exitSourceMode();
+  await page.locator('.confirm-dialog-button-cancel').click();
+  await page.waitForTimeout(500);
+  await expect(page.locator('.monaco-markdown-toolbar')).toBeVisible();
+  expect(await readSourceBuffer()).toContain('typed in source mode');
+
+  // Accepting the same prompt discards them deliberately, and the toggle
+  // completes: the rich editor re-registers as a presenter and the model
+  // immediately publishes the LATEST generation, not the one that was live when
+  // source mode was entered.
+  await exitSourceMode();
+  await page.locator('.confirm-dialog-button-confirm').click();
+  await expect(page.locator(PLAYWRIGHT_TEST_SELECTORS.unifiedDiffHeader)).toBeVisible({ timeout: 5000 });
+
+  const editorText = (await page.locator(ACTIVE_EDITOR_SELECTOR).textContent()) ?? '';
+  expect(editorText).toContain('Whiskey');
+  expect(editorText).not.toContain('Juliett');
+
+  // dispatchEvent, like the other accept-all clicks here: the chat sidebar
+  // overlays the header button in this layout.
+  await page.locator(PLAYWRIGHT_TEST_SELECTORS.unifiedDiffAcceptAllButton).dispatchEvent('click');
+  await page.waitForTimeout(1000);
+  expect(await fs.readFile(mdPath, 'utf-8')).toBe(gen('Whiskey'));
+
+  await closeTabByFileName(page, 'source-mode-diff-test.md');
 });
 
 test('clean editor picks up content saved by sibling editor via DocumentModel', async () => {

@@ -7,7 +7,7 @@
 
 import { ipcMain, BrowserWindow } from 'electron';
 import log from 'electron-log/main';
-import simpleGit from 'simple-git';
+import { createGit } from '../services/gitClient';
 import { FeatureUsageService, FEATURES } from '../services/FeatureUsageService';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { WorktreeStore, createWorktreeStore } from '../services/WorktreeStore';
@@ -20,10 +20,17 @@ import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { getTerminalSessionManager } from '../services/TerminalSessionManager';
 import { getTerminalsByWorktreeId, deleteTerminalInstance } from '../utils/terminalStore';
 import { gitRefWatcher } from '../file/GitRefWatcher';
+import { isGitRepositoryInUse } from '../file/GitWatcherLifecycle';
+import { listReposForRoot, resolveDefaultRepo } from '../services/workspaceRepos';
+import { withTimeout } from '../utils/gitUncommittedFiles';
 import type { WorktreeCreateResult } from '../../shared/ipc/types';
 import { gitOperationLock } from '../services/GitOperationLock';
 import fs from 'node:fs';
 import { archiveSessionsAndDestroyProviders } from '../services/ai/archiveSessionProviderLifecycle';
+import { createWorktreeArchiveCleanup } from '../services/worktreeArchiveCleanup';
+
+// Archive waits on this fetch; a stalled remote must not hang the click (#282).
+const STATUS_FETCH_TIMEOUT_MS = 15_000;
 
 const logger = log.scope('WorktreeHandlers');
 
@@ -250,24 +257,17 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
     });
 
     // Step 4: Queue the slow cleanup work
+    const cleanupArchivedWorktree = createWorktreeArchiveCleanup({
+      deleteWorktree: (worktreePath, repoPath) => gitWorktreeService.deleteWorktree(worktreePath, repoPath),
+      worktreeStore,
+      superLoopStore,
+      archiveQueue: archiveProgressManager,
+      unarchiveSession: (sessionId) => AISessionsRepository.updateMetadata(sessionId, { isArchived: false }),
+      pathExists: fs.existsSync,
+    });
     const cleanupCallback = async () => {
       try {
-        // Update status to show we're removing the worktree
-        archiveProgressManager.updateTaskStatus(worktreeId, 'removing-worktree');
-
-        // Remove the git worktree from disk (throws if directory still exists after cleanup)
-        await gitWorktreeService.deleteWorktree(worktree.path, workspacePath);
-
-        archiveLogger.info('Worktree cleanup completed, now marking as archived in database', { worktreeId });
-
-        // Only mark as archived AFTER disk deletion is confirmed
-        await worktreeStore.updateArchived(worktreeId, true);
-        const existingLoop = await superLoopStore.getLoopByWorktreeId(worktreeId);
-        if (existingLoop && !existingLoop.isArchived) {
-          await superLoopStore.updateLoop(existingLoop.id, { isArchived: true });
-        }
-
-        archiveLogger.info('Worktree marked as archived in database', { worktreeId });
+        await cleanupArchivedWorktree(worktree, sessionIds);
 
         // Track successful completion
         const durationMs = Date.now() - archiveStartTime;
@@ -276,16 +276,6 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
           duration_ms: durationMs,
         });
       } catch (error) {
-        // Unarchive the sessions since the cleanup failed
-        archiveLogger.warn('Cleanup failed, unarchiving sessions', { worktreeId, error });
-        for (const sessionId of sessionIds) {
-          try {
-            await AISessionsRepository.updateMetadata(sessionId, { isArchived: false });
-          } catch (unarchiveErr) {
-            archiveLogger.error('Failed to unarchive session after cleanup failure', { sessionId, worktreeId, error: unarchiveErr });
-          }
-        }
-
         // Track failure
         analyticsService.sendEvent('worktree_archive_failed', {
           error_type: error instanceof Error ? error.constructor.name : 'Unknown',
@@ -326,7 +316,6 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
  */
 export function registerWorktreeHandlers(): void {
   const gitWorktreeService = new GitWorktreeService();
-  let watchersInitialized = false;
 
   // In-flight request dedup for worktree:get-status -- if multiple sessions share
   // the same worktree path, only one set of git commands runs at a time.
@@ -342,12 +331,24 @@ export function registerWorktreeHandlers(): void {
   ipcMain.handle('worktree:create', async (
     _event,
     workspacePath: string,
-    options?: { name?: string; baseBranch?: string }
+    options?: { name?: string; baseBranch?: string; sourceFolderPath?: string }
   ): Promise<WorktreeCreateResult> => {
     const startTime = Date.now();
     const MAX_RETRIES = 3;
     const name = options?.name;
     const baseBranch = options?.baseBranch;
+    /**
+     * Repository the worktree is branched from. A workspace can span several
+     * roots, so the caller names which one; unnamed falls back to the primary
+     * root's repo, which is the only repo a single-folder workspace has.
+     *
+     * The worktree's IDENTITY stays `workspacePath` (sessions, kanban and
+     * trackers key off it) -- only the git operations move to this repo.
+     */
+    const sourceRepo =
+      (options?.sourceFolderPath ? listReposForRoot(options.sourceFolderPath)[0] : undefined)
+      ?? resolveDefaultRepo(workspacePath)
+      ?? workspacePath;
 
     // Retry loop for handling race conditions where concurrent requests pick the same name
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -360,7 +361,7 @@ export function registerWorktreeHandlers(): void {
           throw new Error('workspacePath is required');
         }
 
-        logger.info('Creating worktree', { workspacePath, name, baseBranch, attempt });
+        logger.info('Creating worktree', { workspacePath, sourceRepo, name, baseBranch, attempt });
 
         // Get database early for de-duplication
         const db = getDatabase();
@@ -378,8 +379,8 @@ export function registerWorktreeHandlers(): void {
 
           const [dbNames, filesystemNames, branchNames] = await Promise.all([
             worktreeStore.getAllNames(),
-            Promise.resolve(gitWorktreeService.getExistingWorktreeDirectories(workspacePath)),
-            gitWorktreeService.getAllBranchNames(workspacePath),
+            Promise.resolve(gitWorktreeService.getExistingWorktreeDirectories(sourceRepo)),
+            gitWorktreeService.getAllBranchNames(sourceRepo),
           ]);
 
           timings.deduplication = Date.now() - dedupeStartTime;
@@ -404,7 +405,15 @@ export function registerWorktreeHandlers(): void {
 
         // Create the git worktree
         const gitCreateStartTime = Date.now();
-        const worktree = await gitWorktreeService.createWorktree(workspacePath, { name: finalName, baseBranch });
+        const created = await gitWorktreeService.createWorktree(sourceRepo, { name: finalName, baseBranch });
+        // The service reports the repo it branched from as `projectPath`;
+        // re-anchor to the workspace so identity stays on the primary root and
+        // record the source repo separately.
+        const worktree = {
+          ...created,
+          projectPath: workspacePath,
+          sourceFolderPath: sourceRepo,
+        };
         timings.gitWorktreeCreate = Date.now() - gitCreateStartTime;
 
         // Track the created worktree for potential cleanup
@@ -418,10 +427,12 @@ export function registerWorktreeHandlers(): void {
         // DB insert succeeded, clear cleanup tracking
         createdWorktree = null;
 
-        // Start git ref watcher for the worktree path to detect commits
-        gitRefWatcher.start(worktree.path).catch((error) => {
-          logger.error('Failed to start GitRefWatcher for worktree:', error);
-        });
+        // The project may have closed while Git created the worktree.
+        if (isGitRepositoryInUse(worktree.path, new Set([workspacePath]))) {
+          gitRefWatcher.start(worktree.path, undefined, workspacePath).catch((error) => {
+            logger.error('Failed to start GitRefWatcher for worktree:', error);
+          });
+        }
 
         const totalDuration = Date.now() - startTime;
         logger.info('Worktree created successfully', {
@@ -461,7 +472,7 @@ export function registerWorktreeHandlers(): void {
             worktreePath: createdWorktree.path,
           });
           try {
-            await gitWorktreeService.deleteWorktree(createdWorktree.path, workspacePath);
+            await gitWorktreeService.deleteWorktree(createdWorktree.path, sourceRepo);
             logger.info('Successfully cleaned up orphaned worktree', { worktreePath: createdWorktree.path });
           } catch (cleanupError) {
             logger.error('Failed to clean up orphaned worktree - manual cleanup required', {
@@ -536,8 +547,12 @@ export function registerWorktreeHandlers(): void {
         // Fetch latest remote refs for accurate merge detection
         if (options?.fetchFirst && baseBranch) {
           try {
-            const git = simpleGit(worktreePath);
-            await git.fetch(['origin', baseBranch]);
+            const git = createGit(worktreePath, { timeout: { block: STATUS_FETCH_TIMEOUT_MS } });
+            await withTimeout(
+              git.fetch(['origin', baseBranch]),
+              STATUS_FETCH_TIMEOUT_MS,
+              `git fetch timed out after ${STATUS_FETCH_TIMEOUT_MS}ms`,
+            );
           } catch (fetchError) {
             logger.warn('Failed to fetch base branch before status check (continuing with local refs)', { fetchError });
           }
@@ -601,8 +616,9 @@ export function registerWorktreeHandlers(): void {
       // Stop the git ref watcher for this worktree
       await gitRefWatcher.stop(worktree.path);
 
-      // Delete the git worktree
-      await gitWorktreeService.deleteWorktree(worktree.path, workspacePath);
+      // Delete the git worktree from the repo it was branched from, not the
+      // workspace's primary root -- see the note in `archiveWorktree`.
+      await gitWorktreeService.deleteWorktree(worktree.path, worktree.sourceFolderPath || workspacePath);
 
       // Delete the database record
       await worktreeStore.delete(worktreeId);
@@ -633,8 +649,6 @@ export function registerWorktreeHandlers(): void {
         throw new Error('workspacePath is required');
       }
 
-      logger.info('Listing worktrees', { workspacePath });
-
       const db = getDatabase();
       if (!db) {
         throw new Error('Database not initialized');
@@ -643,31 +657,28 @@ export function registerWorktreeHandlers(): void {
       const worktreeStore = createWorktreeStore(db);
       const worktrees = await worktreeStore.list(workspacePath);
 
-      logger.info('Found worktrees', { count: worktrees.length });
+      // Idempotent starts also restore monitoring after a project is reopened.
+      // Each project's list must be initialized, not just the first in the app.
+      const limitConcurrency = createConcurrencyLimiter(2);
+      const activeWorktrees = worktrees.filter(wt => !wt.isArchived);
 
-      // Start git ref watchers for all non-archived worktrees on first list call.
-      // This ensures commit detection works for worktrees loaded on app restart.
-      // Only runs once; per-worktree start() is called at creation time.
-      // Concurrency-limited to avoid a burst of git processes at startup.
-      if (!watchersInitialized) {
-        watchersInitialized = true;
-        const limitConcurrency = createConcurrencyLimiter(2);
-        const activeWorktrees = worktrees.filter(wt => !wt.isArchived);
-
-        Promise.all(
-          activeWorktrees.map(worktree =>
-            limitConcurrency(() => gitRefWatcher.start(worktree.path)).catch((error) => {
-              logger.warn('Failed to start GitRefWatcher for worktree:', {
-                worktreeId: worktree.id,
-                path: worktree.path,
-                error: error instanceof Error ? error.message : String(error),
-              });
-            })
-          )
-        ).catch(error => {
-          logger.error('Error during worktree watcher initialization:', error);
-        });
-      }
+      Promise.all(
+        activeWorktrees.map(worktree =>
+          limitConcurrency(() => {
+            // A list can still be queued when its project closes.
+            if (!isGitRepositoryInUse(worktree.path, new Set([workspacePath]))) return Promise.resolve();
+            return gitRefWatcher.start(worktree.path, undefined, workspacePath);
+          }).catch((error) => {
+            logger.warn('Failed to start GitRefWatcher for worktree:', {
+              worktreeId: worktree.id,
+              path: worktree.path,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          })
+        )
+      ).catch(error => {
+        logger.error('Error during worktree watcher initialization:', error);
+      });
 
       return {
         success: true,
@@ -791,7 +802,7 @@ export function registerWorktreeHandlers(): void {
         };
       }
 
-      logger.info('Batch fetching worktrees', { count: worktreeIds.length, ids: worktreeIds });
+      // logger.info('Batch fetching worktrees', { count: worktreeIds.length, ids: worktreeIds });
 
       const db = getDatabase();
       if (!db) {
@@ -1142,7 +1153,8 @@ export function registerWorktreeHandlers(): void {
    * Merge worktree branch to main
    *
    * @param worktreePath - Path to the worktree
-   * @param mainRepoPath - Path to the main repository
+   * @param mainRepoPath - Path to the workspace's primary root; only a fallback
+   *   for worktrees with no stored source repository
    * @returns Merge result
    */
   ipcMain.handle('worktree:merge', async (_event, worktreePath: string, mainRepoPath: string) => {
@@ -1154,9 +1166,16 @@ export function registerWorktreeHandlers(): void {
         throw new Error('mainRepoPath is required');
       }
 
-      logger.info('Merging worktree to main', { worktreePath, mainRepoPath });
+      // Merge back into the repo the worktree was branched from. The renderer
+      // only knows the workspace's primary root, which in a multi-root
+      // workspace is a different repository -- or no repository at all.
+      const db = getDatabase();
+      const stored = db ? await createWorktreeStore(db).getByPath(worktreePath) : null;
+      const targetRepoPath = stored?.sourceFolderPath || mainRepoPath;
 
-      const result = await gitWorktreeService.mergeToMain(worktreePath, mainRepoPath);
+      logger.info('Merging worktree to main', { worktreePath, targetRepoPath });
+
+      const result = await gitWorktreeService.mergeToMain(worktreePath, targetRepoPath);
 
       // Track merge attempt
       const analyticsService = AnalyticsService.getInstance();
@@ -1387,8 +1406,7 @@ export function registerWorktreeHandlers(): void {
       return await gitOperationLock.withLock(worktreePath, 'worktree:stage-file', async () => {
         logger.info('Staging/unstaging file', { worktreePath, filePath, stage });
 
-        const simpleGit = (await import('simple-git')).default;
-        const git = simpleGit(worktreePath);
+        const git = createGit(worktreePath);
 
         if (stage) {
           await git.add(filePath);
@@ -1425,8 +1443,7 @@ export function registerWorktreeHandlers(): void {
       return await gitOperationLock.withLock(worktreePath, 'worktree:stage-all', async () => {
         logger.info('Staging/unstaging all files', { worktreePath, stage });
 
-        const simpleGit = (await import('simple-git')).default;
-        const git = simpleGit(worktreePath);
+        const git = createGit(worktreePath);
 
         if (stage) {
           await git.add('-A');
@@ -1462,7 +1479,11 @@ export function registerWorktreeHandlers(): void {
 
       logger.info('Starting git ref watcher for worktree', { worktreePath });
 
-      await gitRefWatcher.start(worktreePath);
+      const db = getDatabase();
+      if (!db) throw new Error('Database not initialized');
+      const worktree = await createWorktreeStore(db).getByPath(worktreePath);
+      if (!worktree) throw new Error('Worktree not found');
+      await gitRefWatcher.start(worktreePath, undefined, worktree.projectPath);
 
       return { success: true };
     } catch (error) {

@@ -1,7 +1,9 @@
+import type { OrganizationDirectoryResult } from '../shared/organizationDirectory';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { createIpcSubscriber } from './ipcSubscriptions.ts';
 import {ClaudeForWindowsInstallation} from "../main/services/CLIManager.ts";
 import type { GhCliStatus } from '../main/services/GhCliDetector.ts';
+import type { GitStatusChangedPayload } from '../main/services/GitStatusRefreshCoordinator.ts';
 import type {
   AppendLocalReplicaUpdateInput,
   AppendRemoteReplicaUpdatesInput,
@@ -135,6 +137,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('agent-new-session', callback);
     return () => ipcRenderer.removeListener('agent-new-session', callback);
   },
+  onCreateInTree: (callback: (kind: string) => void) => {
+    const handler = (_event: unknown, kind: string) => callback(kind);
+    ipcRenderer.on('create-in-tree', handler);
+    return () => ipcRenderer.removeListener('create-in-tree', handler);
+  },
   onFileOpen: (callback: () => void) => {
     ipcRenderer.on('file-open', callback);
     return () => ipcRenderer.removeListener('file-open', callback);
@@ -148,11 +155,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const handler = (_event: any, filePath: string) => callback(filePath);
     ipcRenderer.on('open-workspace-file', handler);
     return () => ipcRenderer.removeListener('open-workspace-file', handler);
-  },
-  onOpenDocument: (callback: (data: { path: string }) => void) => {
-    const handler = (_event: any, data: { path: string }) => callback(data);
-    ipcRenderer.on('open-document', handler);
-    return () => ipcRenderer.removeListener('open-document', handler);
   },
   onOpenWorkspaceFromCLI: (callback: (workspacePath: string) => void) => {
     const handler = (_event: any, workspacePath: string) => callback(workspacePath);
@@ -363,7 +365,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('share:delete', options) as Promise<{ success: boolean; error?: string }>,
   getShareKeys: () =>
     ipcRenderer.invoke('share:getKeys') as Promise<Record<string, string>>,
-  shareFileAsLink: (options: { filePath: string; expirationDays?: number; personalOrgId?: string }) =>
+  shareFileAsLink: (options: { filePath: string; expirationDays?: number; personalOrgId?: string; mermaidSvgs?: Record<string, string> }) =>
     ipcRenderer.invoke('share:fileAsLink', options) as Promise<{ success: boolean; url?: string; shareId?: string; isUpdate?: boolean; encryptionKey?: string; owningPersonalOrgId?: string; error?: string }>,
   getShareExpirationPreference: () =>
     ipcRenderer.invoke('share:getExpirationPreference') as Promise<number>,
@@ -373,6 +375,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Window operations
   setDocumentEdited: (edited: boolean) => ipcRenderer.send('set-document-edited', edited),
   setTitle: (title: string) => ipcRenderer.send('set-title', title),
+  /** Point the window's AXDocument at the visible document; null clears it. */
+  setRepresentedFile: (filePath: string | null) => ipcRenderer.send('set-represented-file', filePath),
   openAccountSettings: () => ipcRenderer.invoke('app:open-account-settings'),
   /** Report user activity for sync presence awareness */
   reportUserActivity: () => ipcRenderer.send('user-activity'),
@@ -386,6 +390,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Workspace operations
   getFolderContents: (dirPath: string) => ipcRenderer.invoke('get-folder-contents', dirPath),
   refreshFolderContents: (folderPath: string) => ipcRenderer.invoke('refresh-folder-contents', folderPath),
+  getFolderFilesRecursive: (folderPath: string): Promise<{ files: string[]; truncated: boolean }> =>
+    ipcRenderer.invoke('get-folder-files-recursive', folderPath),
   createFile: (filePath: string, content: string) => ipcRenderer.invoke('create-file', filePath, content),
   createFolder: (folderPath: string) => ipcRenderer.invoke('create-folder', folderPath),
   switchWorkspaceFile: (filePath: string) => ipcRenderer.invoke('switch-workspace-file', filePath),
@@ -408,6 +414,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   copyImageToClipboard: (payload: { filePath?: string; dataUrl?: string }) =>
     ipcRenderer.invoke('copy-image-to-clipboard', payload),
   readClipboard: () => ipcRenderer.invoke('read-from-clipboard'),
+  readWindowsClipboardImage: () => ipcRenderer.invoke('read-image-from-windows-clipboard'),
 
   // File change event listeners
   onFileRenamed: (callback: (data: { oldPath: string; newPath: string }) => void) => {
@@ -746,12 +753,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('mcp:streamContent', handler);
     return () => ipcRenderer.removeListener('mcp:streamContent', handler);
   },
-  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string, workspacePath?: string }) => void) => {
+  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string, workspacePath?: string, includeDecisionState?: boolean }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('mcp:readCollabDoc', handler);
     return () => ipcRenderer.removeListener('mcp:readCollabDoc', handler);
   },
-  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; error?: string; code?: string }) => {
+  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; title?: string; documentType?: string; decisionState?: unknown; error?: string; code?: string }) => {
     ipcRenderer.send(resultChannel, result);
   },
   onMcpReadCollabDocComments: (callback: (data: any) => void) => {
@@ -964,12 +971,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
       priority: string;
       workspace: string;
       description?: string;
+      creationRequestId?: string;
+      content?: unknown;
       owner?: string;
       tags?: string[];
       customFields?: Record<string, any>;
       sharing?: 'personal' | 'team';
       draftByDefault?: boolean;
-    }) => ipcRenderer.invoke('document-service:create-tracker-item', item) as Promise<{ success: boolean; item?: any; error?: string }>,
+    }) => ipcRenderer.invoke('document-service:create-tracker-item', item) as Promise<{ success: boolean; item?: any; error?: string; publication?: import("@nimbalyst/runtime/core/trackerCreation").TrackerCreationPublication }>,
+    publishTrackerCreation: (payload: { workspacePath: string; itemId: string }) => ipcRenderer.invoke('tracker-creation:publish', payload) as Promise<import('@nimbalyst/runtime/core/trackerCreation').TrackerCreationPublication>,
+    getTrackerCreationStatus: (payload: { workspacePath: string; itemId: string }) => ipcRenderer.invoke('tracker-creation:status', payload) as Promise<import('@nimbalyst/runtime/core/trackerCreation').TrackerCreationPublication | null>,
+    listPendingTrackerCreations: (workspacePath: string) => ipcRenderer.invoke('tracker-creation:pending', { workspacePath }) as Promise<string[]>,
+    stageTrackerImage: (payload: { workspacePath: string; bytes: ArrayBuffer; mimeType: string }) => ipcRenderer.invoke('tracker-creation:stage-image', payload) as Promise<{ relativePath: string }>,
     updateTrackerItem: (payload: {
       itemId: string;
       updates: Record<string, any>;
@@ -1017,7 +1030,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     updateTrackerItemContent: (payload: {
       itemId: string;
       content: any;
-    }) => ipcRenderer.invoke('document-service:tracker-item-update-content', payload) as Promise<{ success: boolean; error?: string }>,
+      expectedBodyVersion?: number;
+    }) => ipcRenderer.invoke('document-service:tracker-item-update-content', payload) as Promise<{ success: boolean; conflict?: boolean; bodyVersion?: number; error?: string }>,
     getTrackerItemContent: (payload: {
       itemId: string;
     }) => ipcRenderer.invoke('document-service:tracker-item-get-content', payload) as Promise<{ success: boolean; content?: any; error?: string }>,
@@ -1090,6 +1104,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
           snippet: string;
           score: number;
           signals: { dense: boolean; sparse: boolean };
+          /** Raw pre-fusion scores; `score` is an RRF rank and carries no threshold. */
+          similarity?: { cosine?: number; bm25?: number };
         }>
       >,
   },
@@ -1100,6 +1116,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     get: (type: string) => ipcRenderer.invoke('tracker-schema:get', type) as Promise<any | null>,
     getRoleField: (type: string, role: string) => ipcRenderer.invoke('tracker-schema:get-role-field', type, role) as Promise<string | null>,
     getFieldByRole: (type: string, role: string) => ipcRenderer.invoke('tracker-schema:get-field-by-role', type, role) as Promise<any | null>,
+    getVocabulary: (workspacePath: string) => ipcRenderer.invoke('tracker-schema:get-vocabulary', workspacePath) as Promise<{ labels: any; predicates: any[] } | null>,
     onChanged: (callback: (schemas: any[]) => void) => {
       const handler = (_event: any, schemas: any[]) => callback(schemas);
       ipcRenderer.on('tracker-schema:changed', handler);
@@ -1117,6 +1134,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
       }>,
     setArchived: (payload: { workspacePath: string; type: string; archived: boolean }) =>
       ipcRenderer.invoke('tracker-lifecycle:set-archived', payload) as Promise<{ success: boolean; error?: string }>,
+    defineType: (payload: { workspacePath: string; schema: Record<string, unknown> }) =>
+      ipcRenderer.invoke('tracker-lifecycle:define-type', payload) as Promise<{
+        success: boolean;
+        type?: string;
+        scope?: 'team' | 'personal';
+        status?: 'created' | 'syncing';
+        error?: string;
+      }>,
   },
 
   // Plaintext recovery copies for collaborative content
@@ -1584,7 +1609,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   // Worktree operations
-  worktreeCreate: (workspacePath: string, options?: { name?: string; baseBranch?: string }) =>
+  worktreeCreate: (workspacePath: string, options?: { name?: string; baseBranch?: string; sourceFolderPath?: string }) =>
     ipcRenderer.invoke('worktree:create', workspacePath, options),
   worktreeGetStatus: (worktreePath: string, options?: { fetchFirst?: boolean }) =>
     ipcRenderer.invoke('worktree:get-status', worktreePath, options),
@@ -1695,6 +1720,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Open external links
   openExternal: (url: string) => ipcRenderer.invoke('open-external', url),
+  openInBrowser: (url: string) => ipcRenderer.invoke('open-in-browser', url),
   openThirdPartyNotices: () => ipcRenderer.invoke('legal:open-third-party-notices'),
 
   // Image operations
@@ -1778,7 +1804,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Team Management (all member ops take explicit orgId -- per-workspace, not global)
   team: {
-    list: (options?: { forceRefresh?: boolean }) => ipcRenderer.invoke('team:list', options),
+    list: (options?: { forceRefresh?: boolean }): Promise<OrganizationDirectoryResult> => ipcRenderer.invoke('team:list', options),
     /** Open (or focus + retarget) the dedicated org-management window. */
     openManagementWindow: (target?: {
       orgId?: string;
@@ -1846,6 +1872,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Server-managed custody status. `unmigrated` means the organization was
     // never converted and the server refuses its team content.
     getKeyCustodyStatus: (orgId: string) => ipcRenderer.invoke('team:get-key-custody-status', orgId) as Promise<{ success: boolean; mode?: 'server-managed' | 'unmigrated'; dekFingerprint?: string | null; error?: string }>,
+    recovery: (orgId: string, command: import('../shared/teamRecovery').TeamRecoveryCommand, options?: { workspacePath?: string; password?: string }) => ipcRenderer.invoke('team:recovery', orgId, command, options) as Promise<{ success: boolean; overview?: import('../shared/teamRecovery').TeamRecoveryOverview; error?: string }>,
     setProjectIdentity: (orgId: string, workspacePath: string) => ipcRenderer.invoke('team:set-project-identity', orgId, workspacePath),
     clearProjectIdentity: (orgId: string) => ipcRenderer.invoke('team:clear-project-identity', orgId),
   },
@@ -1853,7 +1880,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Typed organization facade. The legacy `team` bridge remains as a
   // compatibility adapter while settings and older extensions migrate.
   organization: {
-    list: () => ipcRenderer.invoke('team:list'),
+    list: (): Promise<OrganizationDirectoryResult> => ipcRenderer.invoke('team:list'),
     get: (orgId: string) => ipcRenderer.invoke('team:get', orgId),
     rename: (orgId: string, name: string) =>
       ipcRenderer.invoke('team:rename', orgId, name),
@@ -1863,8 +1890,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('team:find-pending-invite-for-email', email),
     acceptInvitation: (orgId: string) => ipcRenderer.invoke('team:accept-invite', orgId),
     listMembers: (orgId: string) => ipcRenderer.invoke('team:list-members', orgId),
-    inviteMember: (orgId: string, email: string, role?: 'owner' | 'admin' | 'member' | 'viewer' | 'guest') =>
-      ipcRenderer.invoke('team:invite', orgId, email, role),
+    inviteMember: (
+      orgId: string,
+      email: string,
+      role?: 'owner' | 'admin' | 'member' | 'viewer' | 'guest',
+      projectGrants?: Array<{ teamProjectId: string; projectRole: string }>,
+    ) => ipcRenderer.invoke('team:invite', orgId, email, role, projectGrants),
     removeMember: (orgId: string, memberId: string) => ipcRenderer.invoke('team:remove-member', orgId, memberId),
     updateMemberRole: (orgId: string, memberId: string, role: string) => ipcRenderer.invoke('team:update-role', orgId, memberId, role),
     listProjects: (orgId: string) => ipcRenderer.invoke('team:list-projects', orgId),
@@ -2137,8 +2168,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Git operations (real-time status events)
   git: {
     // Listen for git status changes (staging, unstaging, etc.)
-    onStatusChanged: (callback: (data: { workspacePath: string }) => void) => {
-      const handler = (_event: any, data: { workspacePath: string }) => callback(data);
+    // `revision`/`status` are present when main computed the snapshot itself
+    // (after a Git operation settled). The index and ref watchers still send the
+    // path-only shape, so both must stay handled.
+    onStatusChanged: (callback: (data: GitStatusChangedPayload) => void) => {
+      const handler = (_event: any, data: GitStatusChangedPayload) => callback(data);
       ipcRenderer.on('git:status-changed', handler);
       return () => ipcRenderer.removeListener('git:status-changed', handler);
     },

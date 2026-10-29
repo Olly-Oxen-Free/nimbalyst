@@ -32,7 +32,7 @@ import type {
   ParseContext,
   CanonicalEventDescriptor,
 } from './parsers/IRawMessageParser';
-import { processDescriptor as processDescriptorShared, findTeammateSpawnToolUseId } from './processDescriptor';
+import { processDescriptor as processDescriptorShared, findTeammateSpawnToolUseId, stampPromptSource } from './processDescriptor';
 
 // ---------------------------------------------------------------------------
 // Dependencies (injected via interfaces)
@@ -119,6 +119,13 @@ export class TranscriptTransformer {
    * Each entry is a promise that resolves when the current processing completes.
    */
   private sessionLocks = new Map<string, Promise<unknown>>();
+
+  /**
+   * Last Claude Code thinking-block message id per session, carried across
+   * batches so a progress update arriving in a later batch than its empty
+   * sibling thinking block is still recognized (#1801).
+   */
+  private lastThinkingMessageIds = new Map<string, string>();
 
   constructor(
     private rawStore: IRawMessageStore,
@@ -260,6 +267,7 @@ export class TranscriptTransformer {
     // that was processed in a previous batch.
     if (afterId > 0 && parser instanceof ClaudeCodeRawParser) {
       parser.setSuppressResultChunkText(true);
+      parser.setLastThinkingMessageId(this.lastThinkingMessageIds.get(sessionId));
     }
 
     const startSequence = await this.transcriptStore.getNextSequence(sessionId);
@@ -271,6 +279,17 @@ export class TranscriptTransformer {
     // instead of in-memory maps (no batch state to carry over)
     const toolEventIds = new Map<string, number>();
     const subagentEventIds = new Map<string, number>();
+    // A late sidecar arrives after its Agent/Task spawn's batch. Restore the
+    // canonical subagent identities before the parser makes synchronous routing
+    // decisions; an empty map would send child tools to the top-level transcript.
+    if (afterId > 0) {
+      for (const event of await this.transcriptStore.getSessionEvents(sessionId, { eventTypes: ['subagent'] })) {
+        if (event.subagentId) {
+          subagentEventIds.set(event.subagentId, event.id);
+          toolEventIds.set(event.subagentId, event.id);
+        }
+      }
+    }
 
     const context: ParseContext = {
       sessionId,
@@ -294,6 +313,7 @@ export class TranscriptTransformer {
       try {
         const descriptors = await parser.parseMessage(msg, context);
         for (const desc of descriptors) {
+          stampPromptSource(desc, msg);
           const event = await this.processDescriptorWithNotify(
             writer,
             sessionId,
@@ -308,6 +328,7 @@ export class TranscriptTransformer {
       }
       lastRawMessageId = msg.id;
     }
+    this.rememberLastThinkingMessageId(sessionId, parser);
 
     await this.metadataStore.updateTransformStatus(sessionId, {
       transformVersion: TranscriptTransformer.CURRENT_VERSION,
@@ -525,6 +546,7 @@ export class TranscriptTransformer {
     // turns need result text, and those are always in the first batch.
     if (isResume && parser instanceof ClaudeCodeRawParser) {
       parser.setSuppressResultChunkText(true);
+      parser.setLastThinkingMessageId(this.lastThinkingMessageIds.get(sessionId));
     }
 
     const startSequence = await targetStore.getNextSequence(sessionId);
@@ -551,6 +573,7 @@ export class TranscriptTransformer {
       try {
         const descriptors = await parser.parseMessage(msg, context);
         for (const desc of descriptors) {
+          stampPromptSource(desc, msg);
           const event = suppressNotify
             ? await this.processDescriptor(writer, sessionId, desc, toolEventIds, subagentEventIds, targetStore)
             : await this.processDescriptorWithNotify(
@@ -568,8 +591,16 @@ export class TranscriptTransformer {
 
       lastRawMessageId = msg.id;
     }
+    this.rememberLastThinkingMessageId(sessionId, parser);
 
     return { lastRawMessageId, eventsWritten };
+  }
+
+  private rememberLastThinkingMessageId(sessionId: string, parser: IRawMessageParser): void {
+    if (!(parser instanceof ClaudeCodeRawParser)) return;
+    const messageId = parser.getLastThinkingMessageId();
+    if (messageId) this.lastThinkingMessageIds.set(sessionId, messageId);
+    else this.lastThinkingMessageIds.delete(sessionId);
   }
 
   // ---------------------------------------------------------------------------

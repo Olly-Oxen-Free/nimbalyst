@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback, useSyncExternalStore } from 'react';
-import { useAtomValue } from 'jotai';
+import { useAtomValue, useSetAtom } from 'jotai';
+import { setTitleBarCreateMenuAtom } from '../store/atoms/titleBarCreate';
 import { FlatFileTree } from './FlatFileTree';
 import type { RendererFileTreeItem } from '../store';
 import { InputModal } from './InputModal';
@@ -11,15 +12,16 @@ import { NewFileMenu, NewFileType, ExtensionFileType, contributionToExtensionFil
 import { createInitialFileContent, createMockupContent } from '../utils/fileUtils';
 import { getFileName } from '../utils/pathUtils';
 import { getExtensionLoader } from '@nimbalyst/runtime';
-import { KeyboardShortcuts } from '../../shared/KeyboardShortcuts';
+import { KeyboardShortcuts, getShortcutDisplay } from '../../shared/KeyboardShortcuts';
 import { HelpTooltip } from '../help';
 import { store, gitStatusMapAtom, revealRequestAtom, rawFileTreeAtom, fileTreeLoadedAtom, type FileGitStatus as AtomFileGitStatus } from '../store';
 import { sessionFileEditsAtom } from '../store/atoms/sessionFiles';
 import { loadSessionFilesResult } from '../services/sessionFilesLoader';
-import { refreshFileTree } from '../store/listeners/fileTreeListeners';
+import { applyLoadedFolderContents, refreshFileTree } from '../store/listeners/fileTreeListeners';
 import { useTabsActions } from '../contexts/TabsContext';
 import { useProjectOrg } from '../hooks/useProjectOrg';
 import { WorkspaceSummaryHeader } from './WorkspaceSummaryHeader';
+import { errorNotificationService } from '../services/ErrorNotificationService';
 
 type FileTreeItem = RendererFileTreeItem;
 
@@ -87,38 +89,6 @@ function resolveSessionFilePath(filePath: string, workspacePath?: string): strin
   const base = normalizeFilePath(workspacePath);
   const relative = sanitized.replace(/^\.?\//, '');
   return normalizeFilePath(`${base}/${relative}`);
-}
-
-function replaceFolderChildren(
-  items: FileTreeItem[],
-  normalizedFolderPath: string,
-  newChildren: FileTreeItem[]
-): [FileTreeItem[], boolean] {
-  let mutated = false;
-
-  const updatedItems = items.map(item => {
-    if (item.type !== 'directory') {
-      return item;
-    }
-
-    const normalizedItemPath = normalizeFilePath(item.path);
-    if (normalizedItemPath === normalizedFolderPath) {
-      mutated = true;
-      return { ...item, children: newChildren };
-    }
-
-    if (item.children && item.children.length > 0) {
-      const [nextChildren, childMutated] = replaceFolderChildren(item.children, normalizedFolderPath, newChildren);
-      if (childMutated) {
-        mutated = true;
-        return { ...item, children: nextChildren };
-      }
-    }
-
-    return item;
-  });
-
-  return [mutated ? updatedItems : items, mutated];
 }
 
 export function WorkspaceSidebar({
@@ -211,21 +181,11 @@ export function WorkspaceSidebar({
 
   const handleFolderContentsLoaded = useCallback((folderPath: string, contents: FileTreeItem[]) => {
     if (!folderPath) return;
-
-    const normalizedFolderPath = normalizeFilePath(folderPath);
-    const normalizedWorkspacePath = workspacePath ? normalizeFilePath(workspacePath) : '';
-
-    const prevTree = store.get(rawFileTreeAtom);
-    if (normalizedWorkspacePath && normalizedFolderPath === normalizedWorkspacePath) {
-      store.set(rawFileTreeAtom, contents);
-      return;
-    }
-
-    const [updatedTree, changed] = replaceFolderChildren(prevTree, normalizedFolderPath, contents);
-    if (changed) {
-      store.set(rawFileTreeAtom, updatedTree);
-    }
-  }, [workspacePath]);
+    // Routed through the listener so the per-root cache it republishes from
+    // stays in step -- writing rawFileTreeAtom directly would be undone by the
+    // next watcher rebuild.
+    applyLoadedFolderContents(folderPath, contents);
+  }, []);
 
   // Load file tree settings from workspace state
   useEffect(() => {
@@ -363,6 +323,60 @@ export function WorkspaceSidebar({
     setIsFolderModalOpen(true);
   };
 
+  // Publish this tree's create menu for the title bar. Markdown is pinned and
+  // the rest sorted, matching NewFileMenu — the ordering rule lives with the
+  // list either way, and the bar stays a dumb renderer.
+  const setTitleBarCreateMenu = useSetAtom(setTitleBarCreateMenuAtom);
+  // Handlers via ref, effect keyed on primitives only — republishing on every
+  // render feeds an atom write back into a re-render and loops.
+  const createHandlersRef = useRef({ handleNewFileTypeSelect, handleNewFolder });
+  createHandlersRef.current = { handleNewFileTypeSelect, handleNewFolder };
+
+  const extensionTypeSignature = extensionFileTypes
+    .map((type) => `${type.extension}:${type.displayName}:${type.icon}`)
+    .sort()
+    .join('|');
+
+  useEffect(() => {
+    if (currentView !== 'files') return undefined;
+
+    const typeItems = [...extensionFileTypes]
+      .sort((a, b) => a.displayName.localeCompare(b.displayName))
+      .map((extType) => ({
+        id: `ext:${extType.extension}`,
+        label: extType.displayName,
+        icon: extType.icon,
+        onSelect: () => createHandlersRef.current.handleNewFileTypeSelect(`ext:${extType.extension}`),
+      }));
+
+    setTitleBarCreateMenu('files', {
+      mode: 'files',
+      destination: selectedFolder ? getFileName(selectedFolder) : null,
+      primaryTrailing: getShortcutDisplay(KeyboardShortcuts.file.newFile),
+      onPrimary: () => createHandlersRef.current.handleNewFileTypeSelect('markdown'),
+      items: [
+        ...typeItems,
+        {
+          id: 'any',
+          label: 'New File…',
+          icon: 'note_add',
+          onSelect: () => createHandlersRef.current.handleNewFileTypeSelect('any'),
+        },
+        {
+          id: 'folder',
+          label: 'New folder',
+          icon: 'create_new_folder',
+          separatorBefore: true,
+          onSelect: () => createHandlersRef.current.handleNewFolder(),
+        },
+      ],
+    });
+    return () => setTitleBarCreateMenu('files', null);
+    // extensionFileTypes is read through its signature; adding the array itself
+    // would republish on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentView, extensionTypeSignature, selectedFolder, setTitleBarCreateMenu]);
+
   const [targetFolder, setTargetFolder] = useState<string | null>(null);
 
   const handleCreateFile = async (fileName: string) => {
@@ -410,11 +424,11 @@ export function WorkspaceSidebar({
         handleRefreshFileTree();
         onFileSelect(filePath);
       } else {
-        alert('Failed to create file: ' + (result?.error || 'Unknown error'));
+        errorNotificationService.showError('Create file failed', 'Failed to create file: ' + (result?.error || 'Unknown error'));
       }
     } catch (error) {
       console.error('Failed to create file:', error);
-      alert('Failed to create file: ' + error);
+      errorNotificationService.showError('Create file failed', 'Failed to create file: ' + error);
     } finally {
       setTargetFolder(null);
     }
@@ -432,11 +446,11 @@ export function WorkspaceSidebar({
         // Refresh file tree
         handleRefreshFileTree();
       } else {
-        alert('Failed to create folder: ' + (result?.error || 'Unknown error'));
+        errorNotificationService.showError('Create folder failed', 'Failed to create folder: ' + (result?.error || 'Unknown error'));
       }
     } catch (error) {
       console.error('Failed to create folder:', error);
-      alert('Failed to create folder: ' + error);
+      errorNotificationService.showError('Create folder failed', 'Failed to create folder: ' + error);
     } finally {
       setTargetFolder(null);
     }
@@ -492,11 +506,11 @@ export function WorkspaceSidebar({
         handleRefreshFileTree();
         onFileSelect(filePath);
       } else {
-        alert('Failed to create file: ' + (result?.error || 'Unknown error'));
+        errorNotificationService.showError('Create file failed', 'Failed to create file: ' + (result?.error || 'Unknown error'));
       }
     } catch (error) {
       console.error('Failed to create file:', error);
-      alert('Failed to create file: ' + error);
+      errorNotificationService.showError('Create file failed', 'Failed to create file: ' + error);
     } finally {
       setIsNewFileDialogOpen(false);
       setNewFileDialogDirectory(null);
@@ -824,7 +838,9 @@ export function WorkspaceSidebar({
   const gitWorktreeModifiedPathSet = useMemo(() => new Set(gitWorktreeModifiedFiles), [gitWorktreeModifiedFiles]);
 
   // Filter file tree based on current filter
-  const filterFileTree = useCallback((items: FileTreeItem[], filter: FileTreeFilter): FileTreeItem[] => {
+  const filteredFileTree = useMemo((): FileTreeItem[] => {
+    const items = fileTree;
+    const filter = fileTreeFilter;
     if (filter === 'all') {
       return items;
     }
@@ -937,12 +953,7 @@ export function WorkspaceSidebar({
     };
 
     return filterItems(items);
-  }, [aiReadPathSet, aiWrittenPathSet, gitUncommittedPathSet, gitWorktreeModifiedPathSet]);
-
-  const filteredFileTree = useMemo(
-    () => filterFileTree(fileTree, fileTreeFilter),
-    [fileTree, fileTreeFilter, filterFileTree]
-  );
+  }, [fileTree, fileTreeFilter, aiReadPathSet, aiWrittenPathSet, gitUncommittedPathSet, gitWorktreeModifiedPathSet]);
 
   const isAISessionFilter = CLAUDE_SESSION_FILTERS.has(fileTreeFilter);
   const hasActiveClaudeSession = Boolean(currentAISessionId);
@@ -1131,17 +1142,9 @@ export function WorkspaceSidebar({
           <>
             {currentView === 'files' && (
               <>
-                <button
-                  ref={newFileButtonRef}
-                  className="workspace-action-button bg-transparent border-none p-1.5 cursor-pointer rounded text-[var(--nim-text-faint)] flex items-center justify-center transition-all duration-200 relative hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
-                  onClick={handleNewFileButtonClick}
-                  title="New file"
-                  aria-label="New file"
-                >
-                  <span className="material-symbols-outlined" style={{ fontSize: '20px' }}>
-                    edit_square
-                  </span>
-                </button>
+                {/* New file / New folder moved to the title bar's left create
+                    control, which sits directly over this tree. The folder
+                    context menu still covers "create here". */}
                 <HelpTooltip testId="file-tree-refresh-button">
                   <button
                     data-testid="file-tree-refresh-button"
@@ -1155,16 +1158,6 @@ export function WorkspaceSidebar({
                     </span>
                   </button>
                 </HelpTooltip>
-                <button
-                  className="workspace-action-button bg-transparent border-none p-1.5 cursor-pointer rounded text-[var(--nim-text-faint)] flex items-center justify-center transition-all duration-200 relative hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
-                  onClick={handleNewFolder}
-                  title="New folder"
-                  aria-label="New folder"
-                >
-                  <span className="material-symbols-outlined" style={{ fontSize: '20px' }}>
-                    create_new_folder
-                  </span>
-                </button>
                 {onOpenQuickSearch && (
                   <HelpTooltip testId="file-tree-quick-open-button">
                     <button

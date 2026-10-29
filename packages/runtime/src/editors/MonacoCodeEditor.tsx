@@ -16,7 +16,13 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import Editor, { DiffEditor, type Monaco, type OnMount } from '@monaco-editor/react';
 import type { editor as MonacoEditorType, Selection } from 'monaco-editor';
-import type { ConfigTheme } from '../editor';
+// Deep path, not the `../editor` barrel: that barrel is the Lexical editor's
+// entry point, and importing it here drags the whole Lexical tree into every
+// graph that contains Monaco -- including the web console, which loads Monaco
+// but deliberately does not ship Lexical's editor surface. `ConfigTheme` is a
+// string union in a leaf module, so there is nothing to gain by routing it
+// through the barrel.
+import type { Theme as ConfigTheme } from '../editor/EditorConfig';
 import { getMonacoTheme, getMonacoLanguage } from './monacoUtils';
 import './MonacoCodeEditor.css';
 
@@ -65,7 +71,8 @@ export interface MonacoDiffModeConfig {
 
 export const MonacoCodeEditor: React.FC<MonacoCodeEditorProps> = ({
   filePath,
-  fileName,
+  // `fileName` stays on the props interface (callers pass it) but nothing in
+  // here reads it: the language is resolved from `filePath`.
   initialContent,
   theme,
   extensionThemeId,
@@ -85,9 +92,6 @@ export const MonacoCodeEditor: React.FC<MonacoCodeEditorProps> = ({
 
   // Content ownership: track what we believe is on disk to ignore our own saves
   const lastKnownDiskContentRef = useRef<string>(initialContent);
-
-  // Track if we've done initial load
-  const hasLoadedInitialContentRef = useRef(false);
 
   // Diff mode state
   const [diffMode, setDiffMode] = useState<MonacoDiffModeConfig | null>(null);
@@ -300,15 +304,16 @@ export const MonacoCodeEditor: React.FC<MonacoCodeEditorProps> = ({
     editorRef.current = editor;
     monacoRef.current = monaco;
 
-    // Disable TypeScript/JavaScript diagnostics globally
+    // Disable TypeScript/JavaScript diagnostics globally. A Monaco build without
+    // the TypeScript service (the wiki browser view) has no diagnostics to disable.
     try {
-      monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
+      monaco.languages.typescript?.typescriptDefaults.setDiagnosticsOptions({
         noSemanticValidation: true,
         noSyntaxValidation: true,
         noSuggestionDiagnostics: true,
       });
 
-      monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
+      monaco.languages.typescript?.javascriptDefaults.setDiagnosticsOptions({
         noSemanticValidation: true,
         noSyntaxValidation: true,
         noSuggestionDiagnostics: true,
@@ -413,13 +418,13 @@ export const MonacoCodeEditor: React.FC<MonacoCodeEditorProps> = ({
 
     // Disable diagnostics for diff editor too
     try {
-      monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
+      monaco.languages.typescript?.typescriptDefaults.setDiagnosticsOptions({
         noSemanticValidation: true,
         noSyntaxValidation: true,
         noSuggestionDiagnostics: true,
       });
 
-      monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
+      monaco.languages.typescript?.javascriptDefaults.setDiagnosticsOptions({
         noSemanticValidation: true,
         noSyntaxValidation: true,
         noSuggestionDiagnostics: true,

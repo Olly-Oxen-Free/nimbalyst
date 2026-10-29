@@ -111,7 +111,7 @@ export interface ThreadStartResponse {
   serviceTier?: string | null;
   cwd?: string;
   approvalPolicy?: AskForApproval;
-  sandbox?: unknown;
+  sandbox?: { type: 'readOnly' | 'workspaceWrite' | 'dangerFullAccess' | 'externalSandbox'; writableRoots?: string[]; networkAccess?: boolean };
   reasoningEffort?: string;
 }
 
@@ -187,12 +187,19 @@ export interface TurnCompletedNotification {
   usage?: TokenUsage;
 }
 
+/**
+ * App-server error classification: a string variant ("contextWindowExceeded")
+ * or a single-key object variant ({ httpConnectionFailed: { httpStatusCode } }).
+ * Unknown variants are accepted since 0.162, so treat both forms as open-ended.
+ */
+export type CodexErrorInfo = string | Record<string, unknown>;
+
 export interface TurnFailedNotification {
   threadId: string;
   turn: {
     id: string;
     status: 'failed';
-    error: { message?: string; codexErrorInfo?: string; additionalDetails?: unknown } | null;
+    error: { message?: string; codexErrorInfo?: CodexErrorInfo | null; additionalDetails?: unknown } | null;
   };
 }
 
@@ -380,7 +387,7 @@ export interface McpServerStartupStatusUpdatedNotification {
 export interface ErrorNotification {
   threadId?: string;
   turnId?: string;
-  error: { message: string; codexErrorInfo?: string; additionalDetails?: unknown };
+  error: { message: string; codexErrorInfo?: CodexErrorInfo | null; additionalDetails?: unknown };
   willRetry?: boolean;
 }
 

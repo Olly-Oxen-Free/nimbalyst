@@ -6,17 +6,19 @@ import { WindowState, FileTreeItem } from '../types';
 import { WINDOW_CASCADE_OFFSET } from '../utils/constants';
 import { getTheme, saveWorkspaceWindowState, getWorkspaceNavigationHistory, saveWorkspaceNavigationHistory } from '../utils/store';
 import { stopFileWatcher } from '../file/FileWatcher';
+import { releaseWhenWorkspaceUnused } from '../file/GitWatcherLifecycle';
 import { stopWorkspaceWatcher, startWorkspaceWatcher } from '../file/WorkspaceWatcher.ts';
 import { getFolderContents } from '../utils/FileTree';
 import { getBackgroundColor, getTitleBarColors } from '../theme/ThemeManager';
 import { ElectronDocumentService, setupDocumentServiceHandlers } from '../services/ElectronDocumentService';
 import { ElectronFileSystemService } from '../services/ElectronFileSystemService';
-import { isWorktreePath, resolveProjectPath } from '../utils/workspaceDetection';
+import { isWorktreePath, resolveProjectPath, resolveProjectPathCandidates } from '../utils/workspaceDetection';
 import { getPreloadPath } from '../utils/appPaths';
 import { createUnresponsiveHandler } from './unresponsiveHandler';
+import { recoverAfterProjectWindowClosed } from './ApplicationWindowRecovery';
 import {
   setFileSystemService,
-  clearFileSystemService,
+  clearFileSystemServiceFor,
   setFileSystemServiceFor,
 } from '@nimbalyst/runtime';
 import { navigationHistoryService } from '../services/NavigationHistoryService';
@@ -30,13 +32,19 @@ import { getMcpConfigService } from '../mcpConfigServiceRef';
 import { addNimAssetRoot } from '../protocols/nimAssetProtocol';
 import { addNimPreviewWorkspaceRoot } from '../protocols/nimPreviewProtocol';
 import { scheduleAttachmentStagingCleanup } from '../services/attachments/attachmentStagingCleanup';
-import { windows, windowStates, anyWindowReferencesWorkspace, resolveDocumentServicePath, getWindowIdForWindow } from './windowState';
+import { windows, windowStates, resolveDocumentServicePath, getWindowIdForWindow } from './windowState';
+import {
+    matchWorkspaceWindow,
+    type WorkspaceWindowCandidate,
+    type WorkspaceWindowMatch,
+} from './workspaceWindowMatch';
 import { shouldSaveSessionOnWindowClose } from './sessionSaveOnClose';
 import {
     registerCustomTitleBarWindow,
     registerFullScreenChrome,
     titleBarOptionsForWindow,
 } from './windowChrome';
+import { cascadeWindowBounds, restoreVisibleWindowBounds } from './windowBounds';
 
 // Window management
 export { windows, windowStates };
@@ -112,7 +120,7 @@ export const documentServices = new Map<string, ElectronDocumentService>();
 import { fileSystemServices } from './serviceRegistry';
 import { watchAndInjectGlassCss } from './glassCss';
 
-function resolveDocumentServiceForEvent(event: IpcMainEvent | IpcMainInvokeEvent): ElectronDocumentService | null {
+function resolveDocumentServiceForEvent(event: IpcMainEvent | IpcMainInvokeEvent, workspacePath?: string): ElectronDocumentService | null {
     const browserWindow = BrowserWindow.fromWebContents(event.sender);
     if (!browserWindow) {
         // console.log('[DocumentService] No browser window from event');
@@ -127,7 +135,9 @@ function resolveDocumentServiceForEvent(event: IpcMainEvent | IpcMainInvokeEvent
     // Honor the project rail's active selection (issue #591). Reading the raw
     // primary `workspacePath` here leaked another project's tracker items when
     // the visible project differed from the window's startup project.
-    const path = resolveDocumentServicePath(state);
+    // A request that names its project (#1822) is answered for that project,
+    // whichever one the rail has marked active by now.
+    const path = resolveDocumentServicePath(state, workspacePath);
     if (!path) {
         return null;
     }
@@ -170,6 +180,8 @@ export function getFocusedOrNewWindow(): BrowserWindow {
 }
 
 export interface CreateWindowOptions {
+    /** Explicit project windows must not inherit another window's saved rail. */
+    restorePreviousProjects?: boolean;
     /** Show the window without activating the app (no focus steal). */
     showInactive?: boolean;
     /**
@@ -204,38 +216,27 @@ export function createWindow(
             // console.log('[MAIN] Using icon at:', iconPath);
         }
 
-        // Calculate window position with cascading effect
-        let x: number | undefined;
-        let y: number | undefined;
-        let width = 1024;
-        let height = 768;
-
-        if (savedBounds) {
-            // Use saved bounds from session
-            x = savedBounds.x;
-            y = savedBounds.y;
-            width = savedBounds.width;
-            height = savedBounds.height;
-        } else {
-            // Get the display containing the cursor
+        let resolvedBounds;
+        if (!savedBounds) {
             const cursorPoint = screen.getCursorScreenPoint();
             const display = screen.getDisplayNearestPoint(cursorPoint);
-
-            // Calculate position with cascading offset
-            x = display.bounds.x + 100 + windowPositionOffset;
-            y = display.bounds.y + 100 + windowPositionOffset;
-
-            // Update offset for next window (wrap around after 10 windows)
+            resolvedBounds = cascadeWindowBounds(display.bounds, windowPositionOffset, {
+                width: 1024,
+                height: 768,
+            });
             windowPositionOffset = (windowPositionOffset + WINDOW_CASCADE_OFFSET) % (WINDOW_CASCADE_OFFSET * 10);
-
-            // Make sure window is not off screen
-            if (x + width > display.bounds.x + display.bounds.width) {
-                x = display.bounds.x + 100;
-            }
-            if (y + height > display.bounds.y + display.bounds.height) {
-                y = display.bounds.y + 100;
-            }
+        } else {
+            const savedCenter = {
+                x: Math.round(savedBounds.x + savedBounds.width / 2),
+                y: Math.round(savedBounds.y + savedBounds.height / 2),
+            };
+            resolvedBounds = restoreVisibleWindowBounds(
+                savedBounds,
+                screen.getAllDisplays().map((display) => display.workArea),
+                screen.getDisplayNearestPoint(savedCenter).workArea,
+            );
         }
+        const { x, y, width, height } = resolvedBounds;
 
         // Passed to the renderer as a query param so it can apply the theme on
         // first paint; this is the persisted id, extension themes included.
@@ -308,6 +309,7 @@ export function createWindow(
 
         // Generate a unique window ID
         const windowId = ++windowIdCounter;
+        const electronWindowId = window.id;
         // console.log('[MAIN] Created window with ID:', windowId, 'Electron ID:', window.id);
 
         // Store window and initial state
@@ -316,6 +318,7 @@ export function createWindow(
             mode: isWorkspaceMode ? 'workspace' : 'document',
             filePath: null,
             workspacePath: isWorkspaceMode ? workspacePath : null,
+            restorePreviousProjects: options?.restorePreviousProjects,
             documentEdited: false
         });
 
@@ -423,6 +426,11 @@ export function createWindow(
             // Save workspace-specific window state before closing
             const state = windowStates.get(windowId);
             savedState = state; // Preserve for 'closed' handler
+            console.info('[WindowLifecycle] Project close requested', {
+                windowId: electronWindowId, managedWindowId: windowId, isQuitting,
+                prevented: event.defaultPrevented, focused: window.isFocused(),
+                visible: window.isVisible(), minimized: window.isMinimized(),
+            });
 
             if (state?.mode === 'workspace' && state.workspacePath) {
                 const bounds = window.getBounds();
@@ -471,6 +479,12 @@ export function createWindow(
 
         window.on('closed', () => {
             windows.delete(windowId);
+            console.info('[WindowLifecycle] Project closed', {
+                windowId: electronWindowId, managedWindowId: windowId, isQuitting,
+                remainingProjectWindows: windows.size,
+                remainingBrowserWindows: BrowserWindow.getAllWindows().length,
+            });
+            recoverAfterProjectWindowClosed();
             // Use saved state from 'close' handler
             const state = savedState;
             savingWindows.delete(windowId);
@@ -492,7 +506,7 @@ export function createWindow(
             // Clean up document/file-system services for any workspace this
             // window referenced (its primary path AND any rail-warm
             // additional paths). A path is freed only when no other window
-            // still references it — covers both window-per-project overlap
+            // still references it and no agent turn is unfinished — covers window-per-project overlap
             // and the multi-project rail.
             if (state?.mode === 'workspace') {
                 const referencedPaths = new Set<string>();
@@ -500,30 +514,30 @@ export function createWindow(
                 state.additionalWorkspacePaths?.forEach((p) => referencedPaths.add(p));
 
                 for (const path of referencedPaths) {
-                    if (anyWindowReferencesWorkspace(path)) continue;
-
-                    const docService = documentServices.get(path);
-                    if (docService) {
-                        docService.destroy();
-                        documentServices.delete(path);
-                        console.log('[MAIN] Destroyed DocumentService for workspace:', path);
-                    }
-                    const fileSystemService = fileSystemServices.get(path);
-                    if (fileSystemService) {
-                        fileSystemService.destroy();
-                        fileSystemServices.delete(path);
-                        clearFileSystemService();
-                        console.log('[MAIN] Destroyed FileSystemService for workspace:', path);
-                    }
-                    try {
-                        const mcpService = getMcpConfigService();
-                        if (mcpService) {
-                            mcpService.stopWatchingWorkspaceConfig(path);
-                            console.log('[MAIN] Stopped watching MCP config for workspace:', path);
+                    releaseWhenWorkspaceUnused(path, () => {
+                        const docService = documentServices.get(path);
+                        if (docService) {
+                            docService.destroy();
+                            documentServices.delete(path);
+                            console.log('[MAIN] Destroyed DocumentService for workspace:', path);
                         }
-                    } catch (error) {
-                        console.error('[MAIN] Error stopping MCP config watcher:', error);
-                    }
+                        const fileSystemService = fileSystemServices.get(path);
+                        if (fileSystemService) {
+                            fileSystemService.destroy();
+                            fileSystemServices.delete(path);
+                            clearFileSystemServiceFor(path);
+                            console.log('[MAIN] Destroyed FileSystemService for workspace:', path);
+                        }
+                        try {
+                            const mcpService = getMcpConfigService();
+                            if (mcpService) {
+                                mcpService.stopWatchingWorkspaceConfig(path);
+                                console.log('[MAIN] Stopped watching MCP config for workspace:', path);
+                            }
+                        } catch (error) {
+                            console.error('[MAIN] Error stopping MCP config watcher:', error);
+                        }
+                    });
                 }
             }
 
@@ -797,64 +811,47 @@ export function findWindowByFilePath(filePath: string): BrowserWindow | null {
  * @returns The BrowserWindow for that workspace, or null if not found
  */
 export function findWindowByWorkspace(workspacePath: string): BrowserWindow | null {
-    // First try exact match — primary or any rail-warm additional path.
-    // Prefer windows where the path is currently active so MCP routes to
-    // the visible project when several windows host the same workspace.
-    let bestActiveMatch: BrowserWindow | null = null;
-    let bestAnyMatch: BrowserWindow | null = null;
+    return findWorkspaceWindowMatch(workspacePath)?.window ?? null;
+}
 
-    for (const [windowId, window] of windows) {
+/** A window that can host the workspace, plus how it currently relates to it. */
+export interface WorkspaceWindowMatchResult extends WorkspaceWindowMatch {
+    window: BrowserWindow;
+}
+
+/**
+ * Same lookup as `findWindowByWorkspace`, but it also reports whether the
+ * matched window is *showing* the workspace. Callers that reuse a window need
+ * that: a window keeps referencing every rail project, so the window that has
+ * Project-A may be displaying Project-B, and focusing it changes nothing on
+ * screen (https://github.com/nimbalyst/nimbalyst/issues/1427).
+ */
+export function findWorkspaceWindowMatch(workspacePath: string): WorkspaceWindowMatchResult | null {
+    const candidates: WorkspaceWindowCandidate[] = [];
+    for (const [windowId] of windows) {
         const state = windowStates.get(windowId);
         if (!state) continue;
-
-        const isActive = (state.activeWorkspacePath ?? state.workspacePath) === workspacePath;
-        const isReferenced =
-            state.workspacePath === workspacePath ||
-            state.additionalWorkspacePaths?.includes(workspacePath) === true;
-
-        if (isActive) {
-            bestActiveMatch = window;
-            break;
-        }
-        if (isReferenced && !bestAnyMatch) {
-            bestAnyMatch = window;
-        }
+        candidates.push({
+            windowId,
+            workspacePath: state.workspacePath,
+            activeWorkspacePath: state.activeWorkspacePath,
+            additionalWorkspacePaths: state.additionalWorkspacePaths,
+        });
     }
 
-    if (bestActiveMatch) return bestActiveMatch;
-    if (bestAnyMatch) return bestAnyMatch;
+    // resolveProjectPathCandidates lets the match see through a symlinked or
+    // case-variant spelling, so a window opened as `~/dev/x` is still found when
+    // a worktree resolves the request to `~/Dev/x` (#1551).
+    const match = matchWorkspaceWindow(candidates, workspacePath, {
+        isWorktreePath,
+        resolveProjectPath,
+        resolveProjectPathCandidates,
+    });
+    if (!match) return null;
 
-    // If the given path is a worktree, try to find window by parent project path
-    if (isWorktreePath(workspacePath)) {
-        const projectPath = resolveProjectPath(workspacePath);
-        for (const [windowId, window] of windows) {
-            const state = windowStates.get(windowId);
-            if (!state) continue;
-            if (
-                state.workspacePath === projectPath ||
-                state.additionalWorkspacePaths?.includes(projectPath)
-            ) {
-                return window;
-            }
-        }
-    }
-
-    // If the given path is a project path, check if any window is a worktree of that project
-    for (const [windowId, window] of windows) {
-        const state = windowStates.get(windowId);
-        if (!state) continue;
-        const candidatePaths: string[] = [];
-        if (state.workspacePath) candidatePaths.push(state.workspacePath);
-        if (state.additionalWorkspacePaths) candidatePaths.push(...state.additionalWorkspacePaths);
-
-        for (const candidate of candidatePaths) {
-            if (isWorktreePath(candidate) && resolveProjectPath(candidate) === workspacePath) {
-                return window;
-            }
-        }
-    }
-
-    return null;
+    const window = windows.get(match.windowId);
+    if (!window) return null;
+    return { ...match, window };
 }
 
 /**

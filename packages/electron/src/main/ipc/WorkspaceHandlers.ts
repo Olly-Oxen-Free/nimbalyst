@@ -1,11 +1,11 @@
-import { BrowserWindow, app, shell, clipboard, nativeImage } from 'electron';
+import { BrowserWindow, shell, clipboard, nativeImage } from 'electron';
+import { systemShell } from '../utils/systemShell';
+import { readWindowsClipboardImage } from '../utils/windowsClipboard';
 import { readFileSync, readdirSync, statSync, existsSync, promises as fsPromises } from 'fs';
-import * as fs from 'fs';
 import { join, basename, dirname, extname } from 'path';
 import * as path from 'path';
-import { exec, execFile, spawn } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
-import os from 'os';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { openWorkspaceFile, openFile } from '../file/FileOpener';
 import { fuzzyMatchPath } from '@nimbalyst/runtime';
@@ -15,17 +15,18 @@ import { getSyncId, removeFileFromIndex } from '../services/DocSyncService';
 const { writeFile, mkdir, rename, unlink, rmdir, copyFile, readFile, rm, stat, cp } = fsPromises;
 
 const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
 import { windowStates, getWindowId, createWindow, markRecentlyDeleted, clearRecentlyDeleted } from '../window/WindowManager';
+// Aliased: this module has a local `windows` (BrowserWindow[]) further down.
+import { syncRepresentedFilename, windows as windowsById } from '../window/windowState';
 import { startFileWatcher, stopFileWatcher } from '../file/FileWatcher';
-import { getFolderContents } from '../utils/FileTree';
+import { getFolderContents, listFolderFilesRecursive } from '../utils/FileTree';
 import { decodeTextFileBuffer } from '../utils/textEncoding';
-import { RIPGREP_EXCLUDE_ARGS_ARRAY, QUICKOPEN_FILE_TYPE_ARGS } from '../utils/fileFilters';
 import {
     getWorkspaceRecentFiles,
     addWorkspaceRecentFile,
     store,
     getWorkspaceState,
+    getWorkspaceRoots,
     updateWorkspaceState,
     getAppSetting
 } from '../utils/store';
@@ -37,6 +38,8 @@ import {
 } from '../services/tracker/localKeyAllocator';
 import { workspaceLocalKeyStore } from '../services/tracker/workspaceLocalKeyStore';
 import { database } from '../database/PGLiteDatabaseWorker';
+import { findWorkspaceFiles, listContentSearchRoots, searchFileContent } from '../file/QuickOpenFileScanner';
+import { quickOpenFileNameCache } from '../file/QuickOpenFileNameCache';
 
 /**
  * Deep merge utility for workspace state updates.
@@ -86,35 +89,9 @@ function getFileType(filePath: string): string {
     return typeMap[ext] || 'other';
 }
 
-// Cache for quick open file searches
-const fileNameCaches = new Map<string, Array<{ path: string; name: string; type: 'file' | 'directory' }>>();
-
 interface QuickOpenFileNameSearchOptions {
     fileMask?: string | null;
 }
-
-// Binary file extensions to exclude from QuickOpen results
-// Note: Images are NOT excluded - Nimbalyst can display them
-// Note: PDFs are NOT excluded - extensions may add support
-const BINARY_EXTENSIONS = new Set([
-    // Audio/Video
-    '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flac', '.wav', '.ogg', '.webm', '.mkv',
-    // Archives
-    '.zip', '.tar', '.gz', '.rar', '.7z', '.bz2', '.xz',
-    // Binaries/Libraries
-    '.exe', '.dll', '.so', '.dylib', '.o', '.a', '.lib', '.bin',
-    // Documents (non-text)
-    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-    // Database/Lock files
-    '.db', '.sqlite', '.sqlite3', '.lock',
-    // Fonts
-    '.ttf', '.otf', '.woff', '.woff2', '.eot',
-    // Other binary
-    '.pyc', '.pyo', '.class', '.jar', '.war', '.ear',
-    '.node', '.wasm',
-]);
-
-const NIMBALYST_LOCAL_DIRNAME = 'nimbalyst-local';
 
 function shouldIncludeQuickOpenCacheItem(
     item: { path: string; type: 'file' | 'directory' },
@@ -123,115 +100,6 @@ function shouldIncludeQuickOpenCacheItem(
     if (maskPatterns.length === 0) return true;
     if (item.type === 'directory') return false;
     return matchesFileMask(item.path, maskPatterns);
-}
-
-// Get the ripgrep binary path for the current platform.
-// Resolves the rg bundled by the @vscode/ripgrep package at
-// node_modules/@vscode/ripgrep/bin/rg(.exe). Result is cached for
-// the lifetime of the process — search is called frequently and
-// the binary doesn't move.
-let cachedRgPath: string | null = null;
-function getRipgrepPath(): string {
-    if (cachedRgPath !== null) return cachedRgPath;
-
-    const platform = os.platform();
-    const rgBinaryName = platform === 'win32' ? 'rg.exe' : 'rg';
-    const isPackaged = app.isPackaged;
-
-    // Use a variable to avoid Vite trying to resolve 'node_modules' as an identifier
-    const NODE_MODULES_DIR = ['node', '_', 'modules'].join('');
-    const rgRelPath = path.join(NODE_MODULES_DIR, '@vscode', 'ripgrep', 'bin', rgBinaryName);
-
-    const possibleRgPaths: string[] = [];
-
-    if (isPackaged) {
-        const resourcesPath = process.resourcesPath;
-        possibleRgPaths.push(path.join(resourcesPath, 'app.asar.unpacked', rgRelPath));
-    } else {
-        possibleRgPaths.push(
-            path.join(__dirname, '..', '..', rgRelPath),
-            path.join(process.cwd(), rgRelPath),
-        );
-        // In monorepos, node_modules may be hoisted to the repo root.
-        // Walk up from cwd to find it.
-        let searchDir = process.cwd();
-        for (let i = 0; i < 5; i++) {
-            const parent = path.dirname(searchDir);
-            if (parent === searchDir) break; // reached filesystem root
-            possibleRgPaths.push(path.join(parent, rgRelPath));
-            searchDir = parent;
-        }
-    }
-
-    for (const testPath of possibleRgPaths) {
-        if (existsSync(testPath)) {
-            // Make sure the binary is executable in production (non-Windows)
-            if (isPackaged && platform !== 'win32') {
-                try {
-                    fs.chmodSync(testPath, 0o755);
-                } catch (e) {
-                    console.warn('[SEARCH] Could not set executable permission on ripgrep:', e);
-                }
-            }
-            // console.log('[SEARCH] Found ripgrep at:', testPath);
-            cachedRgPath = testPath;
-            return testPath;
-        }
-    }
-
-    // Fall back to system rg
-    console.warn('[SEARCH] Could not find bundled ripgrep, falling back to system rg. Probed:', possibleRgPaths);
-    cachedRgPath = 'rg';
-    return 'rg';
-}
-
-async function runRipgrepFiles(rootPath: string, options?: { noIgnore?: boolean }): Promise<string[]> {
-    const rgPath = getRipgrepPath();
-    const rgArgs = [
-        '--files',
-        '--hidden',  // Include dotfiles like .gitignore
-        ...(options?.noIgnore ? ['--no-ignore'] : []),
-        ...RIPGREP_EXCLUDE_ARGS_ARRAY,
-        rootPath
-    ];
-
-    let stdout = '';
-    try {
-        const result = await execFileAsync(rgPath, rgArgs, { maxBuffer: 5 * 1024 * 1024 });
-        stdout = result.stdout;
-    } catch (execError: any) {
-        // ripgrep returns exit code 1 when no matches found
-        if (execError.code === 1) {
-            stdout = execError.stdout || '';
-        } else {
-            throw execError;
-        }
-    }
-
-    if (!stdout) return [];
-
-    return stdout
-        .split('\n')
-        .filter(line => line.trim())
-        .map(file => path.normalize(file));
-}
-
-// Cross-platform file finder using ripgrep --files.
-// Respects .gitignore for the general workspace scan, but explicitly includes
-// nimbalyst-local/ so local plan files remain mentionable in @ typeahead.
-async function findWorkspaceFiles(dir: string): Promise<string[]> {
-    const baseFiles = await runRipgrepFiles(dir);
-    const nimbalystLocalPath = path.join(dir, NIMBALYST_LOCAL_DIRNAME);
-    const extraFiles = existsSync(nimbalystLocalPath)
-      ? await runRipgrepFiles(nimbalystLocalPath, { noIgnore: true })
-      : [];
-
-    return Array.from(new Set([...baseFiles, ...extraFiles]))
-        .filter(file => {
-            // Filter out binary files by extension
-            const ext = path.extname(file).toLowerCase();
-            return !BINARY_EXTENSIONS.has(ext);
-        });
 }
 
 export function registerWorkspaceHandlers() {
@@ -244,6 +112,11 @@ export function registerWorkspaceHandlers() {
     // Refresh folder contents (for when user expands a folder)
     safeHandle('refresh-folder-contents', async (event, folderPath: string) => {
         return await getFolderContents(folderPath);
+    });
+
+    // Every file under a folder, uncapped per-directory, for "Share Folder to Team".
+    safeHandle('get-folder-files-recursive', async (event, folderPath: string) => {
+        return await listFolderFilesRecursive(folderPath);
     });
 
     // Create new file
@@ -297,7 +170,7 @@ export function registerWorkspaceHandlers() {
             let isBinary = forceBinary;
             if (!forceBinary) {
                 const ext = extname(filePath).toLowerCase();
-                const binaryExtensions = ['.pdf', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.zip', '.tar', '.gz', '.woff', '.woff2', '.ttf', '.eot'];
+                const binaryExtensions = ['.pdf', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.zip', '.tar', '.gz', '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.mov', '.m4v', '.webm', '.mkv', '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.webp', '.avif', '.heic'];
                 isBinary = binaryExtensions.includes(ext);
             }
 
@@ -371,46 +244,17 @@ export function registerWorkspaceHandlers() {
         }
     });
 
-    // Build file name cache for quick open
+    // Build file name cache for quick open, one entry per workspace root so a
+    // detached folder's files leave the index with it.
     safeHandle('build-quick-open-cache', async (event, workspacePath: string) => {
         try {
-            // Use cross-platform Node.js file walking instead of Unix find command
-            const files = await findWorkspaceFiles(workspacePath);
-
-            const cache: Array<{ path: string; name: string; type: 'file' | 'directory' }> = [];
-
-            // Extract unique directories from file paths
-            const dirs = new Set<string>();
-            for (const file of files) {
-                // Walk up the directory tree from each file
-                let dir = dirname(file);
-                while (dir.length > workspacePath.length) {
-                    if (dirs.has(dir)) break; // Already seen this dir and its parents
-                    dirs.add(dir);
-                    dir = dirname(dir);
-                }
+            const roots = getWorkspaceRoots(workspacePath);
+            let fileCount = 0;
+            for (const rootPath of roots) {
+                const cache = await quickOpenFileNameCache.get(rootPath, true);
+                fileCount += cache.length;
             }
-
-            // Add directories to cache
-            for (const dir of dirs) {
-                cache.push({
-                    path: dir,
-                    name: basename(dir).toLowerCase(),
-                    type: 'directory'
-                });
-            }
-
-            // Add files to cache
-            for (const file of files) {
-                cache.push({
-                    path: file,
-                    name: basename(file).toLowerCase(),
-                    type: 'file'
-                });
-            }
-
-            fileNameCaches.set(workspacePath, cache);
-            return { success: true, fileCount: cache.length };
+            return { success: true, fileCount };
         } catch (error) {
             console.error('Error building quick open cache:', error);
             return { success: false, error: String(error) };
@@ -429,10 +273,20 @@ export function registerWorkspaceHandlers() {
             const trimmedQuery = query.trim();
             const maskPatterns = parseFileMask(options?.fileMask);
 
-            // Use cache if available
-            const cache = fileNameCaches.get(workspacePath);
-            if (!cache) {
-                console.warn('Quick open cache not built for workspace:', workspacePath);
+            // Union the per-root caches: quick open spans every root the
+            // workspace shows, in root order. A clone nested in a root is
+            // scanned from that root (#1449) and again when it is also attached
+            // as a root of its own, so keep each path once.
+            const roots = getWorkspaceRoots(workspacePath);
+            const seenPaths = new Set<string>();
+            const cache = (await Promise.all(roots.map(rootPath => quickOpenFileNameCache.get(rootPath))))
+                .flat()
+                .filter(item => {
+                    if (seenPaths.has(item.path)) return false;
+                    seenPaths.add(item.path);
+                    return true;
+                });
+            if (cache.length === 0) {
                 return [];
             }
 
@@ -492,59 +346,7 @@ export function registerWorkspaceHandlers() {
             const trimmedQuery = query.trim();
             if (!trimmedQuery) return [];
 
-            const rgPath = getRipgrepPath();
-            const rgArgs = [
-                ...QUICKOPEN_FILE_TYPE_ARGS,
-                '-i',
-                '--json',
-                ...RIPGREP_EXCLUDE_ARGS_ARRAY,
-                trimmedQuery,
-                workspacePath
-            ];
-
-            let stdout = '';
-            try {
-                const result = await execFileAsync(rgPath, rgArgs, { maxBuffer: 5 * 1024 * 1024 });
-                stdout = result.stdout;
-            } catch (execError: any) {
-                // ripgrep returns exit code 1 when no matches found, which is not an error
-                if (execError.code === 1) {
-                    stdout = execError.stdout || '';
-                } else {
-                    throw execError;
-                }
-            }
-
-            const contentMatches = new Map<string, any>();
-            if (stdout) {
-                const lines = stdout.split('\n').filter(line => line.trim());
-                for (const line of lines) {
-                    try {
-                        const item = JSON.parse(line);
-                        if (item.type === 'match') {
-                            const filePath = item.data.path.text;
-                            if (!contentMatches.has(filePath)) {
-                                contentMatches.set(filePath, {
-                                    path: path.normalize(filePath),
-                                    isContentMatch: true,
-                                    matches: []
-                                });
-                            }
-
-                            contentMatches.get(filePath).matches.push({
-                                line: item.data.line_number,
-                                text: item.data.lines.text.trim(),
-                                start: item.data.submatches[0]?.start || 0,
-                                end: item.data.submatches[0]?.end || item.data.lines.text.length
-                            });
-                        }
-                    } catch (e) {
-                        // Skip invalid JSON lines
-                    }
-                }
-            }
-
-            return Array.from(contentMatches.values()).slice(0, 50);
+            return await searchFileContent(await listContentSearchRoots(getWorkspaceRoots(workspacePath)), trimmedQuery);
         } catch (error) {
             console.error('Error searching file content:', error);
             return [];
@@ -561,7 +363,10 @@ export function registerWorkspaceHandlers() {
 
             // First, search file names using ripgrep --files
             try {
-                const allFiles = await findWorkspaceFiles(workspacePath);
+                const perRoot = await Promise.all(
+                    getWorkspaceRoots(workspacePath).map(rootPath => findWorkspaceFiles(rootPath)),
+                );
+                const allFiles = Array.from(new Set(perRoot.flat()));
                 const queryLower = trimmedQuery.toLowerCase();
                 const matchingFiles = allFiles
                     .filter(file => basename(file).toLowerCase().includes(queryLower))
@@ -580,67 +385,18 @@ export function registerWorkspaceHandlers() {
 
             // Then search content using ripgrep
             try {
-                const rgPath = getRipgrepPath();
-                const rgArgs = [
-                    '--type', 'md',
-                    '-i',
-                    '--json',
-                    ...RIPGREP_EXCLUDE_ARGS_ARRAY,
+                const contentMatches = await searchFileContent(
+                    await listContentSearchRoots(getWorkspaceRoots(workspacePath)),
                     trimmedQuery,
-                    workspacePath
-                ];
-
-                let stdout = '';
-                try {
-                    const result = await execFileAsync(rgPath, rgArgs, { maxBuffer: 5 * 1024 * 1024 });
-                    stdout = result.stdout;
-                } catch (execError: any) {
-                    // ripgrep returns exit code 1 when no matches found, which is not an error
-                    if (execError.code === 1) {
-                        stdout = execError.stdout || '';
+                    { typeArgs: ['--type', 'md'] },
+                );
+                for (const data of contentMatches) {
+                    const existing = allResults.find(r => r.path === data.path);
+                    if (existing) {
+                        existing.matches = data.matches;
+                        existing.isContentMatch = true;
                     } else {
-                        throw execError;
-                    }
-                }
-
-                if (stdout) {
-                    const lines = stdout.split('\n').filter(line => line.trim());
-                    const contentMatches = new Map<string, any>();
-
-                    for (const line of lines) {
-                        try {
-                            const item = JSON.parse(line);
-                            if (item.type === 'match') {
-                                const filePath = path.normalize(item.data.path.text);
-                                if (!contentMatches.has(filePath)) {
-                                    contentMatches.set(filePath, {
-                                        path: filePath,
-                                        isContentMatch: true,
-                                        matches: []
-                                    });
-                                }
-
-                                contentMatches.get(filePath).matches.push({
-                                    line: item.data.line_number,
-                                    text: item.data.lines.text.trim(),
-                                    start: item.data.submatches[0]?.start || 0,
-                                    end: item.data.submatches[0]?.end || item.data.lines.text.length
-                                });
-                            }
-                        } catch (e) {
-                            // Skip invalid JSON lines
-                        }
-                    }
-
-                    // Merge content matches with existing results
-                    for (const [filePath, data] of contentMatches) {
-                        const existing = allResults.find(r => r.path === filePath);
-                        if (existing) {
-                            existing.matches = data.matches;
-                            existing.isContentMatch = true;
-                        } else {
-                            allResults.push(data);
-                        }
+                        allResults.push(data);
                     }
                 }
             } catch (error: any) {
@@ -723,7 +479,9 @@ export function registerWorkspaceHandlers() {
 
     // Get entire workspace state - no routing, no BS
     safeHandle('workspace:get-state', async (event, workspacePath: string) => {
-        return getWorkspaceState(workspacePath);
+        const state = structuredClone(getWorkspaceState(workspacePath));
+        for (const config of Object.values(state.aiProviderOverrides?.providers ?? {})) delete config.apiKey;
+        return state;
     });
 
     /**
@@ -790,6 +548,7 @@ export function registerWorkspaceHandlers() {
 
     // Update workspace state - takes partial update, merges atomically with deep merge
     safeHandle('workspace:update-state', async (event, workspacePath: string, updates: any) => {
+        if (Object.values(updates?.aiProviderOverrides?.providers ?? {}).some((config: any) => config && 'apiKey' in config)) throw new Error('Use the provider credential API to change keys.');
         if (
             updates
             && (
@@ -799,7 +558,7 @@ export function registerWorkspaceHandlers() {
         ) {
             throw new Error('Local tracker numbering state must be changed through the validated tracker-local-key API.');
         }
-        return updateWorkspaceState(workspacePath, (state) => {
+        const updated = updateWorkspaceState(workspacePath, (state) => {
             // Extension storage writes carry the complete cache. Replace this one
             // field so deletions survive; deepMerge intentionally preserves keys.
             if (updates && Object.prototype.hasOwnProperty.call(updates, 'extensionStorage')) {
@@ -810,6 +569,8 @@ export function registerWorkspaceHandlers() {
             }
             deepMerge(state, updates);
         });
+        for (const config of Object.values(updated.aiProviderOverrides?.providers ?? {})) delete config.apiKey;
+        return updated;
     });
 
     // File operations for workspace files
@@ -932,6 +693,10 @@ export function registerWorkspaceHandlers() {
                 if (state?.filePath === filePath) {
                     state.filePath = null;
                     state.documentEdited = false;
+                    // #1375: Clearing window state is not enough — the
+                    // represented file is OS-level and would keep pointing at
+                    // a file that is now in the trash.
+                    syncRepresentedFilename(windowsById.get(windowId), null);
                 }
             }
 
@@ -1108,7 +873,7 @@ export function registerWorkspaceHandlers() {
     safeHandle('open-in-default-app', async (event, filePath: string) => {
         try {
             // Open file in the OS default application
-            const result = await shell.openPath(filePath);
+            const result = await systemShell.openPath(filePath);
             if (result) {
                 // openPath returns an error string if it failed, empty string on success
                 return { success: false, error: result };
@@ -1153,10 +918,14 @@ export function registerWorkspaceHandlers() {
         return { success: true, text: clipboard.readText() };
     });
 
+    safeHandle('read-image-from-windows-clipboard', async () => {
+        return readWindowsClipboardImage();
+    });
+
     safeHandle('show-in-finder', async (event, filePath: string) => {
 
         try {
-            shell.showItemInFolder(filePath);
+            systemShell.showItemInFolder(filePath);
             return { success: true };
         } catch (error: any) {
             console.error('Error showing in finder:', error);

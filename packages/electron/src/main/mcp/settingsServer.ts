@@ -17,6 +17,10 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 
 import { SettingsControlService } from "../services/SettingsControlService";
+import {
+  buildExtensionInventory,
+  scanInstalledExtensions,
+} from "../services/extensionInventory";
 
 // ─── Tool descriptors ───────────────────────────────────────────────
 
@@ -24,7 +28,7 @@ const TOOLS = [
   {
     name: "settings_get_overview",
     description:
-      "Return a curated, redacted snapshot of Nimbalyst settings (app-level + current workspace). NEVER includes API keys, auth tokens, or secrets. Includes Stytch auth state booleans so you can tell whether sync prerequisites are met. Use this before changing anything so you can show the user what's currently set.",
+      "Return a curated, redacted snapshot of Nimbalyst settings (app-level + current workspace). NEVER includes API keys, auth tokens, or secrets. Includes Stytch auth state and workspace agentPermissionMode, allowAllUsesClassifier, and agentTrustLabel. These describe workspace policy, not an individual session's active mode. Read all three permission fields: bypass-all alone does not mean automatic review is disabled. Use this before changing anything so you can show the user what's currently set.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -173,6 +177,22 @@ const TOOLS = [
     },
   },
   {
+    name: "extensions_list",
+    description:
+      "List this install's extensions: which are installed (with enabled state and whether they are built-in) and which further extensions the marketplace registry offers. Use it before recommending an extension so you can tell installed-but-disabled (needs enabling) from not-installed (needs installing). If the registry is unreachable the installed half is still returned and registryAvailable is false. Never installs anything -- surface nimbalyst://install/<extensionId> and let the user decide.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeAvailable: {
+          type: "boolean",
+          description:
+            "Include the registry's not-yet-installed extensions. Defaults to true. Pass false when you only need the installed set, which avoids a registry fetch.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "extension_set_enabled",
     description:
       "Enable or disable an installed extension by ID. Does not install or uninstall -- use the nimbalyst-extension-dev tools for that.",
@@ -188,7 +208,7 @@ const TOOLS = [
   {
     name: "workspace_set_trust",
     description:
-      "Set the agent trust mode for a workspace. Permission modes: 'ask' (smart per-tool permission prompts), 'allow-all' (auto-approve file edits), 'bypass-all' (auto-approve every tool including shell). Set trusted=false to untrust. Bypass-all is powerful -- ask the user to confirm via AskUserQuestion before using it on unfamiliar projects.",
+      "Set the agent trust mode for a workspace. Permission modes: 'ask' (smart per-tool permission prompts), 'allow-all' (auto-approve file edits), 'bypass-all' (Agent-verified when allowAllUsesClassifier is true; Allow everything otherwise). The classifier flag is preserved unless allowAllUsesClassifier is passed; the loosest setting is mode='bypass-all' with allowAllUsesClassifier=false. The result reports permissionMode and allowAllUsesClassifier before and after. Users can change it in Settings > Project > Agent Permissions. Set trusted=false to untrust. Bypass-all is powerful -- ask the user to confirm via AskUserQuestion before using it on unfamiliar projects.",
     inputSchema: {
       type: "object",
       properties: {
@@ -201,6 +221,11 @@ const TOOLS = [
           type: "string",
           enum: ["ask", "allow-all", "bypass-all"],
           description: "Permission mode when trusted=true. Defaults to 'ask'. Ignored when trusted=false.",
+        },
+        allowAllUsesClassifier: {
+          type: "boolean",
+          description:
+            "Optional. true routes bypass-all through automatic review (Agent-verified); false makes bypass-all Allow everything. Omit to keep the current value.",
         },
       },
       required: ["workspacePath", "trusted"],
@@ -316,6 +341,15 @@ export async function dispatchSettingsTool(
           }),
         );
 
+      case "extensions_list": {
+        // Read-only: no rate limit, no audit entry, no settings mutation.
+        if (args.includeAvailable === false) {
+          const installed = await scanInstalledExtensions();
+          return respond({ ok: true, installed, available: [], registryAvailable: false });
+        }
+        return respond({ ok: true, ...(await buildExtensionInventory()) });
+      }
+
       case "extension_set_enabled":
         return respond(
           await svc.setExtensionEnabled(aiSessionId, {
@@ -330,6 +364,7 @@ export async function dispatchSettingsTool(
             workspacePath: args.workspacePath,
             trusted: !!args.trusted,
             mode: args.mode,
+            allowAllUsesClassifier: args.allowAllUsesClassifier,
           }),
         );
 

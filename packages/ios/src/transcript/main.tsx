@@ -62,9 +62,7 @@ interface SessionEntry {
   metadata: BridgeMetadataUpdate;
 }
 
-function lastMessageId(messages: BridgeMessage[]): string | null {
-  return messages.length > 0 ? messages[messages.length - 1].id : null;
-}
+
 
 function metadataEqual(a: BridgeMetadataUpdate, b: BridgeMetadataUpdate): boolean {
   return (
@@ -338,8 +336,31 @@ function TranscriptApp() {
     // are stripped from the bridge.
     const isDebugBuild = (window as any).__nimbalystDebug === true;
 
+    // Deltas and metadata updates are computed by Swift against ITS idea of the
+    // current session. If the two sides have drifted — a swap Swift thinks
+    // landed but the bridge never applied — grafting them onto whatever is
+    // active writes one session's messages into another's transcript. Every
+    // mutation names its session, and one that isn't the active one is dropped.
+    const applyToSession = (
+      sessionId: string,
+      mutate: (entry: SessionEntry) => SessionEntry
+    ): boolean => {
+      const activeId = activeSessionIdRef.current;
+      if (!activeId || !sessionId || sessionId !== activeId) return false;
+      const entry = sessionsRef.current[activeId];
+      if (!entry) return false;
+      const next = { ...sessionsRef.current, [activeId]: mutate(entry) };
+      sessionsRef.current = next;
+      setSessions(next);
+      return true;
+    };
+
     const nimbalyst: Record<string, unknown> = {
-      loadSession(data: BridgeSessionData) {
+      // Returns the sessionId now active so Swift can verify the transcript on
+      // screen is the one it asked for. The webview is pooled and never
+      // cleared, so an unverified load leaves the previous session's transcript
+      // visible under the new session's title.
+      loadSession(data: BridgeSessionData): string | null {
         try {
           const id = data.sessionId;
           const incomingMessages = data.messages || [];
@@ -363,17 +384,20 @@ function TranscriptApp() {
             // cache. Only replace when there is genuinely new content; a switch
             // back to an unchanged session must be a pure visibility toggle.
             const supersedes =
-              incomingMessages.length > existing.rawMessages.length ||
-              (incomingMessages.length === existing.rawMessages.length &&
-                incomingMessages.length > 0 &&
-                lastMessageId(incomingMessages) !== lastMessageId(existing.rawMessages));
+              incomingMessages.length > 0 &&
+              (incomingMessages.length !== existing.rawMessages.length ||
+                incomingMessages.some((message, index) => {
+                  const previous = existing.rawMessages[index];
+                  return message.id !== previous.id || message.contentDecrypted !== previous.contentDecrypted
+                    || message.metadataJson !== previous.metadataJson;
+                }));
             const metaChanged = !metadataEqual(existing.metadata, incomingMetadata);
 
             if (!supersedes && !metaChanged) {
               // Nothing changed — pure activation. No session-state churn, so
               // the transform effect and VList never re-run.
               setActiveSessionId(id);
-              return;
+              return id;
             }
 
             const next = {
@@ -389,7 +413,7 @@ function TranscriptApp() {
             sessionsRef.current = next;
             setSessions(next);
             setActiveSessionId(id);
-            return;
+            return id;
           }
 
           // Cache miss — create the entry and evict the LRU session if over
@@ -412,49 +436,33 @@ function TranscriptApp() {
           sessionsRef.current = next;
           setSessions(next);
           setActiveSessionId(id);
+          return id;
         } catch (e) {
           postErrorToNative('loadSession', e);
+          return null;
         }
       },
 
-      appendMessage(message: BridgeMessage) {
-        const activeId = activeSessionIdRef.current;
-        if (!activeId) return;
-        setSessions((prev) => {
-          const entry = prev[activeId];
-          if (!entry) return prev;
-          const updated = { ...entry, rawMessages: [...entry.rawMessages, message] };
-          const next = { ...prev, [activeId]: updated };
-          sessionsRef.current = next;
-          return next;
-        });
+      appendMessage(message: BridgeMessage, sessionId: string) {
+        return applyToSession(sessionId, (entry) => ({
+          ...entry,
+          rawMessages: [...entry.rawMessages, message],
+        }));
       },
 
-      appendMessages(messages: BridgeMessage[]) {
-        if (messages.length === 0) return;
-        const activeId = activeSessionIdRef.current;
-        if (!activeId) return;
-        setSessions((prev) => {
-          const entry = prev[activeId];
-          if (!entry) return prev;
-          const updated = { ...entry, rawMessages: [...entry.rawMessages, ...messages] };
-          const next = { ...prev, [activeId]: updated };
-          sessionsRef.current = next;
-          return next;
-        });
+      appendMessages(messages: BridgeMessage[], sessionId: string) {
+        if (messages.length === 0) return true;
+        return applyToSession(sessionId, (entry) => ({
+          ...entry,
+          rawMessages: [...entry.rawMessages, ...messages],
+        }));
       },
 
-      updateMetadata(update: BridgeMetadataUpdate) {
-        const activeId = activeSessionIdRef.current;
-        if (!activeId) return;
-        setSessions((prev) => {
-          const entry = prev[activeId];
-          if (!entry) return prev;
-          const updated = { ...entry, metadata: { ...entry.metadata, ...update } };
-          const next = { ...prev, [activeId]: updated };
-          sessionsRef.current = next;
-          return next;
-        });
+      updateMetadata(update: BridgeMetadataUpdate, sessionId: string) {
+        return applyToSession(sessionId, (entry) => ({
+          ...entry,
+          metadata: { ...entry.metadata, ...update },
+        }));
       },
 
       clearSession() {

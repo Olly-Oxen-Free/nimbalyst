@@ -426,7 +426,7 @@
 .git-log-detail-panel {
   flex-shrink: 0;
   border-left: 1px solid var(--nim-border);
-  overflow-y: auto;
+  overflow: hidden;
   background: var(--nim-bg);
   display: flex;
   flex-direction: column;
@@ -453,7 +453,9 @@
 .git-detail-vertical {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .git-detail-session {
@@ -506,14 +508,11 @@
   word-break: break-word;
   color: var(--nim-text);
   border-bottom: 1px solid var(--nim-border);
-  overflow-y: auto;
-  max-height: 140px;
   flex-shrink: 0;
 }
 
 .git-detail-files {
-  flex: 1;
-  overflow-y: auto;
+  flex-shrink: 0;
   padding: 4px 0;
   border-bottom: 1px solid var(--nim-border);
 }
@@ -770,10 +769,90 @@
   line-height: 1;
 }
 
+/* Repo picker (multi-root workspaces only; hidden when there is one repo) */
+.git-repo-picker-chevron {
+  font-size: 8px;
+  color: var(--nim-text-faint);
+  flex-shrink: 0;
+}
+
+.git-repo-menu {
+  min-width: 220px;
+}
+
+.git-repo-menu-branch {
+  color: var(--nim-text-faint);
+  font-size: 11px;
+  flex-shrink: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .git-branch-menu-empty {
   padding: 8px 10px;
   color: var(--nim-text-faint);
   font-style: italic;
+}
+
+/* All-repositories Changes scope: one collapsible section per repo. */
+.git-changes-all-repos {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.git-changes-repo-section {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--nim-border);
+  min-height: 0;
+}
+
+.git-changes-repo-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--nim-bg-secondary);
+  border: none;
+  cursor: pointer;
+  color: var(--nim-text);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.git-changes-repo-header:hover {
+  background: var(--nim-bg-hover);
+}
+
+.git-changes-repo-caret {
+  color: var(--nim-text-faint);
+  font-size: 9px;
+  flex-shrink: 0;
+}
+
+.git-changes-repo-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-changes-repo-count {
+  flex-shrink: 0;
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--nim-bg);
+  color: var(--nim-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-align: center;
 }
 
 /* Commit context menu */
@@ -1636,6 +1715,17 @@
   font-size: 11px;
   font-family: var(--nim-font-mono, monospace);
   flex-shrink: 0;
+}
+
+.git-output-source {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border: 1px solid var(--nim-border);
+  border-radius: 4px;
+  color: var(--nim-text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .git-output-command {

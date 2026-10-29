@@ -70,6 +70,7 @@ import {
   subscribe,
   unsubscribe,
   resetBus,
+  drainWorkspaceEvents,
 } from '../WorkspaceEventBus';
 import type { WorkspaceEventListener } from '../WorkspaceEventBus';
 
@@ -107,8 +108,8 @@ function fireWatchEvent(eventType: string, filename: string) {
  *     nested/rootfs/etc/foo.txt
  */
 function buildIssue207Layout(): { workspace: string; cleanup: () => void } {
-  // Bus refuses workspaces below MIN_WORKSPACE_DEPTH=3, so on Linux CI where
-  // os.tmpdir() is /tmp (depth 1) we need an extra parent level.
+  // Nest under an extra parent so the workspace is never a bare container dir
+  // like /tmp, which the bus refuses to watch.
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nimbalyst-test-'));
   const parent = path.join(baseDir, 'parent');
   fs.mkdirSync(parent, { recursive: true });
@@ -150,6 +151,7 @@ describe('WorkspaceEventBus nested-repo .gitignore (issue #207)', () => {
     await subscribe(layout.workspace, 'sub-1', listener);
 
     fireWatchEvent('change', 'nested/rootfs/etc/foo.txt');
+    await drainWorkspaceEvents(layout.workspace);
 
     expect(listener.onChange).not.toHaveBeenCalled();
     unsubscribe(layout.workspace, 'sub-1');
@@ -160,6 +162,7 @@ describe('WorkspaceEventBus nested-repo .gitignore (issue #207)', () => {
     await subscribe(layout.workspace, 'sub-1', listener);
 
     fireWatchEvent('change', 'nested/src/app.ts');
+    await drainWorkspaceEvents(layout.workspace);
 
     expect(listener.onChange).toHaveBeenCalledWith(
       path.join(layout.workspace, 'nested/src/app.ts'),
@@ -173,11 +176,15 @@ describe('WorkspaceEventBus nested-repo .gitignore (issue #207)', () => {
     await subscribe(layout.workspace, 'sub-1', listener);
 
     fireWatchEvent('change', 'nested/rootfs/etc/foo.txt');
+    await drainWorkspaceEvents(layout.workspace);
     expect(listener.onChange).not.toHaveBeenCalled();
 
     fs.writeFileSync(path.join(layout.workspace, 'nested', '.gitignore'), '/dist\n');
     fireWatchEvent('change', 'nested/.gitignore');
     fireWatchEvent('change', 'nested/rootfs/etc/foo.txt');
+    // Events past the watcher's per-batch time budget are delivered on a later
+    // turn, and reloading the .gitignore can use that budget up on a busy machine.
+    await drainWorkspaceEvents(layout.workspace);
 
     expect(listener.onChange).toHaveBeenCalledWith(
       path.join(layout.workspace, 'nested/rootfs/etc/foo.txt'),
@@ -193,8 +200,8 @@ describe('WorkspaceEventBus nested-repo .gitignore (issue #207)', () => {
 
     fireWatchEvent('rename', 'nested/rootfs/etc/foo.txt');
 
-    // Wait briefly for the async exists-check inside the rename branch
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    // Wait for the async exists-check inside the rename branch
+    await drainWorkspaceEvents(layout.workspace);
 
     expect(listener.onAdd).not.toHaveBeenCalled();
     expect(listener.onUnlink).not.toHaveBeenCalled();
@@ -208,7 +215,7 @@ describe('WorkspaceEventBus nested-repo .gitignore (issue #207)', () => {
 
     fireWatchEvent('rename', 'nested/rootfs/etc/foo.txt');
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await drainWorkspaceEvents(layout.workspace);
 
     // Path exists on disk, so the rename resolves to an `add`.
     expect(listener.onAdd).toHaveBeenCalledWith(

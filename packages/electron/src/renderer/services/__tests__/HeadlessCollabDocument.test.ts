@@ -20,11 +20,15 @@ const host = vi.hoisted(() => ({
   acquire: vi.fn(),
   getDocuments: vi.fn(),
   getTeamProvider: vi.fn(),
+  findOtherProject: vi.fn((_scopeKey: unknown, _documentId: unknown): unknown => null),
+  resolveScope: vi.fn(async (_scopeKey: unknown): Promise<unknown> => ({ scope: null, retryable: false })),
 }));
 
 vi.mock('../../store/atoms/collabDocuments', () => ({
   getSharedDocumentsForScopeKey: host.getDocuments,
   getTeamSyncProviderForScopeKey: host.getTeamProvider,
+  findOtherProjectDocument: host.findOtherProject,
+  resolveDesktopCollabScope: host.resolveScope,
 }));
 
 vi.mock('../CollaborativeEmbedProviderCache', () => ({
@@ -47,7 +51,7 @@ import {
   HeadlessCollabDocumentError,
   readHeadlessCollabDocContent,
 } from '../HeadlessCollabDocument';
-import { readCollabDocForAgent } from '../agentDocumentAccess';
+import { applyAgentDiff, readCollabDocForAgent } from '../agentDocumentAccess';
 
 const DOCUMENT_URI = 'collab://org:org-1:doc:doc-1';
 const WORKSPACE_PATH = '/workspace';
@@ -247,5 +251,96 @@ describe('readCollabDocForAgent', () => {
     await expect(
       readCollabDocForAgent(DOCUMENT_URI, null),
     ).rejects.toBeInstanceOf(HeadlessCollabDocumentError);
+  });
+});
+
+/**
+ * The window holds other projects' pages only to name them in links. An agent
+ * edit reaches a page through a mounted editor or the room, and either would
+ * write to another project, so the project is checked before either route.
+ */
+describe('another project\'s page', () => {
+  const applyReplacements = vi.fn(async () => ({ success: true }));
+
+  beforeEach(() => {
+    host.acquire.mockReset();
+    applyReplacements.mockClear();
+    host.findOtherProject.mockImplementation((scopeKey: unknown, documentId: unknown) =>
+      scopeKey === WORKSPACE_PATH && documentId === 'doc-1'
+        ? { document: { documentId: 'doc-1', title: 'Their page' }, projectId: 'project-b' }
+        : null);
+    stubRoom();
+  });
+
+  afterEach(() => {
+    host.findOtherProject.mockReset().mockReturnValue(null);
+    editorRegistry.unregister(DOCUMENT_URI);
+  });
+
+  const mount = () => editorRegistry.register({
+    filePath: DOCUMENT_URI,
+    editor: {} as never,
+    hasPendingDiffs: () => false,
+    applyReplacements,
+    startStreaming: () => {},
+    streamContent: () => {},
+    endStreaming: () => {},
+    getContent: () => 'their body',
+  });
+
+  it('refuses an edit whether the page is mounted or not', async () => {
+    const edit = () => applyAgentDiff(DOCUMENT_URI, [{ oldText: 'a', newText: 'b' }], { workspacePath: WORKSPACE_PATH });
+    expect(await edit()).toMatchObject({ success: false, code: 'OTHER_PROJECT', error: expect.stringContaining('changes stay in the current project') });
+    mount();
+    expect(await edit()).toMatchObject({ success: false, code: 'OTHER_PROJECT' });
+    expect(applyReplacements).not.toHaveBeenCalled();
+    expect(host.acquire).not.toHaveBeenCalled();
+  });
+
+  it('does not read a mounted page past the project check', async () => {
+    mount();
+    await expect(readCollabDocForAgent(DOCUMENT_URI, WORKSPACE_PATH))
+      .rejects.toMatchObject({ code: 'OTHER_PROJECT', projectId: 'project-b' });
+  });
+});
+
+/**
+ * A typed page's body is the room `tracker-content/<itemId>` on the team's org.
+ * It is not in the shared-docs index, and agents are handed it in its short
+ * form, which carries no org (#1879).
+ */
+describe('a shared typed-page body', () => {
+  const SHORT_URI = 'collab://tracker-content/item-7';
+  const ORG_URI = 'collab://org:org-1:doc:tracker-content/item-7';
+
+  beforeEach(() => {
+    host.acquire.mockReset();
+    host.getDocuments.mockReturnValue([]);
+    host.resolveScope.mockResolvedValue({ scope: { orgId: 'org-1' }, retryable: false });
+    registerCollabContentAdapter({ ...TEST_CODEC, documentType: 'markdown', fileExtensions: ['.md'] });
+  });
+
+  afterEach(() => {
+    clearCollabContentAdapters();
+    host.resolveScope.mockReset().mockResolvedValue({ scope: null, retryable: false });
+  });
+
+  it.each([SHORT_URI, ORG_URI])('reads %s from the body room on the team org', async (uri) => {
+    stubRoom();
+
+    await expect(readCollabDocForAgent(uri, WORKSPACE_PATH)).resolves.toEqual({ content: BODY, route: 'headless' });
+    expect(host.acquire).toHaveBeenCalledWith(expect.objectContaining({
+      orgId: 'org-1',
+      documentId: 'tracker-content/item-7',
+      documentType: 'markdown',
+    }));
+  });
+
+  it('refuses the short form when the project has no team', async () => {
+    host.resolveScope.mockResolvedValue({ scope: null, retryable: false });
+    stubRoom();
+
+    await expect(readCollabDocForAgent(SHORT_URI, WORKSPACE_PATH)).rejects.toMatchObject({ code: 'DOCUMENT_NOT_AVAILABLE' });
+    expect(host.acquire).not.toHaveBeenCalled();
   });
 });

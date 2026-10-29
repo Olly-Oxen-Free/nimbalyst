@@ -65,6 +65,9 @@ export interface UserMessageDescriptor {
   attachments?: UserMessagePayload['attachments'];
   teammateOrigin?: TeammateOrigin[];
   createdAt?: Date;
+  /** Stamped from the raw row's metadata by `stampPromptSource`, not by parsers. */
+  promptActor?: UserMessagePayload['promptActor'];
+  promptOrigin?: string;
 }
 
 export interface AssistantMessageDescriptor {
@@ -80,6 +83,12 @@ export interface AssistantMessageDescriptor {
    * collapsed-by-default.
    */
   thinking?: string;
+  /**
+   * The thinking block is an API "progress update": a summary of text the
+   * model wrote between tool calls, which the API never returns as text
+   * (#1801). Renderers show it as visible text, not collapsed.
+   */
+  progressUpdate?: boolean;
   /** Signature accompanying the thinking block, when present. */
   thinkingSignature?: string;
   /** Per-turn model id (e.g. "claude-opus-4-7"). New in Claude Code 2.1.x. */

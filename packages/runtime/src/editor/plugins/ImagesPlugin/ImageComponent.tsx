@@ -63,10 +63,20 @@ import ContentEditable from '../../ui/ContentEditable';
 import ImageResizer from '../../ui/ImageResizer';
 import {$isImageNode} from './ImageNode';
 import {getImagePluginCallbacks} from './index';
+import {resolveKnownImageSrc} from './resolveKnownImageSrc';
 import {localAssetUrl} from '../../../utils/localAssetUrl';
 import {copyImageToClipboard} from '../../../utils/clipboard';
 
 const imageCache = new Map<string, Promise<boolean> | boolean>();
+
+function safeDecodePath(src: string): string {
+  try {
+    return decodeURIComponent(src);
+  } catch {
+    // a literal `%` in a file name that is not an escape
+    return src;
+  }
+}
 
 export const RIGHT_CLICK_IMAGE_COMMAND: LexicalCommand<MouseEvent> =
   createCommand('RIGHT_CLICK_IMAGE_COMMAND');
@@ -364,47 +374,11 @@ export default function ImageComponent({
     let cancelled = false;
 
     const resolveSrc = async () => {
-      // collab-asset:// is a registered standard+secure scheme -- the main
-      // process handles fetch+decrypt and hands the bytes to Chromium. The
-      // renderer must pass these URLs through untouched so we don't double-
-      // resolve to a stale blob URL or mistake them for a relative path.
-      if (src.startsWith('collab-asset://')) {
+      const known = await resolveKnownImageSrc(src, getImagePluginCallbacks());
+      if (known) {
         if (!cancelled) {
-          setResolvedSrc(src);
-        }
-        return;
-      }
-
-      const callbacks = getImagePluginCallbacks();
-
-      if (callbacks.resolveImageSrc) {
-        try {
-          const resolved = await callbacks.resolveImageSrc(src);
-          if (resolved) {
-            imageCache.delete(src);
-            if (!cancelled) {
-              setResolvedSrc(resolved);
-            }
-            return;
-          }
-        } catch (error) {
-          console.error('Failed to resolve image source', error);
-        }
-      }
-
-      // file:// needs to be re-routed through the platform's local-asset URL
-      // (nim-asset:// in Electron). Other absolute URL schemes pass through.
-      if (src.startsWith('file://')) {
-        const absolutePath = src.replace(/^file:\/\//, '');
-        if (!cancelled) {
-          imageCache.delete(src);
-          setResolvedSrc(localAssetUrl(absolutePath));
-        }
-        return;
-      }
-      if (src.match(/^(https?|data|blob):/)) {
-        if (!cancelled) {
-          setResolvedSrc(src);
+          if (known.evictCache) imageCache.delete(src);
+          setResolvedSrc(known.src);
         }
         return;
       }
@@ -447,7 +421,8 @@ export default function ImageComponent({
             documentPath.lastIndexOf('\\'),
           );
           const documentDir = lastSep >= 0 ? documentPath.substring(0, lastSep) : '';
-          const absolutePath = documentDir + '/' + src;
+          // Markdown percent-encodes spaces in relative paths (`Q3%20Plan/.assets/x.png`).
+          const absolutePath = documentDir + '/' + safeDecodePath(src);
           setResolvedSrc(localAssetUrl(absolutePath));
         } else {
           setResolvedSrc(src);

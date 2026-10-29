@@ -20,6 +20,7 @@
 import React from 'react';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
+import type { TrackerIdentity } from '@nimbalyst/runtime/core/DocumentService';
 import {
   getFieldByRole,
   getRecordExternalKey,
@@ -30,6 +31,7 @@ import { UserAvatar } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/
 import { TrackerSwatchBadge } from '../primitives/TrackerSwatchBadge';
 import { NEUTRAL_SWATCH, PRIORITY_COLORS, TYPE_COLORS } from './trackerBoardTokens';
 import { TrackerCardStalenessChip } from './TrackerCardStalenessChip';
+import { TrackerRecentActivityChip } from '../TrackerRecentActivityChip';
 import './TrackerBoardCard.css';
 
 export interface TrackerBoardCardProps {
@@ -59,12 +61,15 @@ export interface TrackerBoardCardProps {
   onOpenDocument?: (itemId: string) => void;
   /** Milestone chip, when the host has a milestone picker to open. */
   milestoneSlot?: React.ReactNode;
+  fieldsSlot?: React.ReactNode;
   /** Personal lane, desktop only. Omitted by a host with team auth only. */
   unreadSlot?: React.ReactNode;
   /** Personal lane, desktop only. Omitted by a host with team auth only. */
   favoriteSlot?: React.ReactNode;
   /** Desktop only -- dispatches into electron's local session registry. */
   sessionActionSlot?: React.ReactNode;
+  /** Current viewer, used only to distinguish teammate activity. */
+  currentIdentity?: TrackerIdentity | null;
 }
 
 export const TrackerBoardCard: React.FC<TrackerBoardCardProps> = ({
@@ -81,9 +86,11 @@ export const TrackerBoardCard: React.FC<TrackerBoardCardProps> = ({
   onContextMenu,
   onOpenDocument,
   milestoneSlot,
+  fieldsSlot,
   unreadSlot,
   favoriteSlot,
   sessionActionSlot,
+  currentIdentity,
 }) => {
   const priority = getRecordPriority(item);
   const typeColor = TYPE_COLORS[item.primaryType] || NEUTRAL_SWATCH;
@@ -172,7 +179,9 @@ export const TrackerBoardCard: React.FC<TrackerBoardCardProps> = ({
               />
             ) : null}
             <TrackerCardStalenessChip item={item} />
+            <TrackerRecentActivityChip item={item} identity={currentIdentity} />
             {milestoneSlot}
+            {fieldsSlot}
             {owner ? (
               <span className="ml-auto">
                 <UserAvatar identity={owner} size={18} />

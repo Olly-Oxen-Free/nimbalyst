@@ -14,7 +14,7 @@ Three places where `SYNC_JWT_MODEL.md` is now **out of date** — trust this doc
 
 - Its "Room → scope map" lists five rooms. The system has eight room types (`packages/collabv3/src/index.ts:312-379`). ConversationRoom, TeamInboxRoom, and ProjectSyncRoom are missing.
 - It says the branded types make a mix-up "a compile error". True on the personal side only, plus the new org-scope brand — see [The two JWTs](#2-the-two-jwts).
-- Its whole "What users see (the migration gate)" section describes a migration modal, an acknowledgement checkbox, and a `legacy-e2e` status chip. **All of that is gone.** There is no migration path any more; see [Encryption and key custody](#6-encryption-and-key-custody).
+- Its whole "What users see (the migration gate)" section describes a migration modal, an acknowledgement checkbox, and a `legacy-e2e` status chip. **That retired flow is gone.** An explicit admin recovery flow now preserves existing identities; see [Encryption and key custody](#6-encryption-and-key-custody).
 
 ---
 
@@ -51,6 +51,18 @@ Everything public goes through `parseAuth` → `validateJWT` (JWKS signature, is
 The content gate (`canAccessContentRoom`) asks the org's TeamRoom for the authoritative role + project grant and **fails closed** on any error (`packages/collabv3/src/teamRoomHelpers.ts:157-179`). It runs **only at WebSocket connect** (`index.ts:516-523`).
 
 After the worker authenticates, it stamps `x-nimbalyst-worker-auth` (shared secret) + `x-nimbalyst-auth: <userId>:<orgId>` and forwards to the DO (`index.ts:658`). DOs read identity only from those headers; the old URL-param channel is gone (`packages/collabv3/src/workerAuth.ts:83-99`).
+
+### Credentials that are not Stytch JWTs
+
+Three collabv3-issued credentials reach `/sync/` or `/api/` without being a Stytch JWT. Each has its own resolver and its own type, is consulted only after `parseAuth` fails, and is never written into the Stytch `AuthResult`, so no team branch can see it by mistake:
+
+| Credential | Issued by | Admits | Location |
+| --- | --- | --- | --- |
+| Node credential | headless node pairing | the owner's personal rooms only | `nodeAuth.ts` |
+| GitHub MCP token | GitHub-native sign-in (behind its switch) | a wiki's TrackerRoom and its item-body DocumentRooms, sync channel only | `wiki/wikiGate.ts` |
+| Wiki import credential (`mcpimp_v1~...`) | the `pages_import_token` MCP tool, after the same project-write check as `pages_import`; 15 minutes | WebSocket upgrade on a DocumentRoom whose document is in the credential's project with write access, and document asset PUT/GET under the same check. Nothing else | `mcp/importToken.ts`, `importAuth.ts` |
+
+The import credential exists so `nim wiki move-to-team`, which holds only an MCP OAuth token, can write editor pages and attachments into the team documents `pages_import` registered. It is an HMAC over the MCP signing keys with its own prefix, so `parseAuth`, the node verifier and the MCP access-token verifier reject it on shape.
 
 ### Client acquisition points
 
@@ -109,7 +121,7 @@ Room id is the URL path segment (`/sync/{roomId}`); the **DO name** is what `idF
 
 | Room | Room id | DO name | Addressed by | JWT | Auth check | Stores | Encrypted? |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **PersonalIndexRoom** (`IndexRoom`) | `org:{personalOrg}:user:{personalMember}:index` | `user:{member}:index` — **org dropped** (`index.ts:588`) | personal member id | Personal | `sub` == room member; **org not checked** (`index.ts:524-537`) | session/project/file index, devices, push tokens, settings | Yes — client-held key; DO is a relay (`IndexRoom.ts:1-6`) |
+| **PersonalIndexRoom** (`IndexRoom`) | `org:{personalOrg}:user:{personalMember}:index` | `user:{member}:index` — **org dropped** (`index.ts:588`) | personal member id | Personal | `sub` == room member; **org not checked** (`index.ts:524-537`) | session/project/file index, devices, push tokens, Live Activity tokens + fleet card state, settings | Yes — client-held key; DO is a relay (`IndexRoom.ts:1-6`). **Exception:** the two push lanes (alert titles, Live Activity `content-state`) leave in plaintext, because APNs renders them |
 | `projects` | `org:{personalOrg}:user:{personalMember}:projects` | same DO as `index` (`index.ts:586-589`) | personal member id | Personal | as above | (same DO) | as above |
 | **PersonalSessionRoom** | `org:{personalOrg}:user:{personalMember}:session:{id}` | full room id | personal member id | Personal | as above | one AI session's transcript/state | Yes — client-held key |
 | **PersonalProjectSyncRoom** | `org:{personalOrg}:user:{personalMember}:project:{projectId}` | full room id | personal member id | Personal | as above, plus DO pins the first-seen owner | project `.md` content + Y.Docs | Yes — "dumb encrypted relay" (`ProjectSyncRoom.ts:1-19`) |
@@ -190,7 +202,7 @@ Two more that look dead and are not:
 
 ### The unmigrated population
 
-Cutover is admin-gated and one-way (`legacy-e2e` is explicitly rejected as a target: `teamKeyCustody.ts:56-58`). New orgs are marked server-managed at creation (`TeamService.ts`). There is no longer any client-driven migration: an organization that was never converted has to be set up again.
+Cutover is admin-gated and one-way (`legacy-e2e` is explicitly rejected as a target: `teamKeyCustody.ts:56-58`). New orgs are marked server-managed at creation (`TeamService.ts`). Populated legacy organizations use [in-place recovery](LEGACY_ORG_RECOVERY.md): admin-scoped read-only diagnostics, encrypted source bundles, durable write fences, identity-preserving restoration, and independent-client readback before the one-way marker changes. The marker-only endpoint refuses populated legacy orgs. This does not restore the retired client-encryption sync lane. Retained historical keys can be read only by the explicit offline recovery collector; startup no longer deletes those source files.
 
 The census tooling (`packages/collabv3/src/custodyCensus.ts`, `packages/collabv3/scripts/custody-census*.{mjs,ts}`) and the read-only `/internal/get-key-custody-mode` diagnostic are retained so the remaining population can be identified; the diagnostic still reports the legacy string for exactly that purpose.
 

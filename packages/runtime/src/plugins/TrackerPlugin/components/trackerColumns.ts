@@ -8,18 +8,31 @@
  */
 
 import type { TrackerRecord } from '../../../core/TrackerRecord';
-import { globalRegistry, type FieldDefinition, type TrackerSchemaRole } from '../models/TrackerDataModel';
-import { defaultTrackerTypeColor, defaultTrackerTypeIcon } from '../models/trackerTypeIdentity';
+import { globalRegistry, type FieldDefinition, type TrackerSchemaRole } from '@nimbalyst/tracker-schema';
+import { defaultTrackerTypeColor, defaultTrackerTypeIcon } from '@nimbalyst/tracker-schema';
 import { isDateOnlyValue, parseDate } from '../models/dateUtils';
 import { resolveDisplayIssueKey } from '../models/localIssueKey';
 import { resolveRoleFieldName, getFieldByRole, getItemPublicationState } from '../trackerRecordAccessors';
 import { resolveCellEditor, READONLY_STRUCTURAL_COLUMNS, type CellEditorKind } from './trackerCellEditors';
+import { isQualifiedFieldProperty } from '@nimbalyst/tracker-schema';
 
 // ============================================================================
 // Types
 // ============================================================================
 
 export type ColumnRenderType = 'badge' | 'text' | 'date' | 'avatar' | 'progress' | 'tags' | 'type-icon' | 'module' | 'url' | 'relationship';
+
+/**
+ * How the structural `type` column presents an item's type: as the type's glyph,
+ * or as its name. A workspace running dozens of custom types cannot tell them
+ * apart by glyph alone, so the name has to be available (nimbalyst#1422).
+ */
+export type TypeColumnDisplay = 'icon' | 'label';
+
+export const DEFAULT_TYPE_COLUMN_DISPLAY: TypeColumnDisplay = 'icon';
+
+/** Width the `type` column needs once it carries a type name rather than a glyph. */
+const TYPE_COLUMN_LABEL_WIDTH = 120;
 
 export interface TrackerColumnDef {
   /** Unique column ID -- matches the field name in the schema */
@@ -46,6 +59,12 @@ export interface TrackerColumnDef {
   editable: boolean;
   /** Which cell editor to open on edit. `readonly` when `editable` is false. */
   edit: CellEditorKind;
+  /**
+   * Only on the structural `type` column: whether the cell draws the glyph or
+   * the type name. Set by {@link applyTypeColumnDisplay} from the view's config
+   * so the cell renderer needs no extra argument.
+   */
+  typeDisplay?: TypeColumnDisplay;
 }
 
 /** Per-type column configuration (persisted) */
@@ -54,6 +73,29 @@ export interface TypeColumnConfig {
   visibleColumns: string[];
   /** Custom column widths (overrides defaults) */
   columnWidths: Record<string, number>;
+  /**
+   * How the Type column presents itself. Absent on every view saved before the
+   * option existed, so it resolves to `icon` and nobody's table changes shape
+   * without asking.
+   */
+  typeColumnDisplay?: TypeColumnDisplay;
+}
+
+/** The Type column's display mode for a config that may predate the option. */
+export function resolveTypeColumnDisplay(config: Pick<TypeColumnConfig, 'typeColumnDisplay'> | null | undefined): TypeColumnDisplay {
+  return config?.typeColumnDisplay === 'label' ? 'label' : DEFAULT_TYPE_COLUMN_DISPLAY;
+}
+
+/**
+ * Stamp the Type column with the view's chosen display mode, widening it when it
+ * has to hold a name: 64px fits a glyph and truncates every type name to nothing.
+ * Other columns pass through untouched.
+ */
+export function applyTypeColumnDisplay(columns: TrackerColumnDef[], display: TypeColumnDisplay): TrackerColumnDef[] {
+  if (display !== 'label') return columns;
+  return columns.map(column => (column.id === 'type'
+    ? { ...column, typeDisplay: display, width: TYPE_COLUMN_LABEL_WIDTH, minWidth: 80 }
+    : column));
 }
 
 // ============================================================================
@@ -106,7 +148,12 @@ const ROLE_FALLBACK_COLUMNS: TrackerColumnDef[] = [
  * Infer the column render type from a FieldDefinition.
  */
 function inferRenderType(field: FieldDefinition): ColumnRenderType {
-  if (field.type === 'relationship' || field.type === 'reference') return 'relationship';
+  // A citation entry carries the same `{ itemId, issueKey, title }` display
+  // keys as a relationship value, so it renders as the same chip list rather
+  // than needing a render type (and a formatter) of its own.
+  if (field.type === 'relationship' || field.type === 'reference' || field.type === 'citation') {
+    return 'relationship';
+  }
   if (field.type === 'date' || field.type === 'datetime') return 'date';
   if (field.type === 'array') return 'tags';
   if (field.type === 'user') return 'avatar';
@@ -156,6 +203,9 @@ export function resolveColumnsForType(type: string): TrackerColumnDef[] {
       fieldToRole.set(fieldName, role as TrackerSchemaRole);
     }
   }
+  // An item's title is its `title` field unless a role says otherwise, so a
+  // type that declares no roles still gets a Title column.
+  if (!model.roles?.title && !fieldToRole.has('title')) fieldToRole.set('title', 'title');
 
   // Structural columns always present
   const columns: TrackerColumnDef[] = [...STRUCTURAL_COLUMNS];
@@ -241,7 +291,7 @@ export function getDefaultColumnConfig(type: string): TypeColumnConfig {
     }
   }
 
-  return { visibleColumns, columnWidths: {} };
+  return { visibleColumns, columnWidths: {}, typeColumnDisplay: DEFAULT_TYPE_COLUMN_DISPLAY };
 }
 
 // Keep the old name exported for backward compat
@@ -292,6 +342,22 @@ export function getTypeIcon(type: string): string {
   const model = globalRegistry.get(type);
   if (model?.icon) return model.icon;
   return defaultTrackerTypeIcon(type);
+}
+
+/**
+ * Human-readable name for a tracker type. A registered type names itself; an
+ * unregistered one gets its identifier tidied up rather than shown raw, since
+ * this is what the Type column prints in label mode.
+ */
+export function getTypeLabel(type: string): string {
+  const model = globalRegistry.get(type);
+  if (model?.displayName) return model.displayName;
+  const spaced = type
+    .replace(/[-_]+/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .trim();
+  if (!spaced) return type;
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
 /**
@@ -435,8 +501,19 @@ export function getCellValue(record: TrackerRecord, columnId: string): any {
     case 'archived': return record.archived;
     case 'module': return record.system.documentPath;
     case 'shared': return getItemPublicationState(record);
-    default: return record.fields[columnId];
+    default: return unwrapQualifiedCellValue(columnId, record.fields[columnId]);
   }
+}
+
+/**
+ * A field-stored label property that declares qualifiers (earlier knowledge
+ * graph data) stores `{ value, qualifiers }`; a cell shows (and sorts by) the
+ * value alone.
+ */
+function unwrapQualifiedCellValue(columnId: string, stored: unknown): unknown {
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored) || !('value' in stored)) return stored;
+  const property = globalRegistry.getLabelRegistry().properties.find(candidate => candidate.id === columnId);
+  return property && isQualifiedFieldProperty(property) ? (stored as { value: unknown }).value : stored;
 }
 
 /**
@@ -452,6 +529,8 @@ export function getFieldForColumn(type: string, columnId: string): FieldDefiniti
  * Get initials from a display name (for avatar rendering).
  */
 export function getInitials(name: string): string {
+  // Synced identities can arrive without a display name.
+  if (!name?.trim()) return '?';
   const parts = name.trim().split(/\s+/);
   if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
   return name.substring(0, 2).toUpperCase();

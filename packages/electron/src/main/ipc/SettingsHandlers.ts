@@ -1,6 +1,10 @@
+import { registerProviderCredentialHandlers } from './ProviderCredentialHandlers';
+import { registerCloudflareSandboxHandlers } from './CloudflareSandboxHandlers';
 import { BrowserWindow, safeStorage, session, dialog } from 'electron';
+import { getWindowIdForWindow, windowStates } from '../window/windowState';
 import { applyAnalyticsEnabled } from '../services/analytics/applyAnalyticsEnabled';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
+import { deleteSecretFile, readSecretFile, writeSecretFile } from '../utils/fileUtils';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -45,7 +49,7 @@ import {
     getAgentWorkflowSourceSettings, getAgentWorkflowExportSettings,
     setAgentWorkflowSourceSettings, setAgentWorkflowExportSettings,
 } from '../utils/store';
-import { getEnhancedPath } from '../services/CLIManager';
+import { getEnhancedPath } from '../services/shellEnvironment';
 import { logger } from '../utils/logger';
 import { getSettingsService, isSettingKey } from '../services/SettingsService';
 import { SessionNamingService } from '../services/SessionNamingService';
@@ -57,10 +61,11 @@ import { getCredentials, resetCredentials, generateQRPairingPayload, isUsingSecu
 import {
     isSyncProviderReady,
     onSyncStatusChange,
-    triggerIncrementalSync,
+    triggerIncrementalSync, projectConfigSync,
     updateSleepPrevention,
 } from '../services/SyncManager';
 import { getDocSyncStatusForWorkspace } from '../file/WorkspaceWatcher';
+import { transcriptBackfill } from '../services/sync/transcriptBackfill';
 import * as StytchAuth from '../services/StytchAuthService';
 import { getRestartSignalPath } from '../utils/appPaths';
 import { TrayManager } from '../tray/TrayManager';
@@ -73,7 +78,7 @@ import {
     switchPersonalSyncProfile,
 } from '../services/PersonalSyncProfiles';
 import { purgeOfflineCollabAccounts } from '../services/CollabOfflineAccountLifecycle';
-import { listPersonalSyncDevices } from '../services/PersonalSyncDevicesService';
+import { listPersonalSyncDevices, updatePersonalSyncDevices } from '../services/PersonalSyncDevicesService';
 import { recordProjectWalkOriginator } from '../services/ProjectWalkClaim';
 
 // Track if we've subscribed to sync status changes
@@ -158,6 +163,8 @@ function getLocalNetworkIP(): string | null {
 }
 
 export function registerSettingsHandlers() {
+    registerProviderCredentialHandlers();
+    registerCloudflareSandboxHandlers();
     // ============================================================
     // Flat-key SettingsService (per-key reads/writes + broadcast)
     //
@@ -252,34 +259,24 @@ export function registerSettingsHandlers() {
         return secretsDir;
     }
 
-    function getSecretFilePath(key: string): string {
-        // Sanitize key to be filesystem-safe
-        const safeKey = key.replace(/[^a-zA-Z0-9_:-]/g, '_');
-        return path.join(getSecretsDir(), `${safeKey}.enc`);
-    }
-
     safeHandle('secrets:get', async (_event, key: string) => {
         if (!key) {
             throw new Error('Key is required for secrets:get');
         }
 
-        const filePath = getSecretFilePath(key);
-
-        if (!fs.existsSync(filePath)) {
-            return null;
-        }
+        const decrypt = (data: Buffer) =>
+            safeStorage.isEncryptionAvailable()
+                ? safeStorage.decryptString(data)
+                : data.toString('utf8');
 
         try {
-            const fileData = fs.readFileSync(filePath);
-
-            if (safeStorage.isEncryptionAvailable()) {
-                return safeStorage.decryptString(fileData);
-            } else {
-                // Fallback: read as plain text
-                return fileData.toString('utf8');
-            }
+            return readSecretFile(getSecretsDir(), key, decrypt);
         } catch (error) {
-            logger.main.error(`[secrets:get] Failed to read secret for key ${key}:`, error);
+            // A file exists but will not read back, which is a different
+            // situation from "no secret stored" - that path returns null
+            // without ever reaching here. Log it so a corrupt or undecryptable
+            // secret is greppable rather than silently indistinguishable.
+            logger.main.error(`[secrets:get] Failed to read existing secret for key ${key}:`, error);
             return null;
         }
     });
@@ -292,16 +289,13 @@ export function registerSettingsHandlers() {
             throw new Error('Value is required for secrets:set');
         }
 
-        const filePath = getSecretFilePath(key);
-
         try {
             if (safeStorage.isEncryptionAvailable()) {
-                const encrypted = safeStorage.encryptString(value);
-                fs.writeFileSync(filePath, encrypted);
+                writeSecretFile(getSecretsDir(), key, safeStorage.encryptString(value));
             } else {
                 // Fallback: save as plain text (with warning)
                 logger.main.warn(`[secrets:set] safeStorage not available - saving secret without encryption`);
-                fs.writeFileSync(filePath, value, 'utf8');
+                writeSecretFile(getSecretsDir(), key, value);
             }
             logger.main.info(`[secrets:set] Secret saved for key: ${key}`);
         } catch (error) {
@@ -315,13 +309,9 @@ export function registerSettingsHandlers() {
             throw new Error('Key is required for secrets:delete');
         }
 
-        const filePath = getSecretFilePath(key);
-
         try {
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-                logger.main.info(`[secrets:delete] Secret deleted for key: ${key}`);
-            }
+            deleteSecretFile(getSecretsDir(), key);
+            logger.main.info(`[secrets:delete] Secret deleted for key: ${key}`);
         } catch (error) {
             logger.main.error(`[secrets:delete] Failed to delete secret for key ${key}:`, error);
             throw error;
@@ -661,8 +651,12 @@ export function registerSettingsHandlers() {
         return getOpenProjectPaths();
     });
 
-    safeHandle('app:set-open-projects', async (_event, paths: string[]) => {
-        setOpenProjectPaths(Array.isArray(paths) ? paths : []);
+    safeHandle('app:set-open-projects', async (event, paths: string[]) => {
+        const order = Array.isArray(paths) ? paths.filter(path => typeof path === 'string') : [];
+        const windowId = getWindowIdForWindow(BrowserWindow.fromWebContents(event.sender));
+        const state = windowId === null ? undefined : windowStates.get(windowId);
+        if (state) state.projectRailOrder = order;
+        setOpenProjectPaths(order);
     });
 
     safeHandle('app:get-active-project-path', async () => {
@@ -688,8 +682,8 @@ export function registerSettingsHandlers() {
     // suspected stall point on cold start. The renderer races this call against
     // a timeout (see useOnboarding.ts), so we want a main-side breadcrumb that
     // tells us whether the handler ever ran and how long the underlying store
-    // read took. Logs the elapsed time at info level so it lands in main.log on
-    // packaged builds.
+    // read took. Slow reads and failures remain visible in packaged builds;
+    // successful fast reads are debug-only.
     safeHandle('onboarding:get', async () => {
         const t0 = Date.now();
         try {
@@ -698,7 +692,7 @@ export function registerSettingsHandlers() {
             if (elapsed > 50) {
                 logger.main.warn(`[SettingsHandlers] onboarding:get slow read: ${elapsed}ms`);
             } else {
-                logger.main.info(`[SettingsHandlers] onboarding:get ok (${elapsed}ms)`);
+                logger.main.debug(`[SettingsHandlers] onboarding:get ok (${elapsed}ms)`);
             }
             return state;
         } catch (err) {
@@ -713,10 +707,16 @@ export function registerSettingsHandlers() {
 
     // Developer mode (global app setting)
     safeHandle('developer-mode:get', async () => {
-        return isDeveloperMode();
+        const enabled = isDeveloperMode();
+        // A `false` here hydrates a window into Standard Mode. Log it so a
+        // spurious flip (NIM-3963) can be told apart from a real setting.
+        if (!enabled) {
+            logger.main.info(`[SettingsHandlers] developer-mode:get -> false (stored key present: ${getAppSetting('developerMode') !== undefined})`);
+        }
+        return enabled;
     });
 
-    safeHandle('developer-mode:set', async (_event, enabled: boolean) => {
+    safeHandle('developer-mode:set', async (event, enabled: boolean) => {
         // Logged because this write was previously silent, which left no way to
         // tell a spurious flip back to Standard Mode from a deliberate one.
         const before = isDeveloperMode();
@@ -724,6 +724,11 @@ export function registerSettingsHandlers() {
             logger.main.info(`[SettingsHandlers] developer-mode:set ${before} -> ${enabled}`);
         }
         setDeveloperMode(enabled);
+        // Main is the source of truth; keep every other window in step.
+        for (const win of BrowserWindow.getAllWindows()) {
+            if (win.isDestroyed() || win.webContents.id === event.sender.id) continue;
+            win.webContents.send('app-settings:changed', { key: 'developerMode', value: enabled });
+        }
     });
 
     // Feature walkthrough state (shown on first launch)
@@ -1073,6 +1078,7 @@ export function registerSettingsHandlers() {
     // URL and personal-org JWT. The stored config intentionally omits serverUrl
     // when production is selected, and a team JWT targets a different member.
     safeHandle('sync:get-devices', listPersonalSyncDevices);
+    safeHandle('sync:update-devices', (_event, update) => updatePersonalSyncDevices(update));
 
     // Get sync status for the navigation gutter button
     safeHandle('sync:get-status', async (_event, workspacePath?: string) => {
@@ -1103,15 +1109,13 @@ export function registerSettingsHandlers() {
         const isProjectEnabled = workspacePath ? enabledProjects.includes(workspacePath) : false;
 
         // Get sync provider status from SyncManager
-        const { isSyncEnabled, getSyncProvider } = await import('../services/SyncManager');
-        const provider = getSyncProvider();
-        const syncActive = isSyncEnabled();
+        const { getSyncStatusSnapshot, isSyncEnabled } = await import('../services/SyncManager');
 
         // Get session count for this workspace using a simple, fast query
         let sessionCount = 0;
         let lastSyncedAt: number | null = null;
 
-        if (workspacePath && syncActive) {
+        if (workspacePath && isSyncEnabled()) {
             try {
                 // Get session count for status display (only called on mount, not polled)
                 const { database } = await import('../database/PGLiteDatabaseWorker');
@@ -1134,10 +1138,6 @@ export function registerSettingsHandlers() {
             }
         }
 
-        // Check connection status
-        // The provider doesn't expose a direct "isConnected" status, but we can infer from syncActive
-        const connected = syncActive && provider !== null;
-
         // Get doc sync stats from ProjectFileSyncService
         let docSyncStats = { projectCount: 0, fileCount: 0, connected: false };
         try {
@@ -1150,9 +1150,7 @@ export function registerSettingsHandlers() {
         return {
             appConfigured: true,
             projectEnabled: isProjectEnabled,
-            connected,
-            syncing: false, // We don't have real-time syncing status yet
-            error: null,
+            ...getSyncStatusSnapshot(),
             stats: {
                 sessionCount,
                 lastSyncedAt,
@@ -1192,9 +1190,13 @@ export function registerSettingsHandlers() {
         const docSyncEnabledProjects = [...new Set(selection?.docSyncEnabledProjects ?? [])];
 
         const addedProjects = enabledProjects.filter((path) => !previousEnabled.includes(path));
+        const removedProjects = previousEnabled.filter((path) => !enabledProjects.includes(path));
         const docSyncChanged = docSyncEnabledProjects.length !== previousDocSync.length
             || docSyncEnabledProjects.some((path) => !previousDocSync.includes(path));
 
+        // Before the write: newly enabled projects keep their sessions marked
+        // until the next reconcile queues the transcripts they withheld.
+        transcriptBackfill.holdProjects(addedProjects);
         // One write for the whole selection.
         setSessionSyncConfig(persistActivePersonalSyncProfile({
             ...config,
@@ -1202,19 +1204,20 @@ export function registerSettingsHandlers() {
             docSyncEnabledProjects,
             enabled: enabledProjects.length > 0,
         }));
+        void projectConfigSync.refresh().catch(err => logger.main.warn('[sync:set-project-selection] Failed to refresh project config', err));
         logger.store.info(
             `[sync:set-project-selection] ${enabledProjects.length} project(s) enabled, `
             + `${docSyncEnabledProjects.length} with document sync`,
         );
 
         // ...and one sync trigger. Doc-sync membership is applied during
-        // reinitialization; a project that only gained session sync just needs
-        // its sessions pushed.
+        // reinitialization; a project that gained or lost session sync needs
+        // its sessions republished (transcripts uploaded, or marked withheld).
         try {
             if (docSyncChanged || !isSyncProviderReady()) {
                 await repositoryManager.reinitializeSyncWithNewConfig();
-            } else if (addedProjects.length > 0) {
-                triggerIncrementalSync().catch(err => {
+            } else if (addedProjects.length > 0 || removedProjects.length > 0) {
+                triggerIncrementalSync({ force: true }).catch(err => {
                     logger.store.error('[sync:set-project-selection] Failed to trigger sync:', err);
                 });
             }
@@ -1245,6 +1248,7 @@ export function registerSettingsHandlers() {
             // Add project to enabled list if not already present
             if (!enabledProjects.includes(workspacePath)) {
                 enabledProjects = [...enabledProjects, workspacePath];
+                transcriptBackfill.holdProjects([workspacePath]);
             }
         } else {
             // Remove project from enabled list
@@ -1259,13 +1263,15 @@ export function registerSettingsHandlers() {
         });
 
         logger.store.info(`[sync:toggle-project] Project sync ${enabled ? 'enabled' : 'disabled'} for: ${workspacePath}`);
+        void projectConfigSync.refresh(workspacePath).catch(err => logger.main.warn(`[sync:toggle-project] Failed to refresh config for ${workspacePath}`, err));
 
-        // If a project was enabled, trigger sync to push its sessions immediately
-        if (enabled) {
+        // Republish the project's sessions now: enabled uploads their
+        // transcripts, disabled marks them as withheld on the phone.
+        if (enabled || isSyncProviderReady()) {
             try {
                 if (isSyncProviderReady()) {
                     // Provider exists - trigger incremental sync directly
-                    triggerIncrementalSync().catch(err => {
+                    triggerIncrementalSync({ force: true }).catch(err => {
                         logger.store.error('[sync:toggle-project] Failed to trigger sync:', err);
                     });
                 } else {

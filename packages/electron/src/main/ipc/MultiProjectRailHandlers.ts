@@ -15,25 +15,47 @@
  * - `workspace:set-active` -- update the visible project in a window
  *   without spawning a new BrowserWindow (the legacy `project-selected`
  *   path stays for the "open in new window" escape hatch).
+ *
+ * It also owns attach/detach for multi-root workspaces. An attached folder is
+ * NOT a rail project: it has no identity of its own (no settings entry, no
+ * tabs, no sessions) and lives only as an extra root of its primary workspace.
+ * The service wiring is the same though, which is why it sits here.
+ *
+ * - `workspace:attach-folder` -- add a root to the primary workspace.
+ * - `workspace:detach-folder` -- remove it. Tabs opened from it stay open.
+ * - `workspace:get-folders` -- the workspace's roots, primary first.
  */
 
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, dialog } from 'electron';
 import { basename } from 'path';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { safeHandle } from '../utils/ipcRegistry';
 import {
     getWindowId,
     windowStates,
     documentServices,
 } from '../window/WindowManager';
-import { startWorkspaceWatcher, stopWorkspaceWatcher } from '../file/WorkspaceWatcher.ts';
-import { anyWindowReferencesWorkspace, resolveDocumentServicePath } from '../window/windowState';
+import {
+  startRootWatcher,
+  startWorkspaceWatcher,
+  stopRootWatcher,
+  stopWorkspaceWatcher,
+} from '../file/WorkspaceWatcher.ts';
+import { anyWindowReferencesWorkspace, resolveDocumentServicePath, windows } from '../window/windowState';
 import { ElectronDocumentService, setupDocumentServiceHandlers } from '../services/ElectronDocumentService';
 import { ElectronFileSystemService } from '../services/ElectronFileSystemService';
+import { clearWorkspaceRepoCache } from '../services/workspaceRepos';
 import { addNimAssetRoot } from '../protocols/nimAssetProtocol';
 import { addNimPreviewWorkspaceRoot } from '../protocols/nimPreviewProtocol';
 import { getMcpConfigService } from '../index';
-import { addToRecentItems, getWorkspaceNavigationHistory } from '../utils/store';
+import {
+  addToRecentItems,
+  attachFolderToWorkspace,
+  detachFolderFromWorkspace,
+  getWorkspaceNavigationHistory,
+  getWorkspaceRoots,
+  MAX_ATTACHED_FOLDERS,
+} from '../utils/store';
 import { navigationHistoryService } from '../services/NavigationHistoryService';
 import {
   setFileSystemService,
@@ -42,6 +64,7 @@ import {
   clearFileSystemServiceFor,
 } from '@nimbalyst/runtime';
 import { logger } from '../utils/logger';
+import { notifyWorkspaceUsageChanged, pruneUnusedGitWatchers, releaseWhenWorkspaceUnused } from '../file/GitWatcherLifecycle';
 
 // Re-uses the same Maps that WindowManager populates. WindowManager exports
 // `documentServices` only; the file-system service map lives module-internal
@@ -49,13 +72,15 @@ import { logger } from '../utils/logger';
 // (added below in this PR).
 import { fileSystemServices, getFileSystemService } from '../window/serviceRegistry';
 
-function resolveDocumentServiceForEvent(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent): ElectronDocumentService | null {
+function resolveDocumentServiceForEvent(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent, workspacePath?: string): ElectronDocumentService | null {
     const browserWindow = BrowserWindow.fromWebContents(event.sender);
     if (!browserWindow) return null;
     const windowId = getWindowId(browserWindow);
     if (windowId === null) return null;
     const state = windowStates.get(windowId);
-    const path = resolveDocumentServicePath(state);
+    // A request that names its project (#1822) is answered for that project,
+    // whichever one the rail has marked active by now.
+    const path = resolveDocumentServicePath(state, workspacePath);
     if (!path) return null;
     return documentServices.get(path) ?? null;
 }
@@ -108,6 +133,26 @@ function ensureServicesForPath(window: BrowserWindow, workspacePath: string): vo
     }
 }
 
+/**
+ * Windows currently showing a workspace, as `[windowId, window]` pairs.
+ * Attaching or detaching a folder has to reach every one of them -- the same
+ * project can be open in more than one window, and each keeps its own watcher
+ * registration.
+ */
+function windowsShowingWorkspace(workspacePath: string): Array<[number, BrowserWindow]> {
+    const matches: Array<[number, BrowserWindow]> = [];
+    for (const [windowId, state] of windowStates) {
+        if (state.workspacePath !== workspacePath && !state.additionalWorkspacePaths?.includes(workspacePath)) {
+            continue;
+        }
+        const window = windows.get(windowId);
+        if (window && !window.isDestroyed()) {
+            matches.push([windowId, window]);
+        }
+    }
+    return matches;
+}
+
 export function registerMultiProjectRailHandlers(): void {
     safeHandle('workspace:register-additional', async (event, data: { workspacePath: string }) => {
         const { workspacePath } = data;
@@ -133,6 +178,7 @@ export function registerMultiProjectRailHandlers(): void {
 
         ensureServicesForPath(window, workspacePath);
         addToRecentItems('workspaces', workspacePath, basename(workspacePath));
+        notifyWorkspaceUsageChanged();
 
         return { success: true };
     });
@@ -155,9 +201,11 @@ export function registerMultiProjectRailHandlers(): void {
             state.additionalWorkspacePaths = state.additionalWorkspacePaths.filter((p) => p !== workspacePath);
         }
 
-        // If this window still references the path as primary, leave services alone.
+        // The startup project can close while other rail projects remain.
+        // Move the primary reference so it no longer pins the closed project.
         if (state.workspacePath === workspacePath) {
-            return { success: true, stillPrimary: true };
+            state.workspacePath = state.additionalWorkspacePaths?.[0] ?? null;
+            state.additionalWorkspacePaths = state.additionalWorkspacePaths?.filter(path => path !== state.workspacePath);
         }
 
         // If the path being closed was this window's active path, tear down
@@ -172,8 +220,10 @@ export function registerMultiProjectRailHandlers(): void {
             clearFileSystemService();
         }
 
+        await pruneUnusedGitWatchers();
+
         // Free services only if no other window references the path.
-        if (!anyWindowReferencesWorkspace(workspacePath)) {
+        releaseWhenWorkspaceUnused(workspacePath, () => {
             const docService = documentServices.get(workspacePath);
             if (docService) {
                 docService.destroy();
@@ -195,7 +245,7 @@ export function registerMultiProjectRailHandlers(): void {
             } catch (error) {
                 logger.main.error('[MultiProject] Error stopping MCP config watcher:', error);
             }
-        }
+        });
 
         return { success: true };
     });
@@ -219,7 +269,9 @@ export function registerMultiProjectRailHandlers(): void {
             return { success: false, error: 'workspacePath not registered in this window' };
         }
 
-        const previousActive = state.activeWorkspacePath ?? state.workspacePath;
+        // null means the active project just closed; the promoted primary
+        // still needs its file watcher started. Only legacy state omits this field.
+        const previousActive = state.activeWorkspacePath === undefined ? state.workspacePath : state.activeWorkspacePath;
         if (previousActive === workspacePath) {
             // Idempotent: already active. Make sure the global FS service is
             // pointing at the right place (covers the case of an early call
@@ -257,6 +309,141 @@ export function registerMultiProjectRailHandlers(): void {
 
         return { success: true };
     });
+
+    safeHandle('workspace:get-folders', async (_event, data: { workspacePath: string }) => {
+        const { workspacePath } = data ?? {};
+        if (!workspacePath || typeof workspacePath !== 'string') {
+            return { success: false, error: 'workspacePath required' };
+        }
+        return { success: true, folders: getWorkspaceRoots(workspacePath) };
+    });
+
+    safeHandle(
+        'workspace:attach-folder',
+        async (event, data: { workspacePath: string; folderPath: string }) => {
+            const { workspacePath, folderPath } = data ?? {};
+            if (!workspacePath || typeof workspacePath !== 'string') {
+                return { success: false, error: 'workspacePath required' };
+            }
+            if (!folderPath || typeof folderPath !== 'string') {
+                return { success: false, error: 'folderPath required' };
+            }
+            if (!existsSync(folderPath) || !statSync(folderPath).isDirectory()) {
+                return { success: false, error: 'Folder does not exist' };
+            }
+
+            const window = BrowserWindow.fromWebContents(event.sender);
+            if (!window) return { success: false, error: 'No window for event sender' };
+
+            // Attaching hands this project's agents read/write access to another
+            // folder on disk, so it is confirmed here rather than in the picker:
+            // the picker's `message` option only renders on macOS, and the
+            // drag-drop / command routes never open a picker at all.
+            const consent = await dialog.showMessageBox(window, {
+                type: 'question',
+                buttons: ['Attach Folder', 'Cancel'],
+                defaultId: 0,
+                cancelId: 1,
+                title: 'Attach Folder to Workspace',
+                message: `Attach "${basename(folderPath)}" to "${basename(workspacePath)}"?`,
+                detail:
+                    'The attached folder becomes part of this project and inherits its agent '
+                    + 'trust level. Agents in this project will be able to read and write it.',
+            });
+            if (consent.response !== 0) {
+                return { success: false, reason: 'declined', error: undefined };
+            }
+
+            const result = attachFolderToWorkspace(workspacePath, folderPath);
+            if (!result.ok) {
+                return {
+                    success: false,
+                    reason: result.reason,
+                    error:
+                        result.reason === 'cap-reached'
+                            ? `A workspace can hold at most ${MAX_ATTACHED_FOLDERS} attached folders`
+                            : result.reason === 'already-attached'
+                              ? 'Folder is already attached'
+                              : 'Folder is already this workspace',
+                    folders: [workspacePath, ...result.attachedFolders],
+                };
+            }
+
+            // Same service wiring as a warm rail project: the attached folder
+            // needs a DocumentService and FileSystemService before the explorer
+            // can list it or an agent can read it.
+            ensureServicesForPath(window, folderPath);
+
+            // Only the window showing this workspace watches the new root; a
+            // window on a different project has no tree to update.
+            // A newly attached root has never been scanned for repos.
+            clearWorkspaceRepoCache(folderPath);
+
+            const folders = [workspacePath, ...result.attachedFolders];
+            for (const [, listener] of windowsShowingWorkspace(workspacePath)) {
+                startRootWatcher(listener, folderPath, workspacePath);
+                listener.webContents.send('workspace:folders-changed', { workspacePath, folders });
+            }
+
+            // Deliberately no per-folder trust flag: an attached folder is part
+            // of this workspace, and agent permissions resolve from the
+            // session's workspace (the primary root), so it inherits that
+            // project's trust level. The renderer states that in the picker
+            // rather than prompting again per folder.
+            return { success: true, folders };
+        },
+    );
+
+    safeHandle(
+        'workspace:detach-folder',
+        async (_event, data: { workspacePath: string; folderPath: string }) => {
+            const { workspacePath, folderPath } = data ?? {};
+            if (!workspacePath || typeof workspacePath !== 'string') {
+                return { success: false, error: 'workspacePath required' };
+            }
+            if (!folderPath || typeof folderPath !== 'string') {
+                return { success: false, error: 'folderPath required' };
+            }
+
+            // Drop the attachment first: both the git-ref watcher below and the
+            // service teardown ask `anyWindowReferencesWorkspace`, which reads
+            // attachments out of the store. Stopping first would see this very
+            // attachment and conclude the folder is still in use.
+            const attachedFolders = detachFolderFromWorkspace(workspacePath, folderPath);
+            clearWorkspaceRepoCache(folderPath);
+
+            const folders = [workspacePath, ...attachedFolders];
+            for (const [listenerWindowId, listener] of windowsShowingWorkspace(workspacePath)) {
+                stopRootWatcher(listenerWindowId, folderPath);
+                listener.webContents.send('workspace:folders-changed', { workspacePath, folders });
+            }
+
+            // Free services only if nothing else still shows this folder --
+            // another window may have it attached, or open as a rail project.
+            if (!anyWindowReferencesWorkspace(folderPath)) {
+                const docService = documentServices.get(folderPath);
+                if (docService) {
+                    docService.destroy();
+                    documentServices.delete(folderPath);
+                }
+
+                const fsService = getFileSystemService(folderPath);
+                if (fsService) {
+                    fsService.destroy();
+                    fileSystemServices.delete(folderPath);
+                    clearFileSystemServiceFor(folderPath);
+                }
+
+                try {
+                    getMcpConfigService()?.stopWatchingWorkspaceConfig(folderPath);
+                } catch (error) {
+                    logger.main.error('[MultiRoot] Error stopping MCP config watcher:', error);
+                }
+            }
+
+            return { success: true, folders };
+        },
+    );
 
     // Renderer asks the host to close this window when the rail goes empty
     // (user closed the last open project). Closing the BrowserWindow lets the

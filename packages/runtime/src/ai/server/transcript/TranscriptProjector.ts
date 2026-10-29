@@ -57,6 +57,8 @@ export interface ToolCallDiffLoadResult {
 
 export interface TranscriptViewMessage {
   id: number;
+  /** Matches the canonical event's ephemeral runtime store generation. */
+  transcriptGeneration?: number;
   sequence: number;
   createdAt: Date;
   type: TranscriptEventType;
@@ -65,6 +67,15 @@ export interface TranscriptViewMessage {
   attachments?: UserMessagePayload['attachments'];
   /** Set when this turn was injected by a teammate rather than typed by the user. */
   teammateOrigin?: UserMessagePayload['teammateOrigin'];
+  /** user_message only: who sent the prompt, when the raw row recorded it. */
+  promptActor?: UserMessagePayload['promptActor'];
+  /** user_message only: automated origin such as `interactive-question`. */
+  promptOrigin?: string;
+  /**
+   * user_message only: shown before main persisted it. A send that then fails
+   * leaves this row behind, so it must not close open questions.
+   */
+  optimistic?: boolean;
   toolCall?: {
     toolName: string;
     toolDisplayName: string;
@@ -96,6 +107,8 @@ export interface TranscriptViewMessage {
 
   /** Extended-thinking content rendered by the assistant message UI as a collapsed-by-default block. */
   thinking?: string;
+  /** `thinking` is an API progress update; rendered visibly, not collapsed (#1801). */
+  progressUpdate?: boolean;
   /** Per-turn model id (Claude Code 2.1.x). */
   model?: string;
 
@@ -229,6 +242,7 @@ function projectEvent(
 ): TranscriptViewMessage {
   const base: TranscriptViewMessage = {
     id: event.id,
+    ...(event.transcriptGeneration !== undefined ? { transcriptGeneration: event.transcriptGeneration } : {}),
     sequence: event.sequence,
     createdAt: event.createdAt,
     type: event.eventType,
@@ -246,6 +260,8 @@ function projectEvent(
       if (p.teammateOrigin) {
         base.teammateOrigin = p.teammateOrigin;
       }
+      if (p.promptActor) base.promptActor = p.promptActor;
+      if (p.promptOrigin) base.promptOrigin = p.promptOrigin;
       break;
     }
     case 'assistant_message': {
@@ -253,6 +269,7 @@ function projectEvent(
       base.text = event.searchableText ?? undefined;
       base.mode = p.mode;
       if (p.thinking !== undefined) base.thinking = p.thinking;
+      if (p.progressUpdate) base.progressUpdate = true;
       if (p.model !== undefined) base.model = p.model;
       break;
     }

@@ -5,14 +5,19 @@ import { getWindowId, windowStates } from '../window/WindowManager';
 import { clearGitStatusCache } from '../ipc/GitStatusHandlers';
 import { optimizedWorkspaceWatcher } from './OptimizedWorkspaceWatcher';
 import { gitRefWatcher } from './GitRefWatcher';
+import { initGitWatcherLifecycle, pruneUnusedGitWatchers } from './GitWatcherLifecycle';
 import * as workspaceEventBus from './WorkspaceEventBus';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { readdirSync } from 'fs';
 import path from "path";
 import { createHash } from 'crypto';
 import { getProjectFileSyncService } from '../services/ProjectFileSyncService';
+import { isProjectSyncPath } from '../services/sync/projectSyncWikiRules';
+import { createProjectSyncWatch } from '../services/sync/projectSyncWatch';
 import { isSyncEnabled } from '../services/SyncManager';
-import { getReleaseChannel, getSessionSyncConfig } from '../utils/store';
+import { getReleaseChannel, getSessionSyncConfig, getWorkspaceRoots } from '../utils/store';
+import { anyWindowReferencesWorkspace } from '../window/windowState';
+import { listReposForRoot } from '../services/workspaceRepos';
 
 // Helper function to calculate folder depth relative to workspace
 function calculateFolderDepth(folderPath: string, workspacePath: string): number {
@@ -41,6 +46,7 @@ workspaceEventBus.setGitignoreChangeHandler((workspacePath: string) => {
 
 // Set up IPC handlers for folder expand/collapse events
 export function registerWorkspaceWatcherHandlers() {
+    initGitWatcherLifecycle();
     safeHandle('workspace-folder-expanded', async (event, folderPath: string) => {
         const window = BrowserWindow.fromWebContents(event.sender);
         if (!window) return;
@@ -90,7 +96,12 @@ export function registerWorkspaceWatcherHandlers() {
     });
 }
 
-// Start watching a workspace directory for changes
+/**
+ * Start watching a workspace for changes: the primary root and every folder
+ * attached to it. Each root gets its own tree watcher and its own git-ref
+ * watcher, because roots have independent `.gitignore` files and may be
+ * separate repos (or no repo at all).
+ */
 export function startWorkspaceWatcher(window: BrowserWindow, workspacePath: string) {
     const windowId = getWindowId(window);
     if (windowId === null) {
@@ -98,19 +109,60 @@ export function startWorkspaceWatcher(window: BrowserWindow, workspacePath: stri
         return;
     }
 
-    // Use optimized chokidar-based workspace watcher
-    // logger.workspaceWatcher.info('Using OptimizedWorkspaceWatcher for:', workspacePath);
-    optimizedWorkspaceWatcher.start(window, workspacePath);
+    for (const rootPath of getWorkspaceRoots(workspacePath)) {
+        startRootWatcher(window, rootPath, workspacePath);
+    }
 
-    // Start git ref watcher for this workspace (detects commits and staging changes)
-    gitRefWatcher.start(workspacePath).catch((error) => {
-        logger.workspaceWatcher.error('Failed to start GitRefWatcher:', error);
-    });
-
-    // Start project file sync for .md files (non-blocking, non-fatal)
+    // Project file sync is a workspace-level (primary root) concern: it syncs
+    // the project's own .md documents to mobile, and attached folders have no
+    // workspace identity to sync under.
     startProjectFileSync(workspacePath).catch((error) => {
         logger.workspaceWatcher.error('Failed to start ProjectFileSync:', error);
     });
+}
+
+/**
+ * Start watching one root. Idempotent, and additive -- the window's other roots
+ * keep running. Called for each root at workspace open and again when a folder
+ * is attached.
+ */
+export function startRootWatcher(window: BrowserWindow, rootPath: string, owningWorkspace?: string) {
+    // Use optimized chokidar-based workspace watcher
+    void optimizedWorkspaceWatcher.start(window, rootPath).catch(error => {
+        logger.workspaceWatcher.error('Failed to register workspace watcher:', error);
+    });
+
+    // One git-ref watcher per repo the root contains, not per root: a root may
+    // be no repo at all (nothing to watch) or a container holding several
+    // (watching only the container would miss every commit).
+    //
+    // The owning workspace goes with it: git status is routed per repo, but
+    // pending reviews are workspace-scoped, and a repo under an attached folder
+    // has no workspace identity of its own to broadcast under.
+    for (const repoPath of listReposForRoot(rootPath)) {
+        gitRefWatcher.start(repoPath, owningWorkspace ?? rootPath).catch((error) => {
+            logger.workspaceWatcher.error('Failed to start GitRefWatcher:', error);
+        });
+    }
+}
+
+/**
+ * Stop watching one root, leaving the window's other roots alone. Called when a
+ * folder is detached.
+ *
+ * The git-ref watcher is keyed by path rather than window, so it is only
+ * stopped when no window still shows this root.
+ */
+export function stopRootWatcher(windowId: number, rootPath: string) {
+    optimizedWorkspaceWatcher.stopRoot(windowId, rootPath);
+
+    if (!anyWindowReferencesWorkspace(rootPath)) {
+        for (const repoPath of listReposForRoot(rootPath)) {
+            gitRefWatcher.stop(repoPath).catch((error) => {
+                logger.workspaceWatcher.error('Failed to stop GitRefWatcher:', error);
+            });
+        }
+    }
 }
 
 // Stop watching a workspace
@@ -140,8 +192,9 @@ export function stopWorkspaceWatcher(windowId: number) {
     }
 
     optimizedWorkspaceWatcher.stop(windowId);
-    // Note: gitRefWatcher is keyed by workspacePath, not windowId.
-    // It will be stopped when stopAllWorkspaceWatchers is called.
+    void pruneUnusedGitWatchers().catch(error => {
+        logger.workspaceWatcher.error('Failed to release unused Git watchers:', error);
+    });
 }
 
 // Get workspace watcher info for debugging
@@ -194,6 +247,7 @@ export async function stopAllWorkspaceWatchers() {
 
 // Track active project sync subscriptions (workspacePath -> subscriberId)
 const projectSyncSubscriptions = new Map<string, string>();
+const projectSyncWatches = new Map<string, { dispose(): void }>();
 
 /**
  * Derive a deterministic project ID from a workspace path.
@@ -205,7 +259,7 @@ function hashProjectId(input: string): string {
 
 /**
  * Start project file sync for a workspace.
- * Subscribes to WorkspaceEventBus for .md file changes and starts initial sync sweep.
+ * Subscribes to WorkspaceEventBus for synced file changes and starts initial sync sweep.
  *
  * Called from startWorkspaceWatcher() when sync is enabled.
  */
@@ -227,30 +281,22 @@ export async function startProjectFileSync(workspacePath: string): Promise<void>
 
   const service = getProjectFileSyncService();
 
-  // Subscribe to file change events for .md files
-  await workspaceEventBus.subscribe(workspacePath, subscriberId, {
-    onChange: (filePath) => {
-      if (!filePath.endsWith('.md')) return;
-      // Skip files that were just written by the sync service (echo suppression)
-      if (service.isRecentlyWrittenFromRemote(filePath)) return;
+  const watch = createProjectSyncWatch(workspacePath, subscriberId, workspaceEventBus, {
+    isOwnWrite: filePath => service.isRecentlyWrittenFromRemote(filePath),
+    saved: (filePath, kind) => {
       service.handleFileSaved(filePath, workspacePath, projectId).catch(err => {
-        logger.main.error('[ProjectFileSync] handleFileSaved failed:', err);
+        logger.main.error(`[ProjectFileSync] handleFileSaved (${kind}) failed:`, err);
       });
     },
-    onAdd: (filePath) => {
-      if (!filePath.endsWith('.md')) return;
-      if (service.isRecentlyWrittenFromRemote(filePath)) return;
-      service.handleFileSaved(filePath, workspacePath, projectId).catch(err => {
-        logger.main.error('[ProjectFileSync] handleFileSaved (add) failed:', err);
-      });
-    },
-    onUnlink: (filePath) => {
-      if (!filePath.endsWith('.md')) return;
-      // Skip deletes the sync service itself just performed (remote delete echo)
-      if (service.isRecentlyWrittenFromRemote(filePath)) return;
-      service.handleFileDeletedByPath(filePath, workspacePath, projectId);
-    },
+    deleted: filePath => service.handleFileDeletedByPath(filePath, workspacePath, projectId),
+    wikiCreated: () => service.resync(projectId),
   });
+  // Every sweep (startup and each reconnect) registers what it found, which produced no add event.
+  const offSwept = service.onSwept((sweptProjectId, filePaths) => {
+    if (sweptProjectId === projectId) for (const filePath of filePaths) watch.track(filePath);
+  });
+  projectSyncWatches.set(workspacePath, { dispose: () => { offSwept(); watch.dispose(); } });
+  await workspaceEventBus.subscribe(workspacePath, subscriberId, watch.listener);
 
   // Start initial sync sweep (non-blocking)
   service.syncProject(workspacePath, projectId).catch(err => {
@@ -271,7 +317,7 @@ export async function startProjectFileSync(workspacePath: string): Promise<void>
  * still holds.
  */
 export function pushNewDocumentToSync(filePath: string, workspacePath: string): void {
-  if (!filePath.endsWith('.md')) return;
+  if (!isProjectSyncPath(filePath, workspacePath)) return;
   if (!projectSyncSubscriptions.has(workspacePath)) return;
 
   const projectId = hashProjectId(workspacePath);
@@ -291,6 +337,8 @@ function stopProjectFileSync(workspacePath: string): void {
 
   workspaceEventBus.unsubscribe(workspacePath, subscriberId);
   projectSyncSubscriptions.delete(workspacePath);
+  projectSyncWatches.get(workspacePath)?.dispose();
+  projectSyncWatches.delete(workspacePath);
 
   getProjectFileSyncService().disconnectProject(hashProjectId(workspacePath));
 }

@@ -5,11 +5,14 @@ import type {
   TrackerDataSnapshot,
   TrackerDataSource,
   TrackerItem,
+  TrackerItemRevisionRecord,
   TrackerPresenceMember,
+  TrackerRevisionRef,
   TrackerSavedViewRecord,
   TrackerSyncState,
   TrackerSyncStatus,
 } from '@nimbalyst/collab-client/trackers';
+import { TrackerRevisionUnavailableError } from '@nimbalyst/collab-client/trackers';
 import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 
 interface TrackerItemChangeEvent {
@@ -28,6 +31,14 @@ export interface ElectronTrackerDataSourceOptions {
   workspacePath: string;
   ipc?: ElectronTrackerDataSourceIpc;
 }
+
+/**
+ * Trailing window for collapsing a burst of `metadata-changed` events into one
+ * full tracker-item reload. Long enough to swallow a run of keystrokes inside a
+ * frontmatter block, short enough that a deliberate frontmatter edit still
+ * shows up in the tracker views without feeling stale.
+ */
+const METADATA_RELOAD_COALESCE_MS = 500;
 
 function normalizeSavedViews(value: unknown): TrackerSavedViewRecord[] {
   if (!Array.isArray(value)) return [];
@@ -66,6 +77,9 @@ export class ElectronTrackerDataSource implements TrackerDataSource {
   private watching = false;
   private disposed = false;
   private syncState: TrackerSyncState;
+  private metadataReloadTimer: ReturnType<typeof setTimeout> | null = null;
+  private reloadInFlight = false;
+  private reloadRequestedWhileInFlight = false;
 
   constructor(options: ElectronTrackerDataSourceOptions) {
     this.workspacePath = options.workspacePath;
@@ -80,7 +94,7 @@ export class ElectronTrackerDataSource implements TrackerDataSource {
   async snapshot(): Promise<TrackerDataSnapshot> {
     this.assertActive();
     const [itemsValue, savedViewsValue, presenceValue, statusValue] = await Promise.all([
-      this.ipc.invoke('document-service:tracker-items-list'),
+      this.ipc.invoke('document-service:tracker-items-list', this.workspacePath),
       this.ipc.invoke('tracker-saved-views:list', this.workspacePath),
       this.ipc.invoke('tracker-sync:get-presence', { workspacePath: this.workspacePath }),
       this.ipc.invoke('tracker-sync:get-status', {
@@ -109,11 +123,41 @@ export class ElectronTrackerDataSource implements TrackerDataSource {
     return this.syncState;
   }
 
+  /**
+   * One exact revision from the local revision log (knowledge-scopes 4.2).
+   *
+   * The main process answers with a coded failure rather than throwing across
+   * IPC (an Error loses its type on the crossing), so the code is re-raised
+   * here as `TrackerRevisionUnavailableError`. Every other failure throws a
+   * plain Error: only "that revision does not exist" gets the specific type,
+   * because only that one means the pinned evidence is gone rather than that
+   * the read itself broke.
+   *
+   * There is deliberately no fallback to the live item.
+   */
+  async getItemRevision(itemId: string, ref: TrackerRevisionRef): Promise<TrackerItemRevisionRecord> {
+    this.assertActive();
+    const response = await this.ipc.invoke('tracker-revision:get', {
+      workspacePath: this.workspacePath,
+      itemId,
+      ...ref,
+    }) as
+      | { success: true; revision: TrackerItemRevisionRecord }
+      | { success: false; code?: string; error?: string }
+      | undefined;
+
+    if (response?.success) return response.revision;
+    if (response?.code === 'revision-not-found') {
+      throw new TrackerRevisionUnavailableError(itemId, ref, response.error);
+    }
+    throw new Error(response?.error ?? `Failed to read revision for tracker item '${itemId}'`);
+  }
+
   async command(command: TrackerDataCommand): Promise<TrackerDataCommandResult> {
     this.assertActive();
     switch (command.type) {
       case 'list-items': {
-        const value = await this.ipc.invoke('document-service:tracker-items-list');
+        const value = await this.ipc.invoke('document-service:tracker-items-list', this.workspacePath);
         return {
           ok: true,
           items: Array.isArray(value) ? (value as TrackerItem[]) : [],
@@ -175,6 +219,10 @@ export class ElectronTrackerDataSource implements TrackerDataSource {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.metadataReloadTimer !== null) {
+      clearTimeout(this.metadataReloadTimer);
+      this.metadataReloadTimer = null;
+    }
     this.listeners.clear();
     for (const cleanup of this.ipcCleanups.splice(0)) cleanup();
   }
@@ -195,7 +243,7 @@ export class ElectronTrackerDataSource implements TrackerDataSource {
         }
       }),
       this.ipc.on('document-service:metadata-changed', () => {
-        void this.reloadItems();
+        this.scheduleMetadataReload();
       }),
       this.ipc.on('tracker-saved-views:changed', (data: { workspacePath?: string }) => {
         if (data?.workspacePath !== this.workspacePath) return;
@@ -259,9 +307,40 @@ export class ElectronTrackerDataSource implements TrackerDataSource {
     );
   }
 
+  /**
+   * `metadata-changed` is the only signal for frontmatter-projected tracker
+   * items (they are derived from the metadata cache, not from `tracker_items`),
+   * so it has to reload -- but `items-replaced` is the most expensive change
+   * this source can emit. The list is a single IPC payload of every item in the
+   * workspace (measured at 5,698 items / 27 MB / ~400 ms on the Nimbalyst repo)
+   * and the subscribers rebuild every tracker atom and recompute unread across
+   * the whole set from it.
+   *
+   * So: never more than one reload in flight, and collapse a burst into one
+   * trailing pass. Editing inside a frontmatter block emits a metadata change
+   * per keystroke; without this each one queued its own full reload behind the
+   * last and the renderer spent the whole burst blocked.
+   */
+  private scheduleMetadataReload(): void {
+    if (this.disposed) return;
+    if (this.metadataReloadTimer !== null) return;
+    this.metadataReloadTimer = setTimeout(() => {
+      this.metadataReloadTimer = null;
+      void this.reloadItems();
+    }, METADATA_RELOAD_COALESCE_MS);
+  }
+
   private async reloadItems(): Promise<void> {
+    // A reload already running will observe the writes that triggered this one,
+    // and a second concurrent fetch of the full list only competes with it for
+    // the DB worker and the main thread.
+    if (this.reloadInFlight) {
+      this.reloadRequestedWhileInFlight = true;
+      return;
+    }
+    this.reloadInFlight = true;
     try {
-      const value = await this.ipc.invoke('document-service:tracker-items-list');
+      const value = await this.ipc.invoke('document-service:tracker-items-list', this.workspacePath);
       if (!this.disposed) {
         this.emit({
           type: 'items-replaced',
@@ -270,6 +349,14 @@ export class ElectronTrackerDataSource implements TrackerDataSource {
       }
     } catch (error) {
       console.error('[ElectronTrackerDataSource] Failed to reload tracker items:', error);
+    } finally {
+      this.reloadInFlight = false;
+      if (this.reloadRequestedWhileInFlight && !this.disposed) {
+        this.reloadRequestedWhileInFlight = false;
+        this.scheduleMetadataReload();
+      } else {
+        this.reloadRequestedWhileInFlight = false;
+      }
     }
   }
 

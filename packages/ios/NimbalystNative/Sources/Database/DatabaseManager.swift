@@ -300,7 +300,97 @@ public final class DatabaseManager: @unchecked Sendable {
             try db.create(index: "idx_sessions_created_by", on: "sessions", columns: ["createdBySessionId"])
         }
 
+        // Which desktop owns execution for a session, so a control message goes
+        // to that host instead of every connected desktop. NULL means unknown,
+        // which routes as an untargeted broadcast exactly as before.
+        migrator.registerMigration("v14_session_host_device") { db in
+            try db.alter(table: "sessions") { t in
+                t.add(column: "hostDeviceId", .text)
+            }
+        }
+
+        // Action prompts from the desktop workspace's ai-actions.md, stored as a
+        // JSON blob beside the slash commands they arrive with. NULL means the
+        // desktop predates action sync or the workspace has no actions; both
+        // read as an empty picker.
+        migrator.registerMigration("v15_project_action_prompts") { db in
+            try db.alter(table: "projects") { t in
+                t.add(column: "actionsJson", .text)
+            }
+        }
+
+        // Indexes for the bounded sidebar window (see SessionListQueries.swift). The
+        // list orders by (projectId, updatedAt DESC, id DESC) and resolves group
+        // membership through worktreeId; the pre-existing idx_sessions_updated is not
+        // usable for either because it is not project-scoped. Adding indexes rewrites
+        // no rows, so an existing install keeps its cache.
+        migrator.registerMigration("v16_session_list_window_indexes") { db in
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_updated
+                ON sessions(projectId, updatedAt DESC, id DESC)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_worktree
+                ON sessions(projectId, worktreeId)
+                WHERE worktreeId IS NOT NULL
+                """)
+            // Running / queued / pinned sessions stay reachable from outside the loaded
+            // page, and they can be arbitrarily old, so that query cannot use the
+            // recency index. A partial index keeps it proportional to how many sessions
+            // actually need attention rather than to history.
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_attention
+                ON sessions(projectId, updatedAt DESC, id DESC)
+                WHERE isExecuting = 1 OR hasQueuedPrompts = 1 OR isPinned = 1
+                """)
+        }
+
+        // Derived projection of the sidebar's display groups, so a page of the session
+        // list is a bounded index read instead of a re-aggregation of history. Creating
+        // tables and triggers is additive; no session row is touched.
+        migrator.registerMigration("v17_session_list_group_projection") { db in
+            try SessionListProjection.ensureSchema(db)
+        }
+
+        migrator.registerMigration("v18_session_list_auxiliary_indexes") { db in
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_workstream_page
+                ON sessions(projectId, updatedAt DESC, id DESC) WHERE sessionType = 'workstream';
+                CREATE INDEX IF NOT EXISTS idx_sessions_archived_project
+                ON sessions(projectId) WHERE isArchived = 1;
+                CREATE INDEX IF NOT EXISTS idx_sessions_phase_project
+                ON sessions(projectId) WHERE phase IS NOT NULL AND phase <> '';
+                """)
+        }
+
+        migrator.registerMigration(IndexReplicationStore.migrationIdentifier) { db in
+            try IndexReplicationStore.createSchema(db)
+        }
+
+        // The Local wiki folder and type definitions from the desktop's project
+        // config. NULL means the project has no Local wiki (or no wiki types), or
+        // the desktop predates wiki sync.
+        // Registered after v2IndexReplication so existing installs apply it in order.
+        migrator.registerMigration("v19_project_local_wiki_folder") { db in
+            try db.alter(table: "projects") { t in
+                t.add(column: "localWikiFolder", .text)
+                t.add(column: "localWikiTypesJSON", .text)
+            }
+        }
+
+        // Set from client metadata when the desktop lists a session whose
+        // project is not synced, so the phone shows "not synced" instead of an
+        // empty transcript.
+        migrator.registerMigration("v20_session_transcript_sync_disabled") { db in
+            try db.alter(table: "sessions") { t in
+                t.add(column: "transcriptSyncDisabled", .boolean).notNull().defaults(to: false)
+            }
+        }
+
         try migrator.migrate(writer)
+        // The projection is derived data with its own shape marker; a recorded
+        // migration says nothing about which shape it created.
+        try writer.write { db in try SessionListProjection.ensureSchema(db) }
     }
 
     // MARK: - Project Queries
@@ -536,6 +626,19 @@ public final class DatabaseManager: @unchecked Sendable {
                 sql: "UPDATE sessions SET draftInput = ?, draftUpdatedAt = ? WHERE id = ?",
                 arguments: [draftInput, draftUpdatedAt, sessionId]
             )
+        }
+    }
+
+    /// Update only the live context-window usage for an existing session.
+    /// Returns false when no local row exists; never creates one.
+    @discardableResult
+    public func updateSessionContext(sessionId: String, tokens: Int, contextWindow: Int) throws -> Bool {
+        try writer.write { db in
+            try db.execute(
+                sql: "UPDATE sessions SET contextTokens = ?, contextWindow = ? WHERE id = ?",
+                arguments: [tokens, contextWindow, sessionId]
+            )
+            return db.changesCount > 0
         }
     }
 

@@ -50,7 +50,25 @@ export interface AntigravityModelInfo {
   /** Human label, e.g. "Gemini 3.5 Flash (High)". */
   displayName: string;
   apiProvider?: string;
-  maxTokens?: number;
+  /**
+   * The model's context window, from the server's `ModelDetails.maxTokens`.
+   *
+   * Named apart from that field on purpose: `maxTokens` means the OUTPUT cap
+   * everywhere else in Nimbalyst (see `ModelDefinition` in modelConstants.ts,
+   * where it sits next to a separate `contextWindow`), so carrying the
+   * server's name through would have quietly handed any future consumer a
+   * 1,048,576-token "output limit". Confirmed live 2026-09-15: every current
+   * Gemini agent model reports 1Mi here, read back from a live
+   * `GetAvailableModels`.
+   */
+  contextWindowTokens?: number;
+  /**
+   * The model's declared output ceiling, from `ModelDetails.maxOutputTokens`.
+   * 65,536 for gemini-3.8-flash-high and 25 of 26 Gemini agent models
+   * (same probe). This is the field that bounds a response, and it was not
+   * being read at all.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface AntigravityServerConfig {
@@ -367,7 +385,8 @@ export class AntigravityServerManager {
         enum: v.model,
         displayName: v.displayName ?? v.label ?? '',
         apiProvider: v.apiProvider,
-        maxTokens: v.maxTokens,
+        contextWindowTokens: v.maxTokens,
+        maxOutputTokens: v.maxOutputTokens,
       });
     }
     return out;
@@ -429,10 +448,17 @@ export class AntigravityServerManager {
     const [csrf, ports] = line.split('|');
     const portList = (ports || '').split(',').map((x) => parseInt(x, 10)).filter(Boolean);
     if (!csrf || portList.length === 0) return null;
-    // Lower port = HTTPS, higher = HTTP.
-    const httpsPort = Math.min(...portList);
-    const ep: AntigravityEndpoint = { httpsPort, csrf, owned: false };
-    return (await this.isHealthy(ep)) ? ep : null;
+    // Probe each listener rather than assuming the lower port is the TLS one.
+    // That ordering is incidental to the IDE build and was observed inverted
+    // on 2026-09-15 (1792 spoke plain HTTP, 51717 spoke TLS); since `rpc` uses
+    // https.request, picking the HTTP port fails the handshake, discovery
+    // reports no hub, and Nimbalyst spawns a second language_server instead of
+    // attaching to the user's running editor. The macOS path already does this.
+    for (const httpsPort of portList) {
+      const ep: AntigravityEndpoint = { httpsPort, csrf, owned: false };
+      if (await this.isHealthy(ep)) return ep;
+    }
+    return null;
   }
 
   /**

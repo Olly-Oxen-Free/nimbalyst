@@ -9,7 +9,7 @@
 
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import { getRecordStatus } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
-import { isTerminalStatus } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerStatusCategory';
+import { isTerminalStatus } from '@nimbalyst/tracker-schema';
 import type { GithubIssueRow } from '../../../services/RendererGithubIssueService';
 import {
   detectGithubIssueDivergence,
@@ -17,6 +17,7 @@ import {
   type GithubIssueLocalSnapshot,
 } from '../../../services/githubIssueDivergence';
 import type { PrSortKey } from '../../../store/atoms/pullRequests';
+import { matchesGithubListSearch } from '../githubListSearch';
 
 export type IssueFilterChip =
   | 'open'
@@ -359,14 +360,8 @@ export function selectVisibleIssues({
     rows = rows.filter((r) => linkedPrsByIssue.has(r.number));
   }
 
-  const q = search.trim().toLowerCase();
-  if (q) {
-    rows = rows.filter(
-      (r) =>
-        r.title.toLowerCase().includes(q) ||
-        String(r.number).includes(q) ||
-        r.labels.some((label) => label.name.toLowerCase().includes(q)),
-    );
+  if (search.trim()) {
+    rows = rows.filter((r) => matchesGithubListSearch(r, search));
   }
 
   rows.sort((a, b) => {

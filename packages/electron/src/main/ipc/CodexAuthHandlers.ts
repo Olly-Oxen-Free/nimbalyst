@@ -6,7 +6,8 @@
  * service.
  */
 
-import { shell } from 'electron';
+import { systemShell } from '../utils/systemShell';
+import path from 'node:path';
 import { safeHandle } from '../utils/ipcRegistry';
 import { logger } from '../utils/logger';
 import { codexAuthService, type CodexAuthStatus } from '../services/CodexAuthService';
@@ -49,6 +50,13 @@ function toCheckLoginResult(status: CodexAuthStatus): CheckLoginResult {
 }
 
 export function registerCodexAuthHandlers(): void {
+  safeHandle('openai-codex:sandbox-status', async () => codexAuthService.getWindowsSandboxStatus());
+  safeHandle('openai-codex:sandbox-setup', async (_event, mode: unknown, workspacePath: unknown) => {
+    if (mode !== 'elevated' && mode !== 'unelevated') throw new Error('Invalid Windows sandbox mode.');
+    if (typeof workspacePath !== 'string' || !path.isAbsolute(workspacePath)) throw new Error('An absolute workspace path is required.');
+    return codexAuthService.setupWindowsSandbox(mode, workspacePath);
+  });
+
   safeHandle('openai-codex:check-login', async (): Promise<CheckLoginResult> => {
     try {
       const status = await codexAuthService.getStatus();
@@ -73,7 +81,7 @@ export function registerCodexAuthHandlers(): void {
     try {
       const started = await codexAuthService.startChatGptLogin();
       log.info('[CodexAuthHandlers] login-chatgpt: opening', { loginId: started.loginId });
-      await shell.openExternal(started.authUrl);
+      await systemShell.openExternal(started.authUrl);
       return { success: true, loginId: started.loginId };
     } catch (error: any) {
       log.warn('[CodexAuthHandlers] login-chatgpt failed:', error?.message ?? error);
@@ -121,7 +129,7 @@ export function registerCodexAuthHandlers(): void {
   safeHandle('openai-codex:login', async (): Promise<{ success: boolean; message: string; error?: string }> => {
     try {
       const started = await codexAuthService.startChatGptLogin();
-      await shell.openExternal(started.authUrl);
+      await systemShell.openExternal(started.authUrl);
       return { success: true, message: 'Opened ChatGPT login in your browser.' };
     } catch (error: any) {
       return { success: false, message: 'Failed to start Codex login.', error: error?.message ?? 'Login failed' };

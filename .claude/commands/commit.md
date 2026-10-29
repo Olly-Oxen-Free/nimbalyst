@@ -6,14 +6,22 @@ Prepare a git commit following these steps:
 
 1. Run `git status` and `git diff` to see changes
 2. Review recent commits (`git log --oneline -5`) to match the style
-3. Draft a concise commit message:
+3. Update `CHANGELOG.md` — this is the **only** point at which it should be edited
+  - Add the entry now, as part of preparing this commit; never during implementation
+  - One user-facing sentence in the right `[Unreleased]` subsection, matching the surrounding voice
+  - Internal-only changes (refactors, tests, docs, agent/config tweaks, dep bumps with no behavior change) get NO entry
+  - No entry for a bug introduced and fixed within the same unreleased cycle
+  - Editing an existing bullet beats adding a second one for the same feature
+  - If `CHANGELOG.md` already carries bullets from other sessions, do NOT sweep them in — commit only the code plus your own line, and say so
+4. Check `docs/FEATURE_INVENTORY.md` against the changes being committed, following the root `CLAUDE.md` feature-inventory rule. Include the relevant inventory update for added, significantly expanded, or removed notable capabilities; preserve other sessions' edits. Report "Feature inventory updated" with the section, or "No inventory impact" with a short reason. In a parallel batch, the integrating session owns this update.
+5. Draft a concise commit message:
   - Start with type prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`
   - **Focus on IMPACT and WHY, not implementation details**
   - The title should describe the user-visible outcome or bug fixed
   - Use bullet points (dash prefix) only if there are multiple distinct changes
   - Keep each line under 72 characters
   - No emojis
-4. Run the `developer_git_commit_proposal` tool to propose the commit to the user
+6. Run the `developer_git_commit_proposal` tool to propose the commit to the user
   - Do NOT run `git add` - the widget handles staging when the user confirms
 
 **Commit Message Guidelines:**

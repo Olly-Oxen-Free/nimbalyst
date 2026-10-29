@@ -24,6 +24,23 @@ export interface QueueDriveAttemptDeps<W> {
   isChainActive(sessionId: string): boolean;
   /** Is the session mid-turn (running or streaming)? */
   isSessionBusy(sessionId: string): boolean;
+  /**
+   * Has the session's turn answered and is it only draining background tasks
+   * on a live query that can take the next prompt? Overrides both busy checks.
+   */
+  canDispatchIntoDrain?(sessionId: string): boolean;
+  /**
+   * Is the session's turn blocked on a question the user has not answered?
+   * Holds the queue even when the turn would otherwise accept a follow-up:
+   * a dispatched human turn supersedes the question (NIM-7512). Only an
+   * explicit send-now goes past it.
+   */
+  isAwaitingUserInput?(sessionId: string): boolean;
+  /**
+   * #1682: a `developer_git_commit_proposal` call is in flight. Holds the queue
+   * even for send-now; the deferred send-now replays once the call settles.
+   */
+  isCommitProposalInFlight?(sessionId: string): boolean;
   resolveWindow(workspacePath: string, allowAutoOpen: boolean): Promise<WindowResolution<W>>;
   failAllPending(sessionId: string, errorMessage: string): Promise<number>;
   dispatch(input: { sessionId: string; workspacePath: string; window: W; reason: DriveReason }): Promise<boolean>;
@@ -50,7 +67,15 @@ export async function runQueueDriveAttempt<W>(
     return { kind: 'nothing-pending' };
   }
 
-  if (deps.isChainActive(sessionId) || deps.isSessionBusy(sessionId)) {
+  if (deps.isCommitProposalInFlight?.(sessionId)) {
+    return { kind: 'deferred', reason: 'session-busy' };
+  }
+
+  if (reason !== 'send-now' && deps.isAwaitingUserInput?.(sessionId)) {
+    return { kind: 'deferred', reason: 'session-busy' };
+  }
+
+  if ((deps.isChainActive(sessionId) || deps.isSessionBusy(sessionId)) && !deps.canDispatchIntoDrain?.(sessionId)) {
     return { kind: 'deferred', reason: 'session-busy' };
   }
 

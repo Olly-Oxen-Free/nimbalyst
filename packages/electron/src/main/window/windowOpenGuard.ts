@@ -18,7 +18,10 @@
  * this one — its behavior is unchanged.
  */
 
-import { app, shell } from 'electron';
+import { app } from 'electron';
+
+import { routeConsoleLink } from '../services/consoleLinks/consoleLinkHandlers';
+import { openExternalInBackground } from '../utils/systemShell';
 
 export type WindowOpenDecision = 'allow' | 'open-external' | 'deny';
 
@@ -65,7 +68,8 @@ export function installWindowOpenGuard(): void {
         return { action: 'allow' };
       }
       if (decision === 'open-external') {
-        void shell.openExternal(url);
+        // A console link opens in the app when this window can resolve it.
+        if (!routeConsoleLink(url, contents)) openExternalInBackground(url);
       } else {
         console.warn('[MAIN] Blocked window.open for URL:', url);
       }

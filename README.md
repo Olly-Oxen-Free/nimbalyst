@@ -5,7 +5,6 @@
 ![Version](https://img.shields.io/github/v/release/nimbalyst/nimbalyst)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-
 <p>
 <a href="https://nimbalyst.com">Website</a> ·
 <a href="#download">Download</a> ·
@@ -94,7 +93,8 @@ Download the latest version for your platform:
 | macOS Apple Silicon | [Download .dmg](https://github.com/Nimbalyst/nimbalyst/releases/latest/download/Nimbalyst-macOS-arm64.dmg) | macOS Apple Silicon 12+ |
 | macOS Intel | [Download .dmg](https://github.com/Nimbalyst/nimbalyst/releases/latest/download/Nimbalyst-macOS-x64.dmg) | macOS Intel 12+ |
 | Windows | [Download .exe](https://github.com/Nimbalyst/nimbalyst/releases/latest/download/Nimbalyst-Windows.exe) | Windows 10+ |
-| Linux | [Download AppImage](https://github.com/Nimbalyst/nimbalyst/releases/latest/download/Nimbalyst-Linux.AppImage) | Linux |
+| Linux (Debian, Ubuntu) | [Download .deb](https://github.com/Nimbalyst/nimbalyst/releases/latest/download/Nimbalyst-Linux.deb) | Debian, Ubuntu, or a derivative |
+| Linux (other) | [Download AppImage](https://github.com/Nimbalyst/nimbalyst/releases/latest/download/Nimbalyst-Linux.AppImage) | Linux — on Ubuntu 24.04+ see [Linux installation](docs/LINUX_INSTALL.md) |
 
 ## Getting Started
 
@@ -126,18 +126,23 @@ For the complete list of every event we send and its properties, see [POSTHOG_EV
 
 ## Building from Source
 
-Nimbalyst is a TypeScript / Electron monorepo using npm workspaces.
+Nimbalyst is a TypeScript / Electron monorepo using pnpm workspaces. It needs Node 24 (see `.nvmrc`); pnpm is pinned by the `packageManager` field and provided by corepack.
 
 ```bash
-# Install dependencies (npm 7+ required)
-npm install
+# One-time: enable corepack (ships with Node 24)
+corepack enable
+
+# Install dependencies
+pnpm install
 
 # Start the Electron app in dev mode
-cd packages/electron && npm run dev
+cd packages/electron && pnpm run dev
 
 # Build a local Mac binary
-cd packages/electron && npm run build:mac:local
+cd packages/electron && pnpm run build:mac:local
 ```
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for notes on `allowBuilds` and the release-age cooldown.
 
 Major workspaces:
 

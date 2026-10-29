@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// @vitest-environment node
+import { afterAll, beforeAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -71,6 +72,7 @@ const identity = {
 
 const fixedKeyProvider: ReplicaDeviceKeyProvider = {
   getKey: async () => new Uint8Array(32).fill(7),
+  getExistingKey: async () => new Uint8Array(32).fill(7),
 };
 
 it("refuses persistence when safeStorage is unavailable", async () => {
@@ -94,7 +96,7 @@ describe.each(["pglite", "sqlite"] as const)(
     let tempDir: string | null = null;
     let store: CollabDocumentReplicaStore;
 
-    beforeEach(async () => {
+    beforeAll(async () => {
       if (backend === "pglite") {
         const pglite = new PGlite();
         await pglite.exec(POSTGRES_SCHEMA);
@@ -121,12 +123,61 @@ describe.each(["pglite", "sqlite"] as const)(
         db = sqlite;
         close = () => sqlite.close();
       }
+    });
+
+    beforeEach(async () => {
+      // Each scenario gets a fresh service and empty persisted state, while
+      // retaining real backend transactions and the initialized schema.
+      for (const table of ["collab_document_replica_updates", "collab_document_outbox", "collab_document_replicas"]) {
+        const { rows } = await db.query<{ count: string | number }>(`SELECT COUNT(*) AS count FROM ${table}`);
+        expect(Number(rows[0].count)).toBe(0);
+      }
       store = new CollabDocumentReplicaStore(db, fixedKeyProvider);
     });
 
     afterEach(async () => {
+      vi.restoreAllMocks();
+      await db.runTransaction([
+        { sql: "DELETE FROM collab_document_replica_updates" },
+        { sql: "DELETE FROM collab_document_outbox" },
+        { sql: "DELETE FROM collab_document_replicas" },
+      ]);
+    });
+
+    afterAll(async () => {
       await close();
       if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
+    });
+
+    it("reads recovery sources without touching access times or quarantining failures", async () => {
+      await store.appendLocalUpdate({ identity, documentType: "markdown", updateId: "source", update: new Uint8Array([1, 2]), snapshotGeneration: 0 });
+      const query = vi.spyOn(db, "query");
+      const transaction = vi.spyOn(db, "runTransaction");
+      const loaded = await store.load(identity, { readOnly: true });
+      expect([...loaded!.outbox[0].update]).toEqual([1, 2]);
+      expect(query.mock.calls.every(([sql]) => /^\s*SELECT/.test(sql))).toBe(true);
+      expect(transaction).not.toHaveBeenCalled();
+      await db.query("UPDATE collab_document_replica_updates SET update_checksum = 'broken'");
+      query.mockClear();
+      await expect(store.load(identity, { readOnly: true })).rejects.toThrow("CORRUPT_LOCAL_REPLICA");
+      expect(query.mock.calls.every(([sql]) => /^\s*SELECT/.test(sql))).toBe(true);
+      expect(transaction).not.toHaveBeenCalled();
+    });
+
+    it("refuses a recovery read if compaction changes its snapshot generation during collection", async () => {
+      await store.appendLocalUpdate({ identity, documentType: "markdown", updateId: "race", update: new Uint8Array([1, 2]), snapshotGeneration: 0 });
+      const original = db.query.bind(db);
+      let moved = false;
+      const query = vi.spyOn(db, "query").mockImplementation(async (sql, params) => {
+        const result = await original(sql, params);
+        if (!moved && sql.includes("FROM collab_document_outbox")) {
+          moved = true;
+          await original("UPDATE collab_document_replicas SET snapshot_generation = snapshot_generation + 1");
+        }
+        return result;
+      });
+      await expect(store.load(identity, { readOnly: true })).rejects.toThrow("changed during recovery");
+      query.mockRestore();
     });
 
     it("round-trips encrypted local tail and outbox bytes", async () => {

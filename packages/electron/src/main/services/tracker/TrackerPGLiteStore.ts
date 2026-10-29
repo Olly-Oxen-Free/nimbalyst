@@ -21,6 +21,7 @@
  *   projection via `applyRemoteItem` after bootstrap, which is correct.
  */
 
+import { randomUUID } from 'crypto';
 import type { AppDatabase } from '../../database/PGLiteDatabaseWorker';
 import type {
   TrackerItemEnvelope,
@@ -32,13 +33,28 @@ import type {
   TrackerPersistence,
   TrackerRowSnapshot,
   LabelsMap,
-} from '@nimbalyst/runtime/sync';
-import { mergeLabelMaps, normalizeLegacyLabelValues, projectLabelsToValues } from '@nimbalyst/runtime/sync';
+} from '@nimbalyst/tracker-engine';
+import { mergeLabelMaps, normalizeLegacyLabelValues, projectLabelsToValues } from '@nimbalyst/tracker-engine';
 import type { TrackerItem } from '@nimbalyst/runtime';
 import { trackerRecordToItem, type TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import { logger } from '../../utils/logger';
 import { fromDbBoolean, toDbBoolean } from './trackerDbValue';
-import { extractItemCustomFields } from './trackerRowCustomFields';
+import { mergeActivity } from './trackerActivity';
+import {
+  ackAndRetireSuperseded,
+  causalEnqueuedAt,
+  enqueuedAtMillis,
+  itemsWithStackedUpdates,
+  newestUpdatePayload,
+  samePayload,
+  serializeOutboxWrite,
+  SUPERSEDED_UPDATE,
+} from './trackerOutboxCompaction';
+import {
+  COLUMN_ONLY_IDENTITY_KEYS,
+  extractItemCustomFields,
+  stripColumnOnlyIdentityKeys,
+} from './trackerRowCustomFields';
 
 // ============================================================================
 // Local-only field preservation on UPDATE
@@ -121,18 +137,6 @@ function mergeComments(
     (left.serverOrdinal ?? left.createdAt) - (right.serverOrdinal ?? right.createdAt));
 }
 
-function mergeActivity(
-  prior: TrackerItemPayload['activity'],
-  incoming: TrackerItemPayload['activity'],
-): TrackerItemPayload['activity'] {
-  if (!prior && !incoming) return undefined;
-  const merged = new Map<string, NonNullable<TrackerItemPayload['activity']>[number]>();
-  for (const entry of [...(prior ?? []), ...(incoming ?? [])]) merged.set(entry.id, entry);
-  return [...merged.values()]
-    .sort((left, right) => left.timestamp - right.timestamp)
-    .slice(-100);
-}
-
 /**
  * `trackerRecordToItem` carries these system collections through the legacy
  * `customFields` adapter. The database handlers and canonical row converter
@@ -196,6 +200,7 @@ interface PGLiteTrackerTransactionRow {
   started_at: Date | null;
   confirmed_sync_id: string | number | null;
   last_rejection: unknown;
+  base_sync_id?: string | number | null;
 }
 
 // ============================================================================
@@ -233,6 +238,32 @@ export class TrackerPGLiteStore implements TrackerPersistence {
     const row = result.rows[0];
     if (!row || row.deleted_at !== null) return null;
     return pgliteRowToTrackerItem(row, this.workspacePath);
+  }
+
+  /**
+   * Rows the old issue-key collision branch stranded: `synced`, carrying a
+   * `sync_id`, and holding no `issue_key`.
+   *
+   * `sync_id IS NOT NULL` is what makes them unreachable rather than merely
+   * unkeyed -- a row the room has never seen has no cursor to rewind to, and a
+   * row the room HAS seen sits below `MAX(sync_id)` and is never re-sent.
+   */
+  async getStrandedIdentityFacts(): Promise<{ strandedCount: number; minStrandedSyncId: SyncId }> {
+    const result = await this.db.query<{ stranded: number | string; min_sync_id: string | number | null }>(
+      `SELECT COUNT(*) AS stranded, MIN(sync_id) AS min_sync_id
+         FROM tracker_items
+        WHERE workspace = $1
+          AND issue_key IS NULL
+          AND sync_status = 'synced'
+          AND sync_id IS NOT NULL
+          AND deleted_at IS NULL`,
+      [this.workspacePath],
+    );
+    const row = result.rows[0];
+    return {
+      strandedCount: Number(row?.stranded ?? 0),
+      minStrandedSyncId: row?.min_sync_id == null ? 0 : Number(row.min_sync_id),
+    };
   }
 
   async getMaxSyncId(): Promise<SyncId> {
@@ -327,6 +358,13 @@ export class TrackerPGLiteStore implements TrackerPersistence {
     delete dataJson.lastIndexed;
     delete dataJson.created;
     delete dataJson.updated;
+    // The identity keys live in the indexed columns, and only there. Keeping a
+    // second copy in the blob gave them two writers with different rules --
+    // the columns COALESCE, the blob is replaced wholesale from the server
+    // payload -- so they drifted and an item could report a key that was not
+    // its own. Every reader goes through the columns, so the blob copy could
+    // only ever be a wrong shadow of them.
+    stripColumnOnlyIdentityKeys(dataJson);
     liftSystemCollections(dataJson, record);
 
     // `data` carries device-local keys (e.g. linkedSessions) that the wire
@@ -350,33 +388,59 @@ export class TrackerPGLiteStore implements TrackerPersistence {
     // could therefore only ever write NULL over the user's body: with the
     // room connected, every ordinary metadata sync silently emptied the item.
     //
-    // Issue-number conflict resolution: two clients that each had locally
+    // Issue-key conflict resolution: two clients that each had locally
     // assigned NIM-{N} before the new tracker room arbitrated them can
-    // legitimately ship items with the same `(workspace, issue_number)`
-    // pair. The partial unique index `idx_tracker_workspace_issue_number`
-    // rejects the INSERT in that case, and the engine's bootstrap loop
-    // used to silently die there. Detect the collision up front and
-    // land the incoming row with NULL issue_number / issue_key -- the
-    // data is preserved and the user can renumber later. NULLs are
-    // exempt from the partial index.
-    let effectiveIssueNumber: number | null = envelope.issueNumber ?? item.issueNumber ?? null;
-    let effectiveIssueKey: string | null = envelope.issueKey ?? item.issueKey ?? null;
-    if (effectiveIssueNumber !== null) {
-      const conflict = await this.db.query<{ id: string }>(
-        `SELECT id FROM tracker_items
-         WHERE workspace = $1 AND issue_number = $2 AND id != $3
+    // legitimately ship items carrying the same key. The partial unique
+    // index `idx_tracker_workspace_issue_key` rejects the INSERT in that
+    // case, and the engine's bootstrap loop used to silently die there.
+    //
+    // The incoming row wins, and the local holder gives the key up.
+    //
+    // That direction is not a coin flip. `TrackerRoom.assignIssueIdentity`
+    // is the sole allocator of issue identity and enforces uniqueness
+    // across the room; a client hint only raises its high-water mark. So a
+    // local row holding a key the room has just vouched for someone else is
+    // a legacy client-minted guess from before `LC-###` and the dotted
+    // `local_key` existed. This used to resolve the other way, dropping the
+    // room's allocation and keeping the guess, which stranded the incoming
+    // row with no key at all -- 72 rows across 10 workspaces on the machine
+    // where this was found, 21 of them with no addressable key of any kind.
+    //
+    // The yielding row is NOT renumbered into the room's namespace. It goes
+    // to NULL (exempt from the partial index) and picks up a machine-private
+    // `local_key` from the next `ensureWorkspaceLocalNumbers` sweep, which
+    // already selects rows with `local_key IS NULL`. Per localKeyAllocator:
+    // a missing number is an annoyance, a recycled one sends you to the
+    // wrong item with no warning.
+    //
+    // Nothing records that the yielding row once held the key. A `Fixes
+    // NIM-42` written before a surrender will close whoever holds NIM-42
+    // afterwards. The warning below is the only trail, so it carries both
+    // ids and is emitted BEFORE the write.
+    const effectiveIssueNumber: number | null = envelope.issueNumber ?? item.issueNumber ?? null;
+    const effectiveIssueKey: string | null = envelope.issueKey ?? item.issueKey ?? null;
+    if (effectiveIssueKey !== null) {
+      const conflict = await this.db.query<{ id: string; issue_number: number | null }>(
+        `SELECT id, issue_number FROM tracker_items
+         WHERE workspace = $1 AND issue_key = $2 AND id != $3
          LIMIT 1`,
-        [this.workspacePath, effectiveIssueNumber, envelope.itemId],
+        [this.workspacePath, effectiveIssueKey, envelope.itemId],
       );
       if (conflict.rows.length > 0) {
+        const squatter = conflict.rows[0];
         logger.main.warn(
-          '[TrackerPGLiteStore] issue_number collision for incoming', envelope.itemId,
-          'number:', effectiveIssueNumber,
-          'conflicts with local:', conflict.rows[0].id,
-          '-- landing incoming row with NULL issue_number',
+          '[TrackerPGLiteStore] issue key', effectiveIssueKey,
+          'arrived for', envelope.itemId,
+          'but is held locally by', squatter.id,
+          '-- the room is the allocator, so', squatter.id,
+          'yields it and keeps only its local key',
         );
-        effectiveIssueNumber = null;
-        effectiveIssueKey = null;
+        await this.db.query(
+          `UPDATE tracker_items
+              SET issue_number = NULL, issue_key = NULL
+            WHERE id = $1 AND workspace = $2`,
+          [squatter.id, this.workspacePath],
+        );
       }
     }
     await this.db.query(
@@ -501,6 +565,8 @@ export class TrackerPGLiteStore implements TrackerPersistence {
     delete dataJson.lastIndexed;
     delete dataJson.created;
     delete dataJson.updated;
+    // See applyRemoteItem: the identity keys are column-only.
+    stripColumnOnlyIdentityKeys(dataJson);
     liftSystemCollections(dataJson, record);
 
     // See applyRemoteItem for why the JSONB-merge + COALESCE pattern is
@@ -631,24 +697,32 @@ export class TrackerPGLiteStore implements TrackerPersistence {
   // --------------------------------------------------------------------------
 
   async enqueueTransaction(row: TrackerTransactionRow): Promise<void> {
-    await this.db.query(
-      `INSERT INTO tracker_transactions (
-        client_mutation_id, item_id, workspace_path, state, kind, payload, enqueued_at
-      ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, to_timestamp($7 / 1000.0))
-      ON CONFLICT (client_mutation_id) DO UPDATE SET
-        state = EXCLUDED.state,
-        kind = EXCLUDED.kind,
-        payload = EXCLUDED.payload`,
-      [
-        row.clientMutationId,
-        row.itemId,
-        row.workspacePath || this.workspacePath,
-        row.state,
-        row.kind,
-        row.payload ? JSON.stringify(row.payload) : null,
-        row.enqueuedAt,
-      ],
-    );
+    // `enqueued_at` orders an item's rows for compaction, so it comes from the
+    // per-item clock rather than straight from the wall clock.
+    const workspacePath = row.workspacePath || this.workspacePath;
+    await serializeOutboxWrite(workspacePath, row.itemId, async () => {
+      const enqueuedAt = await causalEnqueuedAt(this.db, workspacePath, row.itemId, row.enqueuedAt);
+      await this.db.query(
+        `INSERT INTO tracker_transactions (
+          client_mutation_id, item_id, workspace_path, state, kind, payload, enqueued_at, base_sync_id
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::timestamptz, $8)
+        ON CONFLICT (client_mutation_id) DO UPDATE SET
+          state = EXCLUDED.state,
+          kind = EXCLUDED.kind,
+          payload = EXCLUDED.payload,
+          base_sync_id = EXCLUDED.base_sync_id`,
+        [
+          row.clientMutationId,
+          row.itemId,
+          workspacePath,
+          row.state,
+          row.kind,
+          row.payload ? JSON.stringify(row.payload) : null,
+          enqueuedAt,
+          row.expectedSyncId ?? null,
+        ],
+      );
+    });
   }
 
   async applyAndEnqueueAtomically(
@@ -681,7 +755,7 @@ export class TrackerPGLiteStore implements TrackerPersistence {
     // BEGIN/COMMIT -- but the ordering above makes every crash window
     // recoverable.
     const snapshot = await this.snapshotRow(itemId);
-    await this.enqueueTransaction({ ...row, state: 'pendingApply' });
+    await this.enqueueTransaction({ ...row, expectedSyncId: snapshot.syncId ?? 0, state: 'pendingApply' });
     await this.applyOptimistic(itemId, payload);
     await this.markTransactionState(row.clientMutationId, 'persistedEnqueue');
     return snapshot;
@@ -712,10 +786,51 @@ export class TrackerPGLiteStore implements TrackerPersistence {
     // via `applyRemoteItem` from the ack's `item` field). We don't keep
     // confirmed rows around -- the local sync_id watermark on `tracker_items`
     // already records the server-assigned version.
-    await this.db.query(
-      `DELETE FROM tracker_transactions WHERE client_mutation_id = $1`,
-      [clientMutationId],
-    );
+    await ackAndRetireSuperseded(this.db, clientMutationId);
+  }
+
+  /**
+   * For each item with stacked update rows, queue one update rebuilt from the
+   * item's local row, which then replays in their place. Only when that row is
+   * `pending`: the last write to it was a local edit, so it is the newest local
+   * state, which the rows' own timestamps cannot be trusted to say. A row the
+   * room has written since (`synced`) is not; its item is left as it is.
+   * Deletes nothing. Returns how many updates were queued.
+   */
+  async consolidatePendingUpdates(): Promise<number> {
+    let queued = 0;
+    for (const { itemId, rows } of await itemsWithStackedUpdates(this.db, this.workspacePath)) {
+      const result = await this.db.query<PGLiteTrackerItemRow>(
+        `SELECT id, type, type_tags, data, workspace,
+                document_path, line_number, issue_number, issue_key,
+                sync_status, sync_id, body_version, deleted_at,
+                archived, source, source_ref,
+                created, updated, last_indexed
+           FROM tracker_items
+          WHERE id = $1 AND workspace = $2`,
+        [itemId, this.workspacePath],
+      );
+      const local = result.rows[0];
+      if (!local || local.deleted_at !== null || local.sync_status !== 'pending') {
+        logger.main.info('[TrackerOutbox]', rows, 'queued updates for item', itemId, 'kept as they are: its local row is not a pending local edit');
+        continue;
+      }
+      const payload = pgliteRowToPayload(local);
+      if (samePayload(await newestUpdatePayload(this.db, this.workspacePath, itemId), payload)) continue;
+      logger.main.info('[TrackerOutbox] queueing one update rebuilt from the local row of item', itemId, 'in place of', rows, 'queued updates');
+      await this.enqueueTransaction({
+        clientMutationId: `cm-${randomUUID()}`,
+        itemId,
+        workspacePath: this.workspacePath,
+        state: 'queued',
+        kind: 'update',
+        payload,
+        expectedSyncId: local.sync_id == null ? 0 : Number(local.sync_id),
+        enqueuedAt: Date.now(),
+      });
+      queued += 1;
+    }
+    return queued;
   }
 
   async rejectTransaction(
@@ -731,13 +846,16 @@ export class TrackerPGLiteStore implements TrackerPersistence {
   }
 
   async loadPendingTransactions(): Promise<TrackerTransactionRow[]> {
+    // Only the newest update per item: older ones carry stale whole-item
+    // snapshots, and loading them all once needed 257 MB (NIM-7336).
     const result = await this.db.query<PGLiteTrackerTransactionRow>(
       `SELECT client_mutation_id, item_id, workspace_path, state, kind, payload,
-              enqueued_at, started_at, confirmed_sync_id, last_rejection
+              enqueued_at, started_at, confirmed_sync_id, last_rejection, base_sync_id
          FROM tracker_transactions
         WHERE workspace_path = $1
           AND confirmed_sync_id IS NULL
-        ORDER BY enqueued_at ASC`,
+          AND NOT ${SUPERSEDED_UPDATE}
+        ORDER BY enqueued_at ASC, client_mutation_id ASC`,
       [this.workspacePath],
     );
     return result.rows.map((row) => {
@@ -747,8 +865,9 @@ export class TrackerPGLiteStore implements TrackerPersistence {
         workspacePath: row.workspace_path,
         state: row.state,
         kind: row.kind,
-        enqueuedAt: row.enqueued_at instanceof Date ? row.enqueued_at.getTime() : Date.now(),
+        enqueuedAt: enqueuedAtMillis(row.enqueued_at),
       };
+      if (row.base_sync_id != null) out.expectedSyncId = Number(row.base_sync_id);
       if (row.payload) {
         try {
           out.payload =
@@ -857,10 +976,17 @@ function pgliteRowToPayload(row: PGLiteTrackerItemRow): TrackerItemPayload {
     typeof row.data === 'string' ? JSON.parse(row.data) : ((row.data as Record<string, unknown>) || {});
 
   // Carve system/non-field keys out of `fields`.
-  const systemKeys = new Set([
+  //
+  // COLUMN_ONLY_IDENTITY_KEYS are listed because rows written before the
+  // identity keys became column-only still carry a stale copy in `data`, and
+  // that copy is exactly the one that drifted. Reading it back into `fields`
+  // would launder a known-wrong key into a payload; the row's own columns are
+  // the authority and are read separately below.
+  const systemKeys = new Set<string>([
     'authorIdentity', 'lastModifiedBy', 'createdByAgent',
     'linkedSessions', 'linkedCommitSha', 'linkedCommits', 'linkedPullRequests', 'documentId',
     'activity', 'comments', 'created', 'updated', 'origin', 'triagedAt', 'triagedBy',
+    ...COLUMN_ONLY_IDENTITY_KEYS,
   ]);
   const fields: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(data)) {
@@ -935,6 +1061,7 @@ export function pgliteRowToTrackerItem(row: PGLiteTrackerItemRow, workspacePath:
     'created', 'updated', 'dueDate', 'progress', 'authorIdentity',
     'lastModifiedBy', 'createdByAgent', 'labels', 'labelsMap',
     'linkedSessions', 'linkedCommitSha', 'linkedCommits', 'documentId',
+    ...COLUMN_ONLY_IDENTITY_KEYS,
   ]);
   return {
     id: row.id,

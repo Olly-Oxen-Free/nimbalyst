@@ -106,6 +106,8 @@ describe('ElectronTrackerDataSource', () => {
     handlers.get('tracker-saved-views:changed')?.({
       workspacePath: '/workspace/one',
     });
+    // The metadata-driven reload is coalesced on a trailing window, so give it
+    // more than vi.waitFor's 1s default.
     await vi.waitFor(() => {
       expect(changes).toContainEqual({
         type: 'items-replaced',
@@ -115,7 +117,7 @@ describe('ElectronTrackerDataSource', () => {
         type: 'saved-views-replaced',
         savedViews,
       });
-    });
+    }, { timeout: 3000 });
 
     expect(changes).toEqual(
       expect.arrayContaining([
@@ -174,7 +176,7 @@ describe('ElectronTrackerDataSource', () => {
     }> = [
       {
         command: { type: 'list-items' },
-        expected: ['document-service:tracker-items-list'],
+        expected: ['document-service:tracker-items-list', '/workspace/one'],
       },
       {
         command: { type: 'refresh-items' },
@@ -270,5 +272,155 @@ describe('ElectronTrackerDataSource', () => {
         expect(result).toEqual({ ok: true, result: hostResult });
       }
     }
+  });
+
+  it('collapses a burst of metadata changes into a single full item reload', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveList: ((items: TrackerItem[]) => void) | null = null;
+      const invoke = vi.fn(async (channel: string) => {
+        if (channel !== 'document-service:tracker-items-list') return [];
+        return new Promise<TrackerItem[]>((resolve) => {
+          resolveList = resolve;
+        });
+      });
+      const { ipc, handlers } = createIpc(invoke);
+      const source = new ElectronTrackerDataSource({ workspacePath: '/workspace/one', ipc });
+      const changes: TrackerDataChange[] = [];
+      source.subscribe((change) => changes.push(change));
+
+      // Typing inside a frontmatter block: one metadata change per keystroke.
+      const fire = handlers.get('document-service:metadata-changed')!;
+      for (let i = 0; i < 20; i++) {
+        fire(undefined);
+        await vi.advanceTimersByTimeAsync(40);
+      }
+      // 800ms of keystrokes 40ms apart used to be 20 full-list fetches.
+      expect(invoke).toHaveBeenCalledTimes(1);
+
+      // A change arriving while the reload is in flight does not start a second
+      // concurrent fetch -- it is served by one trailing pass after it settles.
+      fire(undefined);
+      fire(undefined);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(invoke).toHaveBeenCalledTimes(1);
+
+      resolveList!([item('one')]);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(invoke).toHaveBeenCalledTimes(2);
+      expect(changes).toContainEqual({ type: 'items-replaced', items: [item('one')] });
+
+      source.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // #1822: with several projects on the rail, a list request that carried no
+  // project was answered for whichever project main had marked active at that
+  // moment, so one project's board could show another project's items. Every
+  // list request must name this data source's own project.
+  it('names its own project in every tracker item list request (#1822)', async () => {
+    vi.useFakeTimers();
+    try {
+      const invoke = vi.fn(async (channel: string) => {
+        if (channel === 'tracker-sync:get-status') return { status: 'connected', projectId: 'p' };
+        return [];
+      });
+      const { ipc, handlers } = createIpc(invoke);
+      const source = new ElectronTrackerDataSource({ workspacePath: '/workspace/two', ipc });
+      source.subscribe(() => {});
+
+      // The three places the data source asks for the list: the first load,
+      // the list-items command, and the reload after a metadata change.
+      await source.snapshot();
+      await source.command({ type: 'list-items' });
+      handlers.get('document-service:metadata-changed')!(undefined);
+      await vi.advanceTimersByTimeAsync(600);
+
+      const listCalls = invoke.mock.calls.filter(
+        ([channel]) => channel === 'document-service:tracker-items-list',
+      );
+      expect(listCalls).toHaveLength(3);
+      for (const call of listCalls) {
+        expect(call).toEqual(['document-service:tracker-items-list', '/workspace/two']);
+      }
+
+      source.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Knowledge-scopes contract 4.2. The rule under test is not "the read works",
+   * it is that a missing revision never degrades into the current item: a
+   * citation that pins revision 3 and quietly renders revision 7 says nothing
+   * about the evidence having moved.
+   */
+  describe('getItemRevision', () => {
+    const revision = {
+      revisionId: '9f2c1d4a-7b31-4e59-a0c8-5d6e2f1b3a77',
+      itemId: 'itm_1',
+      parentRevisionId: null,
+      serverRevision: 3,
+      workspace: '/workspace/one',
+      data: { title: 'As it was' },
+      actor: null,
+      published: true,
+      recordedAt: 1_700_000_000_000,
+    };
+
+    it('passes exactly one addressing mode through and returns the stored revision', async () => {
+      const invoke = vi.fn(async () => ({ success: true, revision }));
+      const { ipc } = createIpc(invoke as never);
+      const source = new ElectronTrackerDataSource({ workspacePath: '/workspace/one', ipc });
+
+      await expect(source.getItemRevision('itm_1', { revisionId: revision.revisionId }))
+        .resolves.toEqual(revision);
+      expect(invoke).toHaveBeenCalledWith('tracker-revision:get', {
+        workspacePath: '/workspace/one',
+        itemId: 'itm_1',
+        revisionId: revision.revisionId,
+      });
+
+      await source.getItemRevision('itm_1', { serverRevision: 3 });
+      expect(invoke).toHaveBeenLastCalledWith('tracker-revision:get', {
+        workspacePath: '/workspace/one',
+        itemId: 'itm_1',
+        serverRevision: 3,
+      });
+      source.dispose();
+    });
+
+    it('raises a typed error on a missing revision rather than answering with the item', async () => {
+      const invoke = vi.fn(async () => ({
+        success: false,
+        code: 'revision-not-found',
+        error: "Tracker item 'itm_1' has no revision 9",
+      }));
+      const { ipc } = createIpc(invoke as never);
+      const source = new ElectronTrackerDataSource({ workspacePath: '/workspace/one', ipc });
+
+      await expect(source.getItemRevision('itm_1', { serverRevision: 9 })).rejects.toMatchObject({
+        name: 'TrackerRevisionUnavailableError',
+        itemId: 'itm_1',
+      });
+      source.dispose();
+    });
+
+    it('does not claim the evidence is gone when the read itself failed', async () => {
+      // A read failure and a missing revision must stay distinguishable: only
+      // one of them means the pinned revision no longer exists.
+      const invoke = vi.fn(async () => ({ success: false, code: 'read-failed', error: 'db down' }));
+      const { ipc } = createIpc(invoke as never);
+      const source = new ElectronTrackerDataSource({ workspacePath: '/workspace/one', ipc });
+
+      await expect(source.getItemRevision('itm_1', { serverRevision: 3 })).rejects.toMatchObject({
+        name: 'Error',
+        message: 'db down',
+      });
+      source.dispose();
+    });
   });
 });

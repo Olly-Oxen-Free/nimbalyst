@@ -18,7 +18,9 @@
 import React, { useCallback, useState } from 'react';
 import {
   useFloating,
+  autoUpdate,
   FloatingPortal,
+  FloatingFocusManager,
   useDismiss,
   useHover,
   useInteractions,
@@ -29,22 +31,70 @@ import {
   size,
   type VirtualElement,
 } from '@floating-ui/react';
-import { windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
-import { useAtomValue } from 'jotai';
+import { clearWindowControls, getWindowControlsZones, windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
+import { useAtomValue, useSetAtom } from 'jotai';
 import { OrgSwitcher } from './OrgSwitcher';
-import { multiProjectModeAtom, type OpenProject } from '../store/atoms/openProjects';
+import {
+  multiProjectModeAtom,
+  moveOpenProjectAtom,
+  sortOpenProjectsAtom,
+  type OpenProject,
+} from '../store/atoms/openProjects';
+import { openSettingsCommandAtom } from '../store/atoms/settingsNavigation';
+import { useProjectRailDrag } from './hooks/useProjectRailDrag';
 import { ProjectRailIcon, useProjectRailController, REVEAL_LABEL } from './ProjectRailIcon';
 import './ProjectRail.css';
 
 export function ProjectRail() {
+  const openSettings = useSetAtom(openSettingsCommandAtom);
   const isMultiProjectMode = useAtomValue(multiProjectModeAtom);
   const controller = useProjectRailController();
+  const { openProjects, activePath } = controller;
+  const moveProject = useSetAtom(moveOpenProjectAtom);
+  const sortProjects = useSetAtom(sortOpenProjectsAtom);
+  const projectListRef = React.useRef<HTMLDivElement | null>(null);
+  const drag = useProjectRailDrag(projectListRef, moveProject);
+
+  React.useLayoutEffect(() => {
+    const list = projectListRef.current;
+    if (!isMultiProjectMode || !list) return;
+
+    const revealActiveProject = () => {
+      const active = list.querySelector<HTMLElement>('.project-rail-item.is-active');
+      if (!active) return;
+      const viewport = list.getBoundingClientRect();
+      const item = active.getBoundingClientRect();
+      // Include the close button's overhang. Scroll only the project list,
+      // leaving the rest of the window and keyboard focus untouched.
+      const above = item.top - viewport.top - 4;
+      const below = item.bottom - viewport.bottom + 4;
+      if (above < 0) list.scrollTop += above;
+      else if (below > 0) list.scrollTop += below;
+    };
+
+    revealActiveProject();
+    const observer = new ResizeObserver(revealActiveProject);
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [activePath, openProjects.length, isMultiProjectMode]);
 
   // Right-click context menu state. Anchored to a virtual reference at the
   // cursor position so it works for any rail icon without per-icon refs.
   // The `{x, y}` positioning half stays local to this consumer; the
   // "which project" half lives in the shared controller.
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
+  const { closeContextMenu } = controller;
+  const closeMenu = useCallback(() => {
+    closeContextMenu();
+    setMenuPosition(null);
+  }, [closeContextMenu]);
+  const menuIndex = openProjects.findIndex(project => project.path === controller.contextMenuProject?.path);
+  const moveMenuProject = (direction: -1 | 1) => {
+    if (menuIndex < 0) return;
+    const beforePath = direction === -1 ? openProjects[menuIndex - 1]?.path : openProjects[menuIndex + 2]?.path;
+    moveProject({ path: openProjects[menuIndex].path, beforePath: beforePath ?? null });
+    closeMenu();
+  };
 
   // "Add project" dropdown — opens recents + folder picker action when the
   // user clicks the `+` button.
@@ -57,12 +107,11 @@ export function ProjectRail() {
   } = useFloating({
     open: controller.addMenuOpen,
     onOpenChange: (open) => (open ? controller.openAddMenu() : controller.closeAddMenu()),
-    // `right-start` grows the menu downward from the top of the `+` button.
-    // The old `right-end` grew it upward, so with two or more recents it was
-    // taller than the space above the button and `shift()` clamped it to the
-    // top of the window — beside the traffic lights and ~140px away from the
-    // button that opened it, which read as "the + did nothing" (GitHub #1096).
-    placement: 'right-start',
+    // The Add button stays at the bottom of the rail. Align the menu's
+    // bottom with it, and track size changes as recent folders load.
+    placement: 'right-end',
+    strategy: 'fixed',
+    whileElementsMounted: autoUpdate,
     middleware: [
       offset(8),
       flip({ padding: 8 }),
@@ -70,9 +119,12 @@ export function ProjectRail() {
       windowControlsClearance(),
       size({
         padding: 8,
-        apply({ availableHeight, elements, middlewareData }) {
-          const pushed = middlewareData.windowControlsClearance?.pushed ?? 0;
-          elements.floating.style.maxHeight = `${Math.max(0, availableHeight - pushed)}px`;
+        apply({ availableHeight, elements, x, rects }) {
+          // Reserve the controls band from the viewport's padded top, not
+          // from the menu's current y: bottom alignment makes y depend on
+          // height, so subtracting the last push can cause a resize loop.
+          const reserved = clearWindowControls(x, 8, rects.floating.width, getWindowControlsZones()) - 8;
+          elements.floating.style.maxHeight = `${Math.max(0, availableHeight - reserved)}px`;
           elements.floating.style.overflowY = 'auto';
         },
       }),
@@ -151,23 +203,30 @@ export function ProjectRail() {
     <nav className="project-rail" data-testid="project-rail" aria-label="Open projects">
       {/* Epic H1: org switcher sits above the project switcher. */}
       <OrgSwitcher />
-      {controller.openProjects.map((project) => {
-        const activity = controller.getActivity(project.path);
-        return (
-          <ProjectRailIcon
-            key={project.path}
-            project={project}
-            isActive={project.path === controller.activePath}
-            processingCount={activity.processingCount}
-            unreadCount={activity.unreadCount}
-            orientation="vertical"
-            onActivate={controller.activate}
-            onClose={controller.close}
-            onContextMenu={handleContextMenu}
-          />
-        );
-      })}
-      {controller.openProjects.length > 0 && <div className="project-rail-divider" aria-hidden="true" />}
+      <div ref={projectListRef} className="project-rail-projects" data-testid="project-rail-projects" {...drag.listProps}>
+        {openProjects.map((project) => {
+          const activity = controller.getActivity(project.path);
+          return (
+            <ProjectRailIcon
+              key={project.path}
+              project={project}
+              isActive={project.path === activePath}
+              processingCount={activity.processingCount}
+              unreadCount={activity.unreadCount}
+              orientation="vertical"
+              onActivate={controller.activate}
+              onClose={controller.close}
+              onContextMenu={handleContextMenu}
+              isDragging={drag.draggedPath === project.path}
+              menuOpen={controller.contextMenuProject !== null}
+              dropPosition={drag.beforePath === project.path ? 'before' : drag.beforePath === null && project === openProjects.at(-1) ? 'after' : undefined}
+              onDragStart={(event, path) => { closeMenu(); drag.onDragStart(event, path); }}
+              onDragEnd={drag.onDragEnd}
+            />
+          );
+        })}
+      </div>
+      {openProjects.length > 0 && <div className="project-rail-divider" aria-hidden="true" />}
       <button
         ref={addButtonRef}
         type="button"
@@ -188,7 +247,7 @@ export function ProjectRail() {
             style={addTooltipFloatingStyles}
             {...getAddTooltipFloatingProps()}
           >
-            {controller.atCap ? 'Rail full (8 projects max)' : 'Add project'}
+            {controller.atCap ? 'Eight-project limit reached. Enable Allow unlimited projects in Settings > Advanced.' : 'Add project'}
           </div>
         </FloatingPortal>
       )}
@@ -239,13 +298,50 @@ export function ProjectRail() {
 
       {contextMenuProject && (
         <FloatingPortal>
+          <FloatingFocusManager context={context} modal={false}>
           <div
             ref={refs.setFloating}
             className="project-rail-context-menu"
             style={floatingStyles}
             data-testid="project-rail-context-menu"
-            {...getFloatingProps()}
+            {...getFloatingProps({
+              onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+                if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+                event.preventDefault();
+                event.stopPropagation();
+                const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+                const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+                const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+                  : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
+                buttons[next]?.focus();
+              },
+            })}
           >
+            <button type="button" role="menuitem" className="project-rail-context-menu-item"
+              disabled={menuIndex <= 0} onClick={() => moveMenuProject(-1)}>
+              Move up
+            </button>
+            <button type="button" role="menuitem" className="project-rail-context-menu-item"
+              disabled={menuIndex < 0 || menuIndex === openProjects.length - 1} onClick={() => moveMenuProject(1)}>
+              Move down
+            </button>
+            <button type="button" role="menuitem" className="project-rail-context-menu-item"
+              disabled={openProjects.length < 2} onClick={() => { sortProjects(); closeMenu(); }}>
+              Sort by name
+            </button>
+            <div className="project-rail-context-menu-divider" />
+            <button
+              type="button"
+              role="menuitem"
+              className="project-rail-context-menu-item"
+              onClick={() => {
+                openSettings({ category: 'project-appearance', scope: 'project', timestamp: Date.now(),
+                  destination: { scope: 'project', category: 'project-appearance', target: { kind: 'workspace', workspacePath: contextMenuProject.path } } });
+                closeMenu();
+              }}
+            >
+              Customize appearance…
+            </button>
             <button
               type="button"
               className="project-rail-context-menu-item"
@@ -255,6 +351,7 @@ export function ProjectRail() {
             </button>
             <button
               type="button"
+              role="menuitem"
               className="project-rail-context-menu-item"
               onClick={() => controller.revealInFinder(contextMenuProject)}
             >
@@ -263,6 +360,7 @@ export function ProjectRail() {
             <div className="project-rail-context-menu-divider" />
             <button
               type="button"
+              role="menuitem"
               className="project-rail-context-menu-item"
               onClick={() => {
                 controller.closeContextMenu();
@@ -273,6 +371,7 @@ export function ProjectRail() {
               Close project
             </button>
           </div>
+          </FloatingFocusManager>
         </FloatingPortal>
       )}
     </nav>

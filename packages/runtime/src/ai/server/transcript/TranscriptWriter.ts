@@ -56,6 +56,8 @@ export class TranscriptWriter {
       attachments?: UserMessagePayload['attachments'];
       teammateOrigin?: UserMessagePayload['teammateOrigin'];
       createdAt?: Date;
+      promptActor?: UserMessagePayload['promptActor'];
+      promptOrigin?: string;
     },
   ): Promise<TranscriptEvent> {
     const payload: UserMessagePayload = {
@@ -63,6 +65,8 @@ export class TranscriptWriter {
       inputType: options?.inputType ?? 'user',
       ...(options?.attachments ? { attachments: options.attachments } : {}),
       ...(options?.teammateOrigin ? { teammateOrigin: options.teammateOrigin } : {}),
+      ...(options?.promptActor ? { promptActor: options.promptActor } : {}),
+      ...(options?.promptOrigin ? { promptOrigin: options.promptOrigin } : {}),
     };
 
     return this.insertEvent(sessionId, {
@@ -81,6 +85,7 @@ export class TranscriptWriter {
       mode?: 'agent' | 'planning' | 'auto';
       createdAt?: Date;
       thinking?: string;
+      progressUpdate?: boolean;
       thinkingSignature?: string;
       model?: string;
       subagentId?: string | null;
@@ -122,6 +127,7 @@ export class TranscriptWriter {
     const payload: AssistantMessagePayload = {
       mode,
       ...(options?.thinking !== undefined ? { thinking: options.thinking } : {}),
+      ...(options?.progressUpdate ? { progressUpdate: true } : {}),
       ...(options?.thinkingSignature !== undefined
         ? { thinkingSignature: options.thinkingSignature }
         : {}),

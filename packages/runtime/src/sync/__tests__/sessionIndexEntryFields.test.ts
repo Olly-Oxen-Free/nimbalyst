@@ -38,9 +38,9 @@ describe('buildSyncedSessionIndexFields', () => {
     expect(fields.agentRole).toBe('standard');
   });
 
-  it('normalizes a null createdBySessionId (PGLite) to undefined (wire)', () => {
+  it('preserves an explicit null manager on the wire', () => {
     const fields = buildSyncedSessionIndexFields(makeSession({ createdBySessionId: null }));
-    expect(fields.createdBySessionId).toBeUndefined();
+    expect(fields.createdBySessionId).toBeNull();
   });
 
   it('does not fabricate meta-agent fields for a plain session', () => {
@@ -55,6 +55,7 @@ describe('buildSyncedSessionIndexFields', () => {
         sessionType: 'session',
         parentSessionId: 'parent-1',
         worktreeId: 'worktree-1',
+        metadata: { hostDeviceId: 'desktop-1' },
         isArchived: true,
         isPinned: true,
         branchedFromSessionId: 'branch-src-1',
@@ -68,6 +69,7 @@ describe('buildSyncedSessionIndexFields', () => {
       sessionType: 'session',
       parentSessionId: 'parent-1',
       worktreeId: 'worktree-1',
+      hostDeviceId: 'desktop-1',
       isArchived: true,
       isPinned: true,
       branchedFromSessionId: 'branch-src-1',
@@ -76,5 +78,15 @@ describe('buildSyncedSessionIndexFields', () => {
       agentRole: 'meta-agent',
       createdBySessionId: 'meta-session-123',
     });
+  });
+
+  it('prefers an explicit host while retaining the persisted-metadata fallback', () => {
+    expect(buildSyncedSessionIndexFields(makeSession({
+      hostDeviceId: 'desktop-current',
+      metadata: { hostDeviceId: 'desktop-persisted' },
+    })).hostDeviceId).toBe('desktop-current');
+    expect(buildSyncedSessionIndexFields(makeSession({
+      metadata: { hostDeviceId: 'desktop-persisted' },
+    })).hostDeviceId).toBe('desktop-persisted');
   });
 });

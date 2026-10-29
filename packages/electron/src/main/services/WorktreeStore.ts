@@ -21,6 +21,15 @@ export interface Worktree {
   branch: string;
   baseBranch: string;
   projectPath: string; // Maps to workspace_id in database
+  /**
+   * Root of the workspace this worktree was branched from.
+   *
+   * `projectPath` is the workspace's PRIMARY root and stays the identity
+   * anchor; once a workspace spans several folders that no longer says which
+   * repository the worktree came out of. Defaults to `projectPath`, which is
+   * also what every pre-multi-root row backfills to.
+   */
+  sourceFolderPath?: string;
   createdAt: number;
   updatedAt?: number;
   isPinned?: boolean; // Whether this worktree is pinned to the top of the list
@@ -42,6 +51,7 @@ interface WorktreeRow {
   path: string;
   branch: string;
   base_branch: string;
+  source_folder_path?: string | null;
   created_at: Date | string | number;
   updated_at: Date | string | number;
   is_pinned?: boolean;
@@ -60,6 +70,7 @@ function mapWorktreeRow(row: WorktreeRow): Worktree {
     branch: row.branch,
     baseBranch: row.base_branch,
     projectPath: row.workspace_id,
+    sourceFolderPath: row.source_folder_path ?? row.workspace_id,
     createdAt: toMillis(row.created_at)!,
     updatedAt: toMillis(row.updated_at)!,
     isPinned: row.is_pinned ?? false,
@@ -110,9 +121,9 @@ export function createWorktreeStore(db: PGliteLike, ensureDbReady?: EnsureReadyF
 
       await db.query(
         `INSERT INTO worktrees (
-          id, workspace_id, name, path, branch, base_branch, created_at, updated_at
+          id, workspace_id, name, path, branch, base_branch, source_folder_path, created_at, updated_at
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8
+          $1, $2, $3, $4, $5, $6, $7, $8, $9
         )`,
         [
           worktree.id,
@@ -121,6 +132,9 @@ export function createWorktreeStore(db: PGliteLike, ensureDbReady?: EnsureReadyF
           worktree.path,
           worktree.branch,
           worktree.baseBranch,
+          // Single-root workspaces branch from the primary root, so this equals
+          // `projectPath` unless the caller named an attached folder.
+          worktree.sourceFolderPath || worktree.projectPath,
           createdAt,
           updatedAt,
         ]
@@ -203,8 +217,6 @@ export function createWorktreeStore(db: PGliteLike, ensureDbReady?: EnsureReadyF
     async list(workspaceId: string, includeArchived = false): Promise<Worktree[]> {
       await ensureReady();
 
-      logger.info('Listing worktrees', { workspaceId, includeArchived });
-
       const archiveFilter = includeArchived ? '' : 'AND (is_archived = FALSE OR is_archived IS NULL)';
       const { rows } = await db.query<WorktreeRow>(
         `SELECT * FROM worktrees
@@ -215,7 +227,6 @@ export function createWorktreeStore(db: PGliteLike, ensureDbReady?: EnsureReadyF
 
       const worktrees = rows.map(mapWorktreeRow);
 
-      logger.info('Found worktrees', { count: worktrees.length });
       return worktrees;
     },
 
@@ -479,12 +490,17 @@ export type WorktreeStore = ReturnType<typeof createWorktreeStore>;
  * then either completes the archive operation or reverts the session archiving.
  *
  * @param db - Database instance
+ * @param options.pendingArchiveIds - Worktrees still in the persisted archive
+ *   queue. Their cleanup is replayed right after this check, so they are left
+ *   to it: neither reverted nor marked archived here.
  * @returns Array of inconsistencies found and how they were handled
  */
 export async function checkWorktreeArchiveConsistency(
-  db: { query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }> }
+  db: { query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }> },
+  options: { pendingArchiveIds?: readonly string[] } = {}
 ): Promise<Array<{ worktreeId: string; action: 'completed' | 'reverted' | 'error'; details: string }>> {
   const results: Array<{ worktreeId: string; action: 'completed' | 'reverted' | 'error'; details: string }> = [];
+  const pendingArchiveIds = new Set(options.pendingArchiveIds ?? []);
 
   try {
     logger.info('Running worktree archive consistency check...');
@@ -544,6 +560,20 @@ export async function checkWorktreeArchiveConsistency(
     // For each inconsistent worktree, decide how to handle it
     for (const worktree of inconsistentWorktrees) {
       try {
+        if (pendingArchiveIds.has(worktree.worktree_id)) {
+          // The archive queue replay that runs after this check finishes the
+          // archive the way the live path does: it removes the checkout if it
+          // is still there, unregisters it from its repo, and marks the row
+          // and its super loop archived. Reverting here would leave these
+          // sessions visible on a worktree the replay deletes; completing here
+          // would make the replay skip the unregister and the super loop.
+          logger.info('Worktree archive is still queued, leaving it to the replay', {
+            worktreeId: worktree.worktree_id,
+            path: worktree.worktree_path,
+          });
+          continue;
+        }
+
         // Check if the worktree directory still exists on disk
         const fs = await import('fs');
         const directoryExists = fs.existsSync(worktree.worktree_path);

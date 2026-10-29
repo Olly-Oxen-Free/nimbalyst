@@ -10,14 +10,30 @@ import os
 ///   Swift -> JS: `window.nimbalystEditor.loadMarkdown(content)`
 ///                `window.nimbalystEditor.setReadOnly(boolean)`
 ///   JS -> Swift: `webkit.messageHandlers.editorBridge.postMessage({ type, ... })`
+///
+/// The bundle only reports user edits (a load never echoes back as a save), and
+/// a remote update is not loaded over edits that have not been saved yet; the
+/// next save wins, as on Android.
 public struct DocumentEditorView: View {
     @EnvironmentObject var appState: AppState
     let document: SyncedDocument
+    let readOnly: Bool
+    let header: AnyView?
+    /// Handles a tapped link; return false to fall through to web links.
+    let onLink: ((_ href: String, _ title: String?) -> Bool)?
 
     @State private var isLoading = true
-    @State private var isDirty = false
+    @StateObject private var edits = DocumentEditState()
     @State private var errorMessage: String?
     @State private var editorWebView: WKWebView?
+    @Environment(\.scenePhase) private var scenePhase
+
+    public init(document: SyncedDocument, readOnly: Bool = false, header: AnyView? = nil, onLink: ((_ href: String, _ title: String?) -> Bool)? = nil) {
+        self.document = document
+        self.readOnly = readOnly
+        self.header = header
+        self.onLink = onLink
+    }
 
     /// Document with content resolved (decrypted on demand if needed).
     private var resolvedDocument: SyncedDocument {
@@ -35,18 +51,24 @@ public struct DocumentEditorView: View {
 
     public var body: some View {
         ZStack {
-            EditorWebView(
-                document: resolvedDocument,
-                onReady: {
-                    isLoading = false
-                    errorMessage = nil
-                },
-                onContentChanged: handleContentChanged,
-                onDirtyChanged: { isDirty = $0 },
-                onError: { errorMessage = $0 },
-                onWebViewCreated: { editorWebView = $0 }
-            )
-            .ignoresSafeArea(.container, edges: .bottom)
+            VStack(spacing: 0) {
+                if let header { header }
+                EditorWebView(
+                    document: resolvedDocument,
+                    readOnly: readOnly || isEmbedOnly,
+                    onReady: {
+                        isLoading = false
+                        errorMessage = nil
+                    },
+                    onContentChanged: handleContentChanged,
+                    onDirtyChanged: { edits.isDirty = $0 },
+                    onLinkTapped: handleLink,
+                    readEmbedFile: readEmbedFile,
+                    onError: { errorMessage = $0 },
+                    onWebViewCreated: { editorWebView = $0 }
+                )
+                .ignoresSafeArea(.container, edges: .bottom)
+            }
 
             if isLoading {
                 ProgressView("Loading editor...")
@@ -107,7 +129,7 @@ public struct DocumentEditorView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .toolbar {
-            if isDirty {
+            if edits.isDirty {
                 ToolbarItem(placement: .primaryAction) {
                     Circle()
                         .fill(NimbalystColors.primary)
@@ -119,17 +141,55 @@ public struct DocumentEditorView: View {
             subscribeToRemoteUpdates()
         }
         .onDisappear {
+            flushPendingSave()
             unsubscribeFromRemoteUpdates()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { flushPendingSave() }
         }
     }
 
-    private func handleContentChanged(_ markdown: String) {
-        // Encrypt and push to ProjectSyncRoom via DocumentSyncManager
-        appState.documentSyncManager?.pushEditedContent(
-            document: document,
-            markdown: markdown,
-            projectId: document.projectId
-        )
+    /// Saves typing still inside the bundle's 500ms debounce. The coordinator
+    /// outlives this view value, so the save uses the permission and handler
+    /// current when the content arrives, not the ones captured here.
+    private func flushPendingSave() {
+        (editorWebView as? FormattingWebView)?.coordinator?.flush()
+    }
+
+    /// An `.html` file opened on its own shows as its own embed, never as editable markdown.
+    private var isEmbedOnly: Bool { WikiDocuments.isEmbedOnlyFile(document.relativePath) }
+
+    /// The synced text of an `.html` file this document embeds, or why it is unavailable.
+    private func readEmbedFile(_ src: String) -> EmbedFileRead {
+        guard let path = WikiDocuments.embedPath(src: src, fromRelativePath: document.relativePath) else {
+            return .failure("Only .html files in this project can be embedded")
+        }
+        guard let file = try? appState.databaseManager?.document(forProject: document.projectId, relativePath: path) else {
+            return .failure("\(path) has not synced to this device")
+        }
+        guard let content = file.contentDecrypted ?? appState.documentSyncManager?.decryptContentOnDemand(file) else {
+            return .failure("\(path) could not be decrypted")
+        }
+        return .content(content)
+    }
+
+    /// Persists an edit; true once it is in the local cache and sent or queued.
+    private func handleContentChanged(_ markdown: String) -> Bool {
+        guard !readOnly, !isEmbedOnly, let manager = appState.documentSyncManager else { return false }
+        // Encrypt and push to ProjectSyncRoom via DocumentSyncManager. The push
+        // queues when offline and writes the local cache; it reports failure
+        // only in its log, so the cache is the evidence it worked.
+        manager.pushEditedContent(document: document, markdown: markdown, projectId: document.projectId)
+        let stored = try? appState.databaseManager?.document(byId: document.id)
+        return stored?.contentDecrypted == markdown
+    }
+
+    private func handleLink(_ href: String, _ title: String?) {
+        if onLink?(href, title) == true { return }
+        guard let url = URL(string: href.trimmingCharacters(in: .whitespaces)),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https", "mailto"].contains(scheme) else { return }
+        UIApplication.shared.open(url)
     }
 
     private func copyError(_ error: String) {
@@ -147,19 +207,26 @@ public struct DocumentEditorView: View {
 
     /// Subscribe to remote content updates for this document's syncId.
     private func subscribeToRemoteUpdates() {
+        // The editor shows an `.html` file as an embed of itself, not its text.
+        guard !isEmbedOnly else { return }
         let syncId = document.id
+        let edits = edits
         appState.documentSyncManager?.onRemoteContentUpdate = { [syncId] remoteSyncId, newMarkdown in
             guard remoteSyncId == syncId, let webView = editorWebView else { return }
-
-            // Update the editor content via the JS bridge
+            // Update the editor content via the JS bridge. With unsaved body
+            // edits the bundle defers it: the frontmatter is taken now (the
+            // phone never edits it), the body edits win on their next save
+            // (last write wins), and undoing them shows the remote body.
             let escaped = newMarkdown
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
                 .replacingOccurrences(of: "\n", with: "\\n")
                 .replacingOccurrences(of: "\r", with: "\\r")
                 .replacingOccurrences(of: "\t", with: "\\t")
-            let js = "window.nimbalystEditor.loadMarkdown(\"\(escaped)\")"
-            webView.evaluateJavaScript(js, completionHandler: nil)
+            let call = edits.shouldLoadRemote() ? "loadMarkdown" : "deferRemote"
+            // Loaded or deferred, the remote version is what the cache holds now.
+            (webView as? FormattingWebView)?.coordinator?.ledger.loaded(newMarkdown)
+            webView.evaluateJavaScript("window.nimbalystEditor.\(call)(\"\(escaped)\")", completionHandler: nil)
         }
     }
 
@@ -168,9 +235,25 @@ public struct DocumentEditorView: View {
     }
 }
 
+enum EmbedFileRead: Equatable {
+    case content(String)
+    case failure(String)
+}
+
+/// Whether the open editor holds edits that have not been pushed yet.
+@MainActor
+final class DocumentEditState: ObservableObject {
+    @Published var isDirty = false
+
+    func shouldLoadRemote() -> Bool { !isDirty }
+}
+
 // MARK: - FormattingWebView (adds Bold/Italic/Code to native edit menu)
 
 class FormattingWebView: WKWebView {
+    /// The editor's coordinator, for saves that must outlive the SwiftUI view value.
+    weak var coordinator: EditorWebView.Coordinator?
+
     private func formatText(_ format: String) {
         evaluateJavaScript("window.nimbalystEditor.formatText('\(format)')", completionHandler: nil)
     }
@@ -207,9 +290,12 @@ class FormattingWebView: WKWebView {
 
 struct EditorWebView: UIViewRepresentable {
     let document: SyncedDocument
+    var readOnly = false
     let onReady: () -> Void
-    let onContentChanged: (String) -> Void
+    let onContentChanged: (String) -> Bool
     let onDirtyChanged: (Bool) -> Void
+    var onLinkTapped: (String, String?) -> Void = { _, _ in }
+    var readEmbedFile: (String) -> EmbedFileRead = { _ in .failure("Embeds are unavailable here") }
     let onError: (String) -> Void
     let onWebViewCreated: (WKWebView) -> Void
 
@@ -218,9 +304,12 @@ struct EditorWebView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             document: document,
+            readOnly: readOnly,
             onReady: onReady,
             onContentChanged: onContentChanged,
             onDirtyChanged: onDirtyChanged,
+            onLinkTapped: onLinkTapped,
+            readEmbedFile: readEmbedFile,
             onError: onError
         )
     }
@@ -256,6 +345,7 @@ struct EditorWebView: UIViewRepresentable {
 
         config.userContentController = contentController
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        config.setURLSchemeHandler(HtmlEmbedShellSchemeHandler(), forURLScheme: HtmlEmbedShellSchemeHandler.scheme)
 
         let webView = FormattingWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -266,6 +356,7 @@ struct EditorWebView: UIViewRepresentable {
         webView.allowsBackForwardNavigationGestures = false
 
         context.coordinator.webView = webView
+        webView.coordinator = context.coordinator
         DispatchQueue.main.async {
             onWebViewCreated(webView)
         }
@@ -283,7 +374,15 @@ struct EditorWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: FormattingWebView, context: Context) {
-        // Content updates are handled via the bridge, not SwiftUI re-renders
+        // Content updates are handled via the bridge, not SwiftUI re-renders.
+        // Permission and handlers can change while the editor is open (the wiki
+        // turns unsupported, a page turns malformed, links resolve against a
+        // newer snapshot), so the coordinator always uses the latest ones.
+        let coordinator = context.coordinator
+        coordinator.onContentChanged = onContentChanged
+        coordinator.onLinkTapped = onLinkTapped
+        coordinator.readEmbedFile = readEmbedFile
+        coordinator.setReadOnly(readOnly)
     }
 
     // MARK: - Coordinator
@@ -292,25 +391,71 @@ struct EditorWebView: UIViewRepresentable {
         private let logger = Logger(subsystem: "com.nimbalyst.app", category: "EditorCoordinator")
 
         let document: SyncedDocument
+        private(set) var readOnly: Bool
         let onReady: () -> Void
-        let onContentChanged: (String) -> Void
+        var onContentChanged: (String) -> Bool
         let onDirtyChanged: (Bool) -> Void
+        var onLinkTapped: (String, String?) -> Void
+        var readEmbedFile: (String) -> EmbedFileRead
         let onError: (String) -> Void
         weak var webView: WKWebView?
         private var hasLoadedContent = false
+        var ledger = EditorSaveLedger()
 
         init(
             document: SyncedDocument,
+            readOnly: Bool,
             onReady: @escaping () -> Void,
-            onContentChanged: @escaping (String) -> Void,
+            onContentChanged: @escaping (String) -> Bool,
             onDirtyChanged: @escaping (Bool) -> Void,
+            onLinkTapped: @escaping (String, String?) -> Void,
+            readEmbedFile: @escaping (String) -> EmbedFileRead,
             onError: @escaping (String) -> Void
         ) {
             self.document = document
+            self.readOnly = readOnly
             self.onReady = onReady
             self.onContentChanged = onContentChanged
             self.onDirtyChanged = onDirtyChanged
+            self.onLinkTapped = onLinkTapped
+            self.readEmbedFile = readEmbedFile
             self.onError = onError
+        }
+
+        /// Saves with the permission and handler current now (they follow the
+        /// view through `updateUIView`), then tells the bundle the outcome.
+        func persist(_ markdown: String, revision: Int?) {
+            // A teardown save of text native already wrote must not overwrite a
+            // remote version persisted since.
+            guard ledger.shouldPersist(markdown, revision: revision) else { return }
+            let ok = !readOnly && onContentChanged(markdown)
+            if ok { ledger.persisted(markdown) }
+            if let revision {
+                webView?.evaluateJavaScript("window.nimbalystEditor && window.nimbalystEditor.saveResult(\(revision), \(ok))", completionHandler: nil)
+            }
+        }
+
+        /// Takes the bundle's unsaved content now (the editor is closing or the
+        /// app leaving the foreground) and persists it. The completion holds the
+        /// coordinator and web view, so the save and its ack finish even after
+        /// SwiftUI has dropped the view.
+        func flush() {
+            guard !readOnly, let webView else { return }
+            webView.evaluateJavaScript("window.nimbalystEditor ? window.nimbalystEditor.flush() : null") { result, _ in
+                withExtendedLifetime(webView) {
+                    guard let request = result as? [String: Any],
+                          let markdown = request["content"] as? String else { return }
+                    self.persist(markdown, revision: (request["revision"] as? NSNumber)?.intValue)
+                }
+            }
+        }
+
+        func setReadOnly(_ value: Bool) {
+            guard value != readOnly else { return }
+            readOnly = value
+            if hasLoadedContent {
+                webView?.evaluateJavaScript("window.nimbalystEditor.setReadOnly(\(value))", completionHandler: nil)
+            }
         }
 
         // MARK: - WKScriptMessageHandler
@@ -327,7 +472,27 @@ struct EditorWebView: UIViewRepresentable {
 
             case "contentChanged":
                 if let markdown = body["content"] as? String {
-                    onContentChanged(markdown)
+                    let revision = (body["revision"] as? NSNumber)?.intValue
+                    DispatchQueue.main.async { [weak self] in
+                        self?.persist(markdown, revision: revision)
+                    }
+                }
+
+            case "linkClicked":
+                if let href = body["href"] as? String {
+                    let title = body["title"] as? String
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onLinkTapped(href, title)
+                    }
+                }
+
+            case "readEmbedFile":
+                guard let requestId = (body["requestId"] as? NSNumber)?.intValue,
+                      let src = body["src"] as? String else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let js = Self.embedFileResultScript(requestId: requestId, result: self.readEmbedFile(src))
+                    self.webView?.evaluateJavaScript(js, completionHandler: nil)
                 }
 
             case "dirty":
@@ -354,6 +519,32 @@ struct EditorWebView: UIViewRepresentable {
 
         // MARK: - WKNavigationDelegate
 
+        /// The web view only ever shows the bundled editor; links are handled
+        /// through the bridge (`linkClicked`), never by navigating the editor away.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
+        ) {
+            let url = navigationAction.request.url
+            if navigationAction.navigationType == .other, url?.isFileURL == true, url?.lastPathComponent == "editor.html" {
+                decisionHandler(.allow)
+                return
+            }
+            // An embed's sandbox frame loads the shell; links inside it reach
+            // native through the bundle (`linkClicked`), never as navigations.
+            if navigationAction.targetFrame?.isMainFrame == false,
+               let scheme = url?.scheme?.lowercased(), scheme == HtmlEmbedShellSchemeHandler.scheme || scheme == "about" {
+                decisionHandler(.allow)
+                return
+            }
+            if navigationAction.navigationType == .linkActivated, let url {
+                let href = url.absoluteString
+                DispatchQueue.main.async { [weak self] in self?.onLinkTapped(href, nil) }
+            }
+            decisionHandler(.cancel)
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             logger.info("Editor HTML loaded")
         }
@@ -367,11 +558,36 @@ struct EditorWebView: UIViewRepresentable {
 
         // MARK: - Content Loading
 
+        /// An `.html` file shown on its own: one embed of itself, resolved beside itself.
+        static func selfEmbedMarkdown(relativePath: String) -> String {
+            let name = WikiFormat.basename(relativePath)
+            let label = name.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "")
+            return "[\(label)](<\(name)>)"
+        }
+
+        /// The bundle call answering `readEmbedFile`; strings are JSON-encoded, never spliced.
+        static func embedFileResultScript(requestId: Int, result: EmbedFileRead) -> String {
+            func literal(_ value: String) -> String {
+                guard let data = try? JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed),
+                      let json = String(data: data, encoding: .utf8) else { return "null" }
+                return json
+            }
+            switch result {
+            case .content(let text):
+                return "window.nimbalystEditor && window.nimbalystEditor.embedFileResult(\(requestId), \(literal(text)))"
+            case .failure(let reason):
+                return "window.nimbalystEditor && window.nimbalystEditor.embedFileResult(\(requestId), null, \(literal(reason)))"
+            }
+        }
+
         private func loadContent() {
             guard !hasLoadedContent else { return }
             hasLoadedContent = true
 
-            let content = document.contentDecrypted ?? ""
+            let content = WikiDocuments.isEmbedOnlyFile(document.relativePath)
+                ? Self.selfEmbedMarkdown(relativePath: document.relativePath)
+                : document.contentDecrypted ?? ""
+            ledger.loaded(content)
             // Escape for JS string
             let escaped = content
                 .replacingOccurrences(of: "\\", with: "\\\\")
@@ -380,7 +596,8 @@ struct EditorWebView: UIViewRepresentable {
                 .replacingOccurrences(of: "\r", with: "\\r")
                 .replacingOccurrences(of: "\t", with: "\\t")
 
-            let js = "window.nimbalystEditor.loadMarkdown(\"\(escaped)\")"
+            var js = "window.nimbalystEditor.loadMarkdown(\"\(escaped)\")"
+            if readOnly { js += "; window.nimbalystEditor.setReadOnly(true)" }
             webView?.evaluateJavaScript(js) { [weak self] _, error in
                 if let error = error {
                     self?.logger.error("Failed to load markdown: \(error.localizedDescription)")

@@ -1,0 +1,27 @@
+{
+  "description": "At session start, tell the agent what the project's local wiki covers. Once per session, after substantive work, ask the agent to record what it decided in the wiki. Both run the pinned @nimbalyst/cli through npx; the first run downloads it.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx --prefix / -y @nimbalyst/cli@0.12.3 hook session-start",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx --prefix / -y @nimbalyst/cli@0.12.3 hook stop",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

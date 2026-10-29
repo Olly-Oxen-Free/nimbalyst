@@ -7,6 +7,17 @@ public enum NimbalystExternalURLRoute: Equatable, Sendable {
     /// the link only surfaces the in-app scanner, which re-reads the QR through
     /// the app's own camera so nothing attacker-controlled crosses the trust boundary.
     case openPairingScanner
+    /// `nimbalyst://session/<id>` — a Live Activity row or a push tap.
+    ///
+    /// Carries only an id, which is safe to accept from outside: it is looked up
+    /// in the local database and opens nothing if it does not resolve. Unlike a
+    /// pairing payload there is no attacker-controlled material to apply.
+    case session(id: String)
+    /// `nimbalyst://console/<team path>`: a team console page, opened in Pages.
+    /// The path is validated by `ConsoleRoute`; it names a page, never a credential.
+    case console(ConsoleRoute)
+    /// `nimbalyst://console/app/...`: a personal page, which only the desktop holds.
+    case consolePersonal
     case unsupported
 }
 
@@ -25,6 +36,18 @@ public enum NimbalystExternalURLRouter {
         }
         if url.host?.lowercased() == "pair" {
             return .openPairingScanner
+        }
+        if url.host?.lowercased() == "session" {
+            let id = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if !id.isEmpty { return .session(id: id) }
+        }
+        if url.host?.lowercased() == "console" {
+            let path = url.path
+            if path == "/app" || path.hasPrefix("/app/") { return .consolePersonal }
+            var full = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? path
+            if let query = url.query(percentEncoded: true) { full += "?\(query)" }
+            if let fragment = url.fragment(percentEncoded: true) { full += "#\(fragment)" }
+            if let route = ConsoleRoute(path: full), route.isTeamProjectPath { return .console(route) }
         }
         return .unsupported
     }

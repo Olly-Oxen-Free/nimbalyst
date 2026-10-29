@@ -1,5 +1,6 @@
 import {
   resolveGitCommitProposalLookup,
+  parseCodexToolLookupId,
   type GitCommitProposalLookupCandidate,
 } from '@nimbalyst/runtime/ai/server/toolLookupIds';
 
@@ -14,6 +15,7 @@ export function resolveGitCommitProposalPromptIdFromRows(
   promptId: string,
   proposalRows: Array<{ content: string; created_at: Date | string }>,
   responseRows: Array<{ content: string }>,
+  allowSinglePendingFallback = true,
 ): string | null {
   const proposals: GitCommitProposalLookupCandidate[] = [];
   for (const row of proposalRows) {
@@ -50,6 +52,12 @@ export function resolveGitCommitProposalPromptIdFromRows(
     (proposal) => !respondedProposalIds.has(proposal.proposalId),
   );
 
+  if (!allowSinglePendingFallback) {
+    const rawId = parseCodexToolLookupId(promptId)?.itemId;
+    const exact = proposals.filter(p => p.proposalId === promptId || p.toolUseId === promptId || (rawId && p.toolUseId === rawId));
+    return exact.length === 1 ? exact[0].proposalId : null;
+  }
+
   const resolvedUnresolved = resolveGitCommitProposalLookup(promptId, unresolvedProposals);
   if (resolvedUnresolved) {
     return resolvedUnresolved;
@@ -60,11 +68,71 @@ export function resolveGitCommitProposalPromptIdFromRows(
     return resolvedAny;
   }
 
-  if (unresolvedProposals.length === 1) {
+  if (allowSinglePendingFallback && unresolvedProposals.length === 1) {
     return unresolvedProposals[0].proposalId;
   }
 
   return null;
+}
+
+export interface ProposalWorktreeTarget {
+  path: string;
+  branch: string | null;
+}
+
+/**
+ * #1756: the sibling worktree recorded on this exact proposal when it was
+ * validated, or null for an ordinary proposal into the session checkout.
+ */
+/** The stored `git_commit_proposal` record with exactly this proposal id. */
+export function findProposalRecordInRows(
+  proposalId: string,
+  rows: Array<{ content: string }>,
+): Record<string, any> | null {
+  for (const row of rows) {
+    try {
+      const content = JSON.parse(row.content);
+      if (content?.type === 'git_commit_proposal' && content.proposalId === proposalId) return content;
+    } catch {
+      // Ignore malformed rows
+    }
+  }
+  return null;
+}
+
+export function findProposalWorktreeTargetInRows(
+  proposalId: string,
+  rows: Array<{ content: string }>,
+): ProposalWorktreeTarget | null {
+  const target = findProposalRecordInRows(proposalId, rows)?.targetWorktree;
+  if (!target || typeof target.path !== 'string') return null;
+  return { path: target.path, branch: typeof target.branch === 'string' ? target.branch : null };
+}
+
+export async function loadGitCommitProposalRecord(
+  sessionId: string,
+  proposalId: string,
+): Promise<Record<string, any> | null> {
+  const { database } = await import('../../database/PGLiteDatabaseWorker');
+  const { rows } = await database.query<{ content: string }>(
+    `SELECT content
+     FROM ai_agent_messages
+     WHERE session_id = $1
+       AND content LIKE '%"type":"git_commit_proposal"%'
+       AND content LIKE $2
+     ORDER BY created_at DESC
+     LIMIT 5`,
+    [sessionId, `%${JSON.stringify(proposalId)}%`],
+  );
+  return findProposalRecordInRows(proposalId, rows);
+}
+
+export async function findGitCommitProposalWorktreeTarget(
+  sessionId: string,
+  proposalId: string,
+): Promise<ProposalWorktreeTarget | null> {
+  const record = await loadGitCommitProposalRecord(sessionId, proposalId);
+  return record ? findProposalWorktreeTargetInRows(proposalId, [{ content: JSON.stringify(record) }]) : null;
 }
 
 /**
@@ -77,6 +145,7 @@ export function resolveGitCommitProposalPromptIdFromRows(
 export async function resolveGitCommitProposalPromptId(
   sessionId: string,
   promptId: string,
+  allowSinglePendingFallback = true,
 ): Promise<string> {
   if (!sessionId || !promptId) {
     return promptId;
@@ -104,14 +173,16 @@ export async function resolveGitCommitProposalPromptId(
       [sessionId],
     );
 
-    const resolvedId = resolveGitCommitProposalPromptIdFromRows(promptId, proposalRows, responseRows);
+    const resolvedId = resolveGitCommitProposalPromptIdFromRows(promptId, proposalRows, responseRows, allowSinglePendingFallback);
     if (resolvedId) {
       // console.log(
       //   `[gitCommitProposalPromptUtils] Remapped git commit prompt ID from ${promptId} to ${resolvedId}`,
       // );
       return resolvedId;
     }
+    if (!allowSinglePendingFallback) throw new Error('Cannot identify this exact commit proposal. Refresh the session before answering.');
   } catch (error) {
+    if (!allowSinglePendingFallback) throw error;
     console.warn('[gitCommitProposalPromptUtils] Failed to resolve git commit prompt ID:', error);
   }
 

@@ -21,11 +21,13 @@
  *   {type:'result', subtype:'success'|..., result, usage, session_id}
  */
 
+import fs from 'fs/promises';
 import {
   runHeadlessNdjson,
   HeadlessNdjsonExitError,
 } from './headless/HeadlessNdjsonProcess';
 import { mapCursorRecord } from './headless/CursorAgentRecordMapper';
+import { buildDocumentAttachmentPromptText } from '../providers/codex/documentAttachmentPrompt';
 import type {
   AgentProtocol,
   ProtocolEvent,
@@ -106,7 +108,7 @@ export class CursorAgentProtocol implements AgentProtocol {
     message: ProtocolMessage,
   ): AsyncIterable<ProtocolEvent> {
     const raw = (session.raw ?? {}) as CursorSessionRaw;
-    const args = this.buildArgs(session, raw, message);
+    const args = this.buildArgs(session, raw, await buildPromptWithAttachments(message));
 
     let sawResult = false;
     try {
@@ -127,7 +129,7 @@ export class CursorAgentProtocol implements AgentProtocol {
       }
     } catch (error) {
       if (message.abortSignal?.aborted) return;
-      yield { type: 'error', error: describeCursorFailure(error) };
+      yield { type: 'error', error: describeCursorFailure(error, this.cursorPath) };
       return;
     }
 
@@ -147,11 +149,11 @@ export class CursorAgentProtocol implements AgentProtocol {
   private buildArgs(
     session: ProtocolSession,
     raw: CursorSessionRaw,
-    message: ProtocolMessage,
+    prompt: string,
   ): string[] {
     const args = [
       '--resume', session.id,
-      '-p', message.content,
+      '-p',
       '--output-format', 'stream-json',
     ];
     // Stored model ids are namespaced (`cursor-agent:auto`); the CLI wants the
@@ -163,8 +165,55 @@ export class CursorAgentProtocol implements AgentProtocol {
     // `--trust` avoids a workspace prompt no one can answer headlessly.
     // Nimbalyst gates the turn up front instead; the settings panel says so.
     args.push('--force', '--trust');
+    // The prompt is positional; leading dashes must never become CLI options.
+    args.push('--', prompt);
     return args;
   }
+}
+
+/**
+ * The prompt is a single argv entry, which the OS caps (Windows allows 32,767
+ * characters for the whole command line, Linux 128 KiB per argument). Text
+ * documents beyond this budget are referenced by path instead of inlined, so a
+ * large attachment cannot make the spawn fail with E2BIG.
+ */
+export const CURSOR_INLINE_DOCUMENT_BUDGET = 24_000;
+
+/**
+ * The CLI takes only prompt text; it has no image or file input flag. Images
+ * and PDFs are referenced by absolute path so the agent opens them with its
+ * read tool (measured: it reads images staged outside the workspace); text
+ * documents are inlined as Codex does, up to CURSOR_INLINE_DOCUMENT_BUDGET.
+ */
+export async function buildPromptWithAttachments(message: ProtocolMessage): Promise<string> {
+  const documents: string[] = [];
+  const fileReferences: string[] = [];
+  let inlinedLength = 0;
+  for (const attachment of message.attachments ?? []) {
+    if (!attachment.filepath) continue;
+    if (attachment.type === 'document') {
+      const text = await buildDocumentAttachmentPromptText(attachment);
+      if (inlinedLength + text.length <= CURSOR_INLINE_DOCUMENT_BUDGET) {
+        documents.push(text);
+        inlinedLength += text.length;
+        continue;
+      }
+    }
+    try {
+      await fs.access(attachment.filepath);
+      fileReferences.push(`- ${attachment.filename}: ${attachment.filepath}`);
+    } catch (error) {
+      // Same marker as an unreadable document, so the agent is told why
+      // instead of failing to open a path that is gone.
+      const errMsg = error instanceof Error ? error.message : String(error);
+      documents.push(`<file name="${attachment.filename}" error="failed to read attachment: ${errMsg}" />`);
+    }
+  }
+  const sections = [message.content, ...documents];
+  if (fileReferences.length > 0) {
+    sections.push(`Attached files (open each with your read tool):\n${fileReferences.join('\n')}`);
+  }
+  return sections.join('\n\n');
 }
 
 function stripProviderNamespace(modelId: string): string {
@@ -201,7 +250,7 @@ async function defaultCreateChat(opts: {
   });
 }
 
-function describeCursorFailure(error: unknown): string {
+function describeCursorFailure(error: unknown, executablePath: string): string {
   if (error instanceof HeadlessNdjsonExitError) {
     const stderr = error.stderr.toLowerCase();
     if (/not logged in|unauthorized|authentication/.test(stderr)) {
@@ -210,10 +259,16 @@ function describeCursorFailure(error: unknown): string {
     return error.message;
   }
   const messageText = error instanceof Error ? error.message : String(error);
-  if (/ENOENT|spawn/i.test(messageText)) {
+  if (['E2BIG', 'ENAMETOOLONG'].includes((error as NodeJS.ErrnoException)?.code ?? '') || /\b(?:E2BIG|ENAMETOOLONG)\b/i.test(messageText)) {
+    return 'Cursor prompt was too large to start the CLI. Shorten the prompt or reduce the attached document context and try again.';
+  }
+  if ((error as NodeJS.ErrnoException)?.code === 'ENOENT' || /\bENOENT\b/i.test(messageText)) {
     return 'The Cursor CLI was not found. Install it with:\n\n'
       + '  curl -fsSL https://cursor.com/install | bash\n\n'
       + 'Then run `cursor-agent login` to authenticate.';
+  }
+  if (['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException)?.code ?? '') || /\b(?:EACCES|EPERM)\b/i.test(messageText)) {
+    return `The Cursor CLI was found at "${executablePath}" but is not executable. Check its execution permissions or reinstall the CLI, then try again.`;
   }
   return messageText;
 }

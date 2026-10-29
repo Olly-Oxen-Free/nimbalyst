@@ -12,16 +12,21 @@ const invoke = vi.hoisted(() => {
 import { ChangesTab } from '../components/ChangesTab';
 
 const WORKSPACE = '/repo';
+// The panel's host workspace. Distinct from the repo, as in a workspace that
+// holds several checkouts: the commit session belongs to the host, not the repo.
+const HOST_WORKSPACE = '/workspace';
 
 function renderTab() {
   return render(
     <ChangesTab
       workspacePath={WORKSPACE}
+      hostWorkspacePath={HOST_WORKSPACE}
       withLog={(_command, operation) => operation()}
       onWorkspaceEvent={() => () => {}}
       onShowOutput={() => {}}
       fileMaskEnabled={false}
       fileMaskInput=""
+      refreshToken={0}
     />,
   );
 }
@@ -86,9 +91,14 @@ describe('ChangesTab commit', () => {
     fireEvent.click(screen.getByRole('button', { name: /Commit with AI/ }));
 
     window.removeEventListener('nimbalyst:commit-with-ai', listener);
+    // Absolute paths and an explicit repo: the picked repo need not be the
+    // session's primary root, and a repo-relative path resolved against that
+    // root points at a different repo, or at nothing. The workspace is the
+    // host's: a session addressed by the repo path is rejected as not found.
     expect((listener.mock.calls[0][0] as CustomEvent).detail).toEqual({
-      workspacePath: WORKSPACE,
-      files: [{ path: 'src/picked.ts', status: 'M' }],
+      workspacePath: HOST_WORKSPACE,
+      repoPath: WORKSPACE,
+      files: [{ path: `${WORKSPACE}/src/picked.ts`, status: 'M', repo: WORKSPACE }],
     });
   });
 });

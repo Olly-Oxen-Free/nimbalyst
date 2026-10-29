@@ -7,6 +7,8 @@ description: Prepare and execute an alpha release (patch/minor/major)
 
 Prepare an alpha release following this workflow.
 
+**Inventory check (both auto and interactive modes):** Before running the release script, reconcile the release's notable Added/Changed/Removed capabilities and relevant commits against `docs/FEATURE_INVENTORY.md`, following the root `CLAUDE.md` feature-inventory rule. Update missing, incomplete, or obsolete entries; verify unclear scope against current code. Report the updated sections or a short "No inventory impact" reason. Preserve unrelated pending edits, and do not treat uncommitted or planned work as shipped.
+
 ## AUTO MODE DETECTION
 
 If `{{arg1}}` contains `auto` (for example `patch auto`), run the full process without stopping for approval:
@@ -32,10 +34,22 @@ After pushing the tag, babysit the run instead of handing it back to the user:
    gh run list --limit=5 --json databaseId,headBranch,status,conclusion,event \
      | jq '[.[] | select(.event == "push" and .headBranch == "v[VERSION]")][0]'
    ```
-2. Watch the run to completion:
+2. Watch the run to completion, in **bounded foreground segments** — never one long
+   background watcher. A release build runs 15-30 minutes; a single `gh run watch`
+   exceeds the Bash timeout, gets auto-backgrounded, and is then killed when the turn
+   tears down (GitHub #1355). The grace timer is only armed *after* a turn ends, so a
+   foreground wait is never affected. Repeat this until `status` is `completed`:
    ```bash
    gh run watch [RUN_ID] --exit-status --interval 30
    ```
+   Call it with the Bash tool's own `timeout` set to `480000` (8 minutes) so the segment
+   returns well inside the ceiling rather than auto-backgrounding. On timeout, check
+   where the run stands and issue another segment if it is still going:
+   ```bash
+   gh run view [RUN_ID] --json status,conclusion -q '.status + " " + (.conclusion // "")'
+   ```
+   Do not use `run_in_background` for this, and do not raise the Bash timeout past the
+   ceiling — segmenting is the point.
 3. On success, announce that the alpha release shipped and show the public draft notes.
 4. On failure:
    - Pull failed logs: `gh run view [RUN_ID] --log-failed`
@@ -92,7 +106,7 @@ Do **not** run `/promote-public-release` until the alpha prerelease build is gre
      ```
    - The script will:
      - bump `packages/electron/package.json`
-     - update `package-lock.json`
+     - update `pnpm-lock.yaml`
      - move `[Unreleased]` into a new versioned section
      - create the release commit
      - create the annotated `v*` tag

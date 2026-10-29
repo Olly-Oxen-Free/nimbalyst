@@ -6,6 +6,7 @@ import { useScrollableMenuFloating } from '@nimbalyst/runtime/ui/floating/useScr
 import { MaterialSymbol } from '@nimbalyst/runtime';
 import { ProviderIcon } from '@nimbalyst/runtime/ui/icons/ProviderIcons';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
+import type { TrackerIdentity } from '@nimbalyst/runtime/core/DocumentService';
 import { type TrackerItemType, type TrackerLinkedSessionOption } from '@nimbalyst/runtime/plugins/TrackerPlugin';
 import { MANUAL_TRACKER_ORDERING, type TrackerGroupBy, type TrackerOrdering } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import {
@@ -19,6 +20,7 @@ import { trackerRelationshipLabelAtom } from '@nimbalyst/runtime/plugins/Tracker
 import { TrackerUnreadDot } from '@nimbalyst/runtime/readReceipts/TrackerUnreadDot';
 import { TrackerFavoriteStar } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/TrackerFavoriteStar';
 import { trackerModeStatusScopeAtom } from '../../store/atoms/trackers';
+import { requestConfirmation } from '../../dialogs/requestConfirmation';
 import {
   buildTrackerBoardColumns,
   groupItemsIntoBoardColumns,
@@ -74,6 +76,7 @@ interface KanbanBoardProps {
   onLaunchWorktree?: (itemId: string) => void;
   favoriteItemIds?: ReadonlySet<string>;
   onToggleFavorite?: (itemId: string) => void;
+  currentIdentity?: TrackerIdentity | null;
 }
 
 /**
@@ -111,6 +114,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   onLaunchWorktree,
   favoriteItemIds = new Set<string>(),
   onToggleFavorite,
+  currentIdentity,
 }) => {
   // Items always come from the caller (TrackerMainView passes atom-sourced items).
   // KanbanBoard no longer loads its own data -- single source of truth via Jotai atoms.
@@ -513,6 +517,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                         />
                       )}
                       sessionActionSlot={<TrackerCardSessionButton item={item} />}
+                      currentIdentity={currentIdentity}
                     />
                     {cardIndex === colItems.length - 1 && (
                       <>
@@ -698,10 +703,16 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
           {onDeleteItems && (
             <button
               className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[#ef4444] hover:bg-nim-tertiary cursor-pointer"
-              onClick={() => {
+              onClick={async () => {
                 closeContextMenu();
                 const ids = Array.from(selectedIds);
-                if (window.confirm(`Delete ${ids.length} item${ids.length > 1 ? 's' : ''}? This cannot be undone.`)) {
+                const approved = await requestConfirmation({
+                  title: ids.length > 1 ? 'Delete items?' : 'Delete item?',
+                  message: `Delete ${ids.length} item${ids.length > 1 ? 's' : ''}? This cannot be undone.`,
+                  confirmLabel: 'Delete',
+                  destructive: true,
+                });
+                if (approved) {
                   onDeleteItems(ids);
                   setSelectedIds(new Set());
                 }

@@ -1,9 +1,22 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+
+/**
+ * Only the attached-folder lookup is faked; everything else in the store stays
+ * real. Writing attachments through the real store would need a writable
+ * electron-store on disk, which this file otherwise avoids.
+ */
+const attachedFoldersByWorkspace = new Map<string, string[]>();
+vi.mock('../store', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../store')>()),
+  getAttachedFolders: (workspacePath: string) => attachedFoldersByWorkspace.get(workspacePath) ?? [],
+}));
+
 import {
   resolveProjectPath,
+  resolveProjectPathCandidates,
   isWorktreePath,
   clearWorktreeIdentityCache,
   findNearestAncestor,
@@ -145,6 +158,85 @@ describe('resolveProjectPath', () => {
   });
 });
 
+describe('resolveProjectPathCandidates', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-project-candidates-'));
+    clearWorktreeIdentityCache();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    clearWorktreeIdentityCache();
+  });
+
+  it('always leads with resolveProjectPath, so no persisted key is ever re-keyed', () => {
+    // The write key is the contract: a lookup may fall back to another spelling,
+    // but it must try the historically-written key first (#1419).
+    const project = path.join(tmpRoot, 'project');
+    fs.mkdirSync(path.join(project, '.git'), { recursive: true });
+    const worktree = path.join(tmpRoot, 'project_worktrees', 'swift-falcon');
+    createLinkedWorktree(project, worktree, 'swift-falcon');
+
+    for (const input of [project, worktree, path.join(project, 'packages')]) {
+      expect(resolveProjectPathCandidates(input)[0]).toBe(resolveProjectPath(input));
+    }
+  });
+
+  it('offers the symlink-resolved spelling for a project opened through a symlink', () => {
+    const realProject = path.join(tmpRoot, 'real', 'project');
+    fs.mkdirSync(path.join(realProject, '.git'), { recursive: true });
+    const link = path.join(tmpRoot, 'link');
+    try {
+      fs.symlinkSync(path.join(tmpRoot, 'real'), link, 'junction');
+    } catch {
+      return; // Symlink creation needs elevated privileges in some CI sandboxes.
+    }
+    const opened = path.join(link, 'project');
+
+    expect(resolveProjectPathCandidates(opened)).toEqual([
+      opened,
+      fs.realpathSync.native(realProject),
+    ]);
+  });
+
+  it("offers the parent's symlinked spelling for a worktree of a symlinked checkout", () => {
+    // The #1419 case: permissions were stored under the un-resolved parent, but
+    // the worktree only ever resolved to the realpath'd parent.
+    const realRoot = path.join(tmpRoot, 'real');
+    const realProject = path.join(realRoot, 'project');
+    createLinkedWorktree(realProject, path.join(realRoot, 'project_worktrees', 'wt'), 'wt');
+    const link = path.join(tmpRoot, 'link');
+    try {
+      fs.symlinkSync(realRoot, link, 'junction');
+    } catch {
+      return;
+    }
+
+    expect(resolveProjectPathCandidates(path.join(link, 'project_worktrees', 'wt'))).toEqual([
+      fs.realpathSync.native(realProject),
+      path.join(link, 'project'),
+    ]);
+  });
+
+  it('yields a single candidate when no symlink is involved', () => {
+    const project = path.join(tmpRoot, 'project');
+    fs.mkdirSync(path.join(project, '.git'), { recursive: true });
+    // tmpRoot itself may sit behind a symlinked temp dir (macOS /var), so compare
+    // against the resolved form rather than asserting a bare one-element list.
+    const candidates = resolveProjectPathCandidates(project);
+    expect(candidates[0]).toBe(project);
+    expect(new Set(candidates.map((c) => fs.realpathSync.native(c))).size).toBe(1);
+  });
+
+  it('fails closed for missing and empty inputs', () => {
+    const missing = path.join(tmpRoot, 'does-not-exist');
+    expect(resolveProjectPathCandidates(missing)).toEqual([missing]);
+    expect(resolveProjectPathCandidates('')).toEqual([]);
+  });
+});
+
 describe('isWorktreePath', () => {
   let tmpRoot: string;
 
@@ -208,14 +300,60 @@ describe('getAdditionalDirectoriesForWorkspace', () => {
     // Real filesystem fixture so the sync fs.readdirSync path is exercised
     // end-to-end. The function is called from a synchronous loader and must
     // tolerate a missing _worktrees dir without blowing up.
-    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-add-dirs-'));
+    tmpRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'nim-add-dirs-')));
     projectPath = path.join(tmpRoot, 'project');
     fs.mkdirSync(projectPath);
     worktreesDir = path.join(tmpRoot, 'project_worktrees');
   });
 
   afterEach(() => {
+    attachedFoldersByWorkspace.clear();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('grants the agent access to folders attached to the workspace', () => {
+    // Attachment is workspace-level, so every session in the workspace gets the
+    // extra roots without per-session UI. Without this the user can see the
+    // attached folder in the explorer but the agent cannot read it.
+    const attached = path.join(tmpRoot, 'infra');
+    fs.mkdirSync(attached);
+    attachedFoldersByWorkspace.set(projectPath, [attached]);
+
+    expect(getAdditionalDirectoriesForWorkspace(projectPath)).toEqual([attached]);
+  });
+
+  it('grants a worktree session the folders attached to its project', () => {
+    // Attachments are stored under the project, and a worktree session asks
+    // with the worktree's path, so they used to come back empty.
+    const attached = path.join(tmpRoot, 'infra');
+    fs.mkdirSync(attached);
+    attachedFoldersByWorkspace.set(projectPath, [attached]);
+    fs.mkdirSync(worktreesDir);
+    const cwd = path.join(worktreesDir, 'proud-gorge');
+    createLinkedWorktree(projectPath, cwd, 'proud-gorge');
+
+    expect(getAdditionalDirectoriesForWorkspace(cwd, { includeSiblingWorktrees: false }).sort())
+      .toEqual([attached, fs.realpathSync.native(projectPath)].sort());
+  });
+
+  it.each([false, true])('preserves direct worktree attachments alongside inherited folders (symlink: %s)', (symlink) => {
+    const cwd = path.join(worktreesDir, 'proud-gorge');
+    createLinkedWorktree(projectPath, cwd, 'proud-gorge');
+    let openedRoot = tmpRoot;
+    if (symlink) {
+      openedRoot = path.join(tmpRoot, 'alias');
+      fs.symlinkSync(tmpRoot, openedRoot, 'junction');
+    }
+    const openedWorktree = path.join(openedRoot, 'project_worktrees', 'proud-gorge');
+    const inherited = path.join(tmpRoot, 'inherited');
+    const direct = path.join(tmpRoot, 'direct');
+    const shared = path.join(tmpRoot, 'shared');
+    for (const dir of [inherited, direct, shared]) fs.mkdirSync(dir);
+    attachedFoldersByWorkspace.set(path.join(openedRoot, 'project'), [inherited, shared]);
+    attachedFoldersByWorkspace.set(openedWorktree, [direct, shared]);
+
+    expect(getAdditionalDirectoriesForWorkspace(openedWorktree, { includeSiblingWorktrees: false }).sort())
+      .toEqual([direct, inherited, shared, fs.realpathSync.native(projectPath)].sort());
   });
 
   it('returns an empty list for a project with no worktrees and no extension marker', () => {

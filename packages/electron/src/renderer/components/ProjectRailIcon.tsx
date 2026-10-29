@@ -30,7 +30,7 @@ import {
   shift,
 } from '@floating-ui/react';
 import { windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
-import { useAtom, useAtomValue, useSetAtom } from 'jotai';
+import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai';
 import {
   openProjectsAtom,
   activeWorkspacePathAtom,
@@ -43,19 +43,13 @@ import {
   globalSessionActivityAtom,
   projectActivitySummaryAtom,
 } from '../store/atoms/sessionActivity';
-import { generateWorkspaceAccentColor } from './WorkspaceSummaryHeader';
+import { generateWorkspaceAccentColor, projectIconForeground } from '../../shared/projectAppearance';
+import { projectAppearanceAtom } from '../store/atoms/projectAppearance';
+import { ProjectIcon } from './ProjectIcon';
+import { requestConfirmation } from '../dialogs/requestConfirmation';
+import { errorNotificationService } from '../services/ErrorNotificationService';
 
 export const REVEAL_LABEL = getShowInFileBrowserLabel();
-
-export function projectInitials(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) return '??';
-  const words = trimmed.split(/[-_\s]+/).filter(Boolean);
-  if (words.length >= 2) {
-    return (words[0][0] + words[1][0]).toUpperCase();
-  }
-  return trimmed.slice(0, 2).toUpperCase();
-}
 
 /** 'vertical' is the left-docked rail's own layout; 'horizontal' is the top-docked bar's. */
 export type ProjectRailOrientation = 'vertical' | 'horizontal';
@@ -69,6 +63,14 @@ export interface ProjectRailIconProps {
   onActivate: (path: string) => void;
   onClose: (project: OpenProject) => void;
   onContextMenu: (project: OpenProject, x: number, y: number) => void;
+  // Drag-reorder and menu state. Optional so a consumer without reordering
+  // (the top-docked bar) can omit them; the icon is only draggable when
+  // `onDragStart` is supplied.
+  isDragging?: boolean;
+  menuOpen?: boolean;
+  dropPosition?: 'before' | 'after';
+  onDragStart?: (event: React.DragEvent, path: string) => void;
+  onDragEnd?: () => void;
 }
 
 export function ProjectRailIcon({
@@ -80,6 +82,11 @@ export function ProjectRailIcon({
   onActivate,
   onClose,
   onContextMenu,
+  isDragging = false,
+  menuOpen = false,
+  dropPosition,
+  onDragStart,
+  onDragEnd,
 }: ProjectRailIconProps) {
   // Hover tooltip via floating-ui. Renders through FloatingPortal so the
   // tooltip escapes the rail container's `overflow: hidden` clip — the
@@ -93,7 +100,8 @@ export function ProjectRailIcon({
     placement: orientation === 'horizontal' ? 'bottom' : 'right',
     middleware: [offset(12), flip({ padding: 8 }), shift({ padding: 8 }), windowControlsClearance()],
   });
-  const tooltipHover = useHover(tooltipContext, { delay: { open: 200, close: 0 }, move: false });
+  const tooltipHover = useHover(tooltipContext, { enabled: !menuOpen && !isDragging, delay: { open: 200, close: 0 }, move: false });
+  React.useEffect(() => { if (menuOpen) setTooltipOpen(false); }, [menuOpen]);
   const { getReferenceProps: getTooltipRefProps, getFloatingProps: getTooltipFloatingProps } =
     useInteractions([tooltipHover]);
 
@@ -113,18 +121,20 @@ export function ProjectRailIcon({
     (event: React.MouseEvent) => {
       event.preventDefault();
       event.stopPropagation();
+      event.currentTarget.querySelector<HTMLButtonElement>('.project-rail-item-main')?.focus();
       onContextMenu(project, event.clientX, event.clientY);
     },
     [onContextMenu, project]
   );
 
   const orientationClass = orientation === 'horizontal' ? ' is-horizontal' : '';
-  const className = `project-rail-item${isActive ? ' is-active' : ''}${orientationClass}`;
+  const appearance = useAtomValue(projectAppearanceAtom(project.path)).snapshot?.appearance ?? {};
+  const className = `project-rail-item${isActive ? ' is-active' : ''}${isDragging ? ' is-dragging' : ''}${orientationClass}`;
 
   // Per-project accent color, derived deterministically from the workspace
   // path so the rail icon matches the colored bar shown in the workspace
   // summary header (and in SessionHistory entries) for the same project.
-  const accentColor = useMemo(() => generateWorkspaceAccentColor(project.path), [project.path]);
+  const accentColor = appearance.color || generateWorkspaceAccentColor(project.path);
 
   // Inactive projects show a badge when something needs attention. Active
   // projects already have the user's eyes on them so we suppress the
@@ -142,13 +152,25 @@ export function ProjectRailIcon({
       onContextMenu={handleContextMenu}
       data-testid="project-rail-item"
       data-project-path={project.path}
-      style={{ ['--rail-item-accent' as any]: accentColor }}
+      data-drop-position={dropPosition}
+      style={{ '--rail-item-accent': accentColor, '--rail-item-foreground': projectIconForeground(appearance.color) } as React.CSSProperties}
       {...getTooltipRefProps()}
     >
       <button
         type="button"
         className="project-rail-item-main"
         onClick={handleClick}
+        draggable={onDragStart !== undefined}
+        onDragStart={onDragStart ? event => { setTooltipOpen(false); onDragStart(event, project.path); } : undefined}
+        onDragEnd={onDragEnd}
+        onKeyDown={event => {
+          if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = event.currentTarget.getBoundingClientRect();
+          onContextMenu(project, rect.right, rect.top);
+        }}
+        aria-haspopup="menu"
         aria-label={`Switch to project ${project.name}`}
         aria-current={isActive ? 'true' : undefined}
         // The active project, in the top-docked (horizontal) bar, expands
@@ -159,7 +181,7 @@ export function ProjectRailIcon({
         title={isActive && orientation === 'horizontal' ? undefined : project.name}
         data-testid={isActive && orientation === 'horizontal' ? 'window-top-bar-workspace-name' : undefined}
       >
-        {isActive && orientation === 'horizontal' ? project.name : projectInitials(project.name)}
+        {isActive && orientation === 'horizontal' ? project.name : <ProjectIcon name={project.name} appearance={appearance} />}
         {showBadge && (
           <span
             className="project-rail-item-badge"
@@ -177,7 +199,7 @@ export function ProjectRailIcon({
       >
         ×
       </button>
-      {tooltipOpen && (
+      {tooltipOpen && !isDragging && !menuOpen && (
         <FloatingPortal>
           <div
             ref={tooltipRefs.setFloating}
@@ -228,6 +250,7 @@ export interface ProjectRailController {
 }
 
 export function useProjectRailController(): ProjectRailController {
+  const store = useStore();
   const openProjects = useAtomValue(openProjectsAtom);
   const [activePath, setActivePath] = useAtom(activeWorkspacePathAtom);
   const atCap = useAtomValue(isOpenProjectsAtCapAtom);
@@ -258,6 +281,7 @@ export function useProjectRailController(): ProjectRailController {
   const addProjectByPath = useCallback(
     async (workspacePath: string) => {
       if (!window.electronAPI?.invoke) return;
+      if (store.get(isOpenProjectsAtCapAtom) && !store.get(openProjectsAtom).some(p => p.path === workspacePath)) return;
       try {
         const reg = await window.electronAPI.invoke('workspace:register-additional', { workspacePath });
         if (!reg?.success) {
@@ -272,12 +296,15 @@ export function useProjectRailController(): ProjectRailController {
         };
         // `addOpenProjectAtom` flips `activeWorkspacePathAtom` to this path;
         // the atom subscriber dispatches `workspace:set-active` to main.
-        addProject(project);
+        if (!addProject(project)) {
+          // The limit can change in another window while registration is pending.
+          await window.electronAPI.invoke('workspace:unregister-additional', { workspacePath });
+        }
       } catch (err) {
         console.error('[ProjectRailIcon] addProjectByPath failed:', err);
       }
     },
-    [addProject]
+    [addProject, store]
   );
 
   const pickFolder = useCallback(async () => {
@@ -316,7 +343,10 @@ export function useProjectRailController(): ProjectRailController {
 
   const openAddMenu = useCallback(() => {
     if (atCap) {
-      window.alert('You can have at most 8 projects open in the rail. Close one first or open in a new window.');
+      errorNotificationService.showWarning(
+        'Project limit reached',
+        'The project limit is eight per window. Close a project or enable Allow unlimited projects in Settings > Advanced.',
+      );
       return;
     }
     refreshRecents();
@@ -340,9 +370,11 @@ export function useProjectRailController(): ProjectRailController {
       // the prompt when closing an inactive rail project.
       const streaming = activity.get(project.path)?.streaming.size ?? 0;
       if (streaming > 0) {
-        const proceed = window.confirm(
-          `${project.name} has ${streaming} streaming session${streaming === 1 ? '' : 's'}. Close anyway? Sessions will be paused.`
-        );
+        const proceed = await requestConfirmation({
+          title: 'Close project',
+          message: `${project.name} has ${streaming} streaming session${streaming === 1 ? '' : 's'}. Close anyway? Sessions will be paused.`,
+          confirmLabel: 'Close project',
+        });
         if (!proceed) return;
       }
 
@@ -378,7 +410,7 @@ export function useProjectRailController(): ProjectRailController {
     async (project: OpenProject) => {
       closeContextMenu();
       try {
-        await window.electronAPI?.invoke?.('workspace-manager:open-workspace', project.path);
+        await window.electronAPI?.invoke?.('workspace-manager:open-workspace', project.path, { forceNewWindow: true });
       } catch (err) {
         console.error('[ProjectRailIcon] open-workspace failed:', err);
       }

@@ -69,6 +69,8 @@ import { revealEditorPosition } from './TabEditor/editorRevealCommand';
 import { parseFileMask, matchesFileMask } from '@nimbalyst/extension-sdk/file-mask';
 import type { TrackerItem } from '@nimbalyst/runtime/core/DocumentService';
 
+import { attachWorkspaceFolderWithPicker } from '../store/actions/workspaceFolders';
+
 const isMac =
   typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac');
 
@@ -182,6 +184,7 @@ const RECENT_FILE_EXT_KEY = 'unifiedQuickOpen.recentFileMasks';
 const RECENT_TRACKER_TYPE_KEY = 'unifiedQuickOpen.recentTrackerTypes';
 const SELECTED_FILE_EXT_KEY = 'unifiedQuickOpen.selectedFileMask';
 const SELECTED_TRACKER_TYPE_KEY = 'unifiedQuickOpen.selectedTrackerType';
+const SELECTED_FILE_SOURCE_KEY = 'unifiedQuickOpen.selectedFileSource';
 
 type SemanticSearchScope = 'all' | 'docs' | 'trackers' | 'sessions';
 
@@ -201,6 +204,20 @@ const SEMANTIC_SEARCH_SCOPES: SemanticSearchScopeSpec[] = [
   { id: 'trackers', label: 'Trackers', sourceClasses: ['trackers'] },
   { id: 'sessions', label: 'Sessions', sourceClasses: ['sessions'] },
 ];
+
+// Files-tab source scope. Only rendered for team workspaces that actually have
+// shared documents — a solo workspace never sees this row.
+type FileSourceScope = 'all' | 'local' | 'shared';
+
+const FILE_SOURCE_SCOPES: ReadonlyArray<ScopeBubbleSpec<FileSourceScope>> = [
+  { id: 'all', label: 'All' },
+  { id: 'local', label: 'Local' },
+  { id: 'shared', label: 'Shared' },
+];
+
+function toFileSourceScope(stored: string | null): FileSourceScope {
+  return stored === 'local' || stored === 'shared' ? stored : 'all';
+}
 
 // Tracker status badge colors. Kept here so the Trackers pane and any future
 // status filter stay consistent with the tracker mode UI.
@@ -296,6 +313,65 @@ function usePersistedFilterValue(storageKey: string): [string | null, (value: st
 }
 
 // -----------------------------------------------------------------------------
+// Scope bubbles — the pill row shared by Memory ("Search in") and Files
+// ("Show"). Clicking the active pill falls back to `defaultScope`.
+// -----------------------------------------------------------------------------
+
+interface ScopeBubbleSpec<T extends string> {
+  id: T;
+  label: string;
+}
+
+interface ScopeBubblesProps<T extends string> {
+  rootClassName: string;
+  itemClassName: string;
+  label: string;
+  scopes: ReadonlyArray<ScopeBubbleSpec<T>>;
+  scope: T;
+  defaultScope: T;
+  onChange: (scope: T) => void;
+}
+
+function ScopeBubbles<T extends string>({
+  rootClassName,
+  itemClassName,
+  label,
+  scopes,
+  scope,
+  defaultScope,
+  onChange,
+}: ScopeBubblesProps<T>) {
+  return (
+    <div
+      className={`${rootClassName} shrink-0 flex items-center gap-1.5 px-3 py-2 border-b border-nim bg-nim-secondary`}
+      role="group"
+      aria-label={label}
+    >
+      <span className="mr-1 text-xs text-nim-faint">{label}</span>
+      {scopes.map((candidate) => {
+        const active = candidate.id === scope;
+        return (
+          <button
+            key={candidate.id}
+            type="button"
+            aria-pressed={active}
+            className={`${itemClassName} px-2.5 py-1 text-xs font-medium rounded-full border cursor-pointer transition-colors duration-100 ${
+              active
+                ? 'bg-nim-primary border-[var(--nim-primary)] text-white'
+                : 'bg-nim border-nim text-nim-muted hover:bg-nim-hover hover:text-nim'
+            }`}
+            onClick={() => onChange(active ? defaultScope : candidate.id)}
+            tabIndex={-1}
+          >
+            {candidate.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
 // Main shell
 // -----------------------------------------------------------------------------
 
@@ -331,6 +407,8 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
   // Per-tab filter chip values, hoisted so they survive tab switches.
   const [fileExtFilter, setFileExtFilter] = usePersistedFilterValue(SELECTED_FILE_EXT_KEY);
   const [trackerTypeFilter, setTrackerTypeFilter] = usePersistedFilterValue(SELECTED_TRACKER_TYPE_KEY);
+  const [storedFileSource, setStoredFileSource] = usePersistedFilterValue(SELECTED_FILE_SOURCE_KEY);
+  const fileSourceScope = toFileSourceScope(storedFileSource);
   const inputRef = useRef<HTMLInputElement>(null);
   const trackerTypeFilterRef = useRef<FilterChipHandle>(null);
   // Whether the nimbalyst-memory engine is running for this workspace. `null`
@@ -338,6 +416,10 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
   // it's still being determined). When false, the Memory tab is hidden entirely.
   const [searchAvailable, setSearchAvailable] = useState<boolean | null>(null);
   const hasTeam = useAtomValue(workspaceHasTeamAtom);
+  // The Files source row only earns its space once the workspace is on a team
+  // AND that team has shared documents to filter to.
+  const hasSharedDocuments = useAtomValue(sharedDocumentsAtom).length > 0;
+  const showFileSourceScopes = hasTeam && hasSharedDocuments;
   const visibleTabs = useMemo(
     () => [
       ...TAB_SPECS.filter(
@@ -779,21 +861,35 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
             </div>
           )}
           <div className={activeTab === 'files' ? 'contents' : 'hidden'}>
-            <FilesPane
-              isOpen={isOpen}
-              isActive={activeTab === 'files'}
-              query={activeTab === 'files' ? query : ''}
-              extFilter={fileExtFilter}
-              workspacePath={workspacePath}
-              currentFilePath={currentFilePath}
-              onFileSelect={onFileSelect}
-              onFolderSelect={onFolderSelect}
-              onClose={onClose}
-              onShowFileSessions={(filePath) => {
-                setSessionFileFilter(filePath);
-                switchTab('sessions');
-              }}
-            />
+            <div className="files-pane-container flex-1 min-h-0 flex flex-col">
+              {showFileSourceScopes && (
+                <ScopeBubbles
+                  rootClassName="files-source-scopes"
+                  itemClassName="files-source-scope"
+                  label="Show"
+                  scopes={FILE_SOURCE_SCOPES}
+                  scope={fileSourceScope}
+                  defaultScope="all"
+                  onChange={(next) => setStoredFileSource(next === 'all' ? null : next)}
+                />
+              )}
+              <FilesPane
+                isOpen={isOpen}
+                isActive={activeTab === 'files'}
+                query={activeTab === 'files' ? query : ''}
+                extFilter={fileExtFilter}
+                sourceScope={showFileSourceScopes ? fileSourceScope : 'all'}
+                workspacePath={workspacePath}
+                currentFilePath={currentFilePath}
+                onFileSelect={onFileSelect}
+                onFolderSelect={onFolderSelect}
+                onClose={onClose}
+                onShowFileSessions={(filePath) => {
+                  setSessionFileFilter(filePath);
+                  switchTab('sessions');
+                }}
+              />
+            </div>
           </div>
           <div className={activeTab === 'in-files' ? 'contents' : 'hidden'}>
             <InFilesPane
@@ -1119,6 +1215,8 @@ interface FilesPaneProps {
   query: string;
   /** File-extension filter (e.g. ".ts"). Null means no filter. */
   extFilter: string | null;
+  /** Local / shared source scope. 'all' merges both. */
+  sourceScope: FileSourceScope;
   workspacePath: string;
   currentFilePath?: string | null;
   onFileSelect: (filePath: string) => void;
@@ -1132,6 +1230,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
   isActive,
   query,
   extFilter,
+  sourceScope,
   workspacePath,
   currentFilePath,
   onFileSelect,
@@ -1169,15 +1268,15 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     }
   }, [isOpen, workspacePath]);
 
-  // Reset selected index when query changes
+  // Reset selected index when the result set is re-scoped
   useEffect(() => {
     setSelectedIndex(0);
-  }, [query]);
+  }, [query, sourceScope]);
 
   // Debounced file name search
   useEffect(() => {
     if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-    if (!query.trim()) {
+    if (!query.trim() || sourceScope === 'shared') {
       setResults([]);
       return;
     }
@@ -1241,7 +1340,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     return () => {
       if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
     };
-  }, [query, extFilter, workspacePath, recentFiles, posthog]);
+  }, [query, extFilter, sourceScope, workspacePath, recentFiles, posthog]);
 
   const recentItems: FileItem[] = useMemo(
     () =>
@@ -1258,13 +1357,16 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     [extFilter],
   );
   const displayFiles = useMemo(() => {
-    const localFiles = query ? results : recentItems;
+    const localFiles = sourceScope === 'shared' ? [] : query ? results : recentItems;
     const filteredLocalFiles = maskPatterns.length === 0 ? localFiles : localFiles.filter((f) => {
       if (f.type === 'directory') return false;
       return matchesFileMask(f.path, maskPatterns);
     });
 
-    if (!query.trim()) return filteredLocalFiles;
+    if (sourceScope === 'local') return filteredLocalFiles;
+    // With no query the local side shows recents; the shared side has no
+    // equivalent, so it only lists the team index when scoped to it explicitly.
+    if (!query.trim() && sourceScope !== 'shared') return filteredLocalFiles;
 
     const sharedFiles = searchSharedDocuments(sharedDocuments, sharedFolders, query)
       .filter(({ displayPath }) => (
@@ -1279,7 +1381,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
       }));
 
     return [...sharedFiles, ...filteredLocalFiles];
-  }, [query, results, recentItems, maskPatterns, sharedDocuments, sharedFolders]);
+  }, [query, results, recentItems, maskPatterns, sharedDocuments, sharedFolders, sourceScope]);
 
   // Track mouse movement
   useEffect(() => {
@@ -1356,7 +1458,11 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     <div className="files-pane flex-1 overflow-y-auto">
       {displayFiles.length === 0 ? (
         <div className="p-10 text-center text-nim-faint">
-          {isSearching ? 'Searching...' : query ? 'No files found' : 'No recent files'}
+          {isSearching
+            ? 'Searching...'
+            : sourceScope === 'shared'
+              ? query ? 'No shared documents found' : 'No shared documents'
+              : query ? 'No files found' : 'No recent files'}
         </div>
       ) : (
         <ul
@@ -2421,6 +2527,17 @@ interface ProjectItem {
   isCurrent: boolean;
 }
 
+/**
+ * A Projects-pane row. The attach action shares the list so one arrow-key model
+ * covers both, rather than a separate focus trap for a single button.
+ */
+type ProjectsPaneRow =
+  | { kind: 'attach' }
+  | { kind: 'project'; project: ProjectItem };
+
+/** Query words that surface the attach action. */
+const ATTACH_FOLDER_KEYWORDS = ['attach', 'folder', 'workspace', 'add'];
+
 interface RecentWorkspaceItem {
   path: string;
   name?: string;
@@ -2485,6 +2602,22 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
     );
   }, [visibleQuery, projects]);
 
+  /**
+   * Rows the pane navigates. "Attach Folder to Workspace..." leads, because it
+   * acts on the project you already have open rather than switching away from
+   * it -- the same reason it sits under File rather than under Open Recent.
+   */
+  const rows = useMemo<ProjectsPaneRow[]>(() => {
+    const projectRows = displayProjects.map<ProjectsPaneRow>((project) => ({
+      kind: 'project',
+      project,
+    }));
+    if (!currentWorkspacePath) return projectRows;
+    const q = visibleQuery.trim().toLowerCase();
+    const matchesAttach = !q || ATTACH_FOLDER_KEYWORDS.some((word) => word.includes(q));
+    return matchesAttach ? [{ kind: 'attach' }, ...projectRows] : projectRows;
+  }, [displayProjects, currentWorkspacePath, visibleQuery]);
+
   useEffect(() => {
     if (!isOpen) return;
     const onMove = () => setMouseHasMoved(true);
@@ -2500,11 +2633,19 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
   }, [selectedIndex]);
 
   const handleSelect = useCallback(
-    async (p: ProjectItem) => {
+    async (row: ProjectsPaneRow) => {
       onClose();
-      await window.electronAPI.workspaceManager.openWorkspace(p.path);
+      if (row.kind === 'attach') {
+        if (!currentWorkspacePath) return;
+        const outcome = await attachWorkspaceFolderWithPicker(currentWorkspacePath);
+        if (!outcome.success && outcome.error) {
+          console.error('[ProjectsPane] Attach folder failed:', outcome.error);
+        }
+        return;
+      }
+      await window.electronAPI.workspaceManager.openWorkspace(row.project.path);
     },
-    [onClose],
+    [onClose, currentWorkspacePath],
   );
 
   useEffect(() => {
@@ -2514,7 +2655,7 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
       switch (e.key) {
         case 'ArrowDown':
           e.preventDefault();
-          setSelectedIndex((i) => (i < displayProjects.length - 1 ? i + 1 : i));
+          setSelectedIndex((i) => (i < rows.length - 1 ? i + 1 : i));
           break;
         case 'ArrowUp':
           e.preventDefault();
@@ -2522,7 +2663,7 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
           break;
         case 'Enter':
           e.preventDefault();
-          if (displayProjects[selectedIndex]) handleSelect(displayProjects[selectedIndex]);
+          if (rows[selectedIndex]) handleSelect(rows[selectedIndex]);
           break;
         case 'Escape':
           e.preventDefault();
@@ -2532,11 +2673,11 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [isOpen, isActive, displayProjects, selectedIndex, handleSelect, onClose]);
+  }, [isOpen, isActive, rows, selectedIndex, handleSelect, onClose]);
 
   return (
     <div className="projects-pane flex-1 overflow-y-auto">
-      {displayProjects.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="p-10 text-center text-nim-faint">
           {query ? 'No projects found' : 'No recent projects'}
         </div>
@@ -2545,23 +2686,69 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
           ref={listRef}
           className={`list-none m-0 p-0 ${mouseHasMoved ? '' : 'pointer-events-none'}`}
         >
-          {displayProjects.map((project, index) => (
+          {rows.map((row, index) => row.kind === 'attach' ? (
             <li
-              key={project.path}
-              className={`unified-quick-open-item flex items-center gap-3 py-2.5 px-4 cursor-pointer border-l-[3px] transition-all duration-100 ${
+              key="attach-folder"
+              className={`unified-quick-open-item projects-pane-attach flex items-center gap-3 py-2.5 px-4 cursor-pointer border-l-[3px] transition-all duration-100 ${
                 index === selectedIndex
                   ? 'selected bg-nim-selected border-l-nim-primary'
                   : 'border-transparent hover:bg-nim-hover'
               }`}
-              onClick={() => handleSelect(project)}
+              onClick={() => handleSelect(row)}
               onMouseEnter={() => {
                 if (mouseHasMoved) setSelectedIndex(index);
               }}
             >
               <div className="shrink-0 flex items-center justify-center w-5 h-5 text-nim-muted">
-                <MaterialSymbol icon="folder" size={16} fill={project.isOpen} />
+                <MaterialSymbol icon="create_new_folder" size={16} />
               </div>
               <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium text-nim overflow-hidden text-ellipsis whitespace-nowrap">
+                  Attach Folder to Workspace...
+                </div>
+                <div className="text-xs text-nim-faint mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap">
+                  Browse it here and let agents read it, without leaving this project
+                </div>
+              </div>
+            </li>
+          ) : (
+            <ProjectRow
+              key={row.project.path}
+              project={row.project}
+              isSelected={index === selectedIndex}
+              onSelect={() => handleSelect(row)}
+              onHover={() => {
+                if (mouseHasMoved) setSelectedIndex(index);
+              }}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+});
+
+/** One recent-project row in the Projects pane. */
+const ProjectRow: React.FC<{
+  project: ProjectItem;
+  isSelected: boolean;
+  onSelect: () => void;
+  onHover: () => void;
+}> = memo(({ project, isSelected, onSelect, onHover }) => {
+  return (
+    <li
+      className={`unified-quick-open-item flex items-center gap-3 py-2.5 px-4 cursor-pointer border-l-[3px] transition-all duration-100 ${
+        isSelected
+          ? 'selected bg-nim-selected border-l-nim-primary'
+          : 'border-transparent hover:bg-nim-hover'
+      }`}
+      onClick={onSelect}
+      onMouseEnter={onHover}
+    >
+      <div className="shrink-0 flex items-center justify-center w-5 h-5 text-nim-muted">
+        <MaterialSymbol icon="folder" size={16} fill={project.isOpen} />
+      </div>
+      <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-nim flex items-center gap-2 overflow-hidden text-ellipsis whitespace-nowrap">
                   {project.name}
                   {project.isCurrent && (
@@ -2575,15 +2762,11 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-nim-faint mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap direction-rtl text-left">
-                  {project.path}
-                </div>
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+        <div className="text-xs text-nim-faint mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap direction-rtl text-left">
+          {project.path}
+        </div>
+      </div>
+    </li>
   );
 });
 
@@ -2591,41 +2774,19 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
 // Memory search — global semantic search plus merged rich Tracker results
 // =============================================================================
 
-interface MemoryScopeBubblesProps {
+const MemoryScopeBubbles: React.FC<{
   scope: SemanticSearchScope;
   onChange: (scope: SemanticSearchScope) => void;
-}
-
-const MemoryScopeBubbles: React.FC<MemoryScopeBubblesProps> = memo(({
-  scope,
-  onChange,
-}) => (
-  <div
-    className="memory-search-scopes shrink-0 flex items-center gap-1.5 px-3 py-2 border-b border-nim bg-nim-secondary"
-    role="group"
-    aria-label="Search in"
-  >
-    <span className="mr-1 text-xs text-nim-faint">Search in</span>
-    {SEMANTIC_SEARCH_SCOPES.map((candidate) => {
-      const active = candidate.id === scope;
-      return (
-        <button
-          key={candidate.id}
-          type="button"
-          aria-pressed={active}
-          className={`memory-search-scope px-2.5 py-1 text-xs font-medium rounded-full border cursor-pointer transition-colors duration-100 ${
-            active
-              ? 'bg-nim-primary border-[var(--nim-primary)] text-white'
-              : 'bg-nim border-nim text-nim-muted hover:bg-nim-hover hover:text-nim'
-          }`}
-          onClick={() => onChange(active ? 'all' : candidate.id)}
-          tabIndex={-1}
-        >
-          {candidate.label}
-        </button>
-      );
-    })}
-  </div>
+}> = memo(({ scope, onChange }) => (
+  <ScopeBubbles
+    rootClassName="memory-search-scopes"
+    itemClassName="memory-search-scope"
+    label="Search in"
+    scopes={SEMANTIC_SEARCH_SCOPES}
+    scope={scope}
+    defaultScope="all"
+    onChange={onChange}
+  />
 ));
 
 interface SearchPaneProps {
@@ -2742,12 +2903,12 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
     if (!issueKeyQuery || keyLookupRequested.current) return;
     keyLookupRequested.current = true;
     window.electronAPI
-      .invoke('document-service:tracker-items-list')
+      .invoke('document-service:tracker-items-list', workspacePath)
       .then((result: TrackerItem[] | null) => {
         setKeyLookupItems(Array.isArray(result) ? result : []);
       })
       .catch(() => setKeyLookupItems([]));
-  }, [issueKeyQuery]);
+  }, [issueKeyQuery, workspacePath]);
 
   // Exact issue-key hits are pinned above the semantic ranking.
   const results = useMemo(
@@ -2938,13 +3099,13 @@ const TrackersPane: React.FC<TrackersPaneProps> = memo(({
     if (!isOpen) return;
     setIsLoading(true);
     window.electronAPI
-      .invoke('document-service:tracker-items-list')
+      .invoke('document-service:tracker-items-list', workspacePath)
       .then((result: TrackerItem[] | null) => {
         setItems(Array.isArray(result) ? result : []);
       })
       .catch(() => setItems([]))
       .finally(() => setIsLoading(false));
-  }, [isOpen]);
+  }, [isOpen, workspacePath]);
 
   // The merged Memory Tracker scope keeps exact issue-key/title lookup first,
   // then appends semantic tracker hits in engine rank order.

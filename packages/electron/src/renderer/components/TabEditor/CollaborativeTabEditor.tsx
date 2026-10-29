@@ -35,6 +35,7 @@ import { useAtomValue, useSetAtom } from 'jotai';
 import { MarkdownEditor, MonacoEditor, DocumentPathProvider } from '@nimbalyst/runtime';
 import { $convertFromEnhancedMarkdownString, getEditorTransformers, type CommentsConfig } from '@nimbalyst/runtime/editor';
 import {
+  getElectronCollabDocsSession,
   getTeamSyncProvider,
   getSharedDocumentsForScopeKey,
   sharedDocumentsAtom,
@@ -43,7 +44,11 @@ import {
 import { buildCollabUri } from '@nimbalyst/collab-protocol';
 import { FixedTabHeaderContainer, FixedTabHeaderRegistry } from '@nimbalyst/runtime/plugins/shared/fixedTabHeader';
 import { LexicalDiffHeaderAdapter } from '../UnifiedDiffHeader';
-import { DocumentSyncProvider, CollabHistoryClient, LocalDocumentReplica } from '@nimbalyst/runtime/sync';
+import { PageInfoPanel } from '../PageInfo/PageInfoPanel';
+import { useDocumentDecisionsConfig } from './useDocumentDecisionsConfig';
+import { DecisionOutline } from '@nimbalyst/runtime/editor/plugins/DecisionPlugin/DecisionOutline';
+import { DocumentSyncProvider, CollabHistoryClient, LocalDocumentReplica, type DocumentSyncStatus } from '@nimbalyst/runtime/sync';
+import { CollabHydrationWatch, type CollabHydrationFailure } from './collabHydrationWatch';
 import { CollabLexicalProvider } from '@nimbalyst/runtime/collab-lexical';
 import { createRevisionAdapterFromCollabContent } from '@nimbalyst/runtime/sync';
 import { historyDialogFileAtom } from '../../store/atoms/historyDialog';
@@ -56,6 +61,7 @@ import { $getRoot, $setSelection, type LexicalEditor } from 'lexical';
 import type { EditorHost, ExtensionStorage } from '@nimbalyst/runtime';
 import type { CollabDocumentConfig } from '../../utils/collabDocumentOpener';
 import { resolveCollabConfigForUri } from '../../utils/collabDocumentOpener';
+import { collabPresenceName } from '../../utils/collabPresenceName';
 import { store, editorDirtyAtom, makeEditorKey, themeIdAtom } from '@nimbalyst/runtime/store';
 import type { Doc } from 'yjs';
 import type { Provider } from '@lexical/yjs';
@@ -86,7 +92,7 @@ import { closeActiveTabRequestAtom } from '../../store/atoms/appCommands';
 // React root (one per tab), so the app-root DialogProvider context is not
 // reachable through the tree. The module-level ref is the cross-root path.
 import { dialogRef } from '../../contexts/DialogContext';
-import { customEditorRegistry } from '../CustomEditors';
+import { findPageEditorRegistration } from '../HtmlPage/htmlPageRegistration';
 import type { CustomEditorRegistration } from '../CustomEditors/types';
 import {
   resolveCollabEditorAvailability,
@@ -109,6 +115,8 @@ import {
   CollabRecoveryBanner,
   CollabRenderFailureBanner,
 } from './CollabDocumentHeaderMeta';
+import { CollabPlainPageHeader } from '../CollabMode/CollabPlainPageHeader';
+import { usePageMenuItems } from '../CollabMode/usePageMenuItems';
 import {
   getSharedDocumentDisplayPath,
   getSharedDocumentDisplayPathWithFallback,
@@ -194,8 +202,35 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 // status atom directly so its text stays live without re-rendering the editor.
 // ---------------------------------------------------------------------------
 
-const CollabHydrationOverlay: React.FC<{ filePath: string }> = ({ filePath }) => {
+const CollabHydrationOverlay: React.FC<{
+  filePath: string;
+  /** The page cannot load (refused, unreachable, or failed to open): say so, with Retry. */
+  failure: CollabHydrationFailure | null;
+  onRetry: () => void;
+}> = ({ filePath, failure, onRetry }) => {
   const status = useAtomValue(collabProductStatusAtom(filePath));
+  if (failure) {
+    return (
+      <div
+        className="collab-hydration-overlay collab-hydration-failed absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 text-nim-muted"
+        style={{ background: 'var(--nim-bg)' }}
+        role="alert"
+        data-testid="collab-hydration-failed"
+      >
+        <span className="material-symbols-outlined" style={{ fontSize: '24px' }}>
+          {failure.kind === 'no-access' ? 'lock' : 'cloud_off'}
+        </span>
+        <span className="text-sm text-nim select-text">{failure.message}</span>
+        <button
+          type="button"
+          className="px-3 py-1 rounded border border-nim bg-transparent text-nim text-sm cursor-pointer hover:bg-nim-hover"
+          onClick={onRetry}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
   return (
     <div
       className="collab-hydration-overlay absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 text-nim-muted"
@@ -449,6 +484,11 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
   // 'connected'/'replaying'). Drives the hydration-gate overlay. One-time flip.
   const [hasHydrated, setHasHydrated] = useState(false);
   const hasHydratedRef = useRef(false);
+  // Until hydration: whether the room cannot connect, as opposed to being slow.
+  const [hydrationFailure, setHydrationFailure] = useState<CollabHydrationFailure | null>(null);
+  const hydrationWatchRef = useRef(new CollabHydrationWatch());
+  // Bumped by Retry when there is no provider to reconnect (opening it failed).
+  const [openAttempt, setOpenAttempt] = useState(0);
   useEffect(() => {
     hasHydratedRef.current = hasHydrated;
   }, [hasHydrated]);
@@ -481,6 +521,13 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
     // console.log('[CollaborativeTabEditor] Acquiring replica, initialContent:', !!activeConfig.initialContent);
     setProviderEpoch(0);
     setHasHydrated(false);
+    setHydrationFailure(null);
+    const hydrationWatch = new CollabHydrationWatch();
+    hydrationWatchRef.current = hydrationWatch;
+    const observeHydration = (status: DocumentSyncStatus, provider: DocumentSyncProvider | null) => {
+      const failure = hydrationWatch.observe(status, provider?.getLastAuthRejectionStatus() ?? null);
+      if (failure) setHydrationFailure(failure);
+    };
     resetCollabDocumentState(filePath);
     const tabOpenedAt = performance.now();
     const healthTracker = new CollaborationHealthAttemptTracker(
@@ -585,6 +632,7 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
         },
         onStatusChange: (status) => {
           observeHealth(status);
+          observeHydration(status, syncProvider);
           publishCollabTransportState(filePath, status);
           setCollabOutboxState(
             filePath,
@@ -675,6 +723,7 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
       },
       onTransportStateChange: (status) => {
         observeHealth(status);
+        observeHydration(status, syncProviderRef.current);
         // console.log('[CollaborativeTabEditor] Transport status change:', status);
         publishCollabTransportState(filePath, status);
         if (status === 'connected' || status === 'replaying') {
@@ -851,6 +900,10 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
       if (!cancelled) {
         setProviderEpoch(0);
         setCollabReplicaState(filePath, 'unavailable');
+        setHydrationFailure({
+          kind: 'open-failed',
+          message: `This page could not be opened: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
     });
 
@@ -874,7 +927,15 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
       resetCollabDocumentState(filePath);
       store.set(collabAwarenessAtom(filePath), new Map());
     };
-  }, [activeConfig, ensureBootstrapRevision, filePath, getDocReadWatermark, offlineReplicaEnabled, recordFirstLocalEdit, recordOfflineMetric]);
+  }, [activeConfig, ensureBootstrapRevision, filePath, getDocReadWatermark, offlineReplicaEnabled, recordFirstLocalEdit, recordOfflineMetric, openAttempt]);
+
+  const retryHydration = useCallback(() => {
+    hydrationWatchRef.current.reset();
+    setHydrationFailure(null);
+    const provider = syncProviderRef.current;
+    if (provider) provider.reconnectNow();
+    else setOpenAttempt((attempt) => attempt + 1);
+  }, []);
 
   // Build the provider factory for CollaborationPlugin
   // This function is called by CollaborationPlugin with a doc ID and yjsDocMap.
@@ -906,15 +967,17 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
     providerFactory,
     shouldBootstrap: !!activeConfig.initialContent,
     initialContent: activeConfig.initialContent,
-    username: activeConfig.userName || activeConfig.teamMemberId,
+    username: collabPresenceName(activeConfig),
     cursorColor,
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [providerFactory, activeConfig.initialContent, activeConfig.userName, activeConfig.teamMemberId, cursorColor]);
+  }), [providerFactory, activeConfig.initialContent, activeConfig.userName, activeConfig.userEmail, activeConfig.teamMemberId, cursorColor]);
 
   // Document comments config for the markdown collab branch. Comments live in
   // the same shared Y.Doc (top-level `comments` array); `onMention` / `onReply`
   // route notifications to the org-scoped TeamInboxRoom over the team
   // connection (see documentCommentNotifier).
+  const decisionsMemoConfig = useDocumentDecisionsConfig(activeConfig, hasHydrated, collabProviderRef, syncProviderRef);
+
   const commentsMemoConfig = useMemo<CommentsConfig>(() => ({
     getYDoc: () => collabProviderRef.current?.getYDoc() ?? null,
     // Reaching this mounted editor means the document sync lifecycle already
@@ -971,6 +1034,9 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
   ]);
 
   const markdownConfig = useMemo(() => ({
+    // A page's title and type row scroll with its body, as on a typed page.
+    documentHeader: <CollabPlainPageHeader scope={activeConfig.scope} documentId={activeConfig.documentId} />,
+    showCitationSourcesLine: false, // listed in Page info
     onUploadAsset: (file: File) => assetService.uploadFile(file),
     // NIM-1683: intentionally do NOT wire onAssetReferencesRemoved. Deleting an
     // asset the moment it leaves the *current* editor state is data-loss --
@@ -978,7 +1044,7 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
     // `collab-asset://` URI. Asset lifetime is tied to document lifetime; the
     // server reclaims all of a doc's blobs only when the document itself is
     // deleted. Leaving this unset keeps the asset-GC extension idle.
-  }), [assetService]);
+  }), [assetService, activeConfig.scope, activeConfig.documentId]);
 
   // Create a minimal EditorHost for collaboration mode
   // Most operations are no-ops since content syncs via Y.Doc
@@ -1196,7 +1262,7 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
       fileExtension: activeConfig.fileExtension,
       title: activeConfig.title,
       editorId: activeConfig.editorId,
-      findRegistration: (name) => customEditorRegistry.findRegistrationForFile(name),
+      findRegistration: (name) => findPageEditorRegistration(name, { documentType, editorId: activeConfig.editorId }),
     });
   }, [documentType, fileName, activeConfig.editorId, activeConfig.fileExtension, activeConfig.title]);
 
@@ -1289,51 +1355,31 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
     }
   }, [activeConfig.fileExtension, activeConfig.title, fileName]);
 
+  const pageMenuItems = usePageMenuItems({
+    lane: 'team',
+    session: getElectronCollabDocsSession(activeConfig.scope),
+    page: (documentType === 'markdown' && sharedDocuments.find((document) => document.documentId === activeConfig.documentId)) || null,
+    canMoveAcross: true,
+  });
   const collabActionItems = useMemo(() => {
-    const actionDisabled = localOrigin.busyAction !== null;
+    const busy = localOrigin.busyAction !== null;
+    // Local-source actions only once a local file is linked; until then, only linking one.
+    const linked = localOrigin.binding;
+    const pageItems = pageMenuItems.map(({ label, icon, onSelect, destructive, dividerBefore }) => ({ label, icon, onClick: onSelect, destructive, dividerBefore }));
+    const treeItems = pageItems.filter((item) => !item.destructive);
     return [
-      ...(documentType === 'code' ? [{
-        label: 'Save a Copy',
-        icon: 'download',
-        disabled: !hasHydrated,
-        onClick: () => {
-          void handleSaveCodeCopy();
-        },
-      }] : []),
-      {
-        label: 'Open Local',
-        icon: 'folder_open',
-        disabled: !localOrigin.hasResolvedBinding || actionDisabled,
-        onClick: () => {
-          void localOrigin.openLocalSource();
-        },
-      },
-      {
-        label: 'Re-upload to Shared Doc',
-        icon: 'upload',
-        disabled: !localOrigin.binding || actionDisabled,
-        onClick: () => {
-          void handleReuploadFromLocal();
-        },
-      },
-      {
-        label: localOrigin.binding ? 'Relink Local Source' : 'Link Local Source',
-        icon: 'link',
-        disabled: actionDisabled,
-        onClick: () => {
-          void localOrigin.relinkLocalSource();
-        },
-      },
-      {
-        label: 'Clear Local Source',
-        icon: 'link_off',
-        disabled: !localOrigin.binding || actionDisabled,
-        onClick: () => {
-          void localOrigin.clearLocalSource();
-        },
-      },
+      // Trash stays last, after the local-source actions.
+      ...treeItems,
+      ...(documentType === 'code' ? [{ label: 'Save a Copy', icon: 'download', disabled: !hasHydrated, onClick: () => { void handleSaveCodeCopy(); } }] : []),
+      ...(linked ? [
+        { label: 'Open Local Source', icon: 'folder_open', dividerBefore: treeItems.length > 0, disabled: !localOrigin.hasResolvedBinding || busy, onClick: () => { void localOrigin.openLocalSource(); } },
+        { label: 'Update from Local Source', icon: 'upload', disabled: busy, onClick: () => { void handleReuploadFromLocal(); } },
+      ] : []),
+      { label: linked ? 'Relink Local Source' : 'Link Local Source', icon: 'link', dividerBefore: !linked && treeItems.length > 0, disabled: busy, onClick: () => { void localOrigin.relinkLocalSource(); } },
+      ...(linked ? [{ label: 'Clear Local Source', icon: 'link_off', disabled: busy, onClick: () => { void localOrigin.clearLocalSource(); } }] : []),
+      ...pageItems.filter((item) => item.destructive),
     ];
-  }, [documentType, handleSaveCodeCopy, hasHydrated, localOrigin, handleReuploadFromLocal]);
+  }, [documentType, handleSaveCodeCopy, hasHydrated, localOrigin, handleReuploadFromLocal, pageMenuItems]);
   const handleLexicalEditorReady = useCallback((editor: any) => {
     setLexicalEditor((prev: any) => (prev === editor ? prev : editor));
     lexicalEditorRef.current = editor ?? null;
@@ -1454,7 +1500,7 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
   }, [bumpHistoryControllers, createHistoryClient, documentType, ensureBootstrapRevision, filePath, lexicalEditor]);
 
   return (
-    <div ref={rootRef} className="collaborative-tab-editor" style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div ref={rootRef} data-file-path={filePath} className="collaborative-tab-editor" style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <UnifiedEditorHeaderBar
         filePath={filePath}
         fileName={fileName}
@@ -1462,15 +1508,18 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
         isMarkdown={documentType === 'markdown'}
         lexicalEditor={documentType === 'markdown' ? (lexicalEditor ?? undefined) : undefined}
         breadcrumbContent={(
-          <CollabDocumentHeaderMeta filePath={filePath} displayPath={sharedDisplayPath} />
+          <CollabDocumentHeaderMeta filePath={filePath} displayPath={sharedDisplayPath} scope={activeConfig.scope} documentId={activeConfig.documentId} />
         )}
         showShareLinkButton={false}
         showSharedDocButton={false}
         showHistoryAction={true}
+        showPageInfoAction={documentType === 'markdown'}
         showCommonFileActions={false}
+        showDocumentTypeAction={false}
         sharedDocumentLinkTarget={{
           documentId: activeConfig.documentId,
           orgId: activeConfig.orgId,
+          teamProjectId: activeConfig.scope.indexConfig.teamProjectId,
         }}
         extraActionItems={collabActionItems}
         documentSessionActions={documentSessionActions}
@@ -1488,8 +1537,8 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
       <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', position: 'relative' }}>
         {/* NIM-949: gate editing until the room hydrates, so a server-only doc
             never presents a blank editable surface during a connection/auth blip. */}
-        {providerEpoch > 0 && !hasHydrated && (
-          <CollabHydrationOverlay filePath={filePath} />
+        {(providerEpoch > 0 || hydrationFailure) && !hasHydrated && (
+          <CollabHydrationOverlay filePath={filePath} failure={hydrationFailure} onRetry={retryHydration} />
         )}
         {providerEpoch === 0 ? (
           <div className="flex items-center justify-center h-full text-nim-muted">
@@ -1505,22 +1554,28 @@ export const CollaborativeTabEditor: React.FC<CollaborativeTabEditorProps> = ({
               fileName={fileName}
               editor={lexicalEditor ?? undefined}
             />
-            {/* Accept/reject bar when an AI edit is pending review. Mirrors
-                the TabEditor markdown branch. */}
+            <DecisionOutline editor={lexicalEditor} />
+            {/* Agent edits land in shared documents as final text; this bar
+                only shows for pending diffs older builds wrote into the room. */}
             <LexicalDiffHeaderAdapter
               editor={lexicalEditor ?? undefined}
               filePath={filePath}
               fileName={fileName}
             />
-            <div style={{ flex: 1, overflow: 'hidden' }}>
-              <MarkdownEditor
-                host={editorHost}
-                config={markdownConfig}
-                onGetContent={handleGetContentReady}
-                onEditorReady={handleLexicalEditorReady}
-                collaborationConfig={collaborationMemoConfig}
-                commentsConfig={commentsMemoConfig}
-              />
+            <div className="flex min-h-0 flex-1">
+              <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                <MarkdownEditor
+                  host={editorHost}
+                  config={markdownConfig}
+                  onGetContent={handleGetContentReady}
+                  onEditorReady={handleLexicalEditorReady}
+                  collaborationConfig={collaborationMemoConfig}
+                  commentsConfig={commentsMemoConfig}
+                  decisionsConfig={decisionsMemoConfig}
+                />
+              </div>
+              {/* A shared page has no frontmatter: Page info lists its sources. */}
+              <PageInfoPanel editor={lexicalEditor ?? null} />
             </div>
           </DocumentPathProvider>
         ) : documentType === 'code' && syncProviderRef.current ? (
@@ -1623,7 +1678,7 @@ const MonacoCollabBranch: React.FC<MonacoCollabBranchProps> = ({
       yDoc: syncProvider.getYDoc(),
       user: {
         id: activeConfig.teamMemberId,
-        name: activeConfig.userName ?? activeConfig.teamMemberId,
+        name: collabPresenceName(activeConfig),
         color: '#3A8FD6',
       },
     });
@@ -1831,7 +1886,7 @@ const ExtensionCollabBranch: React.FC<ExtensionCollabBranchProps> = ({
       yDoc: syncProvider.getYDoc(),
       user: {
         id: activeConfig.teamMemberId,
-        name: activeConfig.userName ?? activeConfig.teamMemberId,
+        name: collabPresenceName(activeConfig),
         color: '#3A8FD6',
       },
     });

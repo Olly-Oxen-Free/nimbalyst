@@ -1,7 +1,7 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import { app } from 'electron';
-import { getAgentPermissions, getRecentItems, setWorkspaceTrusted } from './store';
+import { getAgentPermissions, getAttachedFolders, getRecentItems, setWorkspaceTrusted } from './store';
 
 /**
  * NOTE: isPathInWorkspace and getRelativeWorkspacePath have similar implementations
@@ -76,6 +76,7 @@ interface WorktreeIdentity {
 }
 
 const WORKTREE_IDENTITY_CACHE = new Map<string, { value: WorktreeIdentity; expiresAt: number }>();
+const PROJECT_PATH_CANDIDATES_CACHE = new Map<string, { value: string[]; expiresAt: number }>();
 const WORKTREE_IDENTITY_CACHE_TTL_MS = 30_000;
 
 /**
@@ -85,6 +86,7 @@ const WORKTREE_IDENTITY_CACHE_TTL_MS = 30_000;
  */
 export function clearWorktreeIdentityCache(): void {
   WORKTREE_IDENTITY_CACHE.clear();
+  PROJECT_PATH_CANDIDATES_CACHE.clear();
 }
 
 function cacheWorktreeIdentity(key: string, value: WorktreeIdentity): WorktreeIdentity {
@@ -217,6 +219,124 @@ export function resolveProjectPath(workspacePath: string): string {
     return identity.parentRoot;
   }
   return normalizeWorkspacePath(workspacePath);
+}
+
+/**
+ * Every path that names the SAME project directory as `resolveProjectPath()`
+ * returns, differing only in how the symlinks along it are spelled. Most
+ * canonical first: candidate 0 is always exactly `resolveProjectPath()`.
+ *
+ * `resolveProjectPath` is deliberately asymmetric. A linked worktree resolves to
+ * its parent's fully symlink-resolved path (`realpathSync.native`), while a
+ * plain project keeps the path the user opened it by. For a checkout reached
+ * through a symlink those two spellings differ, so a worktree's parent key never
+ * matched the key the parent project's own permissions were stored under and the
+ * worktree inherited nothing (GitHub #1419).
+ *
+ * The mismatch is resolved at COMPARISON time, never at write time:
+ * `resolveProjectPath` still returns the key it always has, so no persisted
+ * state is re-keyed, and a lookup that misses simply tries the other spelling.
+ * Each alias is confirmed with `realpath` to name the very same directory before
+ * it is offered -- an equivalence, not a guess, so nothing can inherit trust
+ * from a directory it is not actually part of.
+ *
+ * Fails closed like the rest of this file: a missing or unreadable path yields
+ * just the canonical key, and an empty input yields no candidates at all.
+ */
+export function resolveProjectPathCandidates(workspacePath: string): string[] {
+  if (!workspacePath) {
+    return [];
+  }
+
+  const cached = PROJECT_PATH_CANDIDATES_CACHE.get(workspacePath);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  const identity = resolveWorktreeIdentity(workspacePath);
+  const candidates: string[] = [];
+  const add = (candidate: string | null): void => {
+    if (!candidate) {
+      return;
+    }
+    const normalized = normalizeWorkspacePath(candidate);
+    if (!candidates.includes(normalized)) {
+      candidates.push(normalized);
+    }
+  };
+
+  if (identity.isWorktree && identity.parentRoot) {
+    add(identity.parentRoot);
+    add(aliasThroughSymlinkPrefix(workspacePath, identity.canonical, identity.parentRoot));
+  } else {
+    add(workspacePath);
+    add(identity.canonical);
+  }
+
+  PROJECT_PATH_CANDIDATES_CACHE.set(workspacePath, {
+    value: candidates,
+    expiresAt: Date.now() + WORKTREE_IDENTITY_CACHE_TTL_MS,
+  });
+  return candidates;
+}
+
+/**
+ * Re-spell `target` (a fully symlink-resolved path) using the symlinked prefix
+ * that `displayPath` is spelled with, so a project opened through a symlink is
+ * recognized by the same string its state is stored under.
+ *
+ * `displayPath` and `realPath` name the same directory, so the segments they
+ * share as a suffix are the part below the symlink; what precedes that suffix is
+ * exactly the substitution pair (real prefix -> the spelling the user opened).
+ * Applying that pair to `target` yields the target's spelling under the same
+ * symlink.
+ *
+ * Returns null unless `realpath` confirms the result is that same directory --
+ * including when the guessed prefix pair is wrong, when `target` sits outside
+ * the symlinked prefix, or when the path is unreadable.
+ */
+function aliasThroughSymlinkPrefix(
+  displayPath: string,
+  realPath: string,
+  target: string,
+): string | null {
+  const display = normalizeWorkspacePath(displayPath);
+  const real = normalizeWorkspacePath(realPath);
+  if (display === real) {
+    // No symlink on this path, so `target` already has only one spelling.
+    return null;
+  }
+
+  const displaySegments = display.split(path.sep);
+  const realSegments = real.split(path.sep);
+  let shared = 0;
+  while (
+    shared < displaySegments.length - 1 &&
+    shared < realSegments.length - 1 &&
+    displaySegments[displaySegments.length - 1 - shared] ===
+      realSegments[realSegments.length - 1 - shared]
+  ) {
+    shared++;
+  }
+
+  const realPrefix = realSegments.slice(0, realSegments.length - shared).join(path.sep);
+  const displayPrefix = displaySegments.slice(0, displaySegments.length - shared).join(path.sep);
+  // An empty prefix would mean substituting at the filesystem root, which says
+  // nothing about where the symlink actually is.
+  if (!realPrefix || !displayPrefix) {
+    return null;
+  }
+  if (target !== realPrefix && !target.startsWith(realPrefix + path.sep)) {
+    return null;
+  }
+
+  const alias = displayPrefix + target.slice(realPrefix.length);
+  try {
+    return fs.realpathSync.native(alias) === target ? alias : null;
+  } catch {
+    // Unreadable or nonexistent - fail closed, offer no alias.
+    return null;
+  }
 }
 
 /**
@@ -529,9 +649,17 @@ export function ensureExtensionSDKDocsTrusted(docsPath: string): void {
 /**
  * Gets additional directories that should be accessible to the agent for the
  * given workspace. This includes:
+ * - Folders attached to this workspace (multi-root)
  * - Extension SDK documentation when working on an extension project
  * - Parent project directory when working in a worktree
  * - Sibling worktrees (unless opted out — see includeSiblingWorktrees)
+ *
+ * Attached folders are workspace-level, so every session in the workspace gets
+ * them, and they inherit the primary root's trust level rather than carrying
+ * one of their own -- attaching is the consent point, and the folder picker
+ * says so. The session cwd stays the primary root, so a bare relative path
+ * from the agent still resolves there and attached folders must be addressed
+ * absolutely.
  *
  * @param workspacePath - The current workspace path
  * @param options.includeSiblingWorktrees - default true. The Claude Code
@@ -551,10 +679,23 @@ export function getAdditionalDirectoriesForWorkspace(
   const workspaceIdentity = resolveWorktreeIdentity(workspacePath);
   const projectPath = resolveProjectPath(workspacePath);
 
+  // Folders attached to this workspace are roots the user can see in the
+  // explorer, so the agent must be able to read and write them too.
+  for (const attached of getAttachedFolders(workspacePath)) {
+    additionalDirs.add(attached);
+  }
+
   // If this is a worktree, add the parent project directory so the agent can
   // read shared configs (.claude/settings.json, package.json) and reach the
   // shared .git common dir for operations like `git rebase --continue`.
   if (workspaceIdentity.isWorktree) {
+    // Inherit project attachments without replacing folders attached directly
+    // to an independently opened worktree. Preserve project-path alias lookup.
+    const attachedFrom = resolveProjectPathCandidates(workspacePath)
+      .find((candidate) => getAttachedFolders(candidate).length > 0);
+    for (const attached of attachedFrom ? getAttachedFolders(attachedFrom) : []) {
+      additionalDirs.add(attached);
+    }
     additionalDirs.add(projectPath);
   }
 

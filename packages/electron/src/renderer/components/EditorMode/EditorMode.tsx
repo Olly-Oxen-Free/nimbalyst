@@ -1,8 +1,10 @@
+import { usePendingFileOpen } from '../../hooks/usePendingFileOpen';
 import React, { useCallback, useEffect, useRef, useState, useImperativeHandle, forwardRef } from 'react';
 import { useSetAtom, useAtomValue, useAtom } from 'jotai';
 import type { ConfigTheme } from '@nimbalyst/runtime';
 import { asTeamJwt } from '@nimbalyst/runtime/auth/jwtScopes';
 import { useTabsActions, useTabNavigationShortcuts, type TabData } from '../../contexts/TabsContext';
+import { useRepresentedFileSync } from '../../hooks/useRepresentedFileSync';
 import { store, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 import { fileDeletedAtomFamily } from '../../store/atoms/fileWatch';
 import { pushNavigationEntryAtom, isRestoringNavigationAtom, historyDialogFileAtom } from '../../store';
@@ -42,6 +44,9 @@ import {
   aiChatCollapsedAtomFamily,
 } from '../../store/atoms/workspaceLayout';
 import { refreshFileTree } from '../../store/listeners/fileTreeListeners';
+import { bindActiveFileToTabs } from '../../store/atoms/fileTree';
+import { requestConfirmation } from '../../dialogs/requestConfirmation';
+import { openFileAsWikiPage } from '../../utils/agentEditedPage';
 
 export interface EditorModeRef {
   closeActiveTab: () => void;
@@ -54,6 +59,7 @@ export interface EditorModeRef {
   toggleAIChatCollapsed: () => void;
   toggleEditorMaximized: () => void;
   createNewChatSession: () => Promise<void>;
+  createNewFile: (initialType?: NewFileType) => void;
   tabs: {
     addTab: (filePath: string, content?: string) => string | undefined;
     removeTab: (tabId: string) => void;
@@ -188,6 +194,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
   // Get tab actions from context (doesn't subscribe to state - no re-renders)
   const tabsActions = useTabsActions();
   useTabNavigationShortcuts(isActive);
+  useRepresentedFileSync(isActive);
 
   // Refs for imperative DOM updates - NO re-renders for tab visibility
   const tabsContainerRef = useRef<HTMLDivElement>(null);
@@ -240,6 +247,10 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     const unsubscribe = tabsActions.subscribe(updateCurrentFileForPlugins);
     return unsubscribe;
   }, [tabsActions]);
+
+  // The repo-aware UI (title-bar branch, new-worktree source) reads the active
+  // file from Jotai; the main tabs live in TabsContext.
+  useEffect(() => bindActiveFileToTabs(tabsActions), [tabsActions]);
 
   // Keep activeTabForContextRef in sync with active tab (no re-render)
   useEffect(() => {
@@ -370,11 +381,14 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
       : 'disconnected';
 
     if (isCollabUri(tab.filePath) && hasCollabUnsyncedChanges(collabStatus)) {
-      const confirmed = window.confirm(
-        collabStatus === 'replaying'
+      const confirmed = await requestConfirmation({
+        title: 'Close document?',
+        message: collabStatus === 'replaying'
           ? 'This collaborative document is still replaying local changes to the server. Close it anyway?'
-          : 'This collaborative document still has local changes that have not been confirmed by the server. Close it anyway?'
-      );
+          : 'This collaborative document still has local changes that have not been confirmed by the server. Close it anyway?',
+        confirmLabel: 'Close Anyway',
+        destructive: true,
+      });
       if (!confirmed) {
         return;
       }
@@ -879,6 +893,8 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     }
   }, [tabsActions]);
 
+  usePendingFileOpen(workspacePath, () => onModeChange?.('files'));
+
   // Handle workspace file selection
   // CRITICAL: Use tabsRef.current to avoid stale closure bug
   // The tabs object changes on every render, so capturing it in a useCallback
@@ -898,6 +914,12 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
       isInitializedRef
     });
   }, []); // No dependencies - uses refs for all mutable state
+
+  // A transcript link: a Local wiki page opens in Pages, anything else here.
+  const handleChatFileOpen = useCallback(async (filePath: string) => {
+    if (await openFileAsWikiPage(filePath, workspacePath, 'agent_tool')) return;
+    await handleWorkspaceFileSelect(filePath);
+  }, [workspacePath, handleWorkspaceFileSelect]);
 
   // Handle opening session - switches to Agent Mode since ChatSidebar manages its own single session
   const handleOpenSessionInChat = useCallback(async (sessionId: string) => {
@@ -1023,6 +1045,16 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         setIsAIChatCollapsed(false);
       }
       await chatSidebarRef.current?.createNewSession();
+    },
+    // Same path the Cmd+N accelerator takes, so the title bar's left control
+    // and the keyboard land the file in the same place: the selected folder if
+    // the tree has one, else the workspace root.
+    createNewFile: (initialType: NewFileType = 'markdown') => {
+      if (selectedFolderPath) {
+        setNewFileDirectory(selectedFolderPath);
+      }
+      setNewFileInitialType(initialType);
+      setIsNewFileDialogOpen(true);
     },
     tabs: {
       addTab: (filePath: string, content?: string) => {
@@ -1438,9 +1470,9 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
             onToggleCollapse={toggleAIChatCollapsed}
             width={aiChatWidth}
             onWidthChange={setAIChatWidth}
-            documentContext={{ filePath: currentFilePath || '' }}
+            documentContext={{ filePath: currentFilePath || '', fileName: currentFileName || undefined }}
             getDocumentContext={getDocumentContext}
-            onFileOpen={handleWorkspaceFileSelect}
+            onFileOpen={handleChatFileOpen}
             onSwitchToAgentMode={onSwitchToAgentMode ? (sid?: string) => onSwitchToAgentMode(undefined, sid) : undefined}
           />
         )}

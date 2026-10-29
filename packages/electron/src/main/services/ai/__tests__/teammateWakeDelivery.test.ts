@@ -133,7 +133,8 @@ const mocks = vi.hoisted(() => ({
 // exists only to let it import; nothing here is under test except the
 // teammate:messageWhileIdle listener itself. Mirrors
 // MessageStreamingHandler.opencodeModel.test.ts's scaffold.
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
+  app: (await import('../../../../../test-stubs/privateUserData')).testApp,
   BrowserWindow: {
     fromWebContents: vi.fn(() => null),
     getAllWindows: vi.fn(() => []),
@@ -255,6 +256,11 @@ vi.mock('../../../HistoryManager', () => ({
 
 vi.mock('../../../file/WorkspaceEventBus', () => ({
   addGitignoreBypass: vi.fn(),
+  // Referenced at module load by codexShellTrackingHost.
+  drainWorkspaceEvents: vi.fn(async () => {}),
+  subscribe: vi.fn(),
+  unsubscribe: vi.fn(),
+  getSubscriberIds: vi.fn(() => []),
 }));
 
 vi.mock('../../SyncManager', () => ({
@@ -295,6 +301,7 @@ vi.mock('../../../utils/store', () => ({
   markCommunityPopupShown: vi.fn(),
   wasCommunityPopupShownThisLaunch: vi.fn(() => false),
   incrementCompletedSessionsWithTools: vi.fn(),
+  getExtensionEnabled: vi.fn(() => undefined),
 }));
 
 vi.mock('../childSessionTakeover', () => ({

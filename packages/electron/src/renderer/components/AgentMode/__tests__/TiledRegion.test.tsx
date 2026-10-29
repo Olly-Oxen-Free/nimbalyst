@@ -473,9 +473,12 @@ describe('TiledRegion', () => {
       // One mousemove (throttle fires leading-edge) plus clientX on mouseup
       // (Split's onRelease reads the event directly, unthrottled) makes the
       // resulting percentages deterministic regardless of throttle timing.
+      // The press lands on the divider (50%) because Split keeps the grab
+      // offset, and the move holds the button because Split aborts the drag
+      // on a buttonless mousemove.
       await act(async () => {
-        fireEvent.mouseDown(splitEl, { button: 0 });
-        fireEvent.mouseMove(document, { clientX: 700 });
+        fireEvent.mouseDown(splitEl, { button: 0, clientX: 500 });
+        fireEvent.mouseMove(document, { clientX: 700, buttons: 1 });
         fireEvent.mouseUp(document, { clientX: 700 });
       });
     } finally {

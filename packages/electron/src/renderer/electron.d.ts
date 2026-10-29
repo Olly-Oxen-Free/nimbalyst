@@ -1,8 +1,29 @@
+type OrganizationDirectoryResult = import('../shared/organizationDirectory').OrganizationDirectoryResult;
+/** Mirrors the main-process `git:status-changed` payload. */
+interface GitStatusChangedPayload {
+  workspacePath: string;
+  /**
+   * The repo whose state changed. In a multi-root workspace this may sit
+   * inside an attached folder rather than under `workspacePath`, so listeners
+   * route on it. Absent from emitters that predate multi-root, in which case
+   * `workspacePath` is the repo.
+   */
+  repoPath?: string;
+  revision?: number;
+  status?: {
+    branch: string;
+    ahead: number;
+    behind: number;
+    hasUncommitted: boolean;
+  };
+}
+
 interface FileTreeItem {
   name: string;
   path: string;
   type: 'file' | 'directory';
   children?: FileTreeItem[];
+  childrenTruncated?: boolean;
 }
 
 interface ClaudeForWindowsInstallation {
@@ -151,11 +172,19 @@ interface SemanticSearchResult {
   snippet: string;
   score: number;
   signals: { dense: boolean; sparse: boolean };
+  /**
+   * Raw pre-fusion scores. `score` is an RRF rank reciprocal and is not
+   * comparable across queries; a caller that needs an absolute similarity
+   * threshold reads `similarity.cosine`.
+   */
+  similarity?: { cosine?: number; bm25?: number };
 }
 
 interface ElectronAPI {
   team: {
+    list: (options?: { forceRefresh?: boolean }) => Promise<OrganizationDirectoryResult>;
     getKeyCustodyStatus: (orgId: string) => Promise<{ success: boolean; mode?: 'server-managed' | 'unmigrated'; error?: string }>;
+    recovery: (orgId: string, command: import('../shared/teamRecovery').TeamRecoveryCommand, options?: { workspacePath?: string; password?: string }) => Promise<{ success: boolean; overview?: import('../shared/teamRecovery').TeamRecoveryOverview; error?: string }>;
     openManagementWindow: (target?: TeamManagementWindowTarget) => Promise<{ success: boolean }>;
     resolveOrgProjectsLocalState: (orgId: string) => Promise<{
       success: boolean;
@@ -180,7 +209,7 @@ interface ElectronAPI {
     [method: string]: any;
   };
   organization: {
-    list: () => Promise<any>;
+    list: () => Promise<OrganizationDirectoryResult>;
     get: (orgId: string) => Promise<any>;
     rename: (
       orgId: string,
@@ -198,6 +227,11 @@ interface ElectronAPI {
       orgId: string,
       email: string,
       role?: 'owner' | 'admin' | 'member' | 'viewer' | 'guest',
+      /** Projects beyond the org's primary one; keyed by `teamProjectId`. */
+      projectGrants?: Array<{
+        teamProjectId: string;
+        projectRole: 'project-admin' | 'project-editor' | 'project-viewer';
+      }>,
     ) => Promise<any>;
     removeMember: (orgId: string, memberId: string) => Promise<any>;
     updateMemberRole: (orgId: string, memberId: string, role: string) => Promise<any>;
@@ -257,6 +291,7 @@ interface ElectronAPI {
   // File menu callbacks
   onFileNew: (callback: () => void) => () => void;
   onFileNewInWorkspace: (callback: () => void) => () => void;
+  onCreateInTree: (callback: (kind: string) => void) => () => void;
   onAgentNewSession: (callback: () => void) => () => void;
   onFileOpen: (callback: () => void) => () => void;
   onFileSave: (callback: () => void) => () => void;
@@ -266,7 +301,6 @@ interface ElectronAPI {
   // Workspace callbacks
   onWorkspaceOpened: (callback: (data: { workspacePath: string; workspaceName: string; fileTree: FileTreeItem[] }) => void) => () => void;
   onOpenWorkspaceFile: (callback: (filePath: string) => void) => () => void;
-  onOpenDocument: (callback: (data: { path: string }) => void) => () => void;
   onOpenWorkspaceFromCLI: (callback: (workspacePath: string) => void) => () => void;
   onWorkspaceFileTreeUpdated: (callback: (data: { fileTree: FileTreeItem[]; addedPath?: string; removedPath?: string }) => void) => () => void;
 
@@ -366,12 +400,13 @@ interface ElectronAPI {
   listShares: () => Promise<{ success: boolean; shares?: Array<{ shareId: string; sessionId: string; title: string; sizeBytes: number; createdAt: string; expiresAt: string | null; viewCount: number; owningPersonalOrgId: string }>; error?: string }>;
   deleteShare: (options: { shareId: string; sessionId?: string; owningPersonalOrgId?: string }) => Promise<{ success: boolean; error?: string }>;
   getShareKeys: () => Promise<Record<string, string>>;
-  shareFileAsLink: (options: { filePath: string; expirationDays?: number; personalOrgId?: string }) => Promise<{ success: boolean; url?: string; shareId?: string; isUpdate?: boolean; encryptionKey?: string; owningPersonalOrgId?: string; error?: string }>;
+  shareFileAsLink: (options: { filePath: string; expirationDays?: number; personalOrgId?: string; mermaidSvgs?: Record<string, string> }) => Promise<{ success: boolean; url?: string; shareId?: string; isUpdate?: boolean; encryptionKey?: string; owningPersonalOrgId?: string; error?: string }>;
   getShareExpirationPreference: () => Promise<number>;
   setShareExpirationPreference: (days: number) => Promise<void>;
 
   setDocumentEdited: (edited: boolean) => void;
   setTitle: (title: string) => void;
+  setRepresentedFile: (filePath: string | null) => void;
   openAccountSettings: () => Promise<{ success: boolean; error?: string }>;
   sendToMainWindow?: (channel: string, data: unknown) => Promise<void>;
   reportUserActivity?: () => void;
@@ -388,6 +423,8 @@ interface ElectronAPI {
   // Workspace operations
   getFolderContents: (dirPath: string) => Promise<FileTreeItem[]>;
   refreshFolderContents: (folderPath: string) => Promise<FileTreeItem[]>;
+  /** Every file under a folder as folder-relative POSIX paths; `truncated` when the global cap was hit. */
+  getFolderFilesRecursive: (folderPath: string) => Promise<{ files: string[]; truncated: boolean }>;
   createFile: (filePath: string, content: string) => Promise<{ success: boolean; filePath?: string; error?: string }>;
   createFolder: (folderPath: string) => Promise<{ success: boolean; error?: string }>;
   switchWorkspaceFile: (filePath: string) => Promise<{ filePath: string; content: string } | { error: string } | null>;
@@ -411,6 +448,8 @@ interface ElectronAPI {
   copyToClipboard: (text: string) => Promise<{ success: boolean }>;
   copyImageToClipboard: (payload: { filePath?: string; dataUrl?: string }) => Promise<{ success: boolean; error?: string }>;
   readClipboard: () => Promise<{ success: boolean; text?: string }>;
+  /** Under WSL, the image on the Windows clipboard; null elsewhere or when there is none. */
+  readWindowsClipboardImage: () => Promise<{ mimeType: string; data: Uint8Array<ArrayBuffer> } | null>;
 
   // Settings operations
   getSidebarWidth: (workspacePath: string) => Promise<number>;
@@ -591,7 +630,7 @@ interface ElectronAPI {
   onMcpApplyDiff: (callback: (data: { replacements: any[], resultChannel: string, targetFilePath?: string, workspacePath?: string, agent?: { sessionId: string; sessionName: string } }) => void) => () => void;
   onMcpStreamContent: (callback: (data: { streamId: string, content: string, position: string, insertAfter?: string, mode?: string, targetFilePath?: string, resultChannel: string }) => void) => () => void;
   onMcpNavigateTo: (callback: (data: { line: number, column: number }) => void) => () => void;
-  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string, workspacePath?: string }) => void) => () => void;
+  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string, workspacePath?: string, includeDecisionState?: boolean }) => void) => () => void;
   onMcpReadCollabDocComments: (callback: (data: {
     targetFilePath: string;
     input: any;
@@ -614,7 +653,7 @@ interface ElectronAPI {
   }) => void) => () => void;
   sendMcpApplyDiffResult: (resultChannel: string, result: any) => void;
   sendMcpStreamContentResult: (resultChannel: string, result: any) => void;
-  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; error?: string; code?: string }) => void;
+  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; title?: string; documentType?: string; decisionState?: unknown; error?: string; code?: string }) => void;
   sendMcpCollabDocCommentResult: (
     resultChannel: string,
     result: { success: boolean; result?: unknown; code?: string; error?: string },
@@ -727,6 +766,13 @@ interface ElectronAPI {
     }>;
     setArchived: (payload: { workspacePath: string; type: string; archived: boolean }) =>
       Promise<{ success: boolean; error?: string }>;
+    defineType: (payload: { workspacePath: string; schema: Record<string, unknown> }) => Promise<{
+      success: boolean;
+      type?: string;
+      scope?: 'team' | 'personal';
+      status?: 'created' | 'syncing';
+      error?: string;
+    }>;
   };
 
   // Document Service
@@ -747,6 +793,7 @@ interface ElectronAPI {
       priority: string;
       workspace: string;
       description?: string;
+      creationRequestId?: string;
       owner?: string;
       tags?: string[];
       customFields?: Record<string, any>;
@@ -755,7 +802,11 @@ interface ElectronAPI {
       content?: any;
       source?: string;
       sourceRef?: string;
-    }) => Promise<{ success: boolean; item?: any; error?: string }>;
+    }) => Promise<{ success: boolean; item?: any; error?: string; publication?: import("@nimbalyst/runtime/core/trackerCreation").TrackerCreationPublication }>;
+    publishTrackerCreation: (payload: { workspacePath: string; itemId: string }) => Promise<import('@nimbalyst/runtime/core/trackerCreation').TrackerCreationPublication>;
+    getTrackerCreationStatus: (payload: { workspacePath: string; itemId: string }) => Promise<import('@nimbalyst/runtime/core/trackerCreation').TrackerCreationPublication | null>;
+    listPendingTrackerCreations: (workspacePath: string) => Promise<string[]>;
+    stageTrackerImage: (payload: { workspacePath: string; bytes: ArrayBuffer; mimeType: string }) => Promise<{ relativePath: string }>;
     updateTrackerItem: (payload: {
       itemId: string;
       updates: Record<string, any>;
@@ -796,7 +847,9 @@ interface ElectronAPI {
     updateTrackerItemContent: (payload: {
       itemId: string;
       content: any;
-    }) => Promise<{ success: boolean; error?: string }>;
+      /** Write only if the stored body is still at this version; otherwise answer `conflict`. */
+      expectedBodyVersion?: number;
+    }) => Promise<{ success: boolean; conflict?: boolean; bodyVersion?: number; error?: string }>;
     getTrackerItemContent: (payload: {
       itemId: string;
     }) => Promise<{ success: boolean; content?: any; error?: string }>;
@@ -1096,7 +1149,7 @@ interface ElectronAPI {
 
   // Git operations (real-time status events)
   git?: {
-    onStatusChanged?: (callback: (data: { workspacePath: string }) => void) => () => void;
+    onStatusChanged?: (callback: (data: GitStatusChangedPayload) => void) => () => void;
     onCommitDetected?: (callback: (data: {
       workspacePath: string;
       commitHash: string;
@@ -1642,7 +1695,7 @@ interface ElectronAPI {
   };
 
   // Worktree operations
-  worktreeCreate: (workspacePath: string, options?: { name?: string; baseBranch?: string }) => Promise<{
+  worktreeCreate: (workspacePath: string, options?: { name?: string; baseBranch?: string; sourceFolderPath?: string }) => Promise<{
     success: boolean;
     error?: string;
     worktree?: {
@@ -1938,6 +1991,8 @@ interface ElectronAPI {
 
   // Open external links
   openExternal: (url: string) => Promise<void>;
+  /** Always the browser; skips the in-app routing `openExternal` applies to console links. */
+  openInBrowser: (url: string) => Promise<void>;
   openThirdPartyNotices: () => Promise<{ success: boolean; error?: string }>;
 
   // Image operations

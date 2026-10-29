@@ -11,7 +11,8 @@
 
 import { atom } from 'jotai';
 import { atomFamily } from '../debug/atomFamilyRegistry';
-import { activeTabIdAtom, getFilePathFromKey } from '@nimbalyst/runtime/store';
+import { store } from '@nimbalyst/runtime/store';
+import { isNonFilesystemTab } from '../../contexts/TabsContext';
 
 /**
  * Git status codes matching what `simple-git` provides.
@@ -117,16 +118,34 @@ export interface RevealRequest {
 export const revealRequestAtom = atom<RevealRequest | null>(null);
 
 /**
- * Derived: Active file path from the main editor context.
- * WorkspaceSidebar subscribes to this for auto-scroll functionality.
- * This allows the file tree to react to tab switches without requiring
- * the parent component to re-render.
+ * The file the main editor's active tab shows; null when no tab is open or the
+ * tab is not a file on disk (a tracker item, a shared document, a virtual
+ * page). The repo-aware UI -- the title-bar branch, the Git operations panel,
+ * the repo a new worktree branches from -- follows it via
+ * `activeFileRepoPathAtom`.
+ *
+ * The main editor's tabs live in TabsContext, not Jotai, so EditorMode keeps
+ * this in step with `bindActiveFileToTabs`. It keeps its value while EditorMode
+ * is unmounted, so agent mode still knows the file the user was last in.
  */
-export const activeFilePathAtom = atom((get) => {
-  const activeTabKey = get(activeTabIdAtom('main'));
-  if (!activeTabKey) return null;
-  return getFilePathFromKey(activeTabKey);
-});
+export const activeFilePathAtom = atom<string | null>(null);
+
+interface ActiveTabSource {
+  subscribe: (callback: () => void) => () => void;
+  getSnapshot: () => { activeTabId: string | null; tabs: Map<string, { filePath: string }> };
+}
+
+/** Mirror the main editor's active tab into `activeFilePathAtom`; returns the unsubscribe. */
+export function bindActiveFileToTabs(tabs: ActiveTabSource, target = store): () => void {
+  const update = () => {
+    const { activeTabId, tabs: open } = tabs.getSnapshot();
+    const filePath = activeTabId ? open.get(activeTabId)?.filePath : undefined;
+    const next = filePath && !isNonFilesystemTab(filePath) ? filePath : null;
+    if (target.get(activeFilePathAtom) !== next) target.set(activeFilePathAtom, next);
+  };
+  update();
+  return tabs.subscribe(update);
+}
 
 /**
  * Active filter for file tree (e.g., "modified", "untracked").
@@ -338,6 +357,8 @@ export interface RendererFileTreeItem {
   path: string;
   type: 'file' | 'directory';
   children?: RendererFileTreeItem[];
+  /** The main-process walk stopped at its depth limit here; `children` was not read. */
+  childrenTruncated?: boolean;
 }
 
 // Special directories that should always appear first with distinct styling
@@ -347,8 +368,170 @@ const SPECIAL_DIRECTORIES = ['nimbalyst-local'];
  * The raw (unfiltered) file tree from the workspace watcher.
  * Written by the centralized file tree listener (fileTreeListeners.ts).
  * WorkspaceSidebar reads this and applies filters before passing to FlatFileTree.
+ *
+ * In a multi-root workspace this holds a FOREST: one synthetic directory node
+ * per root, whose children are that root's contents. With no attached folders
+ * it holds the primary root's contents directly, exactly as before -- so a
+ * single-folder workspace shows no root header row and nothing downstream
+ * changes.
  */
 export const rawFileTreeAtom = atom<RendererFileTreeItem[]>([]);
+
+/**
+ * Every root the workspace spans, primary first. Empty or single-entry for an
+ * ordinary workspace. Read by the tree flattener to mark root header rows and
+ * by the explorer to offer "Detach Folder".
+ */
+export const workspaceRootPathsAtom = atom<string[]>([]);
+
+/**
+ * Build the explorer forest from per-root trees.
+ *
+ * Roots with no loaded tree yet render as empty folders rather than vanishing,
+ * so an attached folder appears the moment it is attached instead of popping in
+ * when its first scan lands.
+ *
+ * Pure and exported for testing.
+ */
+export function buildFileTreeForest(
+  rootPaths: string[],
+  treesByRoot: Record<string, RendererFileTreeItem[]>,
+): RendererFileTreeItem[] {
+  // One root is the single-folder case: no synthetic wrapper, no header row.
+  if (rootPaths.length <= 1) {
+    const only = rootPaths[0];
+    return only ? (treesByRoot[only] ?? []) : [];
+  }
+
+  return rootPaths.map((rootPath) => ({
+    name: basenameOfPath(rootPath),
+    path: rootPath,
+    type: 'directory' as const,
+    children: treesByRoot[rootPath] ?? [],
+  }));
+}
+
+/** Last path segment, tolerant of trailing slashes and Windows separators. */
+function basenameOfPath(rootPath: string): string {
+  const trimmed = rootPath.replace(/[\\/]+$/, '');
+  const segments = trimmed.split(/[\\/]/);
+  return segments[segments.length - 1] || trimmed;
+}
+
+/** Forward slashes, no trailing slash (except a bare drive root). */
+export function normalizeTreePath(path: string): string {
+  if (!path) return '';
+  let normalized = path.replace(/\\/g, '/');
+  if (/^[a-zA-Z]:\/$/i.test(normalized)) {
+    return normalized;
+  }
+  if (normalized !== '/' && normalized.endsWith('/')) {
+    normalized = normalized.replace(/\/+$/, '');
+  }
+  return normalized;
+}
+
+/**
+ * Carry children the renderer already loaded into a rebuilt tree, wherever the
+ * rebuild stopped at the main-process depth limit. A watcher rebuild replaces a
+ * whole root, and without this every folder opened below that depth would turn
+ * empty on the next file change. Branches with nothing to carry are shared.
+ */
+export function keepLoadedTruncatedChildren(
+  previous: RendererFileTreeItem[] | undefined,
+  next: RendererFileTreeItem[],
+): RendererFileTreeItem[] {
+  if (!previous?.length) return next;
+  const loaded = new Map<string, RendererFileTreeItem[]>();
+  const collect = (items: RendererFileTreeItem[]) => {
+    for (const item of items) {
+      if (item.type === 'directory' && item.children?.length) {
+        loaded.set(normalizeTreePath(item.path), item.children);
+        collect(item.children);
+      }
+    }
+  };
+  collect(previous);
+
+  const graft = (items: RendererFileTreeItem[]): RendererFileTreeItem[] => {
+    let changed = false;
+    const result = items.map((item) => {
+      if (item.type !== 'directory') return item;
+      if (item.childrenTruncated) {
+        const kept = loaded.get(normalizeTreePath(item.path));
+        if (!kept) return item;
+        changed = true;
+        return { ...item, children: kept };
+      }
+      if (!item.children?.length) return item;
+      const children = graft(item.children);
+      if (children === item.children) return item;
+      changed = true;
+      return { ...item, children };
+    });
+    return changed ? result : items;
+  };
+  return graft(next);
+}
+
+/**
+ * Open folders where a rebuild stopped at the depth limit. Their kept children
+ * are only as fresh as the last expand, so the listener re-reads these.
+ */
+export function findExpandedTruncatedFolders(
+  items: RendererFileTreeItem[],
+  expanded: Set<string>,
+): string[] {
+  const found: string[] = [];
+  const walk = (nodes: RendererFileTreeItem[]) => {
+    for (const node of nodes) {
+      if (node.type !== 'directory') continue;
+      if (node.childrenTruncated) {
+        if (expanded.has(node.path)) found.push(node.path);
+      } else if (node.children) {
+        walk(node.children);
+      }
+    }
+  };
+  walk(items);
+  return found;
+}
+
+/**
+ * Replace one folder's children within a tree, returning the new tree and
+ * whether anything matched. Structurally shares untouched branches so React
+ * only re-renders the subtree that actually changed.
+ */
+export function replaceFolderChildren(
+  items: RendererFileTreeItem[],
+  normalizedFolderPath: string,
+  newChildren: RendererFileTreeItem[],
+): [RendererFileTreeItem[], boolean] {
+  let mutated = false;
+
+  const updatedItems = items.map(item => {
+    if (item.type !== 'directory') {
+      return item;
+    }
+
+    if (normalizeTreePath(item.path) === normalizedFolderPath) {
+      mutated = true;
+      return { ...item, children: newChildren };
+    }
+
+    if (item.children && item.children.length > 0) {
+      const [nextChildren, childMutated] = replaceFolderChildren(item.children, normalizedFolderPath, newChildren);
+      if (childMutated) {
+        mutated = true;
+        return { ...item, children: nextChildren };
+      }
+    }
+
+    return item;
+  });
+
+  return [mutated ? updatedItems : items, mutated];
+}
 
 /**
  * Whether the initial file tree load has completed.
@@ -365,11 +548,6 @@ export const fileTreeItemsAtom = atom<RendererFileTreeItem[]>([]);
 /**
  * Current active file path for the flat tree.
  * Written by FlatFileTree when currentFilePath prop changes.
- *
- * This exists because the main tab system uses TabsContext (not Jotai),
- * so the Jotai-based activeFilePathAtom (which reads activeTabIdAtom)
- * doesn't get updated. The component bridges the gap by syncing the
- * prop value into this atom.
  */
 export const flatTreeActiveFileAtom = atom<string | null>(null);
 
@@ -419,6 +597,12 @@ export interface FlatTreeNode {
   isMultiSelected: boolean;
   isDragOver: boolean;
   isSpecialDirectory: boolean;
+  /**
+   * A top-level root of a multi-root workspace. Only ever true when the
+   * workspace has attached folders -- a single-folder workspace has no root
+   * header rows at all.
+   */
+  isWorkspaceRoot: boolean;
 }
 
 /**
@@ -432,10 +616,19 @@ export interface FlattenTreeOptions {
   selectedFolder: string | null;
   selectedPaths: Set<string>;
   dragState: DragState | null;
+  /**
+   * Roots of a multi-root workspace. Nodes at depth 0 whose path is in this set
+   * render as root header rows. Omit (or pass a set with fewer than two
+   * entries) for an ordinary single-folder workspace.
+   */
+  workspaceRootPaths?: Set<string>;
 }
 
 export function flattenTree(options: FlattenTreeOptions): FlatTreeNode[] {
   const { items, expanded, activeFile, selectedFolder, selectedPaths, dragState } = options;
+  const rootPaths = options.workspaceRootPaths;
+  // One root is a plain workspace: nothing is a "root header row".
+  const marksRoots = (rootPaths?.size ?? 0) > 1;
   const result: FlatTreeNode[] = [];
 
   function walk(treeItems: RendererFileTreeItem[], depth: number, parentPath: string | null) {
@@ -457,6 +650,7 @@ export function flattenTree(options: FlattenTreeOptions): FlatTreeNode[] {
         isMultiSelected: selectedPaths.has(item.path),
         isDragOver: dragState?.dropTargetPath === item.path,
         isSpecialDirectory: isDir && SPECIAL_DIRECTORIES.includes(item.name),
+        isWorkspaceRoot: marksRoots && depth === 0 && rootPaths!.has(item.path),
       });
 
       if (isExpanded && item.children) {
@@ -484,5 +678,6 @@ export const visibleNodesAtom = atom<FlatTreeNode[]>((get) => {
     selectedFolder: get(selectedFolderPathAtom),
     selectedPaths: get(selectedPathsAtom),
     dragState: get(dragStateAtom),
+    workspaceRootPaths: new Set(get(workspaceRootPathsAtom)),
   });
 });

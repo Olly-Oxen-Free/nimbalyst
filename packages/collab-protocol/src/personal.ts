@@ -1,3 +1,10 @@
+import type {
+  IndexPageRequestMessage,
+  IndexPageResponseMessage,
+  IndexChangesAvailableMessage,
+  PersonalStatePageRequestMessage,
+  PersonalStatePageResponseMessage,
+} from './indexReplication.js';
 /**
  * PersonalSessionRoom + PersonalIndexRoom wire protocol.
  *
@@ -6,12 +13,14 @@
  * and one `ClientMessage` / `ServerMessage` union here.
  */
 
-
 // ============================================================================
 // Client -> Server Messages
 // ============================================================================
 
 export type ClientMessage =
+  | { type: 'beginSessionReplay'; activityAt: number }
+  | IndexPageRequestMessage
+  | PersonalStatePageRequestMessage
   | SyncRequestMessage
   | AppendMessageMessage
   | UpdateMetadataMessage
@@ -31,8 +40,12 @@ export type ClientMessage =
   | VoiceToolRequestMessage
   | VoiceToolResponseMessage
   | SessionControlCommandMessage
+  | SessionContextUpdateMessage
   | RegisterPushTokenMessage
   | UnregisterPushTokenMessage
+  | RegisterLiveActivityTokenMessage
+  | UnregisterLiveActivityTokenMessage
+  | FleetActivityUpdateMessage
   | RequestMobilePushMessage
   | ProjectConfigUpdateMessage
   | SettingsSyncMessage
@@ -138,6 +151,8 @@ export interface DeviceAnnounceMessage {
 export interface CreateSessionRequestMessage {
   type: 'createSessionRequest';
   request: EncryptedCreateSessionRequest;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
 }
 
 /** Response to session creation request from desktop */
@@ -182,6 +197,8 @@ export interface EncryptedCreateSessionResponse {
 export interface CreateWorktreeRequestMessage {
   type: 'createWorktreeRequest';
   request: EncryptedCreateWorktreeRequest;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
 }
 
 /** Response to worktree creation request from desktop */
@@ -254,6 +271,31 @@ export interface SessionControlMessage {
   payload?: Record<string, unknown>;
   timestamp: number;
   sentBy: 'desktop' | 'mobile';
+  /** Stable ID of the sending device. Absent on legacy clients. */
+  sentByDeviceId?: string;
+  /** Deliver to this device only. Absent preserves legacy broadcast routing. */
+  targetDeviceId?: string;
+}
+
+/**
+ * A session's live context-window usage, relayed to the user's other devices
+ * and never stored. Every assistant step changes it; persisting each value
+ * cost an index row rewrite plus a replication journal entry. The stored
+ * index row still gets the last value at the turn boundary.
+ *
+ * `encryptedContext` decrypts to client-metadata JSON holding only
+ * `currentContext: { tokens, contextWindow }`. `at` orders updates.
+ */
+export interface LiveSessionContext {
+  sessionId: string;
+  encryptedContext: string;
+  contextIv: string;
+  at: number;
+}
+
+export interface SessionContextUpdateMessage {
+  type: 'sessionContextUpdate';
+  update: LiveSessionContext;
 }
 
 /** Register a push notification token for this device */
@@ -268,6 +310,118 @@ export interface RegisterPushTokenMessage {
 export interface UnregisterPushTokenMessage {
   type: 'unregisterPushToken';
   deviceId: string;
+}
+
+/**
+ * Which ActivityKit token this is.
+ *
+ * They are not interchangeable and they are not the device token either. A
+ * push-to-start token belongs to the app and lets the server create an activity
+ * on a phone whose owner has not opened the app; an update token belongs to one
+ * live activity and dies with it. Sending a content-state update to a
+ * push-to-start token, or a start payload to an update token, fails at APNs with
+ * an error that reads like a bad token — so the kinds are stored separately and
+ * never merged.
+ */
+export type LiveActivityTokenKind = 'pushToStart' | 'update';
+
+/**
+ * Register an ActivityKit push token for the Live Activity lane.
+ *
+ * Deliberately a different message from `registerPushToken`: the alert lane and
+ * the Live Activity lane use different APNs topics and different payload shapes,
+ * and conflating the two kinds of token server-side would send fleet updates to
+ * the alert channel or vice versa.
+ */
+export interface RegisterLiveActivityTokenMessage {
+  type: 'registerLiveActivityToken';
+  token: string;
+  kind: LiveActivityTokenKind;
+  deviceId: string;
+  /** Only iOS has Live Activities today; carried so the server never has to guess. */
+  platform: 'ios';
+  /** `development` uses the APNs sandbox host. Absent means production. */
+  environment?: 'development' | 'production';
+}
+
+/**
+ * Drop a Live Activity token.
+ *
+ * Sent when the activity ends, when the user turns the feature off, and when the
+ * phone notices its own activity is gone. Omitting `kind` drops both kinds for
+ * the device, which is what turning the feature off means.
+ */
+export interface UnregisterLiveActivityTokenMessage {
+  type: 'unregisterLiveActivityToken';
+  deviceId: string;
+  kind?: LiveActivityTokenKind;
+  /** Optional identity prevents an old activity from unregistering a newer token. */
+  token?: string;
+}
+
+/**
+ * One row on the Live Activity card.
+ *
+ * Plaintext, like the existing push titles: the plan settled that lock-screen
+ * exposure of session names rather than coarsening to counts-plus-project.
+ */
+export interface FleetActivityRow {
+  sessionId: string;
+  title: string;
+  /** Workspace basename. The card has no room for a path. */
+  project: string;
+  state: 'approval' | 'decision' | 'failed' | 'stalled';
+  /** Epoch ms this session entered `state`; the phone ticks the elapsed time itself. */
+  since: number;
+}
+
+/**
+ * The whole ambient fleet, as the phone renders it.
+ *
+ * The same derived value the macOS menu bar strip renders, so the two surfaces
+ * cannot disagree. `revision` is monotonic per desktop process and lets the
+ * server (and the phone) drop an update that arrives out of order.
+ */
+export interface FleetActivitySnapshot {
+  running: number;
+  needsApproval: number;
+  needsDecision: number;
+  failed: number;
+  stalled: number;
+  unread: number;
+  /** Ranked, at most three. Empty means nothing is waiting on the user. */
+  rows: FleetActivityRow[];
+  /** Waiting sessions that did not fit in `rows`. */
+  overflow: number;
+  revision: number;
+  /** Epoch ms the desktop generated this. */
+  updatedAt: number;
+  /** How long after `updatedAt` the card should dim itself. */
+  staleAfterMs: number;
+}
+
+/**
+ * Desktop -> server: the fleet changed, update the Live Activity.
+ *
+ * Coalesced on the desktop — this arrives on transitions, not on streaming
+ * ticks. The server decides between starting, updating and ending an activity
+ * from the payload and the tokens it holds.
+ */
+export interface FleetActivityUpdateMessage {
+  type: 'fleetActivityUpdate';
+  activity: FleetActivitySnapshot;
+  /**
+   * Whether this desktop is itself displaying the fleet right now.
+   *
+   * Deliberately on the message rather than on the snapshot: it is routing
+   * metadata, not card content, and the snapshot is sent verbatim to the phone
+   * as `content-state`. The server pairs this with its own presence check
+   * before suppressing the card — a Mac that says it is showing the strip but
+   * that nobody is sitting at should not silence the phone. Absent from older
+   * desktops, and absent means "not showing", which preserves the previous
+   * always-publish behaviour.
+   */
+  shownOnDesktop?: boolean;
 }
 
 /** Request to send a push notification to mobile devices */
@@ -382,6 +536,10 @@ export interface EncryptedSettingsPayload {
 // ============================================================================
 
 export type ServerMessage =
+  | { type: 'indexSessionExpired'; sessionId: string; activityAt: number }
+  | IndexChangesAvailableMessage
+  | IndexPageResponseMessage
+  | PersonalStatePageResponseMessage
   | SyncResponseMessage
   | MessageBroadcastMessage
   | MetadataBroadcastMessage
@@ -401,6 +559,7 @@ export type ServerMessage =
   | VoiceToolRequestBroadcastMessage
   | VoiceToolResponseBroadcastMessage
   | SessionControlBroadcastMessage
+  | SessionContextBroadcastMessage
   | SettingsSyncBroadcastMessage
   | ReadReceiptSyncBroadcastMessage
   | TrackerPersonalStateSyncBroadcastMessage
@@ -499,6 +658,8 @@ export interface DeviceLeftMessage {
 export interface CreateSessionRequestBroadcastMessage {
   type: 'createSessionRequestBroadcast';
   request: EncryptedCreateSessionRequest;
+  /** Host selected to execute this request. */
+  targetDeviceId?: string;
   fromConnectionId?: string;
 }
 
@@ -513,6 +674,8 @@ export interface CreateSessionResponseBroadcastMessage {
 export interface CreateWorktreeRequestBroadcastMessage {
   type: 'createWorktreeRequestBroadcast';
   request: EncryptedCreateWorktreeRequest;
+  /** Host selected to execute this request. */
+  targetDeviceId?: string;
   fromConnectionId?: string;
 }
 
@@ -541,6 +704,13 @@ export interface CreateWorktreeResponseBroadcastMessage {
 export interface SessionControlBroadcastMessage {
   type: 'sessionControlBroadcast';
   message: SessionControlMessage;
+  fromConnectionId?: string;
+}
+
+/** Relay of a `sessionContextUpdate` to the user's other devices. */
+export interface SessionContextBroadcastMessage {
+  type: 'sessionContextBroadcast';
+  update: LiveSessionContext;
   fromConnectionId?: string;
 }
 
@@ -606,6 +776,7 @@ export interface ErrorMessage {
   type: 'error';
   code: string;
   message: string;
+  requestId?: string;
 }
 
 // ============================================================================
@@ -619,10 +790,12 @@ export interface ErrorMessage {
 export interface DeviceInfo {
   /** Unique device ID (stable across sessions, generated per device) */
   deviceId: string;
+  /** Server-owned inventory visibility; never affects session ownership. */
+  inventoryHidden?: boolean;
   /** Human-readable device name (e.g., "MacBook Pro", "iPhone 15") */
   name: string;
   /** Device type for icon display */
-  type: 'desktop' | 'mobile' | 'tablet' | 'unknown';
+  type: 'desktop' | 'mobile' | 'tablet' | 'headless' | 'unknown';
   /** Platform (e.g., "macos", "ios", "windows", "android", "web") */
   platform: string;
   /** App version */
@@ -691,6 +864,26 @@ export interface SessionMetadata {
   isExecuting?: boolean;
 }
 
+/** Encrypted queued-prompt preview retained in the personal session index. */
+export interface IndexEncryptedQueuedPrompt {
+  options?: { mode?: "agent" | "planning"; model?: string; effortLevel?: string };
+  id: string;
+  encryptedPrompt: string;
+  iv: string;
+  timestamp: number;
+  source?: string;
+  encryptedAttachments?: Array<{
+    id: string;
+    filename: string;
+    mimeType: string;
+    encryptedData: string;
+    iv: string;
+    size: number;
+    width?: number;
+    height?: number;
+  }>;
+}
+
 /** Session entry in the PersonalIndexRoom */
 export interface SessionIndexEntry {
   sessionId: string;
@@ -705,22 +898,29 @@ export interface SessionIndexEntry {
   provider: string;
   model?: string;
   mode?: 'agent' | 'planning';
-  messageCount: number;
+  /** Omit when a metadata-only publisher has no authoritative count. */
+  messageCount?: number;
   lastMessageAt: number;
   createdAt: number;
   updatedAt: number;
   /** Whether the session is currently executing (processing AI request) */
   isExecuting?: boolean;
-  /** Parent session ID for workstream/worktree hierarchy (plaintext UUID) */
-  parentSessionId?: string;
+  /** Omitted preserves the stored queue; zero is an explicit empty queue. */
+  queuedPromptCount?: number;
+  /** Omitted preserves the stored preview; an empty array clears it. */
+  encryptedQueuedPrompts?: IndexEncryptedQueuedPrompt[];
+  /** Parent session ID (plaintext UUID); omitted preserves, null clears. */
+  parentSessionId?: string | null;
   /** Structural type: 'session' (normal), 'workstream' (parent container), 'blitz' (quick task) */
   sessionType?: string;
   /** Worktree ID for git worktree association (plaintext UUID) */
   worktreeId?: string;
+  /** Device that owns execution for this session (plaintext stable device ID). */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'). Plaintext - drives mobile meta-agent grouping. */
   agentRole?: string;
-  /** Meta-agent parent session ID for spawned children (plaintext UUID). Drives mobile meta-agent grouping. */
-  createdBySessionId?: string;
+  /** Manager session ID (plaintext UUID); omitted preserves, null clears. */
+  createdBySessionId?: string | null;
   /** Whether the session is archived */
   isArchived?: boolean;
   /** Whether the session is pinned */

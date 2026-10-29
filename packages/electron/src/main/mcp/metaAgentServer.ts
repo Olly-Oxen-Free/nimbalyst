@@ -1,8 +1,9 @@
+import type { OrchestrationMessageKind } from '@nimbalyst/runtime/ai/server/types';
 /**
  * Meta-agent (child-session orchestration) tool surface — `create_session`,
  * `spawn_session`, `send_prompt`, `list_queued_prompts`, `respond_to_prompt`,
  * `get_session_status`, `get_session_result`, `list_spawned_sessions`,
- * `list_worktrees`.
+ * `list_worktrees`, `consume_session_inbox`.
  *
  * MCP consolidation: these tools are served by the unified internal MCP HTTP
  * server's `/mcp/host` endpoint (`nimbalyst-host`). This module exports the tool
@@ -12,7 +13,7 @@
  * `setMetaAgentToolFns`.
  */
 
-import { resolveProjectPath } from "../utils/workspaceDetection";
+import { resolveCallerWorkspaceId } from "../utils/workspaceIdentity";
 
 type CreateSessionArgs = {
   title?: string;
@@ -22,6 +23,8 @@ type CreateSessionArgs = {
   useWorktree?: boolean;
   worktreeId?: string;
   toolScope?: string;
+  effortLevel?: string;
+  reporting?: string;
 };
 
 type SpawnSessionArgs = {
@@ -30,14 +33,18 @@ type SpawnSessionArgs = {
   useWorktree?: boolean;
   model?: string;
   notifyOnComplete?: boolean;
+  reporting?: string;
   /**
    * When true, the new session is created at the top level — no parent,
    * no workstream container, no shared files-edited or tabs with the
    * caller. Use for fix-and-commit-separately work that should not pollute
    * the caller's workstream. When false (the default), the new session is
-   * spawned as a sibling under the caller's workstream.
+   * spawned directly under the caller in the same worktree.
    */
   isolated?: boolean;
+  /** Place the new session beside the caller instead of under it. */
+  besideCaller?: boolean;
+  effortLevel?: string;
 };
 
 type RespondToPromptArgs = {
@@ -123,7 +130,8 @@ interface MetaAgentToolFns {
     workspaceId: string,
     targetSessionId: string,
     prompt: string,
-    interrupt?: boolean
+    interrupt?: boolean,
+    messageKind?: OrchestrationMessageKind
   ) => Promise<string>;
   notifyUser: (
     metaSessionId: string,
@@ -162,6 +170,13 @@ export interface MetaAgentOpenAITool {
   };
 }
 
+const REPORTING_SCHEMA = {
+  type: "string",
+  enum: ["none", "final", "messages"],
+  description:
+    "How the new session reports back to you. \"none\" (default): nothing, fire and forget. \"final\": you are notified when it completes, errors or needs input, and its final response is the report. \"messages\": as final, and it may also send material changes mid-run. Choose messages only when you will act on them before it finishes.",
+};
+
 /**
  * The single source-of-truth list of meta-agent tools, in MCP
  * `{ name, description, inputSchema }` shape. Both the SSE MCP server's
@@ -186,7 +201,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
   {
     name: "create_session",
     description:
-      "Spawn a new child session for a focused task. Can optionally create a dedicated worktree or attach the session to an existing worktree, then seed it with an initial prompt. Pass toolScope to control the child's capabilities: use \"read\" or \"write\" for analyze/research tasks so the child cannot run builds or claim to have run them; \"full\" (default) grants run_command.",
+      "Create a worker session for part of a task you are coordinating. It nests under you in the session tree, shares your working directory, and is seeded with an initial prompt. Set reporting to \"final\" when you need its result. For unrelated work, or for continuing this work in a fresh session, use spawn_session with isolated=true or besideCaller=true where that tool is available. Pass toolScope to control the child's capabilities: use \"read\" or \"write\" for analyze/research tasks so the child cannot run builds or claim to have run them; \"full\" (default) grants run_command.",
     inputSchema: {
       type: "object",
       properties: {
@@ -222,13 +237,24 @@ export const META_AGENT_TOOL_DEFS: Array<{
           description:
             "Capability scope for the child. \"read\" = read_file/list_files/search_files only (pure investigation). \"write\" = those plus write_file but NO run_command, so the child can save a file deliverable (e.g. a report) yet cannot build/test/run anything. \"full\" (default) = all tools including run_command. Use read or write for analyze/research tasks so the child physically cannot run a build, and reserve full for tasks that must build/test.",
         },
+        effortLevel: {
+          type: "string",
+          enum: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          description:
+            "Optional reasoning effort for the child. Omit to leave it on the app-wide default — an omitted value is NOT inherited from the caller. Levels above the model's ceiling are clamped down (Claude models stop at max; only some Codex models reach ultra). Use a lower level for mechanical work and a higher one for hard reasoning.",
+        },
+        reporting: REPORTING_SCHEMA,
       },
     },
   },
   {
     name: "spawn_session",
     description:
-      "Spawn a new session from the calling session. By default the new session runs as a sibling under the same workstream as the caller (sharing files-edited, tabs, and get_workstream_overview); if the caller is not yet part of a workstream, a workstream container is created and the caller is reparented under it. The new session also inherits the caller's working directory: if the caller is running in a worktree, the spawned session runs in that same worktree (so its edits land where the user is looking). Pass isolated=true to instead create a top-level session with no parent and no workstream — use this when the new session should fix-and-commit work independently without polluting the caller's workstream. Pass useWorktree=true to give the spawned session its OWN new worktree instead of inheriting the caller's. Fire-and-forget by default — the calling session is not notified when the spawned session completes; pass notifyOnComplete=true to opt in. Use this for the /launch-new-session flow.",
+      "Start another session from this one. Choose the setup from what the user asked for:\n" +
+      "- Unrelated work (\"start a new session to fix that other bug\", \"track this down separately\"): isolated=true and reporting \"none\". It is an independent top-level session that does and commits its own work; do not wait for it or check on it.\n" +
+      "- The same work continued in a fresh session (context is too long, or a handoff to a successor): besideCaller=true and reporting \"none\". It sits beside you, so a chain of handoffs stays flat.\n" +
+      "- Workers for one task you are coordinating (the user asked you to orchestrate, split up or parallelize a piece of work): omit both flags so it nests under you in the session tree, and set reporting \"final\" so you get its result.\n" +
+      "The new session runs in your working directory (your worktree, if you are in one); pass useWorktree=true only when the user asks for a separate branch. Reporting defaults to \"none\" (fire and forget). Used by /launch-new-session.",
     inputSchema: {
       type: "object",
       properties: {
@@ -244,7 +270,12 @@ export const META_AGENT_TOOL_DEFS: Array<{
         isolated: {
           type: "boolean",
           description:
-            "Default false. When true, the new session is created at the top level — no parent, no workstream container, no shared files-edited or tabs with the caller. Use for fix-and-commit-separately work that should not pollute the caller's workstream.",
+            "Default false. Set true for work unrelated to your current task: the new session is created at the top level with no parent and shares no files-edited, tabs or workstream overview with you. Pair with reporting \"none\".",
+        },
+        besideCaller: {
+          type: "boolean",
+          description:
+            "Default false. Set true when handing this same work to a successor session: it is placed beside you (under your parent, or at the top level) instead of nested under you, so a chain of handoffs stays flat. It shares your worktree.",
         },
         useWorktree: {
           type: "boolean",
@@ -263,8 +294,14 @@ export const META_AGENT_TOOL_DEFS: Array<{
         },
         notifyOnComplete: {
           type: "boolean",
+          description: "Legacy form of reporting=\"final\"; ignored when reporting is set.",
+        },
+        reporting: REPORTING_SCHEMA,
+        effortLevel: {
+          type: "string",
+          enum: ["low", "medium", "high", "xhigh", "max", "ultra"],
           description:
-            "Default false. When false (the default), the calling session receives no follow-up prompt when the spawned session completes/errors/waits — fire and forget. Set true only when the caller specifically wants to be told the result and continue working with it.",
+            "Optional reasoning effort for the new session (e.g. model 'openai-codex:gpt-6-astra' with effortLevel 'medium'). Omit to leave it on the app-wide default — unlike `model` there is no inherit-from-caller mode. Levels above the model's ceiling are clamped down (Claude models stop at max; only some Codex models reach ultra). Use a lower level for mechanical work and a higher one for hard reasoning.",
         },
       },
       required: ["prompt"],
@@ -306,6 +343,11 @@ export const META_AGENT_TOOL_DEFS: Array<{
     },
   },
   {
+    name: "consume_session_inbox",
+    description: "Receive reports queued for you during your CURRENT active turn and record receipt so they do not replay as another turn. Takes no session ID. Call it only when a decision in this turn depends on a report you are waiting for; otherwise reports arrive with your next turn. A boundary means yield at a safe point for normal queue delivery. Never poll.",
+    inputSchema: { type: "object", properties: { checkpointId: { type: "string", description: "Unique name for this checkpoint (letters, digits, underscores or hyphens; max 100). Reuse only when retrying this same read; use a new name for a later checkpoint." } }, required: ["checkpointId"] },
+  },
+  {
     name: "list_queued_prompts",
     description:
       "Inspect queued prompts for a session. By default returns only pending/executing rows with bounded prompt previews; set includeCompleted to audit recently consumed rows.",
@@ -333,7 +375,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
   {
     name: "send_prompt",
     description:
-      "Queue a follow-up prompt for a child session. If the session is idle, prompt processing starts immediately.",
+      "Queue a follow-up prompt for a session. An instruction to an idle session starts processing immediately; a report or status never wakes it and is read on its next turn. Do not message the session that started you unless it asked for reports.",
     inputSchema: {
       type: "object",
       properties: {
@@ -344,6 +386,11 @@ export const META_AGENT_TOOL_DEFS: Array<{
         prompt: {
           type: "string",
           description: "The follow-up prompt to send.",
+        },
+        messageKind: {
+          type: "string",
+          enum: ["instruction", "report", "status", "question", "error"],
+          description: "Defaults to instruction. report/status are informational and never wake an idle recipient; never label a request to change work as a report.",
         },
         interrupt: {
           type: "boolean",
@@ -447,10 +494,8 @@ export const META_AGENT_TOOL_DEFS: Array<{
 // tools through this OpenAI-shaped list. Built-in providers (claude-code,
 // openai-codex) instead discover tools over the SSE MCP server and are gated by
 // BaseAgentProvider.META_AGENT_ALLOWED_TOOLS, which deliberately OMITS
-// spawn_session. spawn_session creates a workstream container (the
-// launch-new-session flow) and reparents the child under it, which pulls the
-// child out of the META AGENT group and breaks clean meta-agent nesting. To make
-// extension-agent meta-agents behave identically to the built-ins, mirror that
+// spawn_session. Extension-agent meta-agents mirror that established
+// tool allowlist; tree placement is independent of this provider policy. Mirror the
 // allowlist here so spawn_session is never offered (the meta-agent system prompt
 // only references create_session). Keep in sync with the meta-agent subset of
 // BaseAgentProvider.META_AGENT_ALLOWED_TOOLS.
@@ -486,8 +531,9 @@ export function getMetaAgentOpenAITools(): MetaAgentOpenAITool[] {
  * (extension-agent providers) so the dispatch logic lives in exactly one place.
  *
  * `name` may carry the `mcp__nimbalyst-host__` prefix; it is stripped.
- * `workspaceId` is normalized to its canonical repo path via resolveProjectPath
- * so worktree-rooted callers still resolve to the parent repo.
+ * `workspaceId` is resolved to the caller's project via
+ * resolveCallerWorkspaceId, so a worktree-rooted caller still lands on the
+ * parent repo while keeping the spelling that repo was opened by (#1551).
  *
  * Throws if the tool fns are not yet registered or the tool name is unknown.
  */
@@ -501,9 +547,12 @@ export async function dispatchMetaAgentTool(
     throw new Error("Meta-agent service not initialized");
   }
   const toolName = name.replace(/^mcp__nimbalyst-[a-z-]+__/, "");
-  // Normalize the workspaceId to its canonical repo path (worktree callers
-  // pass the worktree dir; sessions compare by exact parent-repo path).
-  const effectiveWorkspaceId = resolveProjectPath(workspaceId);
+  // Resolve the caller to its project (worktree callers pass the worktree dir),
+  // preserving the as-opened spelling where the filesystem can confirm it.
+  // Sessions and windows are keyed by that spelling; the service still compares
+  // identities rather than strings, so a caller whose alias cannot be
+  // reconstructed here is matched against the stored path's identity instead.
+  const effectiveWorkspaceId = resolveCallerWorkspaceId(workspaceId);
 
   switch (toolName) {
     case "list_worktrees":
@@ -536,12 +585,14 @@ export async function dispatchMetaAgentTool(
         }
       );
     case "send_prompt":
+      if (args?.messageKind !== undefined && !['instruction', 'report', 'status', 'question', 'error'].includes(String(args.messageKind))) throw new Error('Invalid orchestration messageKind');
       return toolFns.sendPrompt(
         aiSessionId,
         effectiveWorkspaceId,
         (args?.sessionId as string) ?? "",
         (args?.prompt as string) ?? "",
-        args?.interrupt === true
+        args?.interrupt === true,
+        (args?.messageKind as OrchestrationMessageKind | undefined) ?? 'instruction'
       );
     case "notify_user":
       return toolFns.notifyUser(aiSessionId, effectiveWorkspaceId, (args ?? {}) as NotifyUserArgs);

@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 /**
  * A recipient without the owning extension must be told which extension the
  * shared document needs -- the regression this guards is silent: the tab still
@@ -15,6 +17,10 @@ import {
 import { MissingCollabEditorNotice } from '../MissingCollabEditorNotice';
 import { extensionMarketplaceInstallRequestAtom } from '../../../store/atoms/appCommands';
 import type { CustomEditorRegistration } from '../../CustomEditors/types';
+
+vi.mock('../../CustomEditors', () => ({ customEditorRegistry: { findRegistrationForFile: vi.fn() } }));
+import { customEditorRegistry } from '../../CustomEditors';
+import { findPageEditorRegistration, HTML_PAGE_EDITOR_REGISTRATION } from '../../HtmlPage/htmlPageRegistration';
 
 vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({
   MaterialSymbol: ({ icon }: { icon: string }) => <span data-icon={icon} />,
@@ -82,6 +88,22 @@ describe('resolveCollabEditorAvailability', () => {
     });
 
     expect(result).toEqual({ kind: 'ready', registration });
+  });
+
+  it('opens an html page in the HTML page editor although the Browser extension claims .html', () => {
+    const browser = slidesRegistration({ extensions: ['.html'], extensionId: 'com.nimbalyst.browser', collaboration: undefined });
+    const findRegistration = (name: string) => findPageEditorRegistration(name, { documentType: 'html', editorId: 'builtin.html' });
+    vi.mocked(customEditorRegistry.findRegistrationForFile).mockReturnValue(browser);
+    const result = resolveCollabEditorAvailability({
+      documentType: 'html',
+      fileName: 'Product map.html',
+      fileExtension: '.html',
+      editorId: 'builtin.html',
+      findRegistration,
+    });
+    expect(result).toEqual({ kind: 'ready', registration: HTML_PAGE_EDITOR_REGISTRATION });
+    // Anything else still resolves through the registry.
+    expect(findPageEditorRegistration('deck.slides.md', { documentType: 'slides.md' })).toBe(browser);
   });
 
   it('rebuilds a lookup name for a doc shared under a bare title', () => {

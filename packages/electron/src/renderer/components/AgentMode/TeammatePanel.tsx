@@ -1,10 +1,12 @@
 /**
- * TeammatePanel - Collapsible panel showing teammates and SDK-native sub-agent tasks.
+ * TeammatePanel - Collapsible panel showing teammates and SDK-native spawned tasks.
  *
  * Two sections:
  * - "Teammates" for real team members (from currentTeammates metadata)
- * - "Sub-agents" for SDK-native tasks (from currentTasks metadata, driven by
- *   task_started/task_progress/task_notification events)
+ * - "Agents & commands" for SDK-native tasks (from currentTasks metadata, driven by
+ *   task_started/task_progress/task_notification events). The list is not an agent
+ *   registry: a plain Bash call arrives as local_bash, and foreground work is in
+ *   there too -- so each row names its own kind.
  *
  * Each section is independently collapsible. Sections only render when they have entries.
  * Collapse state is persisted at the project level.
@@ -26,6 +28,7 @@ import {
 } from '../../store/atoms/agentMode';
 import { mapTaskStatus } from '../../store/atoms/subAgentStatus';
 import { TaskThreadPopover } from './TaskThreadPopover';
+import { taskKindLabel, taskOutcomeLabel } from './taskPresentation';
 
 export interface TeammateInfo {
   name: string;
@@ -177,7 +180,7 @@ const TeammateSection: React.FC<TeammateSectionProps> = React.memo(({
 
 TeammateSection.displayName = 'TeammateSection';
 
-// ─── Task Section (SDK-native sub-agents) ─────────────────────────────────
+// ─── Task Section (SDK-native background tasks) ───────────────────────────
 
 interface TaskSectionProps {
   tasks: TaskInfo[];
@@ -208,7 +211,7 @@ const TaskSection: React.FC<TaskSectionProps> = React.memo(({
           className="text-[var(--nim-text-muted)] shrink-0"
         />
         <MaterialSymbol icon="swap_horiz" size={16} className="text-[var(--nim-text-muted)] shrink-0" />
-        <span className="text-xs font-medium text-[var(--nim-text)]">Sub-agents</span>
+        <span className="text-xs font-medium text-[var(--nim-text)]">Agents &amp; commands</span>
         <span className="ml-auto text-[11px] text-[var(--nim-text-muted)] font-mono">
           {runningCount}/{tasks.length}
         </span>
@@ -284,8 +287,9 @@ const TaskItem: React.FC<TaskItemProps> = React.memo(({ task, sessionId }) => {
   const now = useNow(isRunning);
   const isDone = task.status === 'completed' || task.status === 'failed' || task.status === 'stopped';
 
-  // Build stats line
-  const stats: string[] = [];
+  // Build stats line. The kind rides in front rather than on a line of its own:
+  // the section scrolls at 200px, and a third line per row costs a visible entry.
+  const stats: string[] = [taskKindLabel(task.taskType)];
   if (task.durationMs > 0) {
     stats.push(formatElapsed(task.durationMs));
   } else if (isRunning && task.startedAt) {
@@ -296,6 +300,12 @@ const TaskItem: React.FC<TaskItemProps> = React.memo(({ task, sessionId }) => {
   }
   if (task.lastToolName && isRunning) {
     stats.push(task.lastToolName);
+  }
+  // "ran and exited non-zero" vs "did not finish on its own" -- the icons alone
+  // leave the two indistinguishable.
+  const outcome = taskOutcomeLabel(task.status);
+  if (outcome) {
+    stats.push(outcome);
   }
 
   return (
@@ -328,8 +338,11 @@ const TaskItem: React.FC<TaskItemProps> = React.memo(({ task, sessionId }) => {
         {task.status === 'completed' && (
           <span className="text-[#4ade80] text-[10px]">&#x25CF;</span>
         )}
-        {(task.status === 'failed' || task.status === 'stopped') && (
+        {task.status === 'failed' && (
           <span className="text-[var(--nim-error)] text-[10px]">&#x25CF;</span>
+        )}
+        {task.status === 'stopped' && (
+          <MaterialSymbol icon="stop_circle" size={12} className="text-[var(--nim-text-muted)]" />
         )}
       </div>
       <div className="flex-1 min-w-0">

@@ -1,11 +1,12 @@
 // @vitest-environment node
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   BUILTIN_TRACKER_YAML,
   parseBuiltinTrackers,
   loadBuiltinTrackers,
 } from '../ModelLoader';
-import { globalRegistry, type TrackerDataModel } from '../TrackerDataModel';
+import { globalRegistry, type TrackerDataModel } from '@nimbalyst/tracker-schema';
 
 /**
  * Guards the migration of the built-in tracker definitions from the old hardcoded
@@ -25,6 +26,10 @@ const EXPECTED = [
   'idea',
   'milestone',
   'release',
+  // Knowledge-scopes evidence kinds (master plan section 3, N7).
+  'source',
+  'capture',
+  'citation',
 ] as const;
 
 // Behavior-preserving invariants carried over from the pre-migration code array.
@@ -42,7 +47,15 @@ const INVARIANTS: Record<string, {
   // Collection types: both shared, since a sprint or release is a team artifact.
   milestone: { idPrefix: 'mst', sharing: 'team', draftByDefault: false },
   release: { idPrefix: 'rel', sharing: 'team', draftByDefault: false },
+  // Evidence kinds start personal: the pilot's `me:` scope is where a citation
+  // is written, and publishing it to the team is the existing per-item action.
+  source: { idPrefix: 'src', sharing: 'personal', draftByDefault: false },
+  capture: { idPrefix: 'cap', sharing: 'personal', draftByDefault: false },
+  citation: { idPrefix: 'cit', sharing: 'personal', draftByDefault: false },
 };
+
+/** Section 3 pins `modes.fullDocument: false` on all three evidence kinds. */
+const EVIDENCE_KINDS = ['source', 'capture', 'citation'] as const;
 
 describe('bundled builtin tracker YAML', () => {
   it('bundles exactly the expected builtin types, in load order', () => {
@@ -91,11 +104,66 @@ describe('bundled builtin tracker YAML', () => {
     }
   });
 
+  it('keeps the evidence kinds out of type lists until the workspace defines claim', () => {
+    // Every existing tracker user gets these builtins; they must not appear in
+    // create menus, Tracker Mode, or tracker_list_types for a workspace that
+    // has not defined claim. They stay registered so citations render.
+    loadBuiltinTrackers();
+    globalRegistry.clearWorkspaceSchema('claim');
+    const listed = () => globalRegistry.getListed().map((m) => m.type);
+    for (const type of EVIDENCE_KINDS) {
+      expect(globalRegistry.has(type), `${type} registered`).toBe(true);
+      expect(listed(), `${type} listed without claim`).not.toContain(type);
+    }
+    expect(listed()).toContain('bug');
+
+    globalRegistry.register({ ...globalRegistry.get('bug')!, type: 'claim' });
+    try {
+      for (const type of EVIDENCE_KINDS) expect(listed(), `${type} listed with claim`).toContain(type);
+    } finally {
+      globalRegistry.clearWorkspaceSchema('claim');
+    }
+    for (const type of EVIDENCE_KINDS) {
+      expect(listed(), `${type} listed after removing claim`).not.toContain(type);
+      expect(globalRegistry.has(type), `${type} still resolvable`).toBe(true);
+    }
+  });
+
+  it('keeps the evidence kinds out of full-document mode', () => {
+    // A source, a capture, and a citation are records about something else.
+    // Giving them a document body would invite the argument to be written in
+    // the wrong place, where no claim can cite it.
+    const byType = new Map(parseBuiltinTrackers().map((m) => [m.type, m]));
+    for (const type of EVIDENCE_KINDS) {
+      expect(byType.get(type)!.modes?.fullDocument, `${type} fullDocument`).toBe(false);
+    }
+  });
+
+  it('carries the citation locator field through the YAML parser as a declared shape', () => {
+    // The parser copies field properties by an explicit allowlist, so a dropped
+    // `objectShape` would leave `locator` validated as opaque JSON with nothing
+    // at runtime saying the locator contract was never enforced.
+    const citation = parseBuiltinTrackers().find((m) => m.type === 'citation')!;
+    const locator = citation.fields.find((f) => f.name === 'locator')!;
+    expect(locator.type).toBe('object');
+    expect(locator.objectShape).toBe('citation-locator');
+  });
+
   it('registers all builtins into the registry as builtin types', () => {
     loadBuiltinTrackers();
     for (const type of EXPECTED) {
       expect(globalRegistry.get(type), `${type} registered`).toBeDefined();
       expect(globalRegistry.isBuiltin(type), `${type} isBuiltin`).toBe(true);
     }
+  });
+
+  // The collab worker resolves a team's builtin overrides against this
+  // generated copy (#1880). A YAML edit that did not regenerate it would leave
+  // the server resolving deltas against different builtins than desktops do.
+  it('matches the catalog the collab worker bundles (run `pnpm --filter @nimbalyst/tracker-builtins build`)', () => {
+    const catalog = JSON.parse(readFileSync(
+      new URL('../../../../../../tracker-builtins/src/builtinCatalog.json', import.meta.url), 'utf8',
+    ));
+    expect(catalog).toEqual(JSON.parse(JSON.stringify(parseBuiltinTrackers())));
   });
 });

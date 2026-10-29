@@ -9,6 +9,8 @@ import { resolveSenderWorkspacePath } from '../window/captureWindowWorkspace';
 import { dirtyEditorRegistry } from '../services/DirtyEditorRegistry';
 import { ProjectFileService } from '../services/ProjectFileService';
 import { jsonKeyAccessor } from '../database/jsonKeyExpr';
+import { reconcilePendingTagsForFile } from '../history/pendingTagReconciler';
+import { scheduleDailyMaintenance } from '../services/databaseRetentionMaintenance';
 import type { ProjectFileEdit, ProjectFileWriteReceipt } from '@nimbalyst/runtime';
 
 // Initialize history manager
@@ -61,6 +63,8 @@ export async function registerHistoryHandlers() {
 
     // Initialize history manager
     await historyManager.initialize();
+    // Age and per-file retention: after first-usable, then daily while open.
+    scheduleDailyMaintenance('document-history-retention', () => historyManager.cleanup());
 
     safeHandle('project-fs:read', async (event, paths: string[]) => {
         return projectFiles.read(getAuthorizedWorkspaceRoot(event), paths);
@@ -98,9 +102,18 @@ export async function registerHistoryHandlers() {
         await historyManager.deleteSnapshot(filePath, timestamp);
     });
 
-    // PHASE 4/5: Get pending AI edit tags
+    // PHASE 4/5: Get pending AI edit tags.
+    //
+    // Per-file reads reconcile first (#1403): a pending tag whose edit has
+    // since landed in git, or whose file is gone, would otherwise keep claiming
+    // the diff bar and the pending-review dots forever. The workspace-wide read
+    // (no filePath) deliberately does not — it backs a count and must stay a
+    // single query; it picks up the corrected state on the next per-file read.
     safeHandle('history:get-pending-tags', async (event, filePath?: string) => {
-        return await historyManager.getPendingTags(filePath);
+        if (filePath) {
+            return await reconcilePendingTagsForFile(historyManager, filePath);
+        }
+        return await historyManager.getPendingTags();
     });
 
     // PHASE 5: Create tag (for testing)
@@ -135,6 +148,11 @@ export async function registerHistoryHandlers() {
     });
 
     safeHandle('history:get-diff-baseline', async (event, filePath: string) => {
+        // Reconcile before answering: TabEditor falls back to the raw tag
+        // content when the baseline is null, so returning null alone would not
+        // stop a retired tag from rendering (#1403).
+        const surviving = await reconcilePendingTagsForFile(historyManager, filePath);
+        if (surviving.length === 0) return null;
         return await historyManager.getDiffBaseline(filePath);
     });
 

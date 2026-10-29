@@ -1,0 +1,117 @@
+/* Material Symbols, self-hosted so icons never depend on a network fetch.
+   `MaterialSymbol` renders the icon name as ligature text, so without this face
+   every icon reads as a word. Static weight 400 (the one the UI uses). */
+@font-face {
+  font-family: 'Material Symbols Outlined';
+  src: url('./assets/fonts/MaterialSymbolsOutlined.woff2') format('woff2');
+  font-weight: 100 700;
+  font-style: normal;
+  font-display: block;
+}
+
+.material-symbols-outlined {
+  font-family: 'Material Symbols Outlined';
+  font-weight: normal;
+  font-style: normal;
+  display: inline-block;
+  line-height: 1;
+  text-transform: none;
+  letter-spacing: normal;
+  word-wrap: normal;
+  white-space: nowrap;
+  direction: ltr;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+@tailwind components;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* The web console's body (web-console/src/styles.css): the OS UI face at the
+   browser's default size, smoothing only, so the bundle's components and the
+   editor are sized exactly as there. */
+body {
+  background-color: var(--nim-bg);
+  color: var(--nim-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans',
+    'Droid Sans', 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:where(button, a, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--nim-border-focus);
+  outline-offset: 2px;
+}
+
+/* As in the console: the mount's own container must not become a block, or the
+   editor stops filling its pane. */
+.collab-editor-mount-surface {
+  display: contents;
+}
+
+/* Last, so single-class utilities win against the bundle's component rules. */
+@tailwind utilities;
+
+/* An HTML page fills the editor area and scrolls inside its own frame. */
+.wiki-web-html-page-frame {
+  height: 100% !important;
+}
+
+/*
+ * A published wiki (static export): the page tree is a column on wide screens
+ * and a drawer over the page on narrow ones, opened from the top bar and closed
+ * by picking a page, tapping outside it or Escape. Two classes deep on
+ * purpose: the mockup editor's bundle injects unscoped `.flex`/`.hidden` rules
+ * after this stylesheet, which beat single-class utilities such as `md:hidden`.
+ */
+.wiki-static-app .wiki-static-topbar,
+.wiki-static-app .wiki-static-scrim {
+  display: none;
+}
+.wiki-static-app .wiki-static-sidebar-panel {
+  display: flex;
+}
+@media (max-width: 767px) {
+  .wiki-web-app.wiki-static-app {
+    position: relative;
+    flex-direction: column;
+  }
+  .wiki-static-app .wiki-static-topbar {
+    display: flex;
+    height: 40px;
+    flex-shrink: 0;
+  }
+  .wiki-static-app .wiki-static-sidebar-panel {
+    display: none;
+    position: absolute;
+    top: 40px;
+    bottom: 0;
+    left: 0;
+    z-index: 40;
+    width: min(320px, 85vw);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
+  }
+  .wiki-static-app .wiki-static-sidebar-panel[data-open='true'] {
+    display: flex;
+  }
+  .wiki-static-app .wiki-static-scrim[data-open='true'] {
+    display: block;
+    position: absolute;
+    top: 40px;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 39;
+    border: 0;
+    background: rgb(0 0 0 / 0.4);
+  }
+}

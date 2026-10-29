@@ -4,7 +4,8 @@
  * Handles OS-level notifications for AI/agent completion events.
  */
 
-import { Notification, BrowserWindow, app, ipcMain, shell } from 'electron';
+import { Notification, BrowserWindow, app, ipcMain } from 'electron';
+import { systemShell } from '../utils/systemShell';
 import { logger } from '../utils/logger';
 import { isOSNotificationsEnabled, isNotifyWhenFocusedEnabled, isSessionBlockedNotificationsEnabled } from '../utils/store';
 import {
@@ -15,6 +16,7 @@ import {
 import type { SessionNotificationNavigationTarget } from '../../shared/sessionNotificationNavigation';
 import { composeNotificationTitle } from '../../shared/notificationTitle';
 import { resolveNotificationIcon, type NotificationKind } from './notificationIcons';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 
 const NOTIFICATION_OUTCOME_TIMEOUT_MS = 2_000;
 
@@ -192,6 +194,15 @@ class NotificationService {
       }
     }
 
+    // Producers pass the path the agent is *running* in, which for a worktree
+    // session is the worktree, not the project. Sessions are stored under the
+    // project path, so routing a click on the running path makes the renderer's
+    // `sessions:list` come back empty and report the session as missing.
+    const clickOptions: NotificationOptions = {
+      ...options,
+      workspacePath: await this.resolveOwningWorkspacePath(options),
+    };
+
     try {
       // Create and show the notification using Electron API (production mode)
       const notification = new Notification({
@@ -205,7 +216,7 @@ class NotificationService {
 
       // Handle notification click - focus window and switch to session
       notification.on('click', () => {
-        this.handleNotificationClick(options);
+        this.handleNotificationClick(clickOptions);
       });
 
       // Track notification
@@ -334,7 +345,33 @@ class NotificationService {
       throw new Error('Opening notification settings is not supported on this platform');
     }
 
-    await shell.openExternal(target);
+    await systemShell.openExternal(target);
+  }
+
+  /**
+   * The workspace a click must route to: the project that owns the session, not
+   * whatever directory the agent happened to run in. The session record is the
+   * only authority on this -- a worktree path and its project are unrelated
+   * strings as far as session storage is concerned.
+   *
+   * Falls back to the notified path when the session cannot be read, which is
+   * the pre-existing behaviour and still routes correctly for the common case
+   * of a session that is not in a worktree.
+   */
+  private async resolveOwningWorkspacePath(options: NotificationOptions): Promise<string> {
+    if (!options.sessionId) return options.workspacePath;
+
+    try {
+      const session = await AISessionsRepository.get(options.sessionId);
+      return session?.workspacePath?.trim() || options.workspacePath;
+    } catch (error) {
+      logger.main.warn(
+        '[NotificationService] Could not resolve the owning workspace for session',
+        options.sessionId,
+        error,
+      );
+      return options.workspacePath;
+    }
   }
 
   /**

@@ -190,9 +190,9 @@ describe('MetaAgentService blocked-child notification', () => {
     );
     const completed = await runChildEvent('session:completed', baseResult({ status: 'completed' }));
 
-    for (const [{ queuePromptForSession }, eventType] of [
-      [blocked, 'session:waiting'],
-      [completed, 'session:completed'],
+    for (const [{ queuePromptForSession }, eventType, messageKind] of [
+      [blocked, 'session:waiting', 'question'],
+      [completed, 'session:completed', 'report'],
     ] as const) {
       const [targetSessionId, message, third, options] = queuePromptForSession.mock.calls[0];
       expect(targetSessionId).toBe(PARENT_ID);
@@ -200,7 +200,7 @@ describe('MetaAgentService blocked-child notification', () => {
       expect(message).toContain(`Event: ${eventType}`);
       expect(third).toBeUndefined();
       expect(options).toEqual({
-        promptProvenance: { actor: 'agent', origin: 'child-session-update', originSessionId: CHILD_ID },
+        promptProvenance: { actor: 'agent', origin: 'child-session-update', messageKind, originSessionId: CHILD_ID },
       });
     }
   });

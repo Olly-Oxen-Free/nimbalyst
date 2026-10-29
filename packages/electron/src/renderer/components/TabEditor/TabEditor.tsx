@@ -32,8 +32,9 @@ import {
 } from '@nimbalyst/runtime';
 import { $getRoot, $getSelection, $isRangeSelection, $setSelection, SKIP_SCROLL_INTO_VIEW_TAG, SKIP_DOM_SELECTION_TAG, COMMAND_PRIORITY_LOW } from 'lexical';
 import { DocumentHeaderContainer } from '@nimbalyst/runtime/plugins/TrackerPlugin/documentHeader';
-// Side-effect import: registers GenericFrontmatterHeader with DocumentHeaderRegistry
-import '@nimbalyst/runtime/plugins/FrontmatterPlugin';
+// Side-effect import: registers the page status chip as a document header
+import '../PageInfo/PageStatusChip';
+import { PageInfoPanel } from '../PageInfo/PageInfoPanel';
 import { setTextSelection, clearTextSelection } from '../UnifiedAI/TextSelectionIndicator';
 import { FixedTabHeaderContainer, FixedTabHeaderRegistry } from '@nimbalyst/runtime/plugins/shared/fixedTabHeader';
 import { UnifiedDiffHeader, LexicalDiffHeaderAdapter } from '../UnifiedDiffHeader';
@@ -53,7 +54,7 @@ import type { DocumentSessionActions } from './DocumentSessionControl';
 import { usePersonalDocSync } from '../../hooks/usePersonalDocSync';
 import { useDocumentModel } from '../../services/document-model/useDocumentModel';
 import { DocumentModelRegistry } from '../../services/document-model/DocumentModelRegistry';
-import type { DiffState } from '../../services/document-model/types';
+import type { DiffApplyOutcome, DiffState } from '../../services/document-model/types';
 import { diffTrace } from '@nimbalyst/runtime/utils/debugFlags';
 import { SearchReplaceStateManager, isLexicalSearchEditor } from '@nimbalyst/runtime/plugins/SearchReplace';
 import { hasEditorFind, registerEditorFindHandler } from './editorFindCommand';
@@ -63,9 +64,37 @@ import { useSuppressedDocumentHeaderProviderIds } from './DocumentHeaderSuppress
 import { createCollectionItem } from '../TrackerMode/createCollectionItem';
 import { loadTrackerTeamMembers } from '../TrackerMode/useTrackerTeamMembers';
 import { assertFileSaveSucceeded, getSaveFailureMessage, resolveSaveFailureType, type FileSaveResult } from '../../utils/fileSaveResult';
-import { resolveSaveAttempt } from './resolveSaveAttempt';
-import { reloadFromDisk, type ReloadOutcome } from './reloadFromDisk';
+import { customEditorSaveBaseline, resolveSaveAttempt } from './resolveSaveAttempt';
+import { requestConfirmation } from '../../dialogs/requestConfirmation';
+import { editorReloadKind, reloadFromDisk, type ReloadOutcome } from './reloadFromDisk';
 import { resolveDiffResolutionSave } from './resolveDiffResolutionSave';
+import { captureRenderedReview, readResolvedContent, resolveLexicalReview, type RenderedLexicalReview } from './lexicalReviewResolution';
+import { resolveCustomEditorReview } from './resolveCustomEditorReview';
+import { localWikiUploadAssetFor } from '../../services/localWikiAttachments';
+import { findTabEditorRegistration } from './tabEditorRegistration';
+import {
+  decideLexicalDiffByBytes,
+  decideLexicalDiffByRootNodes,
+  lexicalDiffTooLargeReason,
+  type LexicalDiffApplyResult,
+} from './lexicalDiffPresentation';
+import {
+  resolveDiffAutosaveGate,
+  resolveManualSaveReviewGate,
+  type DiffPresentationMode,
+} from './resolveDiffAutosaveGate';
+
+/**
+ * How the autosave gate must read each apply outcome. `detached` maps to
+ * `failed` on purpose: an attachment that could not present the generation has
+ * no more evidence about the buffer than one whose apply threw.
+ */
+const PRESENTATION_FOR_OUTCOME: Record<DiffApplyOutcome, DiffPresentationMode> = {
+  applied: 'inline',
+  'presented-without-inline': 'presented-without-inline',
+  failed: 'failed',
+  detached: 'failed',
+};
 
 /** Normalize a file path for comparison: backslashes to forward slashes, strip trailing slashes. */
 function normalizePathForCompare(p: string): string {
@@ -125,6 +154,9 @@ interface TabEditorProps {
 
   // Document metadata
   workspaceId?: string;
+
+  /** Accept an agent's edit and show the result, never the red/green review (Local wiki pages in the Wiki). */
+  acceptAgentEdits?: boolean;
 }
 
 export const TabEditor: React.FC<TabEditorProps> = ({
@@ -144,6 +176,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                                                       onSwitchToAgentMode,
                                                       onOpenSessionInChat,
                                                       workspaceId,
+                                                      acceptAgentEdits = false,
                                                     }) => {
   // Use theme hook directly so we get live updates when theme changes
   // (TabContent creates each TabEditor in a separate React root, so prop updates don't work)
@@ -183,9 +216,9 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   // Re-computed when registry changes (registryVersion dependency)
   const fileType = useMemo(() => {
     const checkCustomEditor = (): boolean =>
-      customEditorRegistry.findRegistrationForFile(filePath) !== undefined;
+      findTabEditorRegistration(filePath, workspaceId) !== undefined;
     return getFileType(filePath, checkCustomEditor);
-  }, [filePath, registryVersion]);
+  }, [filePath, workspaceId, registryVersion]);
 
   const isMarkdown = fileType === 'markdown';
   const isImage = fileType === 'image';
@@ -194,8 +227,8 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   // Get the custom editor registration for this file (used for source mode and storage)
   const customEditorRegistration = useMemo(() => {
     if (!isCustom) return null;
-    return customEditorRegistry.findRegistrationForFile(filePath) ?? null;
-  }, [isCustom, filePath, registryVersion]);
+    return findTabEditorRegistration(filePath, workspaceId) ?? null;
+  }, [isCustom, filePath, workspaceId, registryVersion]);
 
   // Check if the custom editor supports source mode (from registry)
   const customEditorSupportsSourceMode = customEditorRegistration?.supportsSourceMode || false;
@@ -260,6 +293,13 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   }, []);
   const [showMonacoDiffBar, setShowMonacoDiffBar] = useState(false); // For Monaco diff approval bar
   const [showCustomEditorDiffBar, setShowCustomEditorDiffBar] = useState(false); // For custom editor diff approval bar
+  // A markdown review the document was too large to render inline (#4821). The
+  // Lexical header keys off diff nodes, of which there are none here, so without
+  // its own bar the user has a pending review and no way to act on it.
+  const [noInlineFallbackReview, setNoInlineFallbackReview] = useState(false);
+  // A diff-capable custom editor has registered its own diff callback. That
+  // registration -- not a timer -- is what makes this attachment a presenter.
+  const [customDiffPresenterReady, setCustomDiffPresenterReady] = useState(false);
   const [isEditorReady, setIsEditorReady] = useState(false); // Track when editor is mounted and ready
   const [diffSessionInfo, setDiffSessionInfo] = useState<{sessionId: string; sessionTitle?: string; editedAt?: number; provider?: string} | null>(null); // Session info for diff approval bar
   const [monacoDiffChangeCount, setMonacoDiffChangeCount] = useState(0); // Number of changes in Monaco diff mode
@@ -356,6 +396,11 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   const instanceIdRef = useRef<number>(Math.floor(Math.random() * 10000));
   const hasInitialContentSyncRef = useRef<boolean>(false);
   const pendingAIEditTagRef = useRef<{tagId: string, sessionId: string, filePath: string} | null>(null);
+  // The outcome this tab last reported, tied to the generation it reported on.
+  // The autosave gate reads it: zero diff nodes only means "resolved by hand"
+  // for a generation that verifiably rendered inline (NIM-5359, defect A).
+  const presentedGenerationRef = useRef<{ generation: number; mode: DiffPresentationMode } | null>(null);
+  const renderedReviewRef = useRef<RenderedLexicalReview | null>(null); // #1734, see lexicalReviewResolution
   const isApplyingDiffRef = useRef<boolean>(false); // Track programmatic diff application
   // #3684: set when a reload could not be verified, i.e. the buffer is not a
   // trustworthy picture of anything. Writes are blocked while it is set --
@@ -368,6 +413,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   const editorHostFileChangeCallbackRef = useRef<((newContent: string) => void) | null>(null); // For EditorHost file change subscription
   const diffRequestCallbackRef = useRef<((config: DiffConfig) => void) | null>(null); // For EditorHost diff request subscription
   const customEditorFindCallbackRef = useRef<(() => void) | null>(null); // Custom editor's own find UI (see EditorHost.onFindRequested)
+  const customEditorAPIRef = useRef<unknown>(null);
   const diffClearedCallbackRef = useRef<(() => void) | null>(null); // For EditorHost diff cleared subscription
   const editorHostSaveRequestCallbackRef = useRef<(() => void | Promise<void>) | null>(null); // For EditorHost save request subscription
   const sourceModeChangedCallbackRef = useRef<((isSourceMode: boolean) => void) | null>(null); // For EditorHost source mode subscription
@@ -384,9 +430,28 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   const editorKey = useMemo(() => makeEditorKey(filePath), [filePath]);
   const setPendingAIEditTag = useCallback((tag: {tagId: string, sessionId: string, filePath: string} | null) => {
     pendingAIEditTagRef.current = tag;
+    // The no-inline bar exists only for the duration of one pending review, so
+    // it retires through the same choke point rather than in each caller.
+    if (tag === null) {
+      setNoInlineFallbackReview(false);
+      presentedGenerationRef.current = null;
+    }
     // Update Jotai atom so tab indicator subscribes to it
     store.set(editorHasUnacceptedChangesAtom(editorKey), tag !== null);
   }, [editorKey]);
+
+  /**
+   * True while an agent edit is still under review, from any of the three places
+   * that can know it: this tab's pending tag, the model's live diff state, or a
+   * resolution that reached disk but not the history tag. Source mode consults
+   * this before every write -- it renders no diff, so a save from there is a
+   * write against content the user has never been shown (NIM-5359).
+   */
+  const hasUnresolvedReview = useCallback((): boolean => (
+    pendingAIEditTagRef.current !== null ||
+    documentModel?.getDiffState() !== null ||
+    !!documentModel?.isSaveBlockedByPendingResolution()
+  ), [documentModel]);
 
   // Refs for EditorHost stability - these allow editorHost to access current values without recreating
   const themeRef = useRef(theme);
@@ -662,210 +727,25 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     return undefined;
   }, [isActive, isEditorReady, isMarkdown, sourceMode, filePath, editorInstance]);
 
-  // CRITICAL FIX RC7: On component mount or file path change, check if there are pending AI edits
-  // that should show diffs. This handles the case where a tab is closed and reopened.
-  // Only restore diffs for tags that haven't been reviewed/approved yet.
-  // MERGED WITH MOUNT DIFF APPLICATION: Consolidated into a single effect that both
-  // restores the tag ref AND applies the diff in one operation to prevent flashing.
-  const hasCheckedForPendingTagsRef = useRef(false);
-  const mountEffectHandledPendingDiffRef = useRef(false); // Track if mount effect found pending diffs
-
+  // NIM-5359 defect H: the production hydration seam.
+  //
+  // The DocumentModel -- not this component -- decides whether a reopened file is
+  // under review. It looks up the pending tag and the diff baseline itself and
+  // publishes through the ordinary onDiffRequested subscription below, now the
+  // only presentation path. `initialContent` is the bytes this editor actually
+  // loaded; that is the whole point, because a hydration seam only tests call is
+  // a seam production never uses.
+  //
   useEffect(() => {
-    // Guard against re-running this effect - only run once per filePath change
-    if (hasCheckedForPendingTagsRef.current) return;
-    if (!window.electronAPI?.history) return;
-    // Wait for editor to be ready before checking pending diffs
     if (!isEditorReady) return;
-    if (!editorRef.current && !isCustom) return;
-    // Skip pending diff check when in source mode - source mode is for raw editing
-    if (sourceMode) return;
-
-    hasCheckedForPendingTagsRef.current = true;
-    // Reset the flag for this file
-    mountEffectHandledPendingDiffRef.current = false;
-
-    const checkAndApplyPendingDiffs = async () => {
-      const tCheckStart = performance.now();
-      // For custom editors, wait a tick for their useEffect to register diff callbacks
-      // This ensures diffRequestCallbackRef is set before we try to use it
-      if (isCustom) {
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-      try {
-        const tGetPendingStart = performance.now();
-        const pendingTags = await window.electronAPI.history.getPendingTags(filePath);
-        console.log(`[TabEditor.timing] getPendingTags: ${(performance.now() - tGetPendingStart).toFixed(1)}ms`);
-        if (!pendingTags || pendingTags.length === 0) {
-          return;
-        }
-
-        // Filter out tags that have been reviewed - only show diffs for pending/unreviewed tags
-        const unreviewedTags = pendingTags.filter((tag: any) => tag.status !== 'reviewed' && tag.status !== 'rejected');
-
-        if (unreviewedTags.length === 0) {
-          return;
-        }
-
-        // CRITICAL: Mark that mount effect found pending diffs IMMEDIATELY after we know they exist
-        // This flag prevents the tab activation effect (300ms delay) from also applying the same diff
-        // Must be set before any await statements that could delay it
-        mountEffectHandledPendingDiffRef.current = true;
-
-        const pendingTag = unreviewedTags[0];
-
-        // Get the baseline for diff comparison
-        // This will be the latest incremental-approval tag if it exists, otherwise the pre-edit tag
-        const tBaselineStart = performance.now();
-        const baseline = await window.electronAPI.invoke('history:get-diff-baseline', filePath);
-        console.log(`[TabEditor.timing] get-diff-baseline: ${(performance.now() - tBaselineStart).toFixed(1)}ms`);
-        const oldContent = baseline ? baseline.content : pendingTag.content;
-        const newContent = contentRef.current; // Use current content ref to get actual disk content
-
-        console.log(`[TabEditor.timing] oldContentLen=${oldContent?.length} newContentLen=${newContent?.length}`);
-
-        logger.ui.info(`[TabEditor] Restoring pending AI edit on mount: tagId=${pendingTag.id}, status=${pendingTag.status}`);
-        logger.ui.info(`[TabEditor] Diff content check: oldContentLength=${oldContent?.length}, newContentLength=${newContent?.length}, baseline=${!!baseline}, pendingTagContent=${pendingTag.content?.length}`);
-
-        // If content differs, apply the diff
-        if (oldContent !== newContent) {
-          // Route through EditorHost callback if custom editor has subscribed to diff requests
-          if (diffRequestCallbackRef.current) {
-            // Set the ref so other parts of the component know we're in diff mode
-            setPendingAIEditTag({
-              tagId: pendingTag.id,
-              sessionId: pendingTag.sessionId,
-              filePath: filePath
-            });
-            setShowCustomEditorDiffBar(true);
-            // Fetch session info for the diff approval bar
-            fetchDiffSessionInfo(pendingTag.sessionId, pendingTag.createdAt ? new Date(pendingTag.createdAt).getTime() : Date.now());
-            diffRequestCallbackRef.current({
-              originalContent: oldContent,
-              modifiedContent: newContent,
-              tagId: pendingTag.id,
-              sessionId: pendingTag.sessionId,
-            });
-            contentRef.current = oldContent;
-            initialContentRef.current = oldContent;
-            isDirtyRef.current = false;
-            onDirtyChange?.(false);
-            return;
-          }
-
-          // Custom editors that don't support diff mode: skip diff mode entirely
-          // The new content is already on disk, just don't enter diff mode
-          if (isCustom) {
-            logger.ui.info(`[TabEditor] Custom editor doesn't support diff mode, skipping: ${fileName}`);
-            return;
-          }
-
-          // Set the ref so other parts of the component know we're in diff mode
-          setPendingAIEditTag({
-            tagId: pendingTag.id,
-            sessionId: pendingTag.sessionId,
-            filePath: filePath
-          });
-
-          // For code files, use Monaco diff mode
-          if (!isMarkdown) {
-            logger.ui.info(`[TabEditor] Applying Monaco diff mode for code file on mount`);
-            if (editorRef.current.showDiff) {
-              editorRef.current.showDiff(oldContent, newContent);
-              setShowMonacoDiffBar(true);
-              // Fetch session info for the diff approval bar
-              fetchDiffSessionInfo(pendingTag.sessionId, pendingTag.createdAt ? new Date(pendingTag.createdAt).getTime() : Date.now());
-            } else {
-              logger.ui.warn(`[TabEditor] Monaco editor doesn't have showDiff method`);
-            }
-            return;
-          }
-
-          // For markdown files, use Lexical diff mode.
-          // Skip it for oversize payloads: the TOPT tree-matcher in
-          // applyMarkdownDiffToDocument is O(N^2) in root-children count and
-          // hits V8's Map size cap (~16M entries) on documents with >~1500
-          // root nodes. On a real CHANGELOG-shaped 280KB-vs-413KB pending
-          // diff this pins the renderer for ~57s before throwing a swallowed
-          // "Map maximum size exceeded" error. Until we rewrite the matcher
-          // (see nimbalyst-local/plans/lexical-diff-size-guard.md) we bail
-          // out before entering the slow path. The pendingAIEditTag is
-          // already set above, so the approval bar still appears and the
-          // user can accept/reject from there -- they just don't get the
-          // inline diff highlighting for this one file.
-          const LEXICAL_DIFF_MAX_BYTES = 200_000;
-          if (
-            (oldContent?.length ?? 0) > LEXICAL_DIFF_MAX_BYTES ||
-            (newContent?.length ?? 0) > LEXICAL_DIFF_MAX_BYTES
-          ) {
-            logger.ui.warn(
-              `[TabEditor] Skipping Lexical diff on mount for oversize payload: ` +
-                `oldLen=${oldContent?.length ?? 0} newLen=${newContent?.length ?? 0} ` +
-                `threshold=${LEXICAL_DIFF_MAX_BYTES} file=${fileName}`,
-            );
-            fetchDiffSessionInfo(
-              pendingTag.sessionId,
-              pendingTag.createdAt ? new Date(pendingTag.createdAt).getTime() : Date.now(),
-            );
-            return;
-          }
-
-          // Reset editor to old (tagged) content first
-          const transformers = getEditorTransformers();
-
-          const tReparseStart = performance.now();
-          editorRef.current.update(() => {
-            const tInsideUpdateStart = performance.now();
-            // Clearing a selected node without moving selection first makes
-            // Lexical throw "selection has been lost ..." (NIM-2005).
-            $setSelection(null);
-            const root = $getRoot();
-            root.clear();
-            const tAfterClear = performance.now();
-            $convertFromEnhancedMarkdownString(oldContent, transformers);
-            const tAfterConvert = performance.now();
-            console.log(`[TabEditor.timing]   inside update: clear=${(tAfterClear - tInsideUpdateStart).toFixed(1)}ms convertFromMarkdown=${(tAfterConvert - tAfterClear).toFixed(1)}ms`);
-          }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
-          console.log(`[TabEditor.timing] clear+reparseOldContent (editor.update wall): ${(performance.now() - tReparseStart).toFixed(1)}ms`);
-
-          contentRef.current = oldContent;
-
-          // Wait a tick before applying diff
-          await new Promise(resolve => setTimeout(resolve, 100));
-
-          // Apply the diff
-          // Don't pass oldText - let the command handler extract it from the editor
-          // This handles normalization differences (tables, spacing, etc.)
-          isApplyingDiffRef.current = true;
-          try {
-            const replacements = [{
-              newText: newContent
-            }];
-            const tDispatchStart = performance.now();
-            editorRef.current.dispatchCommand(APPLY_MARKDOWN_REPLACE_COMMAND, replacements);
-            console.log(`[TabEditor.timing] APPLY_MARKDOWN_REPLACE_COMMAND dispatch: ${(performance.now() - tDispatchStart).toFixed(1)}ms`);
-            console.log(`[TabEditor.timing] TOTAL checkAndApplyPendingDiffs: ${(performance.now() - tCheckStart).toFixed(1)}ms`);
-            console.log(`[TabEditor] Applied pending AI edit diff on mount`);
-            // Fetch session info for the diff approval bar (for Lexical)
-            fetchDiffSessionInfo(pendingTag.sessionId, pendingTag.createdAt ? new Date(pendingTag.createdAt).getTime() : Date.now());
-          } finally {
-            setTimeout(() => {
-              isApplyingDiffRef.current = false;
-
-              // Reset dirty state after diff application - user hasn't made any changes
-              // This prevents false-positive autosaves from WYSIWYG rendering differences
-              isDirtyRef.current = false;
-              onDirtyChange?.(false);
-            }, 100);
-          }
-        }
-      } catch (error) {
-        logger.ui.error(`[TabEditor] Failed to check and apply pending diffs on mount:`, error);
-      }
-    };
-
-    checkAndApplyPendingDiffs();
-  }, [filePath, isMarkdown, isEditorReady, isCustom, sourceMode]); // Wait for editor to be ready before checking pending diffs
-
+    // Hydrate in source mode too. Source mode is not a presenter, so the
+    // generation parks as `awaiting-presenter` -- but the model must still know
+    // a review is open, because that is what blocks raw source saves and what
+    // gets published the moment the rich editor comes back.
+    void documentModel.ensureInitialized(initialContent).catch(() => {
+      // Logged inside the model, which also owns the bounded retry.
+    });
+  }, [documentModel, initialContent, isEditorReady, sourceMode]);
 
   // Helper: Save file with history snapshot
   // skipDiffCheck: Set to true when saving during AI operations (accept/reject/streaming)
@@ -875,8 +755,20 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       skipDiffCheck: boolean = false
   ) => {
     if (!window.electronAPI) return;
+    // Source mode is not a diff presenter, so this buffer has never been shown
+    // the agent's write -- writing it back is the revert the whole plan is
+    // about. Blocked at the entry rather than in the autosave gate because
+    // manual save (Cmd+S -> handleManualSave) comes straight here (NIM-5359).
+    if (sourceModeRef.current && hasUnresolvedReview()) {
+      logger.ui.warn(
+        `[TabEditor] Source-mode save refused for ${fileName}: an AI edit is still pending review`,
+      );
+      return;
+    }
 
-    const expectedDiskContent = lastSavedContentRef.current;
+    const expectedDiskContent = isCustom && !sourceMode
+      ? customEditorSaveBaseline(lastSavedContentRef.current, documentModel.getLastPersistedContent())
+      : lastSavedContentRef.current;
     // Generate a unique save ID to track this specific save operation
     const thisSaveId = ++saveIdRef.current;
     pendingSaveIdsRef.current.add(thisSaveId);
@@ -929,11 +821,15 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             window.electronAPI.saveFile(content, path, lastKnown, source),
           confirmOverwrite: () => {
             logger.ui.info('[TabEditor] Save conflict detected, prompting user');
-            return window.confirm(
-              'The file has been modified externally since you opened it.\n\n' +
-              'Do you want to overwrite the external changes with your edits?\n\n' +
-              'Click OK to overwrite, or Cancel to reload the file from disk.'
-            );
+            return requestConfirmation({
+              title: 'Overwrite external changes?',
+              message:
+                'The file has been modified externally since you opened it.\n\n' +
+                'Do you want to overwrite the external changes with your edits?\n\n' +
+                'Click OK to overwrite, or Cancel to reload the file from disk.',
+              confirmLabel: 'Overwrite',
+              destructive: true,
+            });
           },
         },
       );
@@ -1084,7 +980,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       isSavingRef.current = false;
       throw error;
     }
-  }, [filePath, fileName, onSaveComplete]);
+  }, [filePath, fileName, onSaveComplete, hasUnresolvedReview, isCustom, sourceMode, documentModel]);
 
   /**
    * Push external content into the editor and verify it landed (#3684).
@@ -1104,9 +1000,17 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     const canUseLexical =
       !!editor && typeof editor.update === 'function' && typeof editor.getEditorState === 'function';
     const canUseSetContent = !!editor && typeof editor.setContent === 'function';
+    const api = customEditorAPIRef.current as { reloadContent?: (text: string) => unknown } | null;
+    let customBuffer: string | null = null;
+    const canReloadCustom = isCustom && !sourceMode && typeof api?.reloadContent === 'function';
 
     let applyToEditor: ((content: string) => void) | null = null;
-    if (canUseLexical && isMarkdown) {
+    if (canReloadCustom) {
+      applyToEditor = content => {
+        const result = api!.reloadContent!(content);
+        customBuffer = typeof result === 'string' ? result : null;
+      };
+    } else if (canUseLexical && isMarkdown) {
       applyToEditor = (content) => {
         const transformers = getEditorTransformers();
         editor!.update(() => {
@@ -1136,6 +1040,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       {
         applyToEditor,
         readBuffer: () => {
+          if (canReloadCustom) return customBuffer;
           const getContent = getContentFnRef.current;
           if (!getContent) return null;
           try {
@@ -1149,7 +1054,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         },
       },
     );
-  }, [isMarkdown, fileName]);
+  }, [isMarkdown, fileName, isCustom, sourceMode]);
 
   /**
    * Adopt a reload outcome. A verified apply moves the baseline, the buffer and
@@ -1281,6 +1186,95 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   }, [filePath, fileName, documentModel, assertManualSaveSucceeded]);
 
   /**
+   * How this tab is presenting the generation the model currently holds.
+   *
+   * A reported outcome only speaks for the generation it named: if the model has
+   * moved on (or this tab never reported at all), the presentation is unverified
+   * and must block, not settle.
+   */
+  const currentPresentationMode = useCallback((): DiffPresentationMode => {
+    if (!pendingAIEditTagRef.current) return 'none';
+    if (sourceModeRef.current) return 'source-deferred';
+    const generation = documentModel?.getDiffState()?.generation;
+    const reported = presentedGenerationRef.current;
+    if (generation === undefined || !reported || reported.generation !== generation) {
+      return 'failed';
+    }
+    return reported.mode;
+  }, [documentModel]);
+
+  /**
+   * A resolution serializes the buffer and writes it, which is only honest once
+   * the buffer has stopped moving. A click can land inside the settle window of
+   * the apply that rendered the very diff the user acted on, so wait it out
+   * rather than refusing. Bounded: an apply that never finishes must not hang
+   * the user's decision.
+   *
+   * Returns false when the buffer is still in flight after the bound.
+   */
+  const waitForDiffApplyToSettle = useCallback(async (): Promise<boolean> => {
+    const deadline = Date.now() + 2000;
+    while (isApplyingDiffRef.current && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return !isApplyingDiffRef.current;
+  }, []);
+
+  /** Whether the editor still shows diff nodes right now. */
+  const editorStillShowsDiff = useCallback((): boolean => {
+    const current = editorRef.current;
+    if (!current || typeof current.getEditorState !== 'function') return false;
+    return current.getEditorState().read(() => $hasDiffNodes(current));
+  }, []);
+
+  const clearCustomEditorDiff = useCallback(() => {
+    setPendingAIEditTag(null);
+    setShowCustomEditorDiffBar(false);
+    setDiffSessionInfo(null);
+    diffClearedCallbackRef.current?.();
+  }, [setPendingAIEditTag]);
+
+  /**
+   * End the review through the model's single-flight resolution.
+   *
+   * The disk write and the history-tag update are one ordered transaction there,
+   * serialized against watcher delivery. Sequencing them here instead -- write,
+   * then tag, then clear the model's state -- read the conflict baseline outside
+   * that queue: an agent write landing in between was handed to the store as the
+   * *expected* disk content, so the stale buffer overwrote it with a conflict
+   * check that passed (NIM-5359, finding 1).
+   *
+   * `finalContent` is this editor's own serialization when it has one (a Lexical
+   * accept-all after per-group decisions). `generation` is the model generation
+   * that was live when the decision arrived; the model refuses outright if the
+   * agent has written again since, leaving the review open over the content the
+   * user has not seen yet.
+   *
+   * Returns false when the decision was refused -- callers must leave their diff
+   * UI up and write nothing.
+   */
+  const resolveReviewThroughModel = useCallback(async (
+    accepted: boolean,
+    request: { finalContent?: string; generation?: number } = {},
+  ): Promise<boolean> => {
+    const handle = documentModelHandleRef.current;
+    if (!handle || !documentModel?.getDiffState()) {
+      logger.ui.warn(`[TabEditor] No model diff state to resolve for ${fileName}`);
+      return false;
+    }
+    try {
+      await handle.resolveDiff(accepted, request);
+    } catch (err) {
+      logger.ui.warn(
+        `[TabEditor] Diff resolution refused for ${fileName}; leaving the review open:`,
+        err,
+      );
+      return false;
+    }
+    return true;
+  }, [documentModel, fileName]);
+
+  /**
    * Decide whether an autosave may proceed while an AI edit tag is pending.
    *
    * Between `$approveDiffs` removing the diff nodes and `CLEAR_DIFF_TAG_COMMAND`
@@ -1294,33 +1288,88 @@ export const TabEditor: React.FC<TabEditorProps> = ({
    * So: never race a resolution that is already in flight, and when this is the
    * thing that ends diff mode, adopt the agent's content as the baseline before
    * dropping the diff state that names it.
+   *
+   * The decision table itself is `resolveDiffAutosaveGate`, which is where "no
+   * inline diff" stops being confusable with "manually resolved".
    */
-  const settleDiffBeforeAutosave = useCallback((): 'proceed' | 'skip' => {
+  const settleDiffBeforeAutosave = useCallback(async (): Promise<'proceed' | 'skip'> => {
     if (isClearingDiffTagRef.current) return 'skip';
 
+    // A resolution already wrote its bytes but could not mark the tag reviewed.
+    // Until that half lands, nothing may be written on top of it.
+    if (documentModel?.isSaveBlockedByPendingResolution()) {
+      logger.ui.warn(`[TabEditor] Autosave blocked: diff resolution tag still pending for ${fileName}`);
+      return 'skip';
+    }
+
     const pending = pendingAIEditTagRef.current;
-    if (!pending) return 'proceed';
-
     const editor = editorRef.current;
-    if (!editor || typeof editor.getEditorState !== 'function') return 'proceed';
+    const canReadDiffNodes = !!editor && typeof editor.getEditorState === 'function';
+    const modelDiskContent = documentModel?.getDiffState()?.newContent ?? null;
 
-    const hasDiffs = editor.getEditorState().read(() => $hasDiffNodes(editor));
-    if (hasDiffs) return 'skip';
+    const decision = resolveDiffAutosaveGate({
+      hasPendingTag: !!pending,
+      resolutionInFlight: documentModel?.isResolutionInFlight() ?? false,
+      presentation: currentPresentationMode(),
+      hasDiffNodes: canReadDiffNodes
+        ? editor.getEditorState().read(() => $hasDiffNodes(editor))
+        : null,
+      modelDiskContent,
+    });
 
-    const diskBaseline = documentModel?.getDiffState()?.newContent;
+    if (decision.kind === 'proceed') return 'proceed';
+    if (decision.kind === 'skip') {
+      // Not a warning: most of these are the ordinary "the review is still open"
+      // state that fires on every autosave tick.
+      logger.ui.debug(`[TabEditor] Autosave held for ${fileName}: ${decision.reason}`);
+      return 'skip';
+    }
+
+    // `settle`: the user reduced a rendered inline diff to zero groups by hand.
+    const diskBaseline = decision.adoptedBaseline;
     if (typeof diskBaseline === 'string') {
       lastSavedContentRef.current = diskBaseline;
       documentModel?.setLastPersistedContent(diskBaseline);
     }
 
     logger.ui.info(`[TabEditor] No diffs remaining, clearing pending tag: ${fileName}`);
-    window.electronAPI.invoke('history:update-tag-status', pending.filePath, pending.tagId, 'reviewed');
+
+    // End the review through the model's awaited resolution: the disk write and
+    // the tag update are one ordered, recoverable transaction there. The old
+    // fire-and-forget `history:update-tag-status` IPC could fail silently, which
+    // left the baseline on disk under a still-pending tag (NIM-5359, defect I).
+    const handle = documentModelHandleRef.current;
+    if (handle && documentModel?.getDiffState()) {
+      try {
+        await handle.resolveDiff(true);
+      } catch (err) {
+        logger.ui.warn(
+          `[TabEditor] Diff resolution before autosave failed for ${fileName}; holding the write:`,
+          err,
+        );
+        return 'skip';
+      }
+      setPendingAIEditTag(null);
+      return 'proceed';
+    }
+
+    // The model's diff state went away between the gate and here -- its
+    // resolution already ran, and the baseline above is the one it wrote. All
+    // that is left is the tag. (A settle decision requires model disk truth, so
+    // this can no longer be the mount path's "diff mode without a model".)
+    if (!pending) return 'proceed';
+    try {
+      await window.electronAPI.invoke('history:update-tag-status', pending.filePath, pending.tagId, 'reviewed');
+    } catch (err) {
+      logger.ui.warn(`[TabEditor] Clearing pending tag failed for ${fileName}; holding the write:`, err);
+      return 'skip';
+    }
     setPendingAIEditTag(null);
     // Exclude self from the diffResolved fan-out -- siblings still need to
     // exit diff mode, but we already did our local cleanup.
     documentModel?.clearDiffState(documentModelHandleRef.current?.id, true);
     return 'proceed';
-  }, [documentModel, fileName]);
+  }, [documentModel, fileName, currentPresentationMode, setPendingAIEditTag]);
 
   const settleDiffBeforeAutosaveRef = useRef(settleDiffBeforeAutosave);
   useEffect(() => {
@@ -1346,21 +1395,76 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     // If in diff mode (e.g. tab being closed), approve all diffs first so we
     // save clean content without diff markers. This prevents data loss when
     // the user closes a tab or the app quits while diffs are showing.
-    // We call $approveDiffs directly (not via command) to avoid triggering the
-    // CLEAR_DIFF_TAG_COMMAND chain which would double-save.
-    if (pendingAIEditTagRef.current && editorRef.current && typeof editorRef.current.update === 'function') {
-      logger.ui.info(`[TabEditor] Approving diffs before manual save for ${fileName}`);
-      editorRef.current.update(() => {
-        $approveDiffs();
+    //
+    // This is the one keystroke that could reproduce the whole NIM-5359
+    // incident: it used to approve whatever diff nodes it found -- none, if an
+    // apply was mid-flight with the buffer reset to the pre-edit baseline --
+    // clear the model's state, fire an un-awaited tag update, and write that
+    // baseline over the agent's content with a conflict check that passed. So
+    // the review is settled first, through the model, and only a generation
+    // this tab verifiably rendered may be settled at all (finding 2).
+    if (pendingAIEditTagRef.current || documentModel?.isSaveBlockedByPendingResolution()) {
+      // Let an apply that is mid-flight finish rather than refusing a click
+      // that landed a moment early.
+      await waitForDiffApplyToSettle();
+
+      // Same for a resolution another path already owns -- clicking Approve and
+      // then hitting Cmd+S is ordinary. It owns the write; join it and then save
+      // on top, rather than dropping the user's save on the floor.
+      if (documentModel?.isResolutionInFlight()) {
+        await documentModel.retryPendingResolution().catch(() => {});
+      }
+
+      const decision = resolveManualSaveReviewGate({
+        // The model's diff state, not just this tab's ref: once the review is
+        // resolved there is nothing left to gate, and the ref is cleared a tick
+        // later by whoever resolved it.
+        hasPendingTag: !!pendingAIEditTagRef.current && !!documentModel?.getDiffState(),
+        resolutionInFlight: documentModel?.isResolutionInFlight() ?? false,
+        resolutionIncomplete: documentModel?.isSaveBlockedByPendingResolution() ?? false,
+        applyInFlight: isApplyingDiffRef.current,
+        presentation: currentPresentationMode(),
       });
-      // Clear the pending tag since we've accepted everything. Exclude self
-      // from the fan-out so onDiffResolved doesn't recurse into our own editor.
-      documentModel?.clearDiffState(documentModelHandleRef.current?.id, true);
-      const { tagId, filePath: tagFilePath } = pendingAIEditTagRef.current;
-      window.electronAPI.invoke('history:update-tag-status', tagFilePath, tagId, 'reviewed');
-      setPendingAIEditTag(null);
+
+      if (decision.kind === 'refuse') {
+        logger.ui.warn(
+          `[TabEditor] Manual save held for ${fileName}: ${decision.reason}. ` +
+            `The buffer is preserved and the review stays open.`,
+        );
+        return;
+      }
+
+      if (decision.kind === 'resolve-then-save') {
+        const editor = editorRef.current;
+        if (!editor || typeof editor.update !== 'function' || !getContentFnRef.current) {
+          logger.ui.warn(
+            `[TabEditor] Manual save held for ${fileName}: no editor to settle the review with`,
+          );
+          return;
+        }
+        logger.ui.info(`[TabEditor] Approving diffs before manual save for ${fileName}`);
+        // Captured before the approve: the decision belongs to the generation
+        // that was live when the keystroke arrived, not to whatever the agent
+        // publishes while we serialize.
+        const decidedGeneration = documentModel?.getCurrentDiffGeneration() ?? undefined;
+        editor.update(() => {
+          $approveDiffs();
+        });
+        const approvedContent = getContentFnRef.current();
+        if (!(await resolveReviewThroughModel(true, {
+          finalContent: approvedContent,
+          generation: decidedGeneration,
+        }))) {
+          return;
+        }
+        setPendingAIEditTag(null);
+        lastSavedContentRef.current = approvedContent;
+        contentRef.current = approvedContent;
+        initialContentRef.current = approvedContent;
+      }
     }
 
+    if (!getContentFnRef.current) return;
     const currentContent = getContentFnRef.current();
     // Use skipDiffCheck=false so saveWithHistory checks for leftover diff nodes
     // and clears pending tags if all diffs have been resolved
@@ -1369,7 +1473,16 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     } catch (error) {
       logger.ui.error(`[TabEditor] Manual save failed for ${filePath}:`, error);
     }
-  }, [saveWithHistory, fileName, filePath]);
+  }, [
+    saveWithHistory,
+    fileName,
+    filePath,
+    documentModel,
+    waitForDiffApplyToSettle,
+    currentPresentationMode,
+    resolveReviewThroughModel,
+    setPendingAIEditTag,
+  ]);
 
   // Periodic snapshots
   const lastSnapshotContentRef = useRef<string>(initialContent);
@@ -1437,12 +1550,16 @@ export const TabEditor: React.FC<TabEditorProps> = ({
 
     const cleanups: Array<() => void> = [];
 
+    if (documentModel) cleanups.push(documentModel.on('external-conflict', event => {
+      if (isDirtyRef.current && typeof event.diskContent === 'string') setAutosaveConflictDiskContent(event.diskContent);
+    }));
+
     // --- Autosave: DocumentModel calls onSaveRequested when it's time to save ---
     // Custom editors wire their own callback via EditorHost.subscribeToSaveRequests.
     // This handler covers built-in editors (Lexical/Monaco) that use getContentFnRef.
     // If a custom editor has already registered via EditorHost, skip (checked at call time).
     cleanups.push(
-      handle.onSaveRequested(() => {
+      handle.onSaveRequested(async () => {
         // Custom editors handle their own save via EditorHost callback
         if (editorHostSaveRequestCallbackRef.current) return;
         // Skip if no content function (editor not ready)
@@ -1460,7 +1577,9 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         // If in diff mode, check if all diffs have been manually resolved.
         // (User may have deleted all diff content via select-all + backspace.)
         // If no diff nodes remain, clear the pending tag so autosave can proceed.
-        if (settleDiffBeforeAutosaveRef.current() === 'skip') return;
+        if ((await settleDiffBeforeAutosaveRef.current()) === 'skip') return;
+        // The gate above awaits a resolution; re-check the editor is still here.
+        if (!getContentFnRef.current) return;
 
         const currentContent = getContentFnRef.current();
         logger.ui.info(`[TabEditor] DocumentModel autosave: ${fileName}`);
@@ -1470,6 +1589,25 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         });
       }),
     );
+
+    // Shows content now on disk in the built-in editor; false when the reload
+    // could not be verified.
+    const applyDiskContent = (content: string): boolean => {
+      // Guard: suppress the Lexical onChange -> setDirty(true) that fires
+      // from the programmatic content update below.
+      isApplyingExternalContentRef.current = true;
+
+      // The baseline, the buffer and the dirty flag move together or not at
+      // all -- see reloadFromDisk.ts for why an unverified baseline is a
+      // silent data-loss path (#3684).
+      const outcome = applyVerifiedReload(content);
+      commitReloadOutcome(outcome, content);
+
+      setTimeout(() => {
+        isApplyingExternalContentRef.current = false;
+      }, 0);
+      return outcome.verified;
+    };
 
     // --- File changes: DocumentModel calls onFileChanged for non-diff external edits ---
     // Custom editors receive file changes through EditorHost.subscribeToFileChanges(),
@@ -1507,7 +1645,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             hasPendingTag: !!pendingAIEditTagRef.current,
             t: performance.now(),
           });
-          return;
+          return false;
         }
 
         // Skip if content is identical to what we already have.
@@ -1521,18 +1659,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           t: performance.now(),
         });
 
-        // Guard: suppress the Lexical onChange -> setDirty(true) that fires
-        // from the programmatic content update below.
-        isApplyingExternalContentRef.current = true;
-
-        // The baseline, the buffer and the dirty flag move together or not at
-        // all -- see reloadFromDisk.ts for why an unverified baseline is a
-        // silent data-loss path (#3684).
-        commitReloadOutcome(applyVerifiedReload(content), content);
-
-        setTimeout(() => {
-          isApplyingExternalContentRef.current = false;
-        }, 0);
+        return applyDiskContent(content);
       }),
     );
 
@@ -1541,18 +1668,54 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     // DocumentModel runs the DiffSession state machine. It only fires onDiffRequested
     // when the session transitions to `applying` with a fresh payload. Duplicates and
     // in-flight queues are handled inside the model -- we just apply whatever shows up.
-    // After the editor finishes its replay we call `handle.markDiffApplied()` so the
-    // model can transition to `applied` and drain any payload that arrived during the
-    // apply (the model will fire onDiffRequested again with the drained content).
+    // After the editor settles we report the outcome for the exact generation we
+    // were handed via `handle.completeDiffApply`. The model drains the next
+    // payload only once every recipient of that generation reports success; a
+    // `failed` outcome makes it re-read disk instead of advancing the baseline
+    // onto content nothing is showing (NIM-5359, defects F/G).
     const applyDiffState = async (state: DiffState): Promise<void> => {
-      const { tagId, sessionId, oldContent, newContent, createdAt } = state;
+      const { tagId, sessionId, oldContent, newContent, createdAt, generation } = state;
       const tagInfo = { tagId, sessionId, filePath };
+
+      // Exactly one outcome per generation, and never from `finally` -- that is
+      // what let a caught apply error acknowledge success.
+      let reported = false;
+      const report = (outcome: DiffApplyOutcome): void => {
+        if (reported) return;
+        reported = true;
+        // The same outcome the model gets is what the autosave gate reads back:
+        // "zero diff nodes" only means "the user resolved this" for a generation
+        // this tab verifiably rendered inline.
+        presentedGenerationRef.current = {
+          generation,
+          mode: PRESENTATION_FOR_OUTCOME[outcome],
+        };
+        try {
+          handle.completeDiffApply({ generation, outcome });
+        } catch (err) {
+          logger.ui.error('[TabEditor] completeDiffApply failed:', err);
+        }
+      };
 
       isApplyingDiffRef.current = true;
       setPendingAIEditTag(tagInfo);
 
       try {
-        if (diffRequestCallbackRef.current) {
+        if (acceptAgentEdits && !isCustom) {
+          // A Local wiki page in the Wiki shows the page as it is now: the
+          // agent's edit is accepted rather than reviewed. Resolving fires
+          // notifyFileChanged while this tab's diff guards are set, so the
+          // accepted content is applied here.
+          try {
+            await handle.resolveDiff(true);
+            reported = true;
+            setPendingAIEditTag(null);
+            applyDiskContent(newContent);
+          } catch (err) {
+            logger.ui.error('[TabEditor] Accepting an agent edit for a wiki page failed:', err);
+            report('failed');
+          }
+        } else if (diffRequestCallbackRef.current) {
           // Custom editor with declared diff view
           setShowCustomEditorDiffBar(true);
           fetchDiffSessionInfo(sessionId, createdAt);
@@ -1567,6 +1730,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           isDirtyRef.current = false;
           onDirtyChange?.(false);
           setReloadVersion((v) => v + 1);
+          report('applied');
         } else if (isCustom && !customEditorSupportsDiffMode) {
           // Custom editor with no diff view: auto-accept so subsequent external edits flow
           // through notifyFileChanged instead of being swallowed by diff-mode routing.
@@ -1577,6 +1741,10 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           onDirtyChange?.(false);
           try {
             await handle.resolveDiff(true);
+            // The resolution IS this editor's completion: the session is gone, so
+            // a generic apply acknowledgement would name a generation that no
+            // longer exists.
+            reported = true;
             // resolveDiff's notifyFileChanged fired while our diff guards were
             // still set, so the subscribeToFileChanges wrapper dropped it -- and
             // onDiffResolved excludes the resolving editor, so nothing else
@@ -1587,15 +1755,69 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             editorHostFileChangeCallbackRef.current?.(newContent);
           } catch (err) {
             logger.ui.error('[TabEditor] Auto-accept diff failed for no-diff-view custom editor:', err);
+            report('failed');
           }
+        } else if (isCustom) {
+          // A diff-capable custom editor whose own callback has not landed yet.
+          // Registration is the readiness signal, so park the generation instead
+          // of claiming it: `subscribeToDiffRequests` re-registers this
+          // attachment as a presenter and the model replays the latest target
+          // through `onPresenterRegistered` (NIM-5359 Phase 6, replacing the
+          // mount path's 50ms sleep).
+          report('detached');
         } else {
           // Built-in editor: Lexical or Monaco
           contentRef.current = oldContent;
 
-          if (editorRef.current) {
+          if (!editorRef.current) {
+            // Nothing here can present the generation. Claiming it applied would
+            // advance the model past content no editor is showing; reporting
+            // `detached` parks it until this attachment re-registers with a
+            // mounted editor.
+            report('detached');
+          } else {
             if (isMarkdown) {
               const transformers = getEditorTransformers();
+
+              // #4821: the tree matcher's O(m*n) alignment is unaffordable above
+              // these thresholds -- tens of seconds of blocked main thread, then
+              // a throw. Declining it is a PRESENTATION outcome: the buffer gets
+              // the agent's bytes (verified), the approval bar and the pending
+              // tag stay, and the model is told `presented-without-inline` so
+              // autosave cannot read the missing diff nodes as a resolution.
+              const presentWithoutInline = (reason: string): void => {
+                logger.ui.warn(`[TabEditor] Skipping Lexical diff: ${reason} file=${fileName}`);
+                isApplyingExternalContentRef.current = true;
+                const outcome = applyVerifiedReload(newContent);
+                commitReloadOutcome(outcome, newContent);
+                setTimeout(() => {
+                  isApplyingExternalContentRef.current = false;
+                }, 0);
+                // The restore round-trip is a reparse, not a user edit -- don't
+                // let the trailing Lexical onChange leave the tab dirty.
+                setTimeout(() => {
+                  isDirtyRef.current = false;
+                  onDirtyChange?.(false);
+                }, 100);
+                fetchDiffSessionInfo(sessionId, createdAt);
+                if (!outcome.verified) {
+                  // commitReloadOutcome already blocked writes and started
+                  // self-heal; the model must recover rather than move on.
+                  report('failed');
+                  return;
+                }
+                setNoInlineFallbackReview(true);
+                report('presented-without-inline');
+              };
+
+              const byBytes = decideLexicalDiffByBytes(oldContent, newContent);
+              if (byBytes.presentation === 'no-inline-fallback') {
+                presentWithoutInline(byBytes.reason);
+                return;
+              }
+
               diffTrace('TabEditor.applyDiffState resetting editor to oldContent', { filePath, oldLen: oldContent.length, t: performance.now() });
+              let oldRootNodeCount = 0;
               editorRef.current.update(() => {
                 // Clearing a selected node without moving selection first makes
                 // Lexical throw "selection has been lost ..." (NIM-2005).
@@ -1603,7 +1825,18 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 const root = $getRoot();
                 root.clear();
                 $convertFromEnhancedMarkdownString(oldContent, transformers);
+                oldRootNodeCount = root.getChildren().length;
               }, { tag: externalContentUpdateTags(editorRef.current) });
+
+              // Bytes are only a pre-filter -- 194KB of prose is a handful of
+              // nodes, 194KB of bullets is thousands -- so the real guard runs
+              // once the baseline is parsed. The buffer currently holds the
+              // baseline; the fallback puts the agent's bytes back.
+              const byRootNodes = decideLexicalDiffByRootNodes(oldRootNodeCount);
+              if (byRootNodes.presentation === 'no-inline-fallback') {
+                presentWithoutInline(byRootNodes.reason);
+                return;
+              }
 
               await new Promise((resolve) => setTimeout(resolve, 250));
 
@@ -1626,7 +1859,15 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 t: performance.now(),
               });
 
-              editorRef.current.dispatchCommand(APPLY_MARKDOWN_REPLACE_COMMAND, [{ newText: newContent }]);
+              // Lexical swallows listener throws; the synchronous outcome arrives via `onResult`.
+              let applyResult: LexicalDiffApplyResult | null = null;
+              editorRef.current.dispatchCommand(APPLY_MARKDOWN_REPLACE_COMMAND, {
+                replacements: [{ newText: newContent }],
+                onResult: (result: LexicalDiffApplyResult) => { applyResult = result; },
+              });
+              renderedReviewRef.current = captureRenderedReview(editorRef.current, generation); // before any await
+              const tooLarge = lexicalDiffTooLargeReason(applyResult);
+              if (tooLarge) { presentWithoutInline(tooLarge); return; }
               fetchDiffSessionInfo(sessionId, createdAt);
 
               await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1652,11 +1893,22 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                   attempts: (unverifiedReloadRef.current?.attempts ?? 0) + 1,
                 };
                 scheduleSelfHealRef.current?.(unverifiedReloadRef.current.attempts);
+                // The readback is the proof. Without it the target is not on
+                // screen, so the model must recover it rather than move on.
+                report('failed');
+              } else {
+                report('applied');
               }
             } else if (editorRef.current.showDiff) {
               editorRef.current.showDiff(oldContent, newContent);
               setShowMonacoDiffBar(true);
               fetchDiffSessionInfo(sessionId, createdAt);
+              report('applied');
+            } else {
+              // A built-in editor with no diff surface at all. The bytes are on
+              // disk and the approval bar stays pending; there is simply no
+              // inline rendering to verify.
+              report('presented-without-inline');
             }
           }
 
@@ -1666,19 +1918,33 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         }
       } catch (error) {
         logger.ui.error(`[TabEditor] Failed to apply DocumentModel diff:`, error);
+        report('failed');
       } finally {
         isApplyingDiffRef.current = false;
-        // Tell the model we're done so it can drain any payload that landed during apply.
-        // The model will fire onDiffRequested again if there was queued content.
-        try {
-          handle.markDiffApplied();
-        } catch (err) {
-          logger.ui.error('[TabEditor] markDiffApplied failed:', err);
-        }
+        // Backstop only: every branch above names its own outcome. An unreported
+        // generation means we fell through a path that presented nothing, and
+        // `failed` is the outcome that cannot advance the conflict baseline.
+        report('failed');
       }
     };
 
-    cleanups.push(
+    // Registering the callback is what makes this attachment a generation
+    // recipient, so the two cases that cannot present must not register:
+    //
+    // - source mode, which renders raw text and no diff at all. `sourceMode` is
+    //   in this effect's dependencies precisely so entry unregisters and exit
+    //   re-registers, and the re-registration is what republishes the parked
+    //   generation through the model's `onPresenterRegistered`.
+    // - a diff-capable custom editor whose own diff callback has not arrived.
+    //   Its registration is the readiness signal (this effect re-runs on it),
+    //   which is what replaced the mount path's 50ms sleep.
+    //
+    // Either way the model parks the generation as `awaiting-presenter` rather
+    // than waiting on an acknowledgement that cannot come (NIM-5359 Phase 6).
+    const canPresentDiffs =
+      !sourceMode && (!isCustom || !customEditorSupportsDiffMode || customDiffPresenterReady);
+
+    if (canPresentDiffs) cleanups.push(
       handle.onDiffRequested((diffState) => {
         const { tagId, oldContent, newContent, newContentHash } = diffState;
 
@@ -1697,8 +1963,17 @@ export const TabEditor: React.FC<TabEditorProps> = ({
 
         if (oldContent === newContent) {
           diffTrace('TabEditor.onDiffRequested SKIP empty diff', { filePath, tagId, t: performance.now() });
-          // Tell the model the (empty) apply is done so its session doesn't sit in 'applying'.
-          handle.markDiffApplied();
+          // There is nothing to render, but the buffer already equals the target,
+          // so the generation is honestly presented -- naming that outcome keeps
+          // the session from sitting in 'applying' with nobody owing it anything.
+          presentedGenerationRef.current = {
+            generation: diffState.generation,
+            mode: 'presented-without-inline',
+          };
+          handle.completeDiffApply({
+            generation: diffState.generation,
+            outcome: 'presented-without-inline',
+          });
           return;
         }
 
@@ -1715,6 +1990,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       handle.onDiffResolved((accepted) => {
         if (!pendingAIEditTagRef.current) return;
         logger.ui.info('[TabEditor] Sibling editor resolved diff -- exiting diff mode', { filePath, accepted });
+        if (isCustom) clearCustomEditorDiff();
 
         // Drop our local pending-tag tracking. onFileChanged is gated on
         // pendingAIEditTagRef being null, so without this clear the resolved
@@ -1764,8 +2040,22 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     return () => {
       for (const cleanup of cleanups) cleanup();
     };
+    // `sourceMode` and `customDiffPresenterReady` are here so presenter
+    // registration follows readiness deterministically -- see `canPresentDiffs`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filePath, fileName, isMarkdown, isCustom, saveWithHistory, isEditorReady]);
+  }, [
+    filePath,
+    fileName,
+    isMarkdown,
+    isCustom,
+    saveWithHistory,
+    isEditorReady,
+    sourceMode,
+    customEditorSupportsDiffMode,
+    customDiffPresenterReady,
+    clearCustomEditorDiff,
+    acceptAgentEdits,
+  ]);
 
 
   // Listen for "Clear All Pending" event to exit diff mode when this file's pending tag is cleared
@@ -1784,6 +2074,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         }
 
         logger.ui.info('[TabEditor] Pending tag cleared for this file, exiting diff mode:', filePath);
+        if (isCustom) clearCustomEditorDiff();
 
         // Clear pending tag ref
         setPendingAIEditTag(null);
@@ -1803,10 +2094,12 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             isDirtyRef.current = false;
             onDirtyChange?.(false);
 
-            if (isMarkdown && editorRef.current) {
+            const editor = editorRef.current;
+            const reloadKind = editorReloadKind(editor); // Not isMarkdown alone: source mode is Monaco (#1672).
+            if (isMarkdown && reloadKind === 'lexical') {
               // For Lexical (markdown), we need to clear diff nodes and reload content
               const transformers = getEditorTransformers();
-              editorRef.current?.update(() => {
+              editor.update(() => {
                 // Clearing a selected node without moving selection first makes
                 // Lexical throw "selection has been lost ..." (NIM-2005).
                 $setSelection(null);
@@ -1814,25 +2107,25 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 root.clear();
                 $convertFromEnhancedMarkdownString(newContent, transformers);
               }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
-            } else if (!isMarkdown && editorRef.current) {
+            } else if (reloadKind !== 'none') {
               // For Monaco, exit diff mode and update content
-              if (editorRef.current.exitDiffMode) {
-                editorRef.current.exitDiffMode();
+              if (editor.exitDiffMode) {
+                editor.exitDiffMode();
               }
               // Update Monaco editor content to match what's on disk
-              if (editorRef.current.setContent) {
-                editorRef.current.setContent(newContent, { force: true });
+              if (editor.setContent) {
+                editor.setContent(newContent, { force: true });
               }
             }
           }
-        });
+        }).catch((err) => logger.ui.error('[TabEditor] Reload after pending tag cleared failed:', err));
       }
     });
 
     return () => {
       unsubscribe();
     };
-  }, [filePath, isMarkdown]);
+  }, [filePath, isMarkdown, isCustom, clearCustomEditorDiff]);
 
   // Handle conflict dialog actions
   const handleReloadFromDisk = useCallback(async () => {
@@ -1903,7 +2196,8 @@ export const TabEditor: React.FC<TabEditorProps> = ({
               const root = $getRoot();
               root.clear();
               $convertFromEnhancedMarkdownString(newContent, transformers);
-            }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
+              // Re-read by the status chip and Page info once committed.
+            }, { tag: SKIP_SCROLL_INTO_VIEW_TAG, onUpdate: () => setReloadVersion((v) => v + 1) });
           } else {
             // Update Monaco editor
             if (editorRef.current.setContent) {
@@ -1935,10 +2229,23 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     // APPROVE_DIFF_COMMAND and REJECT_DIFF_COMMAND are now handled solely by DiffPlugin.
     // TabEditor only handles CLEAR_DIFF_TAG_COMMAND which is dispatched by DiffPlugin after all diffs are processed.
 
+    // `waitForDiffApplyToSettle` and `editorStillShowsDiff` are component-level:
+    // manual save applies the same two checks before it may settle a review.
+
     // Handle incremental approval - create tag for partial accept/reject
     const handleIncrementalApproval = async () => {
       try {
         if (!pendingAIEditTagRef.current) {
+          return;
+        }
+        // The generation this decision belongs to, read before anything awaits.
+        const decidedGeneration = documentModel?.getCurrentDiffGeneration() ?? undefined;
+        // A partial decision deliberately leaves the other groups on screen, so
+        // only the mid-apply wait applies here.
+        if (!(await waitForDiffApplyToSettle())) {
+          logger.ui.warn(
+            `[TabEditor] Ignoring partial diff resolution for ${fileName}: the buffer is still mid-apply`,
+          );
           return;
         }
 
@@ -1958,6 +2265,17 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           const rejectedContent = editorRef.current.getEditorState().read(() => {
             return $convertToEnhancedMarkdownString(transformers, { rejectMode: true });
           });
+
+          // A partial resolve rotates the tag rather than ending the session, so
+          // it does not go through the model's resolution transaction -- but it
+          // still may not write a buffer the agent has already outrun.
+          if (documentModel?.getCurrentDiffGeneration() !== decidedGeneration) {
+            logger.ui.warn(
+              `[TabEditor] Ignoring partial diff resolution for ${fileName}: the agent wrote again ` +
+                `while the decision was being serialized`,
+            );
+            return;
+          }
 
           // Save the approved content to disk
           if (!(await saveDiffResolutionToDisk(approvedContent))) return;
@@ -2005,6 +2323,23 @@ export const TabEditor: React.FC<TabEditorProps> = ({
 
     // Handle clearing diff tag without accept/reject (for incremental operations)
     const handleClearDiffTag = async () => {
+      // The generation this decision belongs to: read before the waits below, so
+      // anything the agent publishes while we settle and serialize makes the
+      // model refuse rather than accept a buffer that predates it.
+      const decidedGeneration = documentModel?.getCurrentDiffGeneration() ?? undefined;
+      // This command means "every group is resolved", so diff nodes surviving
+      // the wait mean the decision never reached this buffer: the click landed
+      // while an apply had it on the pre-edit baseline with nothing rendered
+      // (the ~350ms a recovery republish opens), and the approve was a no-op.
+      // Serializing now writes that baseline over the agent's content --
+      // byte-for-byte the NIM-5359 incident. Leave the review pending instead.
+      if (!(await waitForDiffApplyToSettle()) || editorStillShowsDiff()) {
+        logger.ui.warn(
+          `[TabEditor] Ignoring diff resolution for ${fileName}: the buffer is mid-apply and still ` +
+            `holds an unrendered generation`,
+        );
+        return;
+      }
       isClearingDiffTagRef.current = true;
       try {
         if (!pendingAIEditTagRef.current) {
@@ -2015,60 +2350,41 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         const { tagId, sessionId: clearSessionId, filePath } = pendingAIEditTagRef.current;
         logger.ui.info('[TabEditor] handleClearDiffTag START:', { tagId, filePath });
 
-        // CRITICAL: Mark tag as reviewed BEFORE saving to disk
-        // This prevents the file watcher from re-entering diff mode when it detects the save
-        await window.electronAPI.history.updateTagStatus(filePath, tagId, 'reviewed', workspaceId);
-        logger.ui.info(`[TabEditor] Successfully marked AI edit tag as reviewed: ${tagId}`);
-
-        // Clear the pending tag reference immediately so file watcher won't re-enter diff mode
-        setPendingAIEditTag(null);
-
-        // Clearing DocumentModel's diff state fans out to sibling attachments so
-        // they dismiss their own diff UI (excluding our own editor id, or we'd
-        // recurse via the onDiffResolved callback we just registered) -- but it
-        // also destroys the conflict baseline for the write below, so it has to
-        // happen *inside* saveDiffResolutionToDisk, after the baseline is read.
-        // Clearing it here first is what made every accept-all look like a disk
-        // conflict (#1408).
-        const clearModelDiffState = () =>
-          documentModel?.clearDiffState(documentModelHandleRef.current?.id, true);
-
-        // Now save current editor state to disk
+        // The write, the tag update and the session teardown all belong to the
+        // model: it holds them on one serial queue, with the agent's latest
+        // write as the conflict baseline. This used to be three steps here --
+        // tag first, then a write whose baseline was read from the model
+        // afterwards -- so an agent write arriving in between was handed over as
+        // the expected disk content and this buffer overwrote it clean
+        // (NIM-5359, finding 1).
         if (editorRef.current) {
-            const transformers = getEditorTransformers();
+            // The reviewed bytes when the buffer is exactly one side, else its export (#1734).
+            const resolution = resolveLexicalReview(editorRef.current, getEditorTransformers(), documentModel?.getDiffState(), decidedGeneration, renderedReviewRef.current);
+            if (!(await resolveReviewThroughModel(resolution.accepted, resolution.request))) return;
 
-            const currentContent = editorRef.current.getEditorState().read(() => {
-              return $convertToEnhancedMarkdownString(transformers);
-            });
+            // Clear the pending tag reference so the file watcher won't re-enter
+            // diff mode. After the resolution, so the model's own
+            // notifyFileChanged is still suppressed locally.
+            setPendingAIEditTag(null);
 
-            // Save to disk
-            if (!(await saveDiffResolutionToDisk(currentContent, clearModelDiffState))) return;
-
-            // Update DocumentModel's echo-suppression baseline
-            documentModel?.setLastPersistedContent(currentContent);
-
-            // Push the resolved content to clean siblings so their editor
-            // reflects the post-approval state (the model skips dirty
-            // siblings, but they should be clean here since diff application
-            // is wrapped in isApplyingDiffRef which suppresses dirty).
-            documentModelHandleRef.current?.notifySiblingsSaved(currentContent);
-
+            const writtenContent = await readResolvedContent(resolution, () => window.electronAPI.readFileContent(filePath));
             // Create history snapshot
-            await window.electronAPI.invoke('history:create-snapshot', filePath, currentContent, 'manual', 'Incremental diff acceptance');
+            await window.electronAPI.invoke('history:create-snapshot', filePath, writtenContent, 'manual', 'Incremental diff acceptance');
 
             // Advance the Codex cache so subsequent AI edits diff against post-review state
             if (clearSessionId) {
-              window.electronAPI.invoke('ai:advance-diff-baseline', clearSessionId, filePath, currentContent);
+              window.electronAPI.invoke('ai:advance-diff-baseline', clearSessionId, filePath, writtenContent);
             }
 
             // Update our state
-            contentRef.current = currentContent;
-            initialContentRef.current = currentContent;
-            lastSavedContentRef.current = currentContent;
+            contentRef.current = writtenContent;
+            initialContentRef.current = writtenContent;
+            lastSavedContentRef.current = writtenContent;
           } else {
-            // No editor to serialize, so there is no write to hang the clear
-            // off -- siblings still have to leave diff mode.
-            clearModelDiffState();
+            // No editor to serialize: the model resolves from the session's own
+            // accepted content, and siblings still leave diff mode.
+            if (!(await resolveReviewThroughModel(true, { generation: decidedGeneration }))) return;
+            setPendingAIEditTag(null);
           }
 
           // Reload editor to exit diff mode and show clean final state
@@ -2079,6 +2395,11 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             if (editorRef.current) {
               const transformers = getEditorTransformers();
 
+              // This reparse is the resolution's own bytes coming back, not a
+              // user edit. Without the guard the tab is left showing "unsaved
+              // changes" the moment a review is approved, and whether that
+              // clears at all depends on a save happening to land afterwards.
+              isApplyingExternalContentRef.current = true;
               editorRef.current.update(() => {
                 // Clearing a selected node without moving selection first makes
                 // Lexical throw "selection has been lost ..." (NIM-2005).
@@ -2087,6 +2408,12 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 root.clear();
                 $convertFromEnhancedMarkdownString(finalContent, transformers);
               }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
+              isDirtyRef.current = false;
+              documentModelHandleRef.current?.setDirty(false);
+              onDirtyChange?.(false);
+              setTimeout(() => {
+                isApplyingExternalContentRef.current = false;
+              }, 0);
             }
           }
       } catch (error) {
@@ -2158,6 +2485,8 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     };
   }, [filePath, isEditorReady]);
 
+  const uploadLocalWikiAsset = useMemo(() => localWikiUploadAssetFor(workspaceId, filePath), [workspaceId, filePath]);
+
   // Image interaction callbacks
   const handleImageDoubleClick = useCallback(async (src: string, nodeKey: string) => {
     try {
@@ -2204,41 +2533,19 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         filePath
       });
 
+      // The generation this click belongs to, before anything awaits.
+      const decidedGeneration = documentModel?.getCurrentDiffGeneration() ?? undefined;
+
       // console.log('[TabEditor] ABOUT TO CALL acceptDiff');
       // Get the new content from Monaco diff editor
       const newContent = editorRef.current.acceptDiff();
       // console.log('[TabEditor] acceptDiff RETURNED:', newContent.length);
 
-      // console.log('[TabEditor] ABOUT TO WRITE TO DISK');
-      // Write to disk - use saveFile with (content, filePath) parameter order
-      try {
-        if (!(await saveDiffResolutionToDisk(newContent))) return;
-        // console.log('[TabEditor] WROTE TO DISK SUCCESSFULLY');
-      } catch (writeError) {
-        console.error('[TabEditor] ERROR WRITING TO DISK:', writeError);
-        throw writeError;
-      }
-
-      // Mark tag as reviewed (must pass filePath, tagId, status, workspacePath)
-      if (window.electronAPI.history) {
-        // console.log('[TabEditor] About to call updateTagStatus', {
-        //   filePath,
-        //   tagId: pendingAIEditTagRef.current.tagId,
-        //   status: 'reviewed',
-        //   workspaceId
-        // });
-
-        await window.electronAPI.history.updateTagStatus(
-          filePath,
-          pendingAIEditTagRef.current.tagId,
-          'reviewed',
-          workspaceId
-        );
-
-        // console.log('[TabEditor] Successfully marked tag as reviewed');
-      } else {
-        console.warn('[TabEditor] No history API available');
-      }
+      // Bytes and tag as one model-owned transaction; see resolveReviewThroughModel.
+      if (!(await resolveReviewThroughModel(true, {
+        finalContent: newContent,
+        generation: decidedGeneration,
+      }))) return;
 
       // Create a history snapshot of the accepted content so future baseline
       // recovery (recoverBaselineFromHistory) finds it instead of older states.
@@ -2276,18 +2583,14 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         editorRef.current.setContent(newContent, { force: true });
       }
 
-      // Tell DocumentModel the diff was resolved and propagate the new content
-      // to sibling attachments (e.g. Files-mode tab when Agent-mode resolved)
-      // so they exit diff mode too. Excludes our own editor id so we don't
-      // recurse via onDiffResolved.
-      documentModel?.clearDiffState(documentModelHandleRef.current?.id, true);
-      documentModelHandleRef.current?.notifySiblingsSaved(newContent);
+      // The model already tore the session down and delivered `newContent` to
+      // sibling attachments as part of the resolution above.
 
       logger.ui.info('[TabEditor] Monaco diff accepted successfully');
     } catch (error) {
       logger.ui.error('[TabEditor] Error accepting Monaco diff:', error);
     }
-  }, [filePath]);
+  }, [filePath, documentModel, resolveReviewThroughModel, setPendingAIEditTag]);
 
   const handleMonacoDiffReject = useCallback(async () => {
     if (!editorRef.current?.rejectDiff || !pendingAIEditTagRef.current) {
@@ -2298,21 +2601,17 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     try {
       logger.ui.info('[TabEditor] Rejecting Monaco diff');
 
+      // The generation this click belongs to, before anything awaits.
+      const decidedGeneration = documentModel?.getCurrentDiffGeneration() ?? undefined;
+
       // Get the old content from Monaco diff editor
       const oldContent = editorRef.current.rejectDiff();
 
-      // Write to disk - use saveFile with (content, filePath) parameter order
-      if (!(await saveDiffResolutionToDisk(oldContent))) return;
-
-      // Mark tag as reviewed (must pass filePath, tagId, status, workspacePath)
-      if (window.electronAPI.history) {
-        await window.electronAPI.history.updateTagStatus(
-          filePath,
-          pendingAIEditTagRef.current.tagId,
-          'reviewed',
-          workspaceId
-        );
-      }
+      // Bytes and tag as one model-owned transaction; see resolveReviewThroughModel.
+      if (!(await resolveReviewThroughModel(false, {
+        finalContent: oldContent,
+        generation: decidedGeneration,
+      }))) return;
 
       // Create a history snapshot of the rejected-to (original) content and advance
       // the Codex cache so subsequent AI edits diff against the post-rejection state.
@@ -2345,132 +2644,75 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         editorRef.current.setContent(oldContent, { force: true });
       }
 
-      // Tell DocumentModel the diff was resolved (rejected) and propagate the
-      // restored content so sibling attachments exit diff mode too.
-      documentModel?.clearDiffState(documentModelHandleRef.current?.id, false);
-      documentModelHandleRef.current?.notifySiblingsSaved(oldContent);
+      // The model already tore the session down and delivered the restored
+      // content to sibling attachments as part of the resolution above.
 
       logger.ui.info('[TabEditor] Monaco diff rejected successfully');
     } catch (error) {
       logger.ui.error('[TabEditor] Error rejecting Monaco diff:', error);
     }
-  }, [filePath]);
+  }, [filePath, documentModel, resolveReviewThroughModel, setPendingAIEditTag]);
 
-  // Custom editor diff mode accept/reject handlers
-  const handleCustomEditorDiffAccept = useCallback(async () => {
-    if (!pendingAIEditTagRef.current) {
-      logger.ui.warn('[TabEditor] Cannot accept custom editor diff - no pending tag');
+  // One completion path for file-level, sibling, and session-wide resolution.
+  const handleCustomEditorDiffDecision = useCallback(async (accepted: boolean) => {
+    const pending = pendingAIEditTagRef.current;
+    const state = documentModel?.getDiffState();
+    if (!pending || !state) {
+      logger.ui.warn('[TabEditor] Cannot resolve custom editor diff - no pending review');
       return;
     }
-
     try {
-      logger.ui.info('[TabEditor] Accepting custom editor diff', {
-        tagId: pendingAIEditTagRef.current.tagId,
-        filePath
+      await resolveCustomEditorReview({
+        accepted,
+        generation: documentModel?.getCurrentDiffGeneration() ?? undefined,
+        content: accepted ? state.newContent : state.oldContent,
+        sessionId: pending.sessionId,
+        resolve: resolveReviewThroughModel,
+        clear: clearCustomEditorDiff,
+        recordHistory: async (content, sessionId, kept) => {
+          await window.electronAPI.invoke('history:create-snapshot', filePath, content, 'manual', kept ? 'Diff accepted' : 'Diff rejected');
+          if (sessionId) await window.electronAPI.invoke('ai:advance-diff-baseline', sessionId, filePath, content);
+        },
       });
-
-      // The custom editor already has the modified content displayed
-      // We just need to save it (it's already on disk from the AI edit)
-      // and mark the tag as reviewed
-
-      // Mark tag as reviewed
-      if (window.electronAPI.history) {
-        await window.electronAPI.history.updateTagStatus(
-          filePath,
-          pendingAIEditTagRef.current.tagId,
-          'reviewed',
-          workspaceId
-        );
-      }
-
-      // Read current disk content to snapshot and advance cache baseline
-      const currentResult = await window.electronAPI.readFileContent(filePath);
-      if (currentResult?.success && currentResult.content) {
-        await window.electronAPI.invoke('history:create-snapshot', filePath, currentResult.content, 'manual', 'Diff accepted');
-        const acceptedSessionId = pendingAIEditTagRef.current?.sessionId;
-        if (acceptedSessionId) {
-          window.electronAPI.invoke('ai:advance-diff-baseline', acceptedSessionId, filePath, currentResult.content);
-        }
-      }
-
-      // Clear pending tag ref
-      setPendingAIEditTag(null);
-
-      // Hide the diff approval bar and clear session info
-      setShowCustomEditorDiffBar(false);
-      setDiffSessionInfo(null);
-
-      // Notify the custom editor that diff mode has ended
-      // The editor will reload content from disk via host.loadContent()
-      diffClearedCallbackRef.current?.();
-
-      // Fan out to sibling attachments so they exit diff mode too. Disk
-      // already holds the AI-written (now-accepted) content; siblings will
-      // pick it up via host.loadContent on their own diff-cleared callback.
-      documentModel?.clearDiffState(documentModelHandleRef.current?.id, true);
-
-      logger.ui.info('[TabEditor] Custom editor diff accepted successfully');
     } catch (error) {
-      logger.ui.error('[TabEditor] Error accepting custom editor diff:', error);
+      logger.ui.error('[TabEditor] Custom editor review history recording failed:', error);
     }
-  }, [filePath, workspaceId]);
+  }, [filePath, documentModel, resolveReviewThroughModel, clearCustomEditorDiff]);
+  const handleCustomEditorDiffAccept = useCallback(() => handleCustomEditorDiffDecision(true), [handleCustomEditorDiffDecision]);
+  const handleCustomEditorDiffReject = useCallback(() => handleCustomEditorDiffDecision(false), [handleCustomEditorDiffDecision]);
 
-  const handleCustomEditorDiffReject = useCallback(async () => {
-    if (!pendingAIEditTagRef.current) {
-      logger.ui.warn('[TabEditor] Cannot reject custom editor diff - no pending tag');
+  /**
+   * Accept/reject for a review that was deliberately presented without an
+   * inline diff (#4821 large-document fallback). There is nothing on screen to
+   * approve group by group, so both decisions go straight through the model's
+   * single-flight resolution, which owns the disk write and the tag update as
+   * one recoverable transaction.
+   */
+  const resolveNoInlineFallbackReview = useCallback(async (accepted: boolean) => {
+    const handle = documentModelHandleRef.current;
+    const state = documentModel?.getDiffState();
+    if (!handle || !state) {
+      logger.ui.warn(`[TabEditor] No model diff state to resolve for ${fileName}`);
       return;
     }
-
+    const finalContent = accepted ? state.newContent : state.oldContent;
     try {
-      logger.ui.info('[TabEditor] Rejecting custom editor diff');
-
-      // Get the original content from the pending tag
-      const baseline = await window.electronAPI.invoke('history:get-diff-baseline', filePath);
-      if (!baseline) {
-        logger.ui.error('[TabEditor] Cannot reject - no baseline found');
-        return;
-      }
-
-      // Write original content back to disk
-      if (!(await saveDiffResolutionToDisk(baseline.content))) return;
-
-      // Mark tag as reviewed
-      if (window.electronAPI.history) {
-        await window.electronAPI.history.updateTagStatus(
-          filePath,
-          pendingAIEditTagRef.current.tagId,
-          'reviewed',
-          workspaceId
-        );
-      }
-
-      // Snapshot the restored content and advance the Codex cache baseline
-      await window.electronAPI.invoke('history:create-snapshot', filePath, baseline.content, 'manual', 'Diff rejected');
-      const rejectedSessionId = pendingAIEditTagRef.current?.sessionId;
-      if (rejectedSessionId) {
-        window.electronAPI.invoke('ai:advance-diff-baseline', rejectedSessionId, filePath, baseline.content);
-      }
-
-      // Clear pending tag ref
-      setPendingAIEditTag(null);
-
-      // Hide the diff approval bar and clear session info
-      setShowCustomEditorDiffBar(false);
-      setDiffSessionInfo(null);
-
-      // Notify the custom editor that diff mode has ended
-      // The editor will reload content from disk via host.loadContent()
-      diffClearedCallbackRef.current?.();
-
-      // Fan out to sibling attachments so they exit diff mode too.
-      documentModel?.clearDiffState(documentModelHandleRef.current?.id, false);
-      documentModelHandleRef.current?.notifySiblingsSaved(baseline.content);
-
-      logger.ui.info('[TabEditor] Custom editor diff rejected successfully');
-    } catch (error) {
-      logger.ui.error('[TabEditor] Error rejecting custom editor diff:', error);
+      await handle.resolveDiff(accepted);
+    } catch (err) {
+      logger.ui.error(`[TabEditor] Failed to resolve the no-inline review for ${fileName}:`, err);
+      return;
     }
-  }, [filePath, workspaceId]);
+    setPendingAIEditTag(null);
+    setDiffSessionInfo(null);
+    // resolveDiff's notifyFileChanged fired while the pending tag was still set,
+    // so onFileChanged dropped it and onDiffResolved excludes the resolver.
+    // Put the resolved bytes in the buffer here, verified like any other reload.
+    isApplyingExternalContentRef.current = true;
+    commitReloadOutcome(applyVerifiedReload(finalContent), finalContent);
+    setTimeout(() => {
+      isApplyingExternalContentRef.current = false;
+    }, 0);
+  }, [documentModel, fileName, setPendingAIEditTag, applyVerifiedReload, commitReloadOutcome]);
 
   // Create extension storage for custom editors
   // Uses the extension ID from the registered custom editor (if any)
@@ -2515,6 +2757,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     };
 
     return createEditorHost({
+      onEditorAPIChange: api => { customEditorAPIRef.current = api; },
       filePath,
       fileName,
       // Theme access via function - reads from ref so always current
@@ -2625,7 +2868,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           // and interfere with the APPROVE_DIFF_COMMAND -> CLEAR_DIFF_TAG_COMMAND
           // chain. Same guard TabEditor's own onSaveRequested handler applies,
           // so built-in editors honor diff mode too.
-          if (settleDiffBeforeAutosaveRef.current() === 'skip') return;
+          if ((await settleDiffBeforeAutosaveRef.current()) === 'skip') return;
           await saveWithHistoryRef.current(content, 'auto', false);
           return;
         }
@@ -2681,8 +2924,14 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       subscribeToDiffRequests: customEditorSupportsDiffMode
         ? (callback: (config: DiffConfig) => void): (() => void) => {
             diffRequestCallbackRef.current = callback;
+            // This is the readiness signal the mount path's 50ms sleep was
+            // guessing at: it re-runs the DocumentModel subscription effect,
+            // which registers this attachment as a presenter and makes the model
+            // replay whatever generation is parked (NIM-5359 Phase 6).
+            setCustomDiffPresenterReady(true);
             return () => {
               diffRequestCallbackRef.current = null;
+              setCustomDiffPresenterReady(false);
             };
           }
         : undefined,
@@ -2692,18 +2941,12 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         ? async (result): Promise<void> => {
             if (!pendingAIEditTagRef.current) return;
 
-            // Save the resulting content
-            if (!(await saveDiffResolutionToDisk(result.content))) return;
-
-            // Update tag status
-            if (window.electronAPI.history) {
-              await window.electronAPI.history.updateTagStatus(
-                filePath,
-                pendingAIEditTagRef.current.tagId,
-                'reviewed',
-                workspaceId
-              );
-            }
+            // One model-owned transaction: the extension's resolved bytes with
+            // the agent's latest write as the conflict baseline, then the tag.
+            if (!(await resolveReviewThroughModel(true, {
+              finalContent: result.content,
+              generation: documentModel?.getCurrentDiffGeneration() ?? undefined,
+            }))) return;
 
             // Clear pending tag
             setPendingAIEditTag(null);
@@ -2763,6 +3006,37 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         // the foreign content. Surface the conflict and abort the toggle so the
         // user can resolve via the autosave-conflict banner.
         const flushDirtyBuffer = async (content: string): Promise<boolean> => {
+          // The toggle's own write bypasses saveWithHistory, so it needs the
+          // same review gate: this buffer has never been shown the agent's
+          // write, and flushing it would revert it.
+          //
+          // But the toggle then reloads from disk, so skipping the flush
+          // silently destroys everything typed since the review opened -- text
+          // that exists nowhere else. Neither side of that is ours to pick, so
+          // ask. Cancel keeps the buffer and the editor exactly as they are
+          // (NIM-5359, finding 3).
+          if (hasUnresolvedReview()) {
+            const discard = await requestConfirmation({
+              title: 'Discard unsaved edits?',
+              message:
+                'An AI edit is still pending review, so these edits cannot be saved yet.\n\n' +
+                'Switching editors reloads the file from disk and discards them.\n\n' +
+                'Click OK to discard your edits, or Cancel to stay here and resolve the review first.',
+              confirmLabel: 'Discard',
+              destructive: true,
+            });
+            if (!discard) {
+              logger.ui.info(
+                `[TabEditor] Editor-mode toggle cancelled for ${fileName}: unsaved edits kept`,
+              );
+              return false;
+            }
+            logger.ui.warn(
+              `[TabEditor] Editor-mode toggle discarded ${content.length} unsaved bytes for ` +
+                `${fileName} at the user's request: an AI edit is still pending review`,
+            );
+            return true;
+          }
           const expected = lastSavedContentRef.current;
           const result = await window.electronAPI.saveFile(
             content,
@@ -2838,11 +3112,9 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           }
         }
 
-        // Reset editor ready state so the pending diff check can run after new editor mounts
+        // Reset editor ready state for the newly mounted editor.
         setIsEditorReady(false);
         setEditorInstance(null);
-        // Reset the pending tags check flag so it runs again after the new editor mounts
-        hasCheckedForPendingTagsRef.current = false;
         setSourceMode(!currentlyInSourceMode);
         // Notify subscribers
         sourceModeChangedCallbackRef.current?.(!currentlyInSourceMode);
@@ -2965,6 +3237,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           onToggleSourceMode={() => editorHost.toggleSourceMode?.()}
           supportsSourceMode={isMarkdown || customEditorSupportsSourceMode}
           isSourceModeActive={sourceMode}
+          showPageInfoAction={isMarkdown && !sourceMode && !isCustom}
           onDirtyChange={(isDirty) => {
             if (isDirty && (isApplyingExternalContentRef.current || isApplyingDiffRef.current)) return;
             isDirtyRef.current = isDirty;
@@ -3009,38 +3282,27 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             data-testid="autosave-conflict-banner"
           >
             <span className="flex-1">
-              File changed on disk. Reload to see new content (your unsaved edits are preserved).
+              File changed on disk. Your unsaved edits are kept until you reload.
             </span>
             <button
               type="button"
-              onClick={() => {
-                const diskContent = autosaveConflictDiskContent;
-                if (typeof diskContent === 'string' && editorRef.current) {
-                  try {
-                    if (isMarkdown) {
-                      const transformers = getEditorTransformers();
-                      editorRef.current.update(() => {
-                        // Clearing a selected node without moving selection first makes
-                        // Lexical throw "selection has been lost ..." (NIM-2005).
-                        $setSelection(null);
-                        const root = $getRoot();
-                        root.clear();
-                        $convertFromEnhancedMarkdownString(diskContent, transformers);
-                      }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
-                    } else if (editorRef.current.setContent) {
-                      editorRef.current.setContent(diskContent);
-                    }
-                  } catch (err) {
-                    logger.ui.error('[TabEditor] Failed to reload disk content:', err);
+              onClick={async () => {
+                if (hasUnresolvedReview()) return;
+                const handle = documentModelHandleRef.current;
+                try {
+                  const result = await window.electronAPI.readFileContent(filePath);
+                  if (!handle || handle !== documentModelHandleRef.current || currentFilePathRef.current !== filePath) return;
+                  if (!result?.success || typeof result.content !== 'string' || hasUnresolvedReview()) return;
+                  const outcome = applyVerifiedReload(result.content);
+                  commitReloadOutcome(outcome, result.content);
+                  if (outcome.verified) {
+                    documentModel?.setLastPersistedContent(result.content);
+                    documentModelHandleRef.current?.setDirty(false);
+                    setAutosaveConflictDiskContent(null);
                   }
-                  contentRef.current = diskContent;
-                  initialContentRef.current = diskContent;
-                  lastSavedContentRef.current = diskContent;
-                  isDirtyRef.current = false;
-                  documentModelHandleRef.current?.setDirty(false);
-                  onDirtyChange?.(false);
+                } catch (error) {
+                  logger.ui.error('[TabEditor] Failed to reload disk content:', error);
                 }
-                setAutosaveConflictDiskContent(null);
               }}
               className="px-2 py-1 rounded border border-nim text-nim hover:bg-nim-active"
               data-testid="autosave-conflict-banner-reload"
@@ -3104,7 +3366,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             // Render custom editor if one is registered for this file's
             // extension. Supports compound extensions of any depth via
             // longest-suffix match (e.g. .mockup.html, .reddit.watch.json).
-            const registration = customEditorRegistry.findRegistrationForFile(filePath) ?? null;
+            const registration = findTabEditorRegistration(filePath, workspaceId) ?? null;
 
             if (registration) {
               // Mark editor as ready when custom editor mounts
@@ -3213,7 +3475,24 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 sessionInfo={diffSessionInfo || undefined}
                 onGoToSession={onOpenSessionInChat ? handleGoToSession : undefined}
               />
-              <div className="tab-editor-wrapper flex-1 overflow-hidden relative">
+              {/* The Lexical header keys off diff nodes, of which a large-document
+                  fallback has none -- without this bar the user would have a
+                  pending review and no way to act on it (#4821, NIM-5359). */}
+              {noInlineFallbackReview && (
+                <UnifiedDiffHeader
+                  filePath={filePath}
+                  fileName={fileName}
+                  capabilities={{
+                    onAcceptAll: () => { void resolveNoInlineFallbackReview(true); },
+                    onRejectAll: () => { void resolveNoInlineFallbackReview(false); },
+                  }}
+                  sessionInfo={diffSessionInfo || undefined}
+                  onGoToSession={onOpenSessionInChat ? handleGoToSession : undefined}
+                  editorType="lexical"
+                />
+              )}
+              <div className="tab-editor-body flex flex-1 min-h-0">
+              <div className="tab-editor-wrapper flex-1 min-w-0 overflow-hidden relative">
               <DocumentPathProvider documentPath={filePath}>
                 <MarkdownEditor
                   key={`${filePath}-lexical`}
@@ -3233,7 +3512,9 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                     onToggleMarkdownMode: () => editorHost.toggleSourceMode?.(),
                     onImageDoubleClick: handleImageDoubleClick,
                     onImageDragStart: handleImageDragStart,
+                    onUploadAsset: uploadLocalWikiAsset,
                     showTreeView, // Debug tree view (dev mode)
+                    showCitationSourcesLine: false, // listed in Page info
                     documentHeader: (
                       <DocumentHeaderContainer
                         filePath={filePath}
@@ -3269,6 +3550,11 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                   }}
                 />
               </DocumentPathProvider>
+              </div>
+              <PageInfoPanel
+                editor={editorInstance}
+                properties={{ getContent: getDocumentHeaderContent, contentVersion: reloadVersion, onContentChange: handleDocumentHeaderContentChange }}
+              />
               </div>
               </>
           ) : isMarkdown && sourceMode ? (

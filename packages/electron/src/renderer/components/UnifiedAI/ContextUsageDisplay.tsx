@@ -18,8 +18,12 @@ const CATEGORY_COLORS = [
 
 interface ContextUsageDisplayProps {
   provider?: string | null;
-  inputTokens: number;       // Cumulative input tokens (for tooltip breakdown)
+  inputTokens: number;       // Cumulative uncached input tokens (for tooltip breakdown)
   outputTokens: number;      // Cumulative output tokens (for tooltip breakdown)
+  // Cumulative prompt-cache reads/writes, disjoint from inputTokens. 0 when the
+  // provider reports no split (see tokenUsageAccumulation.ts).
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
   totalTokens: number;       // Cumulative total tokens (fallback if no currentContext)
   contextWindow: number;     // Context window size (legacy, use currentContext)
   categories?: TokenUsageCategory[];  // Categories (legacy, use currentContext)
@@ -49,6 +53,8 @@ export function ContextUsageDisplay({
   provider,
   inputTokens,
   outputTokens,
+  cacheReadInputTokens = 0,
+  cacheCreationInputTokens = 0,
   totalTokens,
   contextWindow,
   categories,
@@ -66,6 +72,19 @@ export function ContextUsageDisplay({
   // Check what data we have
   const hasTokenData = displayTokens > 0 || totalTokens > 0;
   const hasContextWindow = contextReporting === 'context-window' && displayContextWindow > 0;
+  // `totalTokens` means different things per provider (Codex counts cached
+  // input in it, Claude Code does not), so with a cache split the tooltip's
+  // total is the sum of the rows above it.
+  const hasCacheSplit = cacheReadInputTokens > 0 || cacheCreationInputTokens > 0;
+  const ioRows: Array<[string, number]> = [
+    [hasCacheSplit ? 'Input (uncached)' : 'Input', inputTokens],
+    ...(cacheReadInputTokens > 0 ? [['Cache read', cacheReadInputTokens] as [string, number]] : []),
+    ...(cacheCreationInputTokens > 0 ? [['Cache write', cacheCreationInputTokens] as [string, number]] : []),
+    ['Output', outputTokens],
+  ];
+  const ioTotal = hasCacheSplit
+    ? inputTokens + outputTokens + cacheReadInputTokens + cacheCreationInputTokens
+    : totalTokens;
   const [tooltipVisible, setTooltipVisible] = useState(false);
   const [helpExpanded, setHelpExpanded] = useState(false);
   const [toolBaselineTokens, setToolBaselineTokens] = useState<number | null>(null);
@@ -198,19 +217,25 @@ export function ContextUsageDisplay({
     return 'usage-normal';
   };
 
-  // Build display text
+  // Build display text.
+  //
+  // The two supported states read as different quantities and must not look
+  // alike at a glance: `context-window` is a gauge (fill over a denominator),
+  // `token-counts` is an odometer (what the session has spent, with no
+  // denominator in existence). Bare "29k tokens" next to another session's
+  // "124k/1M (12%)" reads as a fill, so the count-only chip says "used".
   const getDisplayText = (): string => {
     if (!hasTokenData) return '--';
     if (hasContextWindow) {
       return `${formatTokensShort(displayTokens)}/${formatTokensShort(displayContextWindow)} (${percentage}%)`;
     }
-    return `${formatTokensShort(displayTokens)} tokens`;
+    return `${formatTokensShort(displayTokens)} tokens used`;
   };
 
   const label = hasTokenData
     ? hasContextWindow
       ? `Context usage ${formatTokensShort(displayTokens)} of ${formatTokensShort(displayContextWindow)} tokens (${percentage}%)`
-      : `Token usage: ${formatTokensShort(displayTokens)} total tokens`
+      : `Session token usage: ${displayTokens.toLocaleString()} tokens used; this agent reports no context window size`
     : 'Token usage data not available yet';
 
   // Usage level styling
@@ -235,7 +260,7 @@ export function ContextUsageDisplay({
   return (
     <div
       ref={rootRef}
-      className={`context-usage-display ${usageClass} relative inline-flex items-center py-0.5 px-2 rounded-md text-[11px] font-medium whitespace-nowrap bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] ml-auto ${enableTooltip ? 'cursor-pointer' : 'cursor-default'} gap-1 focus:outline-2 focus:outline-[var(--nim-primary)] focus:outline-offset-2 max-[400px]:hidden ${usageStyles[usageClass as keyof typeof usageStyles]}`}
+      className={`context-usage-display ${hasContextWindow ? 'usage-context-window' : 'usage-token-counts'} ${usageClass} relative inline-flex items-center py-0.5 px-2 rounded-md text-[11px] font-medium whitespace-nowrap bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] ml-auto ${enableTooltip ? 'cursor-pointer' : 'cursor-default'} gap-1 focus:outline-2 focus:outline-[var(--nim-primary)] focus:outline-offset-2 max-[400px]:hidden ${usageStyles[usageClass as keyof typeof usageStyles]}`}
       tabIndex={hasTokenData ? 0 : -1}
       aria-label={label}
       aria-describedby={shouldShowTooltip ? tooltipId : undefined}
@@ -255,7 +280,7 @@ export function ContextUsageDisplay({
         >
           <div className="tooltip-header flex justify-between items-center text-xs mb-2 text-[var(--nim-text-muted)]">
             <div className="tooltip-header-left flex items-center gap-1.5">
-              <span>{hasContextWindow ? 'Context Breakdown' : 'Token Usage'}</span>
+              <span>{hasContextWindow ? 'Context Breakdown' : 'Session Token Usage'}</span>
               {helpContent && (
                 <button
                   className="tooltip-help-button inline-flex items-center justify-center w-[18px] h-[18px] p-0 border-none rounded-full bg-[var(--nim-bg-tertiary)] text-[var(--nim-text-faint)] cursor-pointer transition-all duration-150 hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text-muted)]"
@@ -285,8 +310,18 @@ export function ContextUsageDisplay({
             </div>
           )}
 
+          {/* The absence of a percentage is itself information: the agent
+              measured its spend and never reported a window size. Say so,
+              rather than leaving the user to read the missing gauge as a bug
+              (#914 forbids manufacturing the denominator to fill the gap). */}
+          {!hasContextWindow && (
+            <div className="tooltip-no-window-note text-[11px] text-[var(--nim-text-muted)] leading-[1.4] whitespace-normal mb-2">
+              Cumulative spend for this session. This agent reports no context window size, so there is no fill percentage to show.
+            </div>
+          )}
+
           {/* Show input/output breakdown if available. These rows are the
-              CUMULATIVE session spend (uncached input + output summed across
+              CUMULATIVE session spend (input, cache, and output summed across
               turns), a different quantity from the header-right total, which
               is the CURRENT context-window fill (input + cache reads + cache
               creation of the last turn). Label them when both are visible so
@@ -299,17 +334,15 @@ export function ContextUsageDisplay({
                   Session totals (cumulative)
                 </div>
               )}
-              <div className="tooltip-io-row flex justify-between text-[11px]">
-                <span className="tooltip-io-label text-[var(--nim-text-muted)]">Input:</span>
-                <span className="tooltip-io-value text-[var(--nim-text)] tabular-nums">{inputTokens.toLocaleString()}</span>
-              </div>
-              <div className="tooltip-io-row flex justify-between text-[11px]">
-                <span className="tooltip-io-label text-[var(--nim-text-muted)]">Output:</span>
-                <span className="tooltip-io-value text-[var(--nim-text)] tabular-nums">{outputTokens.toLocaleString()}</span>
-              </div>
+              {ioRows.map(([label, value]) => (
+                <div key={label} className="tooltip-io-row flex justify-between text-[11px]">
+                  <span className="tooltip-io-label text-[var(--nim-text-muted)]">{label}:</span>
+                  <span className="tooltip-io-value text-[var(--nim-text)] tabular-nums">{value.toLocaleString()}</span>
+                </div>
+              ))}
               <div className="tooltip-io-row tooltip-io-total flex justify-between text-[11px] font-semibold pt-1 border-t border-[var(--nim-border)] mt-1">
                 <span className="tooltip-io-label text-[var(--nim-text-muted)]">Total:</span>
-                <span className="tooltip-io-value text-[var(--nim-text)] tabular-nums">{totalTokens.toLocaleString()}</span>
+                <span className="tooltip-io-value text-[var(--nim-text)] tabular-nums">{ioTotal.toLocaleString()}</span>
               </div>
             </div>
           )}

@@ -47,6 +47,9 @@ mockSafeHandle.mockImplementation((channel: string, handler: (...args: any[]) =>
 vi.mock('../../database/PGLiteDatabaseWorker', () => ({
   database: {
     query: mockQuery,
+    runTransaction: async (statements: Array<{ sql: string; params: unknown[] }>) => {
+      for (const statement of statements) await mockQuery(statement.sql, statement.params);
+    },
   },
 }));
 
@@ -55,6 +58,25 @@ vi.mock('../TrackerSyncManager', () => ({
   syncTrackerItem: mockSyncTrackerItem,
   unsyncTrackerItem: mockUnsyncTrackerItem,
   isTrackerSyncActive: mockIsTrackerSyncActive,
+  isTrackerSyncConfigured: () => true,
+  // The wire shape, minus the labels CRDT these tests never exercise.
+  trackerItemToPayload: (item: any) => {
+    const record = trackerItemToRecord(item);
+    return {
+      itemId: record.id,
+      primaryType: record.primaryType,
+      archived: record.archived,
+      bodyVersion: 0,
+      fields: { ...record.fields },
+      labels: {},
+      comments: record.system.comments ?? [],
+      activity: record.system.activity ?? [],
+      system: {},
+    };
+  },
+  onTrackerItemApplied: () => () => {},
+  onTrackerSyncWorkspaceConnected: () => () => {},
+  getTrackerItemForSync: async () => null,
 }));
 
 vi.mock('../../utils/store', () => ({
@@ -67,7 +89,7 @@ vi.mock('../../utils/ipcRegistry', () => ({
   safeOn: vi.fn(),
 }));
 
-vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel', () => ({
+vi.mock('../../../../../tracker-schema/src/TrackerDataModel', () => ({
   globalRegistry: {
     get: mockGlobalRegistryGet,
     // The policy resolver reads by explicit workspace (NIM-3702). These tests
@@ -279,7 +301,7 @@ describe('tracker batch IPC handlers', () => {
     expect(updateInFile).toHaveBeenCalledWith('plan-file', {
       collection: [{ itemId: 'milestone-1' }],
     });
-    expect(updateStore).toHaveBeenCalledWith('bug-store', { priority: 'high' });
+    expect(updateStore).toHaveBeenCalledWith('bug-store', { priority: 'high' }, { beforeWrite: expect.any(Function) });
   });
 
   it('keeps a batched file relationship update canonical in nested customFields', async () => {
@@ -550,7 +572,7 @@ describe('createTrackerItem sync status policy', () => {
   // optimistically, so without a sweep here it renders "No key yet" until the
   // next full re-list (NIM.2842).
   it('numbers a newly created personal item before returning it', async () => {
-    mockGlobalRegistryGet.mockReturnValue({ sharing: 'personal', draftByDefault: false });
+    mockGlobalRegistryGet.mockReturnValue({ sharing: 'personal', draftByDefault: false, localNumbers: true });
     mockIsTrackerSyncActive.mockReturnValue(false);
     mockAssignLocalKeysToRows.mockResolvedValue(new Map([['bug-local', 'NIM.42']]));
 
@@ -576,6 +598,30 @@ describe('createTrackerItem sync status policy', () => {
       ['bug-local'],
     );
     expect(created.localKey).toBe('NIM.42');
+  });
+
+  // Local numbers are opt-in per type; a type that says nothing gets none.
+  it('leaves a new item of a type without localNumbers unnumbered', async () => {
+    mockGlobalRegistryGet.mockReturnValue({ sharing: 'personal', draftByDefault: false });
+    mockIsTrackerSyncActive.mockReturnValue(false);
+
+    mockQuery.mockResolvedValueOnce({ rows: [{ min_key: null }] }); // kanbanSortOrder MIN
+    mockQuery.mockResolvedValueOnce({ rows: [] }); // INSERT
+    mockQuery.mockResolvedValueOnce({
+      rows: [makeTrackerRow({ id: 'bug-plain', sync_status: 'local', local_key: null })],
+    }); // read-back
+
+    const created = await service.createTrackerItem({
+      id: 'bug-plain',
+      type: 'bug',
+      title: 'Plain bug',
+      status: 'to-do',
+      priority: 'high',
+      workspace: WORKSPACE,
+    });
+
+    expect(mockAssignLocalKeysToRows).not.toHaveBeenCalled();
+    expect(created.localKey).toBeUndefined();
   });
 });
 
@@ -623,6 +669,30 @@ describe('updateTrackerItem sync payload', () => {
       fields: trackerItemToRecord(mockSyncTrackerItem.mock.calls[0][0]).fields,
     };
     expect(pushedPayload.fields.dependsOn).toEqual(editedValue);
+  });
+
+  // Saving first and letting the sync refusal be swallowed left the item marked
+  // synced with nothing queued, so a teammate's next edit overwrote it.
+  it('refuses an edit that would make a shared item too large for its room, before saving it', async () => {
+    mockGlobalRegistryGet.mockReturnValue({ sharing: 'team', draftByDefault: false, fields: [] });
+    mockIsTrackerSyncActive.mockReturnValue(true);
+    const row = makeTrackerRow({ workspace: tempDir });
+    const writes: string[] = [];
+    mockQuery.mockImplementation(async (sql: string) => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('SELECT')) return { rows: [row] };
+      writes.push(normalized);
+      return { rows: [row] };
+    });
+
+    const result = await mockIpcHandlers.get('document-service:update-tracker-item')!({}, {
+      itemId: 'bug-001',
+      updates: { description: 'd'.repeat(300_000) },
+    });
+
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining('too large') });
+    expect(writes).toEqual([]);
+    expect(mockSyncTrackerItem).not.toHaveBeenCalled();
   });
 });
 
@@ -704,5 +774,68 @@ describe('getTrackerItemContent', () => {
     const content = await service.getTrackerItemContent('bug-001');
 
     expect(content).toBe(markdown);
+  });
+});
+
+// ============================================================================
+// document-service:tracker-items-list names its project (#1822)
+// ============================================================================
+
+// #1822: the rail told main "project B is now active" without waiting, so a list
+// request for project A that arrived next was answered from B. The request now
+// carries the project path, and main must answer for exactly that path no matter
+// which project the window has marked active.
+describe('document-service:tracker-items-list project scoping (#1822)', () => {
+  const PATH_A = '/Users/test/project-a';
+  const PATH_B = '/Users/test/project-b';
+  const itemA = makeTrackerItem('a-1');
+  const itemB = makeTrackerItem('b-1');
+  let serviceA: ElectronDocumentService;
+  let serviceB: ElectronDocumentService;
+
+  beforeEach(() => {
+    serviceA = new ElectronDocumentService(PATH_A);
+    serviceB = new ElectronDocumentService(PATH_B);
+    vi.spyOn(serviceA, 'listTrackerItems').mockResolvedValue([itemA] as any);
+    vi.spyOn(serviceB, 'listTrackerItems').mockResolvedValue([itemB] as any);
+
+    // Stand-in for the real window lookup. The window's active project is B.
+    // A request that names a project it has open is answered for that project;
+    // a request that names nothing falls back to the active project (B).
+    // A project the window does not have open gets no service.
+    const openProjects = new Map([[PATH_A, serviceA], [PATH_B, serviceB]]);
+    setupDocumentServiceHandlers(((_event: unknown, workspacePath?: string) => {
+      if (workspacePath === undefined) return serviceB;
+      return openProjects.get(workspacePath) ?? null;
+    }) as any);
+  });
+
+  afterEach(() => {
+    serviceA.destroy();
+    serviceB.destroy();
+    // Put back the single-service resolver the rest of this file relies on.
+    setupDocumentServiceHandlers(() => service);
+  });
+
+  it("answers project A's request with A's items while B is the active project", async () => {
+    const handler = mockIpcHandlers.get('document-service:tracker-items-list')!;
+
+    const items = await handler({}, PATH_A);
+
+    expect(items).toEqual([itemA]);
+    expect(serviceB.listTrackerItems).not.toHaveBeenCalled();
+  });
+
+  it('throws when the request names no project, instead of answering for the active one', async () => {
+    const handler = mockIpcHandlers.get('document-service:tracker-items-list')!;
+
+    await expect(handler({})).rejects.toThrow(/workspacePath/);
+    expect(serviceB.listTrackerItems).not.toHaveBeenCalled();
+  });
+
+  it('throws when the request names a project the window does not have open', async () => {
+    const handler = mockIpcHandlers.get('document-service:tracker-items-list')!;
+
+    await expect(handler({}, '/Users/test/not-open')).rejects.toThrow(/No document service/);
   });
 });

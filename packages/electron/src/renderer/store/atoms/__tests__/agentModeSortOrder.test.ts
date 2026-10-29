@@ -32,3 +32,18 @@ describe('mergeWithDefaults - sessionHistoryLayout.sortOrder (#924)', () => {
     expect(merged.sessionHistoryLayout.sortOrder).toBe('updated');
   });
 });
+
+describe('mergeWithDefaults - sessionHistoryLayout.compactRows', () => {
+  it('keeps a saved compact preference and defaults older layouts to full rows', () => {
+    expect(mergeWithDefaults({ sessionHistoryLayout: { compactRows: true } as never }).sessionHistoryLayout.compactRows).toBe(true);
+    expect(mergeWithDefaults({ sessionHistoryLayout: { sortOrder: 'created' } as never }).sessionHistoryLayout.compactRows).toBe(false);
+    expect(mergeWithDefaults(undefined).sessionHistoryLayout.compactRows).toBe(false);
+  });
+});
+
+describe('mergeWithDefaults - sessionHistoryLayout.showContextUsage', () => {
+  it('keeps a saved context-bar preference and defaults older layouts to off', () => {
+    expect(mergeWithDefaults({ sessionHistoryLayout: { showContextUsage: true } as never }).sessionHistoryLayout.showContextUsage).toBe(true);
+    expect(mergeWithDefaults({ sessionHistoryLayout: { compactRows: true } as never }).sessionHistoryLayout.showContextUsage).toBe(false);
+  });
+});

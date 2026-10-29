@@ -29,12 +29,22 @@ import {
   ProtocolEvent,
   ToolResult,
 } from './ProtocolInterface';
+import {
+  mapPermissionDecisionToOpenCode,
+  normalizeOpenCodePermissionRequest,
+  type OpenCodePermissionHost,
+} from './openCodePermissions';
 
 /**
  * Minimal interface for the OpenCode SDK client.
  * Matches the actual @opencode-ai/sdk API surface.
  */
 export interface OpenCodeClientLike {
+  postSessionIdPermissionsPermissionId: (options: {
+    path: { id: string; permissionID: string };
+    query?: { directory?: string };
+    body: { response: 'once' | 'always' | 'reject' };
+  }) => Promise<{ data?: unknown; error?: unknown }>;
   session: {
     create: (options?: Record<string, unknown>) => Promise<{ data: { id: string; [key: string]: unknown } }>;
     list: (options?: Record<string, unknown>) => Promise<{ data: Array<{ id: string; [key: string]: unknown }> }>;
@@ -96,6 +106,18 @@ let processCleanupRegistered = false;
 
 /** Default startup deadline; overridable per-user for slow cold boots. */
 const DEFAULT_STARTUP_TIMEOUT_MS = 30000;
+
+/**
+ * Per-request budget for one health probe. Far below the startup deadline so a
+ * request that hangs on an open connection is abandoned and retried (#1428).
+ */
+const HEALTH_PROBE_TIMEOUT_MS = 2000;
+
+/** True when a fetch rejected because its AbortSignal fired (timeout), not a network error. */
+function isAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === 'AbortError' || error.name === 'TimeoutError';
+}
 
 /**
  * Singleton manager for the OpenCode server subprocess.
@@ -284,6 +306,9 @@ export class OpenCodeServerManager {
   private async waitForReady(timeoutMs = this.getStartupTimeoutMs()): Promise<void> {
     const startTime = Date.now();
     const pollIntervalMs = 200;
+    // Log each failure kind once per state change, not per 200ms tick, so a
+    // hung probe and a refused connection are distinguishable in the log.
+    let lastFailure: 'timeout' | 'unreachable' | null = null;
 
     while (Date.now() - startTime < timeoutMs) {
       // A spawn error (e.g. ENOENT) means the process will never become healthy;
@@ -292,18 +317,43 @@ export class OpenCodeServerManager {
         throw this.lastSpawnError;
       }
       try {
-        const response = await fetch(`${this.baseUrl}/global/health`);
+        const response = await this.fetchHealth();
         if (response.ok) {
           console.log(`[OPENCODE-PROTOCOL] Server ready on port ${this.port}`);
           return;
         }
-      } catch {
-        // Server not ready yet
+      } catch (error) {
+        const failure = isAbortError(error) ? 'timeout' : 'unreachable';
+        if (failure !== lastFailure) {
+          lastFailure = failure;
+          if (failure === 'timeout') {
+            console.warn(`[OPENCODE-PROTOCOL] Health probe on port ${this.port} hung for ${HEALTH_PROBE_TIMEOUT_MS}ms; abandoning it and retrying on a fresh connection`);
+          } else {
+            console.log(`[OPENCODE-PROTOCOL] Health endpoint on port ${this.port} not reachable yet (${error instanceof Error ? error.message : String(error)}); waiting for server`);
+          }
+        }
       }
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     }
 
     throw new Error(`OpenCode server failed to start within ${timeoutMs}ms`);
+  }
+
+  /**
+   * Health probe with a per-request budget. A connection that is accepted but
+   * never answered (#1428) must be abandoned so the next poll tick opens a
+   * fresh one, rather than pinning the loop in a single await until the
+   * startup deadline. Uses an explicit timer, not AbortSignal.timeout, so the
+   * budget is driven by the same clock as the poll loop.
+   */
+  private async fetchHealth(): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HEALTH_PROBE_TIMEOUT_MS);
+    try {
+      return await fetch(`${this.baseUrl}/global/health`, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private stopServer(): void {
@@ -351,7 +401,7 @@ export class OpenCodeServerManager {
   /** Single health probe; true only when the server answers with an ok response. */
   private async probeHealthOnce(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.baseUrl}/global/health`);
+      const response = await this.fetchHealth();
       return !!response.ok;
     } catch {
       return false;
@@ -544,19 +594,26 @@ export class OpenCodeSDKProtocol implements AgentProtocol {
    * (#574). Previously this ran on every turn.
    */
   private slashCommandCache: { key: string; commands: Promise<string[]> } | null = null;
+  private permissionHost: OpenCodePermissionHost | null;
 
   /**
    * @param loadSdkModule - Optional SDK loader for testing
    */
   constructor(
-    loadSdkModule?: () => Promise<{ createOpencodeClient: OpenCodeClientFactory }>
+    loadSdkModule?: () => Promise<{ createOpencodeClient: OpenCodeClientFactory }>,
+    permissionHost?: OpenCodePermissionHost,
   ) {
+    this.permissionHost = permissionHost ?? null;
     this.loadSdkModule = loadSdkModule || (async () => {
       const sdk = await loadOpenCodeSdkClientModule();
       return {
         createOpencodeClient: sdk.createOpencodeClient as unknown as OpenCodeClientFactory,
       };
     });
+  }
+
+  setPermissionHost(permissionHost: OpenCodePermissionHost): void {
+    this.permissionHost = permissionHost;
   }
 
   /**
@@ -806,6 +863,7 @@ export class OpenCodeSDKProtocol implements AgentProtocol {
     let fullText = '';
     const usageByMessageId = new Map<string, OpenCodeUsageSnapshot>();
     let latestUsage: OpenCodeUsageSnapshot | undefined;
+    const handledPermissionIds = new Set<string>();
 
     try {
       const sessionOptions = session.raw?.options as SessionOptions | undefined;
@@ -861,6 +919,46 @@ export class OpenCodeSDKProtocol implements AgentProtocol {
           type: 'raw_event',
           metadata: { rawEvent: event },
         };
+
+        if (event.type === 'permission.asked' || event.type === 'permission.updated') {
+          const permission = normalizeOpenCodePermissionRequest(event.properties ?? {});
+          if (!permission) {
+            await this.abortForPermissionFailure(client, session, 'OpenCode sent an invalid permission request.');
+            continue;
+          }
+          if (!handledPermissionIds.has(permission.id)) {
+            handledPermissionIds.add(permission.id);
+            try {
+              if (!this.permissionHost) {
+                throw new Error('OpenCode permission handling is not configured.');
+              }
+              const workspacePath = sessionOptions?.workspacePath ?? '';
+              const rawOptions = sessionOptions?.raw ?? {};
+              const signal = rawOptions.abortSignal instanceof AbortSignal
+                ? rawOptions.abortSignal
+                : new AbortController().signal;
+              const decision = await this.permissionHost.resolvePermission(permission, {
+                sessionId: message.sessionId ?? sessionId,
+                workspacePath,
+                permissionsPath: typeof rawOptions.permissionsPath === 'string'
+                  ? rawOptions.permissionsPath
+                  : workspacePath,
+                signal,
+              });
+              const result = await client.postSessionIdPermissionsPermissionId({
+                path: { id: sessionId, permissionID: permission.id },
+                query: { directory: workspacePath },
+                body: { response: mapPermissionDecisionToOpenCode(decision) },
+              });
+              if (result?.error) {
+                throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
+              }
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              await this.abortForPermissionFailure(client, session, `OpenCode permission reply failed: ${detail}`);
+            }
+          }
+        }
 
         // Parse and yield protocol events
         const protocolEvents = this.parseSSEEvent(event, sessionId);
@@ -947,6 +1045,22 @@ export class OpenCodeSDKProtocol implements AgentProtocol {
         };
       }
     }
+  }
+
+  private async abortForPermissionFailure(
+    client: OpenCodeClientLike,
+    session: ProtocolSession,
+    message: string,
+  ): Promise<never> {
+    try {
+      await client.session.abort({
+        path: { id: session.id },
+        query: { directory: (session.raw?.options as SessionOptions | undefined)?.workspacePath },
+      });
+    } catch {
+      // The original permission failure is the actionable error.
+    }
+    throw new Error(message);
   }
 
   /**
@@ -1086,11 +1200,13 @@ export class OpenCodeSDKProtocol implements AgentProtocol {
         const tokens = info.tokens as Record<string, unknown> | undefined;
         if (!tokens) break;
         const cache = tokens.cache as Record<string, unknown> | undefined;
+        // OpenCode reports input EXCLUDING cache reads/writes, which it keeps
+        // under tokens.cache -- the same disjoint shape as the event's usage.
         const inputTokens = toTokenCount(tokens.input);
         const outputTokens = toTokenCount(tokens.output);
-        const contextFillTokens = inputTokens
-          + toTokenCount(cache?.read)
-          + toTokenCount(cache?.write);
+        const cacheReadTokens = toTokenCount(cache?.read);
+        const cacheWriteTokens = toTokenCount(cache?.write);
+        const contextFillTokens = inputTokens + cacheReadTokens + cacheWriteTokens;
         const reportedTotal = toOptionalTokenCount(tokens.total);
 
         events.push({
@@ -1099,6 +1215,8 @@ export class OpenCodeSDKProtocol implements AgentProtocol {
             input_tokens: inputTokens,
             output_tokens: outputTokens,
             total_tokens: reportedTotal ?? inputTokens + outputTokens,
+            cache_read_input_tokens: cacheReadTokens,
+            cache_creation_input_tokens: cacheWriteTokens,
           },
           contextFillTokens,
           metadata: {
@@ -1175,6 +1293,7 @@ export class OpenCodeSDKProtocol implements AgentProtocol {
       }
 
       // Permission request
+      case 'permission.asked':
       case 'permission.updated': {
         // Permission requests are handled by the provider layer
         // Pass through as raw event
@@ -1249,8 +1368,12 @@ function aggregateOpenCodeUsage(
       input_tokens: total.input_tokens + snapshot.usage.input_tokens,
       output_tokens: total.output_tokens + snapshot.usage.output_tokens,
       total_tokens: total.total_tokens + snapshot.usage.total_tokens,
+      cache_read_input_tokens:
+        (total.cache_read_input_tokens ?? 0) + (snapshot.usage.cache_read_input_tokens ?? 0),
+      cache_creation_input_tokens:
+        (total.cache_creation_input_tokens ?? 0) + (snapshot.usage.cache_creation_input_tokens ?? 0),
     }),
-    { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { input_tokens: 0, output_tokens: 0, total_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
   );
 }
 

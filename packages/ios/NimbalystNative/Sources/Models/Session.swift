@@ -25,6 +25,9 @@ public struct Session: Codable, Identifiable, Hashable, Sendable {
     public var tagsJson: String?
     /// Worktree ID for git worktree association
     public var worktreeId: String?
+    /// Stable ID of the desktop or headless host that owns execution for this
+    /// session. nil means unknown -- control messages then broadcast as before.
+    public var hostDeviceId: String?
     /// Whether the session is archived
     public var isArchived: Bool
     /// Whether the session is pinned
@@ -48,6 +51,9 @@ public struct Session: Codable, Identifiable, Hashable, Sendable {
     public var draftInput: String?
     /// Epoch ms when draftInput was last updated by the sending device
     public var draftUpdatedAt: Int?
+    /// The desktop lists this session but withholds its transcript because its
+    /// project is not enabled for sync. Comes from client metadata; absent is false.
+    public var transcriptSyncDisabled: Bool
 
     /// Context usage as a percentage (0-100), or nil if no context info available.
     public var contextUsagePercent: Int? {
@@ -89,6 +95,7 @@ public struct Session: Codable, Identifiable, Hashable, Sendable {
         phase: String? = nil,
         tagsJson: String? = nil,
         worktreeId: String? = nil,
+        hostDeviceId: String? = nil,
         isArchived: Bool = false,
         isPinned: Bool = false,
         branchedFromSessionId: String? = nil,
@@ -104,7 +111,8 @@ public struct Session: Codable, Identifiable, Hashable, Sendable {
         lastReadAt: Int? = nil,
         lastMessageAt: Int? = nil,
         draftInput: String? = nil,
-        draftUpdatedAt: Int? = nil
+        draftUpdatedAt: Int? = nil,
+        transcriptSyncDisabled: Bool = false
     ) {
         self.id = id
         self.projectId = projectId
@@ -121,6 +129,7 @@ public struct Session: Codable, Identifiable, Hashable, Sendable {
         self.phase = phase
         self.tagsJson = tagsJson
         self.worktreeId = worktreeId
+        self.hostDeviceId = hostDeviceId
         self.isArchived = isArchived
         self.isPinned = isPinned
         self.branchedFromSessionId = branchedFromSessionId
@@ -137,6 +146,7 @@ public struct Session: Codable, Identifiable, Hashable, Sendable {
         self.lastMessageAt = lastMessageAt
         self.draftInput = draftInput
         self.draftUpdatedAt = draftUpdatedAt
+        self.transcriptSyncDisabled = transcriptSyncDisabled
     }
 }
 
@@ -147,12 +157,13 @@ extension Session: FetchableRecord, PersistableRecord {
 
     public enum Columns: String, ColumnExpression {
         case id, projectId, titleEncrypted, titleIv, titleDecrypted
-        case provider, model, mode, sessionType, parentSessionId, agentRole, createdBySessionId, phase, tagsJson, worktreeId
+        case provider, model, mode, sessionType, parentSessionId, agentRole, createdBySessionId, phase, tagsJson, worktreeId, hostDeviceId
         case isArchived, isPinned, branchedFromSessionId, branchPointMessageId, branchedAt
         case isExecuting, hasQueuedPrompts
         case contextTokens, contextWindow
         case createdAt, updatedAt, lastSyncedSeq
         case lastReadAt, lastMessageAt, draftInput, draftUpdatedAt
+        case transcriptSyncDisabled
     }
 
     /// Association to parent project.

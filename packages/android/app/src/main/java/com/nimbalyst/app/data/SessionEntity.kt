@@ -4,6 +4,7 @@ import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import com.google.gson.JsonParser
 
 @Entity(
     tableName = "sessions",
@@ -15,7 +16,12 @@ import androidx.room.PrimaryKey
             onDelete = ForeignKey.CASCADE
         )
     ],
-    indices = [Index("projectId"), Index("updatedAt"), Index("parentSessionId")]
+    indices = [
+        Index("projectId"),
+        Index("updatedAt"),
+        Index("parentSessionId"),
+        Index("createdBySessionId"),
+    ]
 )
 data class SessionEntity(
     @PrimaryKey val id: String,
@@ -47,5 +53,35 @@ data class SessionEntity(
     val lastMessageAt: Long? = null,
     val draftInput: String? = null,
     val draftUpdatedAt: Long? = null,
+    /** Agent role marker, e.g. "meta-agent". */
+    val agentRole: String? = null,
+    /** The meta-agent session that spawned this one. */
+    val createdBySessionId: String? = null,
+    /** Stable id of the desktop or headless host that runs this session. */
+    val hostDeviceId: String? = null,
+    val pendingExecution: PendingExecution? = null,
+    /**
+     * The last client-metadata blob the server holds for this session, as
+     * plaintext JSON. The server replaces the blob whole, so a draft push is
+     * written into this rather than rebuilt from the row's columns, which
+     * would drop fields this build does not model. Null until one is known.
+     */
+    val clientMetadataJson: String? = null,
 )
 
+
+/**
+ * The desktop lists this session but withholds its transcript because its
+ * project is not enabled for sync. Read from [SessionEntity.clientMetadataJson]
+ * rather than a column: that blob is replaced whole on every update, so a blob
+ * without the flag reads false, and a republished blob carries it unchanged.
+ */
+val SessionEntity.transcriptSyncDisabled: Boolean
+    get() {
+        val json = clientMetadataJson ?: return false
+        // Most blobs never carry the key; skip the parse for them.
+        if (!json.contains("transcriptSyncDisabled")) return false
+        return runCatching {
+            JsonParser.parseString(json).asJsonObject.get("transcriptSyncDisabled")?.takeIf { it.isJsonPrimitive }?.asBoolean
+        }.getOrNull() ?: false
+    }

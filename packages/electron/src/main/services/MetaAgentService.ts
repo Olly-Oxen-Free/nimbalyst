@@ -1,15 +1,28 @@
+import type { OrchestrationMessageKind } from '@nimbalyst/runtime/ai/server/types';
 import path from 'path';
 import { BrowserWindow } from 'electron';
+import { createUnderParentOrBeside } from './sessionHierarchy';
 import { randomUUID } from 'crypto';
 import { safeHandle } from '../utils/ipcRegistry';
 import { SessionManager } from '@nimbalyst/runtime/ai/server';
 import type { AIProviderType, PromptProvenance } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
+import {
+  EFFORT_LEVELS,
+  clampEffortLevel,
+  type EffortLevel,
+} from '@nimbalyst/runtime/ai/server/effortLevels';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { AgentMessagesRepository } from '@nimbalyst/runtime/storage/repositories/AgentMessagesRepository';
 import { SessionFilesRepository } from '@nimbalyst/runtime/storage/repositories/SessionFilesRepository';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { getDefaultAIModel } from '../utils/store';
+import { resolveStoredWorkspaceId, sameWorkspaceIdentity } from '../utils/workspaceIdentity';
+import {
+  reserveChildSpawnCapacity,
+  getSessionStatusRow as querySessionStatusRow,
+  getSpawnedSessionRows,
+} from './metaAgentSessionQueries';
 import { toMillis } from '../utils/timestampUtils';
 import { createWorktreeStore } from './WorktreeStore';
 import { GitWorktreeService } from './GitWorktreeService';
@@ -19,6 +32,11 @@ import { gitRefWatcher } from '../file/GitRefWatcher';
 import { AIService } from './ai/AIService';
 import { setMetaAgentToolFns } from '../mcp/metaAgentServer';
 import { computeNotificationSignature } from './metaAgentNotificationSignature';
+import { deletePendingChildUpdates } from './ai/pendingChildUpdates';
+import { inheritedOwnership, isParentNotificationSuppressed } from './extensionSessions/sessionOwnership';
+import { childReportingMetadata, resolveChildReporting, type ChildReporting } from './childReporting';
+import { startExtensionSessionService } from './extensionSessions/extensionSessionsService';
+import { broadcastSessionCreated } from './session/broadcastSessionCreated';
 import { extractMessageText, extractUserPrompts } from './metaAgentMessageText';
 import type { NotificationOptions, NotificationResult, BlockingType } from './NotificationService';
 import type { MobilePushResult } from '@nimbalyst/runtime/sync/types';
@@ -69,6 +87,33 @@ interface CreateChildSessionArgs {
   useWorktree?: boolean;
   worktreeId?: string;
   toolScope?: string;
+  /**
+   * Reasoning effort for the new session. Omit to leave the child on the
+   * app-wide default (what every spawn did before this existed) — an omitted
+   * value is NOT inherited from the caller.
+   */
+  effortLevel?: string;
+  /** none (default) | final | messages; see childReporting.ts. */
+  reporting?: string;
+}
+
+/**
+ * Validate a caller-supplied effort level. Deliberately throws instead of
+ * using `parseEffortLevel`, which returns the 'high' default for unrecognized
+ * input — that would turn a typo ('mid') into a silent, plausible-looking
+ * choice the caller never made.
+ */
+function validateRequestedEffortLevel(value: string | undefined): EffortLevel | undefined {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  const match = EFFORT_LEVELS.find((entry) => entry.key === value);
+  if (!match) {
+    throw new Error(
+      `Invalid effortLevel "${value}". Expected one of: ${EFFORT_LEVELS.map((entry) => entry.key).join(', ')}`
+    );
+  }
+  return match.key;
 }
 
 function normalizeStoredChildModelIdentifier(
@@ -101,13 +146,10 @@ interface SpawnSessionArgs {
    * provided explicitly.
    */
   inheritModel?: boolean;
-  /**
-   * If false (the default for /launch-new-session), the parent will not receive
-   * `[Child Session Update]` notifications when the spawned session completes,
-   * errors, or waits for input. Use this for fire-and-forget hand-offs where the
-   * parent is just kicking off work to escape a long context.
-   */
+  /** Legacy form of `reporting: 'final'`; used only when `reporting` is omitted. */
   notifyOnComplete?: boolean;
+  /** none (default) | final | messages; see childReporting.ts. */
+  reporting?: string;
   /**
    * When true, the new session is created at the top level — no parent, no
    * workstream container, no shared files-edited or tabs with the caller.
@@ -115,6 +157,19 @@ interface SpawnSessionArgs {
    * caller's workstream.
    */
   isolated?: boolean;
+  /**
+   * When true, the new session goes beside the caller (under the caller's
+   * parent) instead of under it, still managed by the caller. For handoff
+   * chains where each session passes work to a successor.
+   */
+  besideCaller?: boolean;
+  /**
+   * Reasoning effort for the new session (e.g. spawn an
+   * `openai-codex:gpt-6-astra` session at 'medium'). Clamped to the resolved
+   * model's ceiling. Omit to leave the child on the app-wide default; unlike
+   * `model` there is no inherit-from-caller mode.
+   */
+  effortLevel?: string;
 }
 
 interface NotifyUserArgs {
@@ -157,51 +212,6 @@ const BLOCKING_TYPE_BY_PROMPT_TYPE: Record<string, BlockingType> = {
   ask_user_question_request: 'question',
   exit_plan_mode_request: 'plan_approval',
 };
-
-/** Notification-only bound for the reinjected original task text. The stored,
- *  returned `SessionResultData.originalPrompt` value itself stays unbounded --
- *  only the text appended into a `[Child Session Update]` notification (which
- *  lands directly in the parent's own prompt queue) is capped. Fixed, not
- *  user-configurable, matching the other hardcoded bounds nearby
- *  (500 chars for lastResponse, 2,000 chars/message for recentMessages). */
-const CHILD_NOTIFICATION_ORIGINAL_PROMPT_MAX_CHARS = 2_000;
-
-function truncateNotificationPreview(
-  text: string,
-  maxChars: number = CHILD_NOTIFICATION_ORIGINAL_PROMPT_MAX_CHARS,
-): { text: string; truncated: boolean } {
-  if (text.length <= maxChars) {
-    return { text, truncated: false };
-  }
-
-  const marker = '…[original task truncated; call get_session_result for the complete prompt]…';
-  const keepChars = Math.max(0, maxChars - marker.length);
-  const headChars = Math.ceil(keepChars * (13 / 19));
-  const tailChars = keepChars - headChars;
-
-  // Avoid splitting a UTF-16 surrogate pair at either cut point.
-  let headEnd = headChars;
-  if (headEnd > 0 && headEnd < text.length) {
-    const code = text.charCodeAt(headEnd - 1);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      headEnd -= 1;
-    }
-  }
-  let tailStart = text.length - tailChars;
-  if (tailStart > 0 && tailStart < text.length) {
-    // If the tail's first kept unit is a lone low surrogate (its high-surrogate
-    // partner falls in the excluded middle region), advance past it instead of
-    // starting the tail mid-pair.
-    const code = text.charCodeAt(tailStart);
-    if (code >= 0xdc00 && code <= 0xdfff) {
-      tailStart += 1;
-    }
-  }
-
-  const head = text.slice(0, headEnd);
-  const tail = tailChars > 0 ? text.slice(tailStart) : '';
-  return { text: `${head}${marker}${tail}`, truncated: true };
-}
 
 export class MetaAgentService {
   private static instance: MetaAgentService | null = null;
@@ -276,10 +286,13 @@ export class MetaAgentService {
       this.showBlockedNotification = showBlockedNotification ?? null;
       this.sessionManager = new SessionManager();
       await this.sessionManager.initialize();
+      // Extension backend modules drive their owned sessions through the same
+      // prompt queue, and receive their settles from the same state feed.
+      startExtensionSessionService(aiService);
 
       setMetaAgentToolFns({
-        listWorktrees: (_metaSessionId, workspaceId) =>
-          this.listWorktreesJson(workspaceId),
+        listWorktrees: (metaSessionId, workspaceId) =>
+          this.listWorktreesJson(metaSessionId, workspaceId),
         createSession: (metaSessionId, workspaceId, args) =>
           this.createChildSession(metaSessionId, workspaceId, args),
         spawnSession: (callerSessionId, workspaceId, args) =>
@@ -290,8 +303,8 @@ export class MetaAgentService {
           this.getSessionResultJson(targetSessionId, workspaceId, options),
         listQueuedPrompts: (_metaSessionId, workspaceId, targetSessionId, options) =>
           this.listQueuedPromptsJson(targetSessionId, workspaceId, options),
-        sendPrompt: (metaSessionId, workspaceId, targetSessionId, prompt, interrupt) =>
-          this.sendPromptToSession(metaSessionId, targetSessionId, workspaceId, prompt, interrupt),
+        sendPrompt: (metaSessionId, workspaceId, targetSessionId, prompt, interrupt, messageKind) =>
+          this.sendPromptToSession(metaSessionId, targetSessionId, workspaceId, prompt, interrupt, messageKind),
         notifyUser: (callerSessionId, workspaceId, args) =>
           this.notifyUserJson(callerSessionId, workspaceId, args),
         respondToPrompt: (_metaSessionId, workspaceId, args) =>
@@ -347,14 +360,14 @@ export class MetaAgentService {
   }
 
   /**
-   * Launch a sibling session in the same workstream from a user-triggered
+   * Launch a child session from a user-triggered
    * action prompt (the Actions dropdown in the AI composer). This is the
    * non-MCP entry point: unlike `spawnSession` (called from the meta-agent
    * MCP server), this is invoked from a human IPC and returns a typed
    * result, not stringified JSON.
    *
    * Workstream/worktree/model resolution mirrors `spawnSession` exactly:
-   * - sibling under the parent's workstream (creating the container if needed)
+   * - child of the caller inside the same container
    * - inherit parent's worktree unless `useWorktree=true`
    * - explicit `model` wins; otherwise inherit caller's model
    *
@@ -369,6 +382,7 @@ export class MetaAgentService {
       prompt: string;
       title?: string;
       model?: string;
+      effortLevel?: string;
       autoSubmit: boolean;
       useWorktree?: boolean;
     }
@@ -378,26 +392,23 @@ export class MetaAgentService {
     worktreeId: string | null;
     promotedParent: boolean;
     queuedInitialPrompt: boolean;
+    workspacePath: string;
   }> {
     if (!args?.prompt?.trim()) {
       throw new Error('prompt is required');
     }
 
     const parent = await AISessionsRepository.get(parentSessionId);
-    if (!parent || parent.workspacePath !== workspaceId) {
+    if (!parent || !sameWorkspaceIdentity(parent.workspacePath, workspaceId)) {
       throw new Error(`Parent session ${parentSessionId} not found in this workspace`);
     }
 
-    const resolved = await this.resolveOrCreateWorkstream(parent, workspaceId);
-    const workstreamId = resolved.workstreamId;
+    // Everything this launch writes goes under the parent's own key, not the
+    // canonicalized one the tool dispatcher handed us (#1551).
+    const workspaceKey = resolveStoredWorkspaceId(parent.workspacePath, workspaceId);
 
-    // Meta-agent children ALWAYS run in the parent's working directory (the
-    // shared workspace), never a fresh isolated worktree. The parent synthesizes
-    // by reading each child's written deliverable; a child that writes into its
-    // own worktree leaves the parent unable to find the file. So we ignore the
-    // requested useWorktree and inherit the parent's worktree (the main checkout
-    // for a top-level meta-agent).
-    const inheritedWorktreeId = parent.worktreeId ?? undefined;
+    const workstreamId = args.useWorktree ? null : parent.id;
+    const inheritedWorktreeId = args.useWorktree ? undefined : parent.worktreeId ?? undefined;
 
     // Explicit model wins; otherwise inherit caller's model (e.g. keep "opus"
     // on "opus") rather than dropping to the global default.
@@ -406,28 +417,30 @@ export class MetaAgentService {
     // Pass prompt only when autoSubmit is true; createChildSessionInternal
     // queues + triggers only when a prompt is supplied. For prefill mode we
     // omit it so nothing runs until the user hits Send in the new session.
-    const childResult = await this.createChildSessionInternal(parentSessionId, workspaceId, {
+    const childResult = await this.createChildSessionInternal(parentSessionId, workspaceKey, {
+      // The title is the action's label ("Continue in New Session"), which says
+      // nothing about the work. Show it until the agent names the session.
       title: args.title,
+      provisionalTitle: true,
       prompt: args.autoSubmit ? args.prompt : undefined,
-      useWorktree: false,
+      useWorktree: !!args.useWorktree,
       worktreeId: inheritedWorktreeId,
       model: effectiveModel,
+      effortLevel: args.effortLevel,
       parentSessionIdOverride: workstreamId,
-    });
-
-    // Always fire-and-forget for human-triggered launches — the user can
-    // watch the new session themselves; no need to surface child-completion
-    // notifications back to the originating session.
-    await AISessionsRepository.updateMetadata(childResult.sessionId, {
-      metadata: { notifyParent: false },
+      // Always fire-and-forget for human-triggered launches — the user can
+      // watch the new session themselves; no need to surface child-completion
+      // notifications back to the originating session.
+      childReporting: 'none',
     });
 
     return {
       sessionId: childResult.sessionId,
       workstreamId,
       worktreeId: childResult.worktreeId ?? null,
-      promotedParent: resolved.promotedParent,
+      promotedParent: false,
       queuedInitialPrompt: childResult.queuedInitialPrompt,
+      workspacePath: workspaceKey,
     };
   }
 
@@ -459,14 +472,23 @@ export class MetaAgentService {
     workspaceId: string,
     args: CreateChildSessionArgs
   ): Promise<string> {
-    const result = await this.createChildSessionInternal(metaSessionId, workspaceId, args);
-    return JSON.stringify(result, null, 2);
+    const childReporting = resolveChildReporting(args.reporting);
+    const result = await this.createChildSessionInternal(metaSessionId, workspaceId, { ...args, childReporting });
+    return JSON.stringify({ ...result, reporting: childReporting }, null, 2);
   }
 
   private async createChildSessionInternal(
     metaSessionId: string,
     workspaceId: string,
-    args: CreateChildSessionArgs & { parentSessionIdOverride?: string | null }
+    args: CreateChildSessionArgs & {
+      parentSessionIdOverride?: string | null;
+      /** Written on the row before the first prompt is queued; see childReporting.ts. */
+      childReporting: ChildReporting;
+      /** Show `title` until the session names itself, instead of locking it in. */
+      provisionalTitle?: boolean;
+      /** Place the new session beside the caller rather than under it; the caller still manages it. */
+      besideCaller?: boolean;
+    }
   ): Promise<{
     sessionId: string;
     title: string;
@@ -478,6 +500,8 @@ export class MetaAgentService {
     createdBySessionId: string;
     queuedInitialPrompt: boolean;
     parentSessionId: string | null;
+    /** Effort actually applied, after clamping; null when left on the app default. */
+    effortLevel: string | null;
   }> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
@@ -485,6 +509,10 @@ export class MetaAgentService {
     if (args.useWorktree && args.worktreeId) {
       throw new Error('useWorktree and worktreeId cannot be combined');
     }
+
+    // Validate before any side effect, so a bad effortLevel can't leave a
+    // half-created worktree or session row behind.
+    const requestedEffortLevel = validateRequestedEffortLevel(args.effortLevel);
 
     // Defense-in-depth: a child-completion notification (built in
     // buildNotificationMessage) starts literally with '[Child Session Update]'.
@@ -511,15 +539,27 @@ export class MetaAgentService {
     // An explicit args.provider/args.model still wins; that is what they are for.
     let parentProvider: string | null = null;
     let parentModel: string | null = null;
+    let callerWorkspacePath: string | null = null;
+    // A failed read is NOT treated like an orphan: the caller may be
+    // extension-owned, and a child created without its owner would escape the
+    // owner's roster and settle routing. Only a missing row falls through.
+    const parentSession = await AISessionsRepository.get(metaSessionId);
+    const callerMetadata: unknown = parentSession?.metadata ?? null;
     try {
-      const parentSession = await AISessionsRepository.get(metaSessionId);
       if (parentSession) {
         parentProvider = parentSession.provider ?? null;
+        callerWorkspacePath = parentSession.workspacePath ?? null;
         parentModel = normalizeStoredChildModelIdentifier(parentProvider, parentSession.model ?? null);
       }
     } catch {
       // Best-effort lookup; fall through to the hardcoded default below.
     }
+
+    // Keyed by the workspace the CALLER is registered under, not the spelling
+    // the dispatcher canonicalized to: a child filed under a spelling no window
+    // is open on is created and then never started (#1551). An orphaned caller
+    // falls back to the caller's own key, as before.
+    const workspaceKey = resolveStoredWorkspaceId(callerWorkspacePath, workspaceId);
 
     const defaultModel =
       parentModel
@@ -532,7 +572,7 @@ export class MetaAgentService {
     // self-describing identifier wrongly trips the claude-code mismatch guard.
     const explicitModelProvider =
       args.provider
-      ?? (args.model?.includes(':') ? ModelIdentifier.tryParse(args.model)?.provider ?? null : null)
+      ?? (args.model?.includes(':') ? ModelIdentifier.tryParse(args.model)?.provider : undefined)
       ?? parentProvider;
     const explicitModel = normalizeStoredChildModelIdentifier(explicitModelProvider, args.model ?? null);
     const model = explicitModel || defaultModel;
@@ -554,204 +594,169 @@ export class MetaAgentService {
       || (parentModel && parentModelProvider === provider ? parentModel : null)
       || ModelIdentifier.getDefaultModelId(provider);
 
-    const callerProvidedTitle = !!args.title?.trim();
+    const callerProvidedTitle = !!args.title?.trim() && !args.provisionalTitle;
     const title = (args.title || this.deriveTitleFromPrompt(args.prompt) || 'Meta Task').trim();
 
-    let worktreeId: string | null = null;
-    let worktreePath: string | null = null;
-
-    const db = getDatabase();
-    if ((args.useWorktree || args.worktreeId) && !db) {
-      throw new Error('Database not initialized');
-    }
-    const worktreeStore = db ? createWorktreeStore(db) : null;
-
-    if (args.worktreeId) {
-      if (!worktreeStore) {
-        throw new Error('Worktree store not initialized');
-      }
-
-      const existingWorktree = await worktreeStore.get(args.worktreeId);
-      if (!existingWorktree) {
-        throw new Error(`Worktree ${args.worktreeId} not found`);
-      }
-      if (existingWorktree.projectPath !== workspaceId) {
-        throw new Error(`Worktree ${args.worktreeId} does not belong to this workspace`);
-      }
-      if (existingWorktree.isArchived) {
-        throw new Error(`Worktree ${args.worktreeId} is archived`);
-      }
-
-      worktreeId = existingWorktree.id;
-      worktreePath = existingWorktree.path;
-    } else if (args.useWorktree) {
-      if (!worktreeStore) {
-        throw new Error('Worktree store not initialized');
-      }
-
-      const gitWorktreeService = new GitWorktreeService();
-      const [dbNames, filesystemNames, branchNames] = await Promise.all([
-        worktreeStore.getAllNames(),
-        Promise.resolve(gitWorktreeService.getExistingWorktreeDirectories(workspaceId)),
-        gitWorktreeService.getAllBranchNames(workspaceId),
-      ]);
-      const existingNames = new Set<string>();
-      for (const name of dbNames) existingNames.add(name);
-      for (const name of filesystemNames) existingNames.add(name);
-      for (const name of branchNames) existingNames.add(name);
-      const finalName = gitWorktreeService.generateUniqueWorktreeName(existingNames);
-      const worktree = await gitWorktreeService.createWorktree(workspaceId, { name: finalName });
-      await worktreeStore.create(worktree);
-      gitRefWatcher.start(worktree.path).catch((error: Error) => {
-        console.error('[MetaAgentService] Failed to start GitRefWatcher for meta-agent worktree:', error);
-      });
-      worktreeId = worktree.id;
-      worktreePath = worktree.path;
-    }
-
-    // Two independent gates on how many children a parent can spawn:
-    //
-    //   1. MAX_IN_FLIGHT — the controllable "max parallel" limit. Counts only
-    //      children currently active (status running / waiting_for_input). Once
-    //      a child finishes, it frees a slot, so a parent can spawn an unbounded
-    //      TOTAL number of children over its lifetime as long as it doesn't
-    //      exceed this many at once. This is the intended behavior.
-    //
-    //   2. LIFETIME_BACKSTOP — a much higher non-controllable ceiling on ALL
-    //      children ever created (regardless of status, non-archived). An
-    //      in-flight count alone does NOT bound SEQUENTIAL re-spawn runaways: a
-    //      completion-wakeup re-drives the parent, a weak model spawns another
-    //      child, the child settles in milliseconds, so the in-flight count
-    //      stays ~0 and never fires. This backstop catches that pathological
-    //      loop without imposing a low lifetime cap on normal use. Mirrors the
-    //      created_by_session_id query in getSpawnedSessions.
-    const MAX_IN_FLIGHT = 4;
-    const LIFETIME_BACKSTOP = 50;
-    // Use SUM(CASE ...) rather than COUNT(*) FILTER (...) so the aggregate is
-    // portable across both PGLite and better-sqlite3 (see DATABASE.md).
-    const { rows: gateRows } = await databaseWorker.query<{ in_flight: string; total: string }>(
-      `SELECT
-         SUM(CASE WHEN status IN ('running', 'waiting_for_input') THEN 1 ELSE 0 END)::text AS in_flight,
-         COUNT(*)::text AS total
-       FROM ai_sessions
-       WHERE workspace_id = $1
-         AND created_by_session_id = $2
-         AND (is_archived = FALSE OR is_archived IS NULL)`,
-      [workspaceId, metaSessionId]
-    );
-    const inFlightCount = Number(gateRows[0]?.in_flight ?? '0');
-    const totalCount = Number(gateRows[0]?.total ?? '0');
-    if (inFlightCount >= MAX_IN_FLIGHT) {
-      throw new Error(
-        `Too many child sessions running at once (${inFlightCount}/${MAX_IN_FLIGHT} in flight). ` +
-        `Wait for a spawned session to finish before spawning more.`
-      );
-    }
-    if (totalCount >= LIFETIME_BACKSTOP) {
-      throw new Error(
-        `Meta-agent lifetime spawn backstop reached (${LIFETIME_BACKSTOP} total children spawned by this parent); refusing to spawn more`
-      );
-    }
-
-    // NIM-858: do NOT auto-promote the spawning parent to agent_role='meta-agent'.
-    // The renderer META AGENT group is reserved for genuine meta-agents (created
-    // via the Meta Agent button, which sets agentRole='meta-agent' at create
-    // time) and their children. A standard session that spawns a sibling — via
-    // the Actions-dropdown launch (launchActionSession) or the spawn_session MCP
-    // tool used by /launch-new-session — must stay agentRole='standard' so it and
-    // its sibling render flat (as workstream siblings), not under Meta Agent.
-    //
-    // A prior promotion block here claimed to be "inert" because spawn tools were
-    // gated on agentRole==='meta-agent'. That gating only covers the extension-
-    // agent (Gemini) branch in MessageStreamingHandler; the nimbalyst-meta-agent
-    // MCP server is attached to every built-in session unconditionally
-    // (McpConfigService), and launchActionSession passes a standard parent — so
-    // the block actually fired and wrongly relabeled standard parents.
-
     const sessionId = randomUUID();
-    await AISessionsRepository.create({
-      id: sessionId,
-      provider,
-      model: normalizedModel,
-      title,
-      workspaceId,
-      worktreeId: worktreeId ?? undefined,
-      agentRole: 'standard',
-      createdBySessionId: metaSessionId,
-      parentSessionId: args.parentSessionIdOverride ?? null,
-      // When the meta-agent (or any caller of spawn_session) supplies an
-      // explicit title, treat the session as already named. claude-code reads
-      // this flag (via documentContext.hasBeenNamed) to set hasOutOfBandNaming
-      // and suppress in-band self-naming, so the child keeps the parent's title.
-      hasBeenNamed: callerProvidedTitle,
-    } as any);
+    const releaseCapacity = await reserveChildSpawnCapacity(workspaceKey, metaSessionId, sessionId);
+    try {
+      let worktreeId: string | null = null;
+      let worktreePath: string | null = null;
 
-    // Read-only tool segregation: persist a restricted capability scope so the
-    // child is granted only the matching dev tools at turn time (an analyze
-    // child physically cannot run_command, so it cannot build or claim to).
-    const childToolScope =
-      args.toolScope === 'read' || args.toolScope === 'write' ? args.toolScope : undefined;
-    if (childToolScope) {
-      await AISessionsRepository.updateMetadata(sessionId, { metadata: { toolScope: childToolScope } });
-    }
-
-    const initialPrompt = args.prompt?.trim();
-    const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
-
-    if (initialPrompt) {
-      const promptProvenance: PromptProvenance = {
-        actor: 'agent',
-        origin: 'session-orchestration',
-        originSessionId: metaSessionId,
-      };
-      if (shouldBypassExecution) {
-        await this.persistSyntheticInputMessage(sessionId, initialPrompt, promptProvenance);
-      } else {
-        await this.aiService.queuePromptForSession(sessionId, initialPrompt, undefined, { promptProvenance });
+      const db = getDatabase();
+      if ((args.useWorktree || args.worktreeId) && !db) {
+        throw new Error('Database not initialized');
       }
-    }
+      const worktreeStore = db ? createWorktreeStore(db) : null;
 
-    const newChildParentId = args.parentSessionIdOverride ?? null;
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.isDestroyed()) {
-        window.webContents.send('sessions:refresh-list', {
-          workspacePath: workspaceId,
-          sessionId,
+      if (args.worktreeId) {
+        if (!worktreeStore) {
+          throw new Error('Worktree store not initialized');
+        }
+
+        const existingWorktree = await worktreeStore.get(args.worktreeId);
+        if (!existingWorktree) {
+          throw new Error(`Worktree ${args.worktreeId} not found`);
+        }
+        if (!sameWorkspaceIdentity(existingWorktree.projectPath, workspaceKey)) {
+          throw new Error(`Worktree ${args.worktreeId} does not belong to this workspace`);
+        }
+        if (existingWorktree.isArchived) {
+          throw new Error(`Worktree ${args.worktreeId} is archived`);
+        }
+
+        worktreeId = existingWorktree.id;
+        worktreePath = existingWorktree.path;
+      } else if (args.useWorktree) {
+        if (!worktreeStore) {
+          throw new Error('Worktree store not initialized');
+        }
+
+        const gitWorktreeService = new GitWorktreeService();
+        const [dbNames, filesystemNames, branchNames] = await Promise.all([
+          worktreeStore.getAllNames(),
+          Promise.resolve(gitWorktreeService.getExistingWorktreeDirectories(workspaceKey)),
+          gitWorktreeService.getAllBranchNames(workspaceKey),
+        ]);
+        const existingNames = new Set<string>();
+        for (const name of dbNames) existingNames.add(name);
+        for (const name of filesystemNames) existingNames.add(name);
+        for (const name of branchNames) existingNames.add(name);
+        const finalName = gitWorktreeService.generateUniqueWorktreeName(existingNames);
+        // As-opened spelling, so the new worktree's projectPath matches the key
+        // the window and its sessions use.
+        const worktree = await gitWorktreeService.createWorktree(workspaceKey, { name: finalName });
+        await worktreeStore.create(worktree);
+        gitRefWatcher.start(worktree.path, undefined, workspaceId).catch((error: Error) => {
+          console.error('[MetaAgentService] Failed to start GitRefWatcher for meta-agent worktree:', error);
         });
-        if (worktreeId) {
-          window.webContents.send('worktree:session-created', { sessionId, worktreeId });
-        }
-        // The general `sessions:refresh-list` only updates `sessionRegistryAtom`.
-        // Workstream surfaces (tab strip, left tree) also read per-parent atoms
-        // (`sessionChildrenAtom`, `workstreamStateAtom`) that the registry
-        // refresh does not touch, so we send a targeted event so listeners can
-        // patch those without re-fetching everything.
-        if (newChildParentId) {
-          window.webContents.send('sessions:child-added', {
-            workspacePath: workspaceId,
-            parentSessionId: newChildParentId,
-            childSessionId: sessionId,
-          });
+        worktreeId = worktree.id;
+        worktreePath = worktree.path;
+      }
+
+      // create_session shares the caller's container just like spawn_session.
+      // Explicit isolation or a different worktree keeps the manager but no tree edge.
+      if (!args.useWorktree && !args.worktreeId && parentSession?.worktreeId) {
+        worktreeId = parentSession.worktreeId;
+        worktreePath = parentSession.worktreePath ?? null;
+      }
+      // Beside the caller = under the caller's own parent (top level for a root caller).
+      const besideCallerParentId = parentSession?.parentSessionId ?? null;
+      const preferredParentId = args.parentSessionIdOverride === null ? null
+        : !parentSession || (parentSession.worktreeId ?? null) !== (worktreeId ?? null) ? null
+        : args.besideCaller ? besideCallerParentId : metaSessionId;
+
+      // NIM-858: do NOT auto-promote the spawning parent to agent_role='meta-agent'.
+      // Spawned sessions keep their configured role; parentage carries the tree.
+
+
+      // Read-only tool segregation: persist a restricted capability scope so the
+      // child is granted only the matching dev tools at turn time (an analyze
+      // child physically cannot run_command, so it cannot build or claim to).
+      const childToolScope =
+        args.toolScope === 'read' || args.toolScope === 'write' ? args.toolScope : undefined;
+
+      // Reasoning effort: every turn reads it back out of session metadata
+      // (MessageStreamingHandler for codex/others, buildClaudeCodeRuntimeConfig
+      // for claude-code). Clamp to the resolved model's ceiling so the child's
+      // effort selector displays the same level the provider will actually run
+      // at, rather than a level the transport would silently lower. Writing
+      // nothing leaves the child on the app-wide default.
+      const childEffortLevel = requestedEffortLevel
+        ? clampEffortLevel(requestedEffortLevel, normalizedModel)
+        : undefined;
+
+      // Everything a reader must never see missing goes in the insert itself:
+      // notifyParent written after the prompt was queued let a fast child settle
+      // notify a parent that asked not to be told. A child of an extension-owned
+      // session inherits the owner (never the directive).
+      const childMetadata: Record<string, unknown> = {
+        ...inheritedOwnership(callerMetadata),
+        ...(childToolScope ? { toolScope: childToolScope } : {}),
+        ...(childEffortLevel ? { effortLevel: childEffortLevel } : {}),
+        ...childReportingMetadata(args.childReporting, metaSessionId),
+        ...(args.parentSessionIdOverride === null && !args.useWorktree ? { isolated: true } : {}),
+      };
+
+      const treeParentId = await createUnderParentOrBeside(parentSessionId => AISessionsRepository.create({
+        id: sessionId,
+        provider,
+        model: normalizedModel,
+        title,
+        workspaceId: workspaceKey,
+        worktreeId: worktreeId ?? undefined,
+        agentRole: 'standard',
+        createdBySessionId: metaSessionId,
+        parentSessionId,
+        // When the meta-agent (or any caller of spawn_session) supplies an
+        // explicit title, treat the session as already named. claude-code reads
+        // this flag (via documentContext.hasBeenNamed) to set hasOutOfBandNaming
+        // and suppress in-band self-naming, so the child keeps the parent's title.
+        hasBeenNamed: callerProvidedTitle,
+        metadata: childMetadata,
+      }), preferredParentId, besideCallerParentId);
+
+      const initialPrompt = args.prompt?.trim();
+      const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
+
+      if (initialPrompt) {
+        const promptProvenance: PromptProvenance = {
+          actor: 'agent',
+          origin: 'session-orchestration',
+          originSessionId: metaSessionId,
+        };
+        if (shouldBypassExecution) {
+          await this.persistSyntheticInputMessage(sessionId, initialPrompt, promptProvenance);
+        } else {
+          await this.aiService.queuePromptForSession(sessionId, initialPrompt, undefined, { promptProvenance });
         }
       }
-    }
 
-    if (initialPrompt && !shouldBypassExecution) {
-      await this.aiService.triggerQueuedPromptProcessingForSession(sessionId, worktreePath || workspaceId, 'meta-agent');
-    }
+      broadcastSessionCreated({
+        workspacePath: workspaceKey,
+        sessionId,
+        parentSessionId: treeParentId,
+        worktreeId,
+      });
 
-    return {
-      sessionId,
-      title,
-      provider,
-      model: normalizedModel,
-      worktreeId,
-      worktreePath,
-      worktreeMode: args.worktreeId ? 'existing' : args.useWorktree ? 'new' : 'none',
-      createdBySessionId: metaSessionId,
-      queuedInitialPrompt: !!initialPrompt,
-      parentSessionId: args.parentSessionIdOverride ?? null,
-    };
+      if (initialPrompt && !shouldBypassExecution) {
+        await this.aiService.triggerQueuedPromptProcessingForSession(sessionId, worktreePath || workspaceKey, 'meta-agent');
+      }
+
+      return {
+        sessionId,
+        title,
+        provider,
+        model: normalizedModel,
+        worktreeId,
+        worktreePath,
+        worktreeMode: args.useWorktree ? 'new' : worktreeId ? 'existing' : 'none',
+        createdBySessionId: metaSessionId,
+        queuedInitialPrompt: !!initialPrompt,
+        parentSessionId: treeParentId,
+        effortLevel: childEffortLevel ?? null,
+      };
+    } finally { releaseCapacity(); }
   }
 
   private async spawnSession(
@@ -764,24 +769,19 @@ export class MetaAgentService {
     }
 
     const parent = await AISessionsRepository.get(parentSessionId);
-    if (!parent || parent.workspacePath !== workspaceId) {
+    if (!parent || !sameWorkspaceIdentity(parent.workspacePath, workspaceId)) {
       throw new Error(`Parent session ${parentSessionId} not found in this workspace`);
     }
 
-    const isolated = args.isolated === true;
+    // The parent's stored spelling is the one the window and every sibling are
+    // registered under; keep writing that (#1551).
+    const workspaceKey = resolveStoredWorkspaceId(parent.workspacePath, workspaceId);
 
-    // Sibling mode: resolve (or create) a workstream container so the new
-    // session shares files-edited, tabs, and workstream overview with the
-    // caller. Isolated mode skips this entirely — the new session is a
-    // top-level row with no parent, intended for fix-and-commit work that
-    // should not pollute the caller's workstream.
-    let workstreamId: string | null = null;
-    let promotedParent = false;
-    if (!isolated) {
-      const resolved = await this.resolveOrCreateWorkstream(parent, workspaceId);
-      workstreamId = resolved.workstreamId;
-      promotedParent = resolved.promotedParent;
-    }
+    const isolated = args.isolated === true;
+    const reporting = resolveChildReporting(args.reporting, args.notifyOnComplete === true);
+
+    const workstreamId = isolated || args.useWorktree ? null : parent.id;
+    const promotedParent = false;
 
     // Inherit the caller's worktree by default. spawn_session means "continue
     // work in the same checkout I'm in"; without this, a child created from a
@@ -798,108 +798,41 @@ export class MetaAgentService {
     const effectiveModel =
       args.model ?? (args.inheritModel ? parent.model ?? undefined : undefined);
 
-    const childResult = await this.createChildSessionInternal(parentSessionId, workspaceId, {
+    const childResult = await this.createChildSessionInternal(parentSessionId, workspaceKey, {
       title: args.title,
       prompt: args.prompt,
       useWorktree: !!args.useWorktree,
       worktreeId: inheritedWorktreeId,
       model: effectiveModel,
+      effortLevel: args.effortLevel,
       parentSessionIdOverride: workstreamId,
+      besideCaller: args.besideCaller === true,
+      // Default is fire-and-forget: kicking off work in a fresh session is the
+      // common /launch-new-session use case (escape a long parent context).
+      childReporting: reporting,
     });
-
-    // Default is fire-and-forget: kicking off work in a fresh session is the
-    // common /launch-new-session use case (escape a long parent context).
-    const notifyOnComplete = args.notifyOnComplete === true;
-    if (!notifyOnComplete) {
-      await AISessionsRepository.updateMetadata(childResult.sessionId, {
-        metadata: { notifyParent: false },
-      });
-    }
 
     return JSON.stringify({
       ...childResult,
       isolated,
       workstreamId,
       promotedParent,
-      notifyOnComplete,
+      reporting,
     }, null, 2);
   }
 
-  private async resolveOrCreateWorkstream(
-    parent: { id: string; title?: string; provider: string; model?: string | null; sessionType?: string; parentSessionId?: string | null; worktreeId?: string | null },
-    workspaceId: string
-  ): Promise<{ workstreamId: string | null; promotedParent: boolean }> {
-    // A worktree IS the workstream — the worktree row in the `worktrees` table is the
-    // container, and every session inside it is a flat sibling keyed by `worktree_id`.
-    // Never wrap a worktree-resident session in a `session_type='workstream'` row;
-    // that produces a forbidden third layer (worktree → workstream → session) and
-    // confuses every grouping derivation (worktreeGroupsData, FilesEditedSidebar,
-    // the workstream tab strip). Hard rule: two layers max.
-    if (parent.worktreeId) {
-      return { workstreamId: null, promotedParent: false };
-    }
-
-    if (parent.parentSessionId) {
-      return { workstreamId: parent.parentSessionId, promotedParent: false };
-    }
-
-    if (parent.sessionType === 'workstream') {
-      return { workstreamId: parent.id, promotedParent: false };
-    }
-
-    const workstreamId = randomUUID();
-    const workstreamTitle = (parent.title && parent.title.trim()) ? parent.title : 'Workstream';
-
-    await AISessionsRepository.create({
-      id: workstreamId,
-      provider: parent.provider,
-      model: parent.model ?? undefined,
-      title: workstreamTitle,
-      workspaceId,
-      sessionType: 'workstream',
-    });
-
-    // Tag the workstream container in metadata so existing renderer code that
-    // relies on metadata.isWorkstreamRoot continues to work.
-    await AISessionsRepository.updateMetadata(workstreamId, {
-      metadata: { isWorkstreamRoot: true },
-    });
-
-    // Reparent the original session under the new workstream container.
-    await AISessionsRepository.updateMetadata(parent.id, {
-      parentSessionId: workstreamId,
-    });
-
-    // Tell the renderer the original session is now a child of the workstream
-    // so per-parent atoms (sessionChildrenAtom, workstreamStateAtom) get
-    // patched alongside the registry refresh that fires below.
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.isDestroyed()) {
-        window.webContents.send('sessions:child-added', {
-          workspacePath: workspaceId,
-          parentSessionId: workstreamId,
-          childSessionId: parent.id,
-        });
-      }
-    }
-
-    // SyncedSessionStore is now the single push path: the create() above pushes
-    // title/provider/model/sessionType for the new workstream, and the
-    // updateMetadata() above pushes the reparented child's parentSessionId.
-    // Both reach iOS via the index channel without needing an explicit
-    // pushChange here.
-
-    return { workstreamId, promotedParent: true };
-  }
-
-  private async listWorktreesJson(workspaceId: string): Promise<string> {
+  private async listWorktreesJson(metaSessionId: string, workspaceId: string): Promise<string> {
     const db = getDatabase();
     if (!db) {
       throw new Error('Database not initialized');
     }
 
+    // Worktree rows are keyed by the project as opened, which a canonicalized
+    // or case-variant caller path cannot be turned back into on its own (#1551);
+    // the caller's own session row is what still knows that spelling.
+    const workspaceKey = (await this.resolveSessionWorkspaceKey(metaSessionId, workspaceId)) ?? workspaceId;
     const worktreeStore = createWorktreeStore(db);
-    const worktrees = await worktreeStore.list(workspaceId);
+    const worktrees = await worktreeStore.list(workspaceKey);
     const summaries = await Promise.all(
       worktrees.map(async (worktree) => {
         const sessionIds = await worktreeStore.getWorktreeSessions(worktree.id);
@@ -921,7 +854,8 @@ export class MetaAgentService {
   }
 
   private async getSessionStatusJson(sessionId: string, workspaceId: string): Promise<string> {
-    const row = await this.getSessionStatusRow(sessionId, workspaceId);
+    const workspaceKey = await this.resolveSessionWorkspaceKey(sessionId, workspaceId);
+    const row = workspaceKey ? await this.getSessionStatusRow(sessionId, workspaceKey) : null;
     if (!row) {
       throw new Error(`Session ${sessionId} not found`);
     }
@@ -967,7 +901,7 @@ export class MetaAgentService {
     }
 
     const session = await AISessionsRepository.get(sessionId);
-    if (!session || session.workspacePath !== workspaceId) {
+    if (!session || !sameWorkspaceIdentity(session.workspacePath, workspaceId)) {
       throw new Error(`Session ${sessionId} not found`);
     }
 
@@ -1012,6 +946,7 @@ export class MetaAgentService {
     workspaceId: string,
     prompt: string,
     interrupt = false,
+    messageKind: OrchestrationMessageKind = 'instruction',
   ): Promise<string> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
@@ -1021,17 +956,20 @@ export class MetaAgentService {
     }
 
     const session = await AISessionsRepository.get(sessionId);
-    if (!session || session.workspacePath !== workspaceId) {
+    if (!session || !sameWorkspaceIdentity(session.workspacePath, workspaceId)) {
       throw new Error(`Session ${sessionId} not found`);
     }
 
+    // Validated by the guard above; this hands the same stored key back verbatim.
+    const sessionWorkspaceKey = resolveStoredWorkspaceId(session.workspacePath, workspaceId);
     const normalizedPrompt = prompt.trim();
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
-    const statusRow = await this.getSessionStatusRow(sessionId, workspaceId);
+    const statusRow = await this.getSessionStatusRow(sessionId, sessionWorkspaceKey);
     const statusBeforeQueue = (statusRow?.status || 'idle') as SessionStatusValue;
     const promptProvenance: PromptProvenance = {
       actor: 'agent',
       origin: 'session-orchestration',
+      messageKind,
       originSessionId,
     };
 
@@ -1059,7 +997,11 @@ export class MetaAgentService {
     );
     const status = (statusRow?.status || 'idle') as SessionStatusValue;
     const workspaceForDrive = session.worktreePath || session.workspacePath || workspaceId;
-    const idleEnoughToDrive = status === 'idle' || status === 'interrupted' || status === 'error';
+    // A report never wakes an idle recipient: it waits for that session's next
+    // turn, where drain-time coalescing folds it in with whatever else arrived.
+    const idle = status === 'idle' || status === 'interrupted' || status === 'error';
+    const heldForNextTurn = idle && !interrupt && (messageKind === 'report' || messageKind === 'status');
+    const idleEnoughToDrive = idle && !heldForNextTurn;
     const interruptSkippedReason = interrupt
       ? this.reasonToSkipInterrupt(status, session.provider)
       : null;
@@ -1068,12 +1010,15 @@ export class MetaAgentService {
     let processingTriggered = idleEnoughToDrive;
     let interrupted = false;
     let interruptMethod: string | null = null;
+    let interruptDeferred: string | null = null;
     let driveOutcome: string | null = null;
 
     if (shouldInterrupt) {
       const result = await this.aiService.interruptCurrentTurn(sessionId);
       interrupted = result.success;
       interruptMethod = result.method ?? null;
+      // #1682: mid-commit, the interrupt waits for the commit call and then runs.
+      interruptDeferred = result.deferred ?? null;
       // The drive runs even when the interrupt found no live provider: a session
       // that only nominally reports running has nothing else coming to trigger it.
       //
@@ -1099,8 +1044,10 @@ export class MetaAgentService {
       statusBeforeQueue: status,
       processingTriggered,
       interrupted,
+      ...(heldForNextTurn ? { heldForNextTurn } : {}),
       ...(interruptMethod ? { interruptMethod } : {}),
       ...(interruptSkippedReason ? { interruptSkippedReason } : {}),
+      ...(interruptDeferred ? { interruptDeferred } : {}),
       ...(driveOutcome ? { driveOutcome } : {}),
     }, null, 2);
   }
@@ -1142,7 +1089,7 @@ export class MetaAgentService {
 
     const targetSessionId = args.sessionId?.trim() || callerSessionId;
     const session = await AISessionsRepository.get(targetSessionId);
-    if (!session || session.workspacePath !== workspaceId) {
+    if (!session || !sameWorkspaceIdentity(session.workspacePath, workspaceId)) {
       throw new Error(`Session ${targetSessionId} not found`);
     }
 
@@ -1158,7 +1105,7 @@ export class MetaAgentService {
       body: boundedBody,
       kind: 'agent-complete',
       sessionId: targetSessionId,
-      workspacePath: session.workspacePath,
+      workspacePath: resolveStoredWorkspaceId(session.workspacePath, workspaceId),
       sourceLabel,
       provider: 'agent',
       bypassFocusCheck: args.bypassFocusCheck === true,
@@ -1204,7 +1151,7 @@ export class MetaAgentService {
     }
 
     const session = await AISessionsRepository.get(args.sessionId);
-    if (!session || session.workspacePath !== workspaceId) {
+    if (!session || !sameWorkspaceIdentity(session.workspacePath, workspaceId)) {
       throw new Error(`Session ${args.sessionId} not found`);
     }
 
@@ -1234,19 +1181,15 @@ export class MetaAgentService {
   }
 
   private async getSpawnedSessions(metaSessionId: string, workspaceId: string): Promise<Array<Record<string, unknown>>> {
-    const { rows } = await databaseWorker.query<any>(
-      `SELECT id, title, provider, model, status, last_activity, created_at, updated_at, worktree_id, agent_role, created_by_session_id
-       FROM ai_sessions
-       WHERE workspace_id = $1
-         AND created_by_session_id = $2
-         AND (is_archived = FALSE OR is_archived IS NULL)
-       ORDER BY created_at DESC`,
-      [workspaceId, metaSessionId]
-    );
+    // Children are filed under the caller's own workspace key -- the spelling
+    // the project was opened by, not the one a worktree caller resolves to
+    // (#1551) -- so the caller's spelling finds no rows.
+    const workspaceKey = (await this.resolveSessionWorkspaceKey(metaSessionId, workspaceId)) ?? workspaceId;
+    const rows = await getSpawnedSessionRows(metaSessionId, workspaceKey);
 
     const sessions: Array<Record<string, unknown>> = [];
     for (const row of rows) {
-      const data = await this.buildSessionResultData(row.id, workspaceId, {
+      const data = await this.buildSessionResultData(row.id, workspaceKey, {
         title: row.title || 'Untitled Session',
         provider: row.provider,
         model: row.model || null,
@@ -1283,15 +1226,14 @@ export class MetaAgentService {
       }
 
       const session = await AISessionsRepository.get(sessionId);
-      if (!session || session.agentRole === 'meta-agent' || !session.createdBySessionId || !session.workspacePath) {
+      if (!session || !session.createdBySessionId || !session.workspacePath) {
         return;
       }
 
-      // Honor fire-and-forget: spawn_session sets metadata.notifyParent=false on
-      // the child for /launch-new-session-style hand-offs where the parent does
-      // not want to receive [Child Session Update] follow-up prompts.
-      const childMetadata = (session.metadata as Record<string, unknown> | undefined) ?? undefined;
-      if (childMetadata && childMetadata.notifyParent === false) {
+      // Honor fire-and-forget (spawn_session writes notifyParent=false on the
+      // child for /launch-new-session-style hand-offs), and owners that route
+      // child settles to themselves (extensionSessionsService delivers those).
+      if (isParentNotificationSuppressed(session.metadata)) {
         return;
       }
 
@@ -1352,6 +1294,19 @@ export class MetaAgentService {
       }
 
       const notification = this.buildNotificationMessage(eventType, result);
+
+      // Supersede rather than append. The signature dedup above only collapses
+      // duplicates within a single child turn (it resets on
+      // session:started/session:streaming), so a child that cycles
+      // idle -> running -> idle emits a fresh session:completed every cycle and
+      // the parent accumulates one row per cycle per child. Those rows are not
+      // independent facts: each is a snapshot of the same child, and the newest
+      // is the only one still true by the time the parent reads it. Dropping the
+      // stale pending row keeps the parent's queue proportional to the number of
+      // children rather than to the number of turns they take.
+      //
+      await deletePendingChildUpdates(session.createdBySessionId, session.id);
+
       await this.aiService.queuePromptForSession(
         session.createdBySessionId,
         notification,
@@ -1360,6 +1315,7 @@ export class MetaAgentService {
           promptProvenance: {
             actor: 'agent',
             origin: 'child-session-update',
+            messageKind: eventType === 'session:completed' ? 'report' : eventType === 'session:waiting' ? 'question' : 'error',
             originSessionId: session.id,
           },
         },
@@ -1416,11 +1372,13 @@ export class MetaAgentService {
       `Event: ${eventType}`,
     ];
 
-    if (result.originalPrompt) {
-      const preview = truncateNotificationPreview(result.originalPrompt);
-      const label = preview.truncated ? 'Original task preview' : 'Original task';
-      lines.push(`${label}: ${preview.text}`);
-    }
+    // The original task is deliberately not repeated here. This notification is
+    // only ever queued to the child's `createdBySessionId`, which is the session
+    // that wrote that prompt in the first place -- it is already in the parent's
+    // own transcript. Re-embedding up to 2,000 characters of it in every update
+    // was the largest part of each row, repeated once per child turn. The title
+    // and session id above are enough to identify the child; `get_session_result`
+    // returns the full prompt when a parent genuinely needs it.
     if (result.recentMessages.length > 0) {
       lines.push('Recent messages:');
       for (const message of result.recentMessages) {
@@ -1514,10 +1472,10 @@ export class MetaAgentService {
       sessionWorktreeId = prefetchedSession.worktreeId;
     } else {
       const session = await AISessionsRepository.get(sessionId);
-      if (!session || session.workspacePath !== workspaceId) {
+      if (!session || !sameWorkspaceIdentity(session.workspacePath, workspaceId)) {
         throw new Error(`Session ${sessionId} not found`);
       }
-      const statusRow = await this.getSessionStatusRow(sessionId, workspaceId);
+      const statusRow = await this.getSessionStatusRow(sessionId, resolveStoredWorkspaceId(session.workspacePath, workspaceId));
       sessionTitle = session.title || 'Untitled Session';
       sessionProvider = session.provider;
       sessionModel = session.model || null;
@@ -1530,15 +1488,27 @@ export class MetaAgentService {
         ((session.metadata as Record<string, unknown> | undefined)?.toolScope as string | undefined) ?? null;
     }
 
-    const messages = await AgentMessagesRepository.list(sessionId, { limit: 500 });
-    const userPrompts = extractUserPrompts(messages);
+    // NIM-7428: list() is oldest-first, so reading one page of it froze the
+    // response fields mid-session once a child passed 500 rows. Results come from
+    // the newest page; the first page is read only for the prompts it adds.
+    const PAGE = 500;
+    const messages = await AgentMessagesRepository.listTail(sessionId, PAGE);
+    const firstTailId = messages[0]?.id ?? Number.POSITIVE_INFINITY;
+    const head = messages.length < PAGE ? [] : await AgentMessagesRepository.list(sessionId, { limit: PAGE });
+    const userPrompts = extractUserPrompts([...head.filter((m) => (m.id ?? 0) < firstTailId), ...messages]);
     const recentMessages = this.extractRecentMessages(messages, 3);
     const pendingPrompt = await this.getPendingInteractivePrompt(sessionId);
 
     let editedFiles: string[] = [];
     try {
       const fileLinks = await SessionFilesRepository.getFilesBySession(sessionId, 'edited');
-      editedFiles = fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId));
+      // #1244: these rows are the per-edit-EVENT history (deduped upstream on
+      // toolUseId, not on path), so a file edited twenty times appears twenty
+      // times. Consumers here want the set of files touched -- collapse to
+      // unique paths, keeping first-edit order.
+      editedFiles = [
+        ...new Set(fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId))),
+      ];
     } catch {
       editedFiles = [];
     }
@@ -1693,15 +1663,27 @@ export class MetaAgentService {
     return null;
   }
 
-  private async getSessionStatusRow(sessionId: string, workspaceId: string): Promise<any | null> {
-    const { rows } = await databaseWorker.query<any>(
-      `SELECT id, title, provider, model, status, last_activity, updated_at, created_by_session_id, agent_role
-       FROM ai_sessions
-       WHERE id = $1 AND workspace_id = $2
-       LIMIT 1`,
-      [sessionId, workspaceId]
-    );
-    return rows[0] || null;
+  /** Status read, scoped to the key the session is stored under. */
+  private getSessionStatusRow(sessionId: string, workspaceId: string): Promise<any | null> {
+    return querySessionStatusRow(sessionId, workspaceId);
+  }
+
+  /**
+   * The spelling a session row is stored under, for a tool called with
+   * `workspaceId` — or null when that session belongs to another project.
+   * `ai_sessions.workspace_id` holds the path the project was opened by, which
+   * is not always the path the caller arrives with (#1551), so workspace-scoped
+   * queries run under the session's key rather than the caller's.
+   */
+  private async resolveSessionWorkspaceKey(sessionId: string, workspaceId: string): Promise<string | null> {
+    if (!sessionId) {
+      return null;
+    }
+    const session = await AISessionsRepository.get(sessionId);
+    if (!session || !sameWorkspaceIdentity(session.workspacePath, workspaceId)) {
+      return null;
+    }
+    return resolveStoredWorkspaceId(session.workspacePath, workspaceId);
   }
 
   private async ensurePlanTrackerItem(workspaceId: string, sessionId: string, result: SessionResultData): Promise<void> {

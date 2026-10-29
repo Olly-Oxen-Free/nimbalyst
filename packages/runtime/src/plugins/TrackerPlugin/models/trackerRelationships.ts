@@ -9,7 +9,8 @@
  * DB. No I/O here.
  */
 
-import type { FieldDefinition, TrackerRelationshipValue } from './TrackerDataModel';
+import type { FieldDefinition, TrackerRelationshipValue } from '@nimbalyst/tracker-schema';
+import { normalizeRelationshipValue as normalizeCoreRelationshipValue } from '@nimbalyst/tracker-core';
 
 /** A relationship vocabulary entry (label + behavior hints for a field). */
 export interface TrackerRelationshipType {
@@ -80,33 +81,7 @@ export function isRelationshipField(def: Pick<FieldDefinition, 'type'>): boolean
  * pre-existing `reference` value never throws.
  */
 export function normalizeRelationshipValue(raw: unknown): TrackerRelationshipValue[] {
-  const list: unknown[] = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
-  const byId = new Map<string, TrackerRelationshipValue>();
-  for (const entry of list) {
-    const v = coerceOne(entry);
-    if (v) byId.set(v.itemId, v);
-  }
-  return [...byId.values()];
-}
-
-function coerceOne(entry: unknown): TrackerRelationshipValue | null {
-  if (typeof entry === 'string') {
-    return entry ? { itemId: entry } : null;
-  }
-  if (entry && typeof entry === 'object') {
-    const o = entry as Record<string, unknown>;
-    const itemId = typeof o.itemId === 'string' ? o.itemId : typeof o.id === 'string' ? o.id : '';
-    if (!itemId) return null;
-    const out: TrackerRelationshipValue = { itemId };
-    if (typeof o.issueKey === 'string') out.issueKey = o.issueKey;
-    if (typeof o.title === 'string') out.title = o.title;
-    if (typeof o.trackerType === 'string') out.trackerType = o.trackerType;
-    if (typeof o.relationshipTypeKey === 'string') out.relationshipTypeKey = o.relationshipTypeKey;
-    if (o.direction === 'out') out.direction = 'out';
-    if (o.metadata && typeof o.metadata === 'object') out.metadata = o.metadata as Record<string, unknown>;
-    return out;
-  }
-  return null;
+  return normalizeCoreRelationshipValue(raw) as TrackerRelationshipValue[];
 }
 
 export interface RelationshipValidationContext {
@@ -211,7 +186,36 @@ export interface RelationshipEdge {
   relationshipTypeKey?: string;
   targetItemId: string;
   targetTrackerType?: string;
+  /** Predicate id: the field's declared `predicate`, or a body link's `rel=`. */
+  predicate?: string | null;
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * One line of a page's Links section, read through
+ * `document-service:tracker-item-links`. Covers both body links (`body:<rel>`,
+ * `body:link`) and relationship-field edges, in either direction.
+ */
+export interface TrackerPageLink {
+  /** `out`: this item is the source; `in`: the other item links here. */
+  direction: 'out' | 'in';
+  /** Null for a plain link or a relationship field with no declared predicate. */
+  predicateId: string | null;
+  /**
+   * The indexed relationship type. For a field edge this honors a value's own
+   * `relationshipTypeKey` over the field default (null when neither is set), so
+   * a predicate-less edge can still be labelled the right way round. For a body
+   * edge it is the predicate id, or 'link' for a plain link.
+   */
+  relationshipTypeKey: string | null;
+  otherItemId: string;
+  otherTitle: string;
+  otherIssueKey: string | null;
+  otherTypeId: string;
+  /** The sentence around a body link; null for field edges. */
+  sentence: string | null;
+  /** `body:<rel>`, `body:link`, or the relationship field id. */
+  sourceFieldId: string;
 }
 
 /** A minimal reference to the source item, stamped onto a target's inverse field. */
@@ -302,6 +306,7 @@ export function deriveRelationshipEdges(
         relationshipTypeKey: v.relationshipTypeKey ?? def.relationshipTypeKey,
         targetItemId: v.itemId,
         targetTrackerType: v.trackerType,
+        predicate: def.predicate ?? null,
         metadata: v.metadata,
       });
     }

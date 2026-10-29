@@ -9,6 +9,8 @@
  */
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { database } from '../database/PGLiteDatabaseWorker';
+import { findSessionTreeRoot, readSessionSubtree } from '../services/sessionHierarchy';
 import {
   AISessionsRepository,
   SessionFilesRepository,
@@ -18,6 +20,16 @@ import {
   appendPendingPromptSection,
   collectPendingPromptDescriptionsFromRawRows,
 } from "../services/sessionSummaryPrompt";
+import {
+  MAX_FILES_EDITED,
+  deriveCoachingSignals,
+  type CoachingMessageRow,
+} from "./sessionCoachingSignals";
+import {
+  LIST_CITABLE_INPUTS_TOOL_NAME,
+  LIST_CITABLE_INPUTS_TOOL_SCHEMA,
+} from "../services/pageCitations/listCitableInputs";
+import { handleListCitableInputs } from "../services/pageCitations/listCitableInputsHandler";
 
 // ─── Utilities ──────────────────────────────────────────────────────
 
@@ -142,6 +154,8 @@ async function handleGetSessionSummary(
   // Keep actionable interactive prompts at the end of every summary. Raw
   // prompt rows are filtered in SQL so large sessions do not need to load their
   // complete transcript just to find an unmatched question.
+  // Synthetic terminal rows (e.g. a question superseded by a new user turn)
+  // carry only the tool_use_id, so they are matched by their row type.
   const { rows: promptRows } = await db.query<{ content: string }>(
     `SELECT content FROM ai_agent_messages
      WHERE session_id = $1
@@ -158,6 +172,7 @@ async function handleGetSessionSummary(
          OR content LIKE '%permission_response%'
          OR content LIKE '%git_commit_proposal%'
          OR content LIKE '%exit_plan_mode_%'
+         OR content LIKE '%nimbalyst_tool_result%'
        )
      ORDER BY id ASC`,
     [sessionId]
@@ -232,37 +247,108 @@ async function handleGetSessionSummary(
   return appendPendingPromptSection(lines.join("\n"), pendingPrompts);
 }
 
+/**
+ * Bounded per-session evidence for the coach command.
+ *
+ * Deliberately narrower than `get_session_summary`: it answers "what did this
+ * session reach for, and what is it linked to", not "what happened". The
+ * expensive-to-read parts of a transcript are never returned -- see the caps in
+ * `sessionCoachingSignals.ts`, which exist because the coach reads up to 30
+ * sessions in one pass.
+ *
+ * Workspace-scoped: a caller may only inspect sessions from its own workspace.
+ * `get_session_summary` has no such check, but this tool is designed to be
+ * called in a loop over ids the model chose, so the boundary is enforced here.
+ */
+async function handleGetSessionCoachingSignals(
+  targetSessionId: string | undefined,
+  currentSessionId: string,
+  workspaceId: string,
+): Promise<string> {
+  const sessionId = targetSessionId || currentSessionId;
+
+  const session = await AISessionsRepository.get(sessionId);
+  if (!session) {
+    return `Error: Session ${sessionId} not found`;
+  }
+  // `workspaceId` is the workspace path here (see stripWorkspacePath), and
+  // SessionData carries it as `workspacePath`.
+  if (workspaceId && session.workspacePath && session.workspacePath !== workspaceId) {
+    return `Error: Session ${sessionId} belongs to a different workspace`;
+  }
+
+  const { getDatabase } = await import("../database/initialize");
+  const db = getDatabase();
+  const { rows } = await db.query<CoachingMessageRow>(
+    `SELECT content, message_kind, searchable_text, metadata, hidden
+     FROM ai_agent_messages
+     WHERE session_id = $1
+     ORDER BY id ASC`,
+    [sessionId],
+  );
+
+  const signals = deriveCoachingSignals(rows);
+
+  // The repository returns one row per edit, so a file edited 15 times appears
+  // 15 times. `get_session_summary` shows that as-is; here it would be repeated
+  // across every session in a 30-session sweep, which is exactly the context
+  // flooding this tool exists to avoid. Dedupe and cap.
+  let filesEdited: string[] = [];
+  let filesEditedTruncated = false;
+  try {
+    const fileLinks = await SessionFilesRepository.getFilesBySession(sessionId, "edited");
+    const unique = Array.from(
+      new Set(fileLinks.map((f: any) => stripWorkspacePath(f.filePath, workspaceId))),
+    );
+    filesEditedTruncated = unique.length > MAX_FILES_EDITED;
+    filesEdited = unique.slice(0, MAX_FILES_EDITED);
+  } catch {
+    // File tracking might not be available for all sessions
+  }
+
+  // Phase, tags, and tracker links live in the metadata JSONB, same as
+  // get_session_summary reads them.
+  const metadata = session.metadata as Record<string, unknown> | undefined;
+
+  return JSON.stringify(
+    {
+      sessionId,
+      title: session.title || "Untitled",
+      provider: session.provider,
+      model: session.model ?? null,
+      phase: (metadata?.phase as string | undefined) ?? null,
+      tags: (metadata?.tags as string[] | undefined) ?? [],
+      workstreamId: session.parentSessionId ?? null,
+      worktreeId: session.worktreeId ?? null,
+      createdAt: new Date(session.createdAt).toISOString(),
+      lastActiveAt: new Date(session.updatedAt).toISOString(),
+      isArchived: Boolean(session.isArchived),
+      linkedTrackerItemIds:
+        (metadata?.linkedTrackerItemIds as string[] | undefined) ?? [],
+      turnCount: signals.turnCount,
+      filesEdited,
+      toolUsage: signals.toolUsage,
+      userPrompts: signals.userPrompts,
+      truncated: signals.truncated || filesEditedTruncated,
+    },
+    null,
+    2,
+  );
+}
+
 async function handleGetWorkstreamOverview(
   workstreamId: string | undefined,
   currentSessionId: string,
   workspaceId: string
 ): Promise<string> {
-  let parentId = workstreamId;
-
-  if (!parentId) {
-    const currentSession = await AISessionsRepository.get(currentSessionId);
-    if (!currentSession) {
-      return "Error: Current session not found";
-    }
-    parentId = currentSession.parentSessionId ?? undefined;
-    if (!parentId) {
-      return "This session is not part of a workstream (no parent session). Use get_session_summary to view the current session.";
-    }
-  }
+  const parentId = await findSessionTreeRoot(database, workstreamId || currentSessionId, workspaceId);
 
   const parent = await AISessionsRepository.get(parentId);
   if (!parent) {
     return `Error: Workstream session ${parentId} not found`;
   }
 
-  const { database } = await import("../database/PGLiteDatabaseWorker");
-  const { rows } = await database.query<any>(
-    `SELECT s.id, s.title, s.provider, s.model, s.session_type, s.created_at, s.updated_at
-     FROM ai_sessions s
-     WHERE s.parent_session_id = $1 AND s.workspace_id = $2
-     ORDER BY s.created_at ASC`,
-    [parentId, workspaceId]
-  );
+  const rows = await readSessionSubtree(database, parentId, workspaceId);
 
   if (rows.length === 0) {
     return `Workstream: "${parent.title || "Untitled"}" (${parentId})\nNo child sessions found.`;
@@ -487,23 +573,8 @@ async function handleGetWorkstreamEditedFiles(
     return "Error: Current session not found";
   }
 
-  const parentId = currentSession.parentSessionId;
-  if (!parentId) {
-    const files = await SessionFilesRepository.getFilesBySession(
-      currentSessionId,
-      "edited"
-    );
-    if (files.length === 0) {
-      return "No files have been edited in this session. This session is not part of a workstream.";
-    }
-    return `This session is not part of a workstream. Files edited in current session (${files.length}):\n${files.map((f) => `- ${stripWorkspacePath(f.filePath, workspaceId)}`).join("\n")}`;
-  }
-
-  const { database } = await import("../database/PGLiteDatabaseWorker");
-  const { rows } = await database.query<any>(
-    `SELECT id, title FROM ai_sessions WHERE parent_session_id = $1 AND workspace_id = $2 ORDER BY created_at ASC`,
-    [parentId, workspaceId]
-  );
+  const parentId = await findSessionTreeRoot(database, currentSessionId, workspaceId);
+  const rows = await readSessionSubtree(database, parentId, workspaceId);
 
   if (rows.length === 0) {
     return "No child sessions found in this workstream.";
@@ -633,6 +704,22 @@ export const SESSION_CONTEXT_TOOL_SCHEMAS = [
           type: "string",
           description:
             "ID of the session to summarize. If omitted, summarizes the current session. Use list_recent_sessions to find session IDs.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "get_session_coaching_signals",
+    description:
+      "Get bounded, structured evidence about one AI session as JSON: turn count, the user's own prompts, normalized tool usage, files edited, linked tracker item IDs, phase, tags, and workstream. Built for auditing how a workspace uses Nimbalyst (see the /planning:nimbalyst-coach workflow) -- prefer get_session_summary when you just want to know what a session was about. Output is capped so it is safe to call across many sessions; the `truncated` flag says when a cap was hit. Only sessions in the current workspace can be inspected.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: {
+          type: "string",
+          description:
+            "ID of the session to inspect. If omitted, inspects the current session. Use list_recent_sessions to find session IDs.",
         },
       },
       required: [],
@@ -771,6 +858,7 @@ export const SESSION_CONTEXT_TOOL_SCHEMAS = [
       required: ["sessionId"],
     },
   },
+  LIST_CITABLE_INPUTS_TOOL_SCHEMA,
 ];
 
 /**
@@ -791,6 +879,18 @@ export async function dispatchSessionContextTool(
     switch (toolName) {
       case "get_session_summary": {
         const result = await handleGetSessionSummary(
+          args?.sessionId as string | undefined,
+          aiSessionId,
+          workspaceId
+        );
+        return {
+          content: [{ type: "text", text: result }],
+          isError: result.startsWith("Error:"),
+        };
+      }
+
+      case "get_session_coaching_signals": {
+        const result = await handleGetSessionCoachingSignals(
           args?.sessionId as string | undefined,
           aiSessionId,
           workspaceId
@@ -893,6 +993,11 @@ export async function dispatchSessionContextTool(
           content: [{ type: "text", text: result }],
           isError: result.startsWith("Error:"),
         };
+      }
+
+      case LIST_CITABLE_INPUTS_TOOL_NAME: {
+        const result = await handleListCitableInputs(args, aiSessionId, workspaceId);
+        return { content: [{ type: "text", text: result }], isError: false };
       }
 
       case "update_session_board": {

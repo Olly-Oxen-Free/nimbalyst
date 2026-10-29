@@ -5,9 +5,14 @@ import {
   validateNimPreviewPath,
   previewPathsEqual,
   previewPathInsideRoot,
+  ensureUtf8HtmlResponse,
   NIM_PREVIEW_SCHEME,
   NIM_PREVIEW_HOST,
+  HTML_EMBED_SHELL_URL,
+  htmlEmbedShellResponse,
 } from '../nimPreviewProtocol';
+import { HTML_EMBED_SHELL_CSP } from '@nimbalyst/runtime/ui/htmlEmbed/htmlEmbedShell';
+import { DESKTOP_HTML_EMBED_SHELL_URL } from '../../../renderer/components/EmbedFrame/htmlEmbedShellUrl';
 
 const ROOT = `${sep}tmp${sep}preview-root`;
 const OTHER = `${sep}tmp${sep}preview-other`;
@@ -130,6 +135,33 @@ describe('nimPreviewProtocol', () => {
     });
   });
 
+  describe('ensureUtf8HtmlResponse', () => {
+    it('adds an explicit UTF-8 charset to HTML while preserving response metadata and bytes', async () => {
+      const original = new Response('“Preview café”', {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html',
+          'Last-Modified': 'Tue, 15 Sep 2026 12:00:00 GMT',
+        },
+      });
+
+      const response = ensureUtf8HtmlResponse(`${ROOT}${sep}index.html`, original);
+
+      expect(response.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
+      expect(response.headers.get('Last-Modified')).toBe('Tue, 15 Sep 2026 12:00:00 GMT');
+      expect(response.status).toBe(200);
+      await expect(response.text()).resolves.toBe('“Preview café”');
+    });
+
+    it('returns non-HTML responses unchanged', () => {
+      const response = new Response('body { color: red; }', {
+        headers: { 'Content-Type': 'text/css' },
+      });
+
+      expect(ensureUtf8HtmlResponse(`${ROOT}${sep}styles.css`, response)).toBe(response);
+    });
+  });
+
   // Issue #612: Windows compares paths case-insensitively (drive-letter and
   // directory casing vary between path sources), so the comparison helpers
   // take a caseInsensitive flag that defaults to process.platform === 'win32'.
@@ -155,6 +187,25 @@ describe('nimPreviewProtocol', () => {
 
     it('previewPathInsideRoot still rejects sibling substring prefixes case-insensitively', () => {
       expect(previewPathInsideRoot(ROOT, `${ROOT}-EVIL${sep}index.html`, true)).toBe(false);
+    });
+  });
+
+  // Release-blocking: the HTML embed shell must always carry the sandbox CSP,
+  // so a teammate's HTML never runs as the app's origin.
+  describe('html embed shell', () => {
+    it('serves the shell with the sandbox CSP at the URL the renderer frames', async () => {
+      expect(DESKTOP_HTML_EMBED_SHELL_URL).toBe(HTML_EMBED_SHELL_URL);
+      const response = htmlEmbedShellResponse(new URL(DESKTOP_HTML_EMBED_SHELL_URL))!;
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-security-policy')).toBe(HTML_EMBED_SHELL_CSP);
+      expect(response.headers.get('content-security-policy')).toMatch(/^sandbox allow-scripts allow-popups;/);
+      expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
+      expect(await response.text()).toContain('nimbalyst-html-embed');
+    });
+
+    it('serves nothing else from the shell host and leaves preview URLs alone', () => {
+      expect(htmlEmbedShellResponse(new URL(`${NIM_PREVIEW_SCHEME}://html-embed/other`))!.status).toBe(404);
+      expect(htmlEmbedShellResponse(new URL(encodeNimPreviewUrl(ROOT, 'index.html')))).toBeNull();
     });
   });
 });

@@ -1,3 +1,4 @@
+import { claimExternalSessionForLocalExecution } from '../externalSessions/ExternalSessionService';
 /**
  * Production wiring for `ClaudeCliSessionLauncher` (NIM-806, Phase 1).
  *
@@ -16,9 +17,10 @@
 import os from 'os';
 import { existsSync, mkdirSync } from 'fs';
 import { McpConfigService, getMcpConfigService } from '@nimbalyst/runtime/ai/server';
+import { ClaudeCodeDeps } from '@nimbalyst/runtime/ai/server/providers/claudeCode/dependencyInjection';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { getTerminalSessionManager } from '../TerminalSessionManager';
-import { getEnhancedPath, getShellEnvironment } from '../CLIManager';
+import { getEnhancedPath, getShellEnvironment } from '../shellEnvironment';
 import { ClaudeCliSessionLauncher } from './ClaudeCliSessionLauncher';
 import { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
 import { resolveClaudeCliWorktreeCwd } from './resolveClaudeCliWorktreeCwd';
@@ -53,14 +55,34 @@ export const ClaudeCliLauncherConfig = {
 };
 
 /**
- * Resolve the `claude` executable. We must run the same `claude` the user runs
- * in their terminal (the official ~/.claude/local install / login-shell PATH),
- * never a stale homebrew/npm global. See `claudeExecutableResolver.ts`.
+ * Read the user's "Custom Claude executable path" setting for this workspace
+ * (#1296). Reuses the loader `AIService` already registers for the Agent SDK
+ * path, so the CLI honors exactly the same merged value (project override with
+ * worktree inheritance, else the global setting) with no second settings reader.
+ * Returns undefined when unset, when we have no workspace to merge against, or
+ * on any loader failure — the resolver then falls back to normal discovery.
+ */
+function loadCustomClaudeExecutablePath(workspacePath?: string): string | undefined {
+  if (!workspacePath) return undefined;
+  try {
+    return ClaudeCodeDeps.customClaudeCodePathLoader?.(workspacePath) || undefined;
+  } catch (err) {
+    console.warn('[ClaudeCliLauncher] failed to read custom claude executable path:', err);
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the `claude` executable. An explicitly configured custom path wins
+ * (#1296); otherwise we must run the same `claude` the user runs in their
+ * terminal (the official ~/.claude/local install / login-shell PATH), never a
+ * stale homebrew/npm global. See `claudeExecutableResolver.ts`.
  * node-pty spawns with the enhanced PATH so a bare `claude` resolves at exec
  * time; we still prefer an absolute hit so a thin GUI PATH still finds it.
  */
-function resolveClaudeExecutable(): string {
+function resolveClaudeExecutable(workspacePath?: string): string {
   return resolveClaudeExecutablePath({
+    customPath: loadCustomClaudeExecutablePath(workspacePath),
     homedir: os.homedir(),
     pathExists: existsSync,
     enhancedPath: getEnhancedPath(),
@@ -73,8 +95,9 @@ function resolveClaudeExecutable(): string {
  * install notice instead of spawning a bare `claude` that yields a cryptic
  * `command not found`. `ensureClaudeCliSession` also short-circuits on it.
  */
-export function isClaudeCliInstalled(): boolean {
+export function isClaudeCliInstalled(workspacePath?: string): boolean {
   return isClaudeExecutableInstalled({
+    customPath: loadCustomClaudeExecutablePath(workspacePath),
     homedir: os.homedir(),
     pathExists: existsSync,
     enhancedPath: getEnhancedPath(),
@@ -96,8 +119,8 @@ export function isClaudeCliInstalled(): boolean {
  * commands when the CLI can't run them (NIM-845). Resolves the same executable
  * the launcher would spawn, so the picker matches actual launch behavior.
  */
-export function claudeCliSessionSupportsPlugins(): boolean {
-  return resolveClaudeCliSupportsPluginDir(resolveClaudeExecutable());
+export function claudeCliSessionSupportsPlugins(workspacePath?: string): boolean {
+  return resolveClaudeCliSupportsPluginDir(resolveClaudeExecutable(workspacePath));
 }
 
 function prepareAttachmentsAllowDir(workspacePath: string): string[] | undefined {
@@ -173,12 +196,15 @@ function buildLauncher(): ClaudeCliSessionLauncher {
       getPermissionService().getPermissionMode(workspacePath),
     // NIM-845: load extension Claude-plugins so namespaced slash commands
     // (`/feedback:bug-report`, …) resolve in CLI sessions. Mirror the SDK path's
-    // loader EXACTLY (`getClaudeProviderPluginPaths`, the same aggregator wired at
-    // index.ts → setExtensionPluginsLoader): native + legacy + CLI-installed AND
-    // GENERATED extension-workflow plugins. The raw `getClaudePluginPaths` omits
-    // the generated ones, so a supported-CLI user would see generated namespaced
-    // commands in the picker that the launched CLI couldn't resolve. We map to the
-    // bare directory paths the CLI's `--plugin-dir` expects. Gated by the
+    // loader EXACTLY (`getClaudeProviderPluginPaths`, the same loader wired at
+    // index.ts → setExtensionPluginsLoader): plugins contributed by enabled
+    // extensions AND the GENERATED extension-workflow plugins. The raw
+    // `getClaudePluginPaths` omits the generated ones, so a supported-CLI user
+    // would see generated namespaced commands in the picker that the launched CLI
+    // couldn't resolve. #1465: it deliberately omits the user's own
+    // `/plugin`-installed plugins — the CLI loads those itself, and passing them
+    // as `--plugin-dir` added an unconfigured `@inline` duplicate of each. We map
+    // to the bare directory paths the CLI's `--plugin-dir` expects. Gated by the
     // `--version` probe below so old CLIs that reject the flag silently skip it.
     loadPluginDirs: async (workspacePath: string) =>
       (await getAgentWorkflowService(workspacePath).getClaudeProviderPluginPaths()).map(
@@ -234,6 +260,7 @@ const cliFileWatcher = new HooklessAgentFileWatcher();
 export async function ensureClaudeCliSession(
   input: EnsureClaudeCliSessionInput
 ): Promise<EnsureClaudeCliSessionResult> {
+  await claimExternalSessionForLocalExecution(input.sessionId);
   const manager = getTerminalSessionManager();
   if (manager.isTerminalActive(input.sessionId)) {
     return { success: true, alreadyActive: true };
@@ -242,7 +269,7 @@ export async function ensureClaudeCliSession(
   // NIM-852: don't spawn a bare `claude` when it isn't installed — that yields a
   // cryptic `command not found` and strands the session as "running". The
   // renderer shows an install notice; this is the defense-in-depth short-circuit.
-  if (!isClaudeCliInstalled()) {
+  if (!isClaudeCliInstalled(input.workspacePath)) {
     return {
       success: false,
       claudeNotInstalled: true,

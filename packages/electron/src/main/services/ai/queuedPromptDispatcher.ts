@@ -1,4 +1,62 @@
 import type { DocumentContext } from '@nimbalyst/runtime/ai/server/types';
+import { mergeClaimedRun, selectCoalescibleRun } from './coalesceQueuedPrompts';
+
+/**
+ * The per-session "a queued-prompt chain is running" guard, as an ownership lease.
+ *
+ * #1018: this used to be a bare `Set<string>`, and every dispatch released it in
+ * its `finally` with an unconditional `delete(sessionId)`. When an interrupt
+ * displaced an in-flight dispatch with a priority prompt, the displaced dispatch
+ * eventually settled and deleted a guard the priority prompt now held — so an
+ * ordinary FIFO prompt could be claimed and sent while the priority prompt was
+ * still executing. Releasing now requires still being the owner.
+ *
+ * Extends `Set<string>` so every existing `.has(sessionId)` reader keeps working
+ * unchanged, including the seven reads in MessageStreamingHandler.
+ */
+export class SessionProcessingGuard extends Set<string> {
+  private owners = new Map<string, symbol>();
+  private claims = new Set<string>();
+
+  override has(sessionId: string): boolean {
+    return this.claims.has(sessionId) || super.has(sessionId);
+  }
+
+  /** Reserve before storage awaits, including when a live drain bypasses the turn guard. */
+  beginClaim(sessionId: string): boolean {
+    if (this.claims.has(sessionId)) return false;
+    this.claims.add(sessionId);
+    return true;
+  }
+
+  endClaim(sessionId: string): void {
+    this.claims.delete(sessionId);
+  }
+
+  /** Take the guard for `sessionId`; the returned token is required to release it. */
+  acquire(sessionId: string): symbol {
+    const token = Symbol(sessionId);
+    this.owners.set(sessionId, token);
+    this.add(sessionId);
+    return token;
+  }
+
+  /** Release only if `token` is still the owner. Returns whether it released. */
+  releaseIfOwner(sessionId: string, token: symbol): boolean {
+    if (this.owners.get(sessionId) !== token) return false;
+    return this.delete(sessionId);
+  }
+
+  /**
+   * Unconditional release, used by the authoritative cancel/interrupt paths.
+   * Clearing the owner is what makes the displaced dispatch's later
+   * `releaseIfOwner` a no-op rather than a release of whoever came next.
+   */
+  override delete(sessionId: string): boolean {
+    this.owners.delete(sessionId);
+    return super.delete(sessionId);
+  }
+}
 
 export interface ClaimedQueuedPrompt {
   id: string;
@@ -16,6 +74,12 @@ export interface QueuedPromptStoreLike {
 
 interface DispatchClaimedQueuedPromptOptions {
   claimed: ClaimedQueuedPrompt;
+  /**
+   * Every row this turn delivers. Defaults to `[claimed.id]`; a coalesced run
+   * passes all of its ids so complete/fail settle the whole batch rather than
+   * leaving the merged-away rows stuck in `executing`.
+   */
+  claimedIds?: string[];
   continueQueuedPromptChain: (
     sessionId: string,
     workspacePath: string,
@@ -26,7 +90,7 @@ interface DispatchClaimedQueuedPromptOptions {
   onAfterSettled?: () => Promise<void>;
   onChainSettled?: (payload: { sessionId: string; workspacePath: string; source: string }) => Promise<void>;
   onPromptClaimed: (payload: { sessionId: string; promptId: string }) => void;
-  processingSet: Set<string>;
+  processingSet: SessionProcessingGuard;
   queueStore: QueuedPromptStoreLike;
   sendMessageHandler: (
     event: Electron.IpcMainInvokeEvent,
@@ -40,6 +104,9 @@ interface DispatchClaimedQueuedPromptOptions {
   startSession: (options: { sessionId: string; workspacePath: string }) => Promise<void>;
   targetWindow: Electron.BrowserWindow;
   workspacePath: string;
+  /** The provider started (or is about to start) a turn of its own, e.g. a background-task wake. */
+  isLeadTurnPending?: () => boolean;
+  logInfo?: (message: string) => void;
 }
 
 export async function dispatchClaimedQueuedPrompt(
@@ -47,6 +114,7 @@ export async function dispatchClaimedQueuedPrompt(
 ): Promise<void> {
   const {
     claimed,
+    claimedIds,
     continueQueuedPromptChain,
     logError,
     onAfterSettled,
@@ -60,18 +128,29 @@ export async function dispatchClaimedQueuedPrompt(
     startSession,
     targetWindow,
     workspacePath,
+    isLeadTurnPending,
+    logInfo,
   } = options;
 
-  processingSet.add(sessionId);
+  const settleIds = claimedIds && claimedIds.length > 0 ? claimedIds : [claimed.id];
+
+  // #1018: hold the guard as a lease. An interrupt can drop it and hand the
+  // session to a priority prompt while this dispatch is still in flight, so the
+  // release below must check it is still the owner.
+  const guardToken = processingSet.acquire(sessionId);
 
   try {
     await startSession({ sessionId, workspacePath });
   } catch (error) {
-    processingSet.delete(sessionId);
+    processingSet.releaseIfOwner(sessionId, guardToken);
     throw error;
   }
 
-  onPromptClaimed({ sessionId, promptId: claimed.id });
+  // Announce every merged row, not just the head, so the renderer clears the
+  // whole run from the queue list instead of leaving stale entries on screen.
+  for (const promptId of settleIds) {
+    onPromptClaimed({ sessionId, promptId });
+  }
 
   const docContext = {
     ...(claimed.documentContext || {}),
@@ -87,15 +166,34 @@ export async function dispatchClaimedQueuedPrompt(
       } as Electron.IpcMainInvokeEvent;
 
       await sendMessageHandler(mockEvent, claimed.prompt, docContext, sessionId, workspacePath);
-      await queueStore.complete(claimed.id);
+      for (const promptId of settleIds) {
+        await queueStore.complete(promptId);
+      }
     } catch (queueError) {
       logError(`[AIService] Failed to process queued prompt ${claimed.id}:`, queueError);
-      await queueStore.fail(
-        claimed.id,
-        queueError instanceof Error ? queueError.message : 'Unknown error',
-      );
+      for (const promptId of settleIds) {
+        await queueStore.fail(
+          promptId,
+          queueError instanceof Error ? queueError.message : 'Unknown error',
+        );
+      }
     } finally {
-      processingSet.delete(sessionId);
+      // Only release if this dispatch still owns the guard: if an interrupt
+      // displaced it, the priority prompt that replaced it is still running and
+      // releasing here would let the FIFO continuation start a second turn
+      // underneath it (#1018).
+      const released = processingSet.releaseIfOwner(sessionId, guardToken);
+      // A replacement dispatch owns continuation and settlement as well as
+      // the guard. A displaced turn must not report the child finished.
+      if (!released && processingSet.has(sessionId)) return;
+      // NIM-7428: the turn ended by waking the session with background-task
+      // results. That wake turn's own completion continues the queue, ends the
+      // session and reports to the parent; doing it here would end a running
+      // session, or send a prompt that aborts the wake and drops its results.
+      if (isLeadTurnPending?.()) {
+        logInfo?.(`[AIService] ${source} finally: session ${sessionId} woke for background results; its wake turn owns the queue`);
+        return;
+      }
       try {
         await continueQueuedPromptChain(
           sessionId,
@@ -135,7 +233,7 @@ interface TryClaimAndDispatchNextQueuedPromptOptions {
   onAfterSettled?: DispatchClaimedQueuedPromptOptions['onAfterSettled'];
   onChainSettled?: DispatchClaimedQueuedPromptOptions['onChainSettled'];
   onPromptClaimed: DispatchClaimedQueuedPromptOptions['onPromptClaimed'];
-  processingSet: Set<string>;
+  processingSet: SessionProcessingGuard;
   queueStore: QueuedPromptStoreLike;
   sendMessageHandler: DispatchClaimedQueuedPromptOptions['sendMessageHandler'] | null;
   sessionId: string;
@@ -144,6 +242,9 @@ interface TryClaimAndDispatchNextQueuedPromptOptions {
   resolveLiveWindow?: (workspacePath: string) => Electron.BrowserWindow | null;
   targetWindow: Electron.BrowserWindow | null;
   workspacePath: string;
+  /** True when a draining turn holds the guard but its live query can take this prompt. */
+  canBypassChainGuard?: () => boolean;
+  isLeadTurnPending?: DispatchClaimedQueuedPromptOptions['isLeadTurnPending'];
 }
 
 export async function tryClaimAndDispatchNextQueuedPrompt(
@@ -165,6 +266,8 @@ export async function tryClaimAndDispatchNextQueuedPrompt(
     resolveLiveWindow,
     targetWindow,
     workspacePath,
+    canBypassChainGuard,
+    isLeadTurnPending,
   } = options;
 
   const liveWindow =
@@ -177,48 +280,78 @@ export async function tryClaimAndDispatchNextQueuedPrompt(
     return false;
   }
 
-  if (processingSet.has(sessionId)) {
+  if (processingSet.has(sessionId) && !canBypassChainGuard?.()) {
     logInfo(`[AIService] ${source}: session ${sessionId} already processing a queued prompt, skipping`);
     return false;
   }
 
-  const pendingPrompts = await queueStore.listPending(sessionId);
-  if (pendingPrompts.length === 0) {
-    // logInfo(`[AIService] ${source}: no pending prompts for session ${sessionId}`);
-    return false;
+  if (!processingSet.beginClaim(sessionId)) return false;
+  try {
+    const pendingPrompts = await queueStore.listPending(sessionId);
+    if (pendingPrompts.length === 0) {
+      // logInfo(`[AIService] ${source}: no pending prompts for session ${sessionId}`);
+      return false;
+    }
+
+    // Agent-authored rows deliver as one turn; a human row keeps its own turn and
+    // bounds the run on both sides. See coalesceQueuedPrompts.ts.
+    const run = selectCoalescibleRun(pendingPrompts);
+    const nextPrompt = run[0];
+    logInfo(`[AIService] ${source}: processing prompt ${nextPrompt.id} for session ${sessionId}`);
+
+    const claimedHead = await queueStore.claim(nextPrompt.id);
+    if (!claimedHead) {
+      logInfo(`[AIService] ${source}: prompt ${nextPrompt.id} already claimed`);
+      return false;
+    }
+
+    // Claim the tail one row at a time. A row that fails to claim was taken by
+    // another drainer, so stop extending rather than skipping over it -- pulling
+    // the row behind it forward would deliver the run out of order.
+    const claimedRun = [claimedHead];
+    for (const queued of run.slice(1)) {
+      const claimedNext = await queueStore.claim(queued.id);
+      if (!claimedNext) break;
+      claimedRun.push(claimedNext);
+    }
+
+    const claimed = mergeClaimedRun(claimedRun);
+    const claimedIds = claimedRun.map((row) => row.id);
+
+    if (claimedRun.length > 1) {
+      logInfo(`[AIService] ${source}: coalesced ${claimedRun.length} agent-authored prompts into one turn for session ${sessionId}`);
+    }
+
+    if (!sendMessageHandler) {
+      for (const promptId of claimedIds) {
+        await queueStore.fail(promptId, 'sendMessageHandler not initialized');
+      }
+      logError('[AIService] Failed to process queued prompt because sendMessageHandler is not initialized', new Error('sendMessageHandler not initialized'));
+      return false;
+    }
+
+    await dispatchClaimedQueuedPrompt({
+      claimed,
+      claimedIds,
+      continueQueuedPromptChain,
+      logError,
+      onAfterSettled,
+      onChainSettled,
+      onPromptClaimed,
+      processingSet,
+      queueStore,
+      sendMessageHandler,
+      sessionId,
+      source,
+      startSession,
+      targetWindow: liveWindow,
+      workspacePath,
+      isLeadTurnPending,
+      logInfo,
+    });
+
+    return true;
+  } finally {
+    processingSet.endClaim(sessionId);
   }
-
-  const nextPrompt = pendingPrompts[0];
-  logInfo(`[AIService] ${source}: processing prompt ${nextPrompt.id} for session ${sessionId}`);
-
-  const claimed = await queueStore.claim(nextPrompt.id);
-  if (!claimed) {
-    logInfo(`[AIService] ${source}: prompt ${nextPrompt.id} already claimed`);
-    return false;
-  }
-
-  if (!sendMessageHandler) {
-    await queueStore.fail(claimed.id, 'sendMessageHandler not initialized');
-    logError('[AIService] Failed to process queued prompt because sendMessageHandler is not initialized', new Error('sendMessageHandler not initialized'));
-    return false;
-  }
-
-  await dispatchClaimedQueuedPrompt({
-    claimed,
-    continueQueuedPromptChain,
-    logError,
-    onAfterSettled,
-    onChainSettled,
-    onPromptClaimed,
-    processingSet,
-    queueStore,
-    sendMessageHandler,
-    sessionId,
-    source,
-    startSession,
-    targetWindow: liveWindow,
-    workspacePath,
-  });
-
-  return true;
 }

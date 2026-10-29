@@ -149,6 +149,16 @@ export interface ProtocolSession {
 
   /** Platform-specific session data (for internal use) */
   raw?: RawProtocolSession;
+
+  /** Number of host-supplied MCP servers this protocol actually delivered. */
+  deliveredMcpServerCount?: number;
+
+  /**
+   * Model the agent is actually running, when the protocol can observe it.
+   * Absent means "the protocol has no say"; the host then reports the model it
+   * asked for. Never report a requested model a protocol knows was not applied.
+   */
+  appliedModel?: string;
 }
 
 /**
@@ -194,11 +204,18 @@ export interface ProtocolEvent {
   /** Error message (for 'error' events) */
   error?: string;
 
-  /** Token usage (for 'usage' or 'complete' events) */
+  /**
+   * Token usage (for 'usage' or 'complete' events). When the provider reports a
+   * prompt-cache split, `input_tokens` is uncached input only and the cache
+   * reads/writes go in their own fields (Anthropic's shape), so the three input
+   * counts never overlap. Omit the cache fields when the provider has no split.
+   */
   usage?: {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
 
   /** Current context fill tokens for this turn (provider-reported snapshot) */

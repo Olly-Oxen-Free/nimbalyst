@@ -11,7 +11,8 @@ import { Terminal, FitAddon, OSC8LinkProvider, UrlRegexProvider, type ITheme, ty
 import { themeIdAtom } from '@nimbalyst/runtime/store';
 import { TerminalContextMenu } from './TerminalContextMenu';
 import { sanitizeScrollback, stripProblematicEscapeSequences, cleanScrollback } from './scrollbackSanitization';
-import { loadTerminalGhostty } from './ghosttyInstance';
+import { loadTerminalGhostty, isGhosttyWasmTrap, writeGuardingWasmTrap } from './ghosttyInstance';
+import { logger } from '../../utils/logger';
 import {
   isElementMeasurable,
   waitUntilElementMeasurable,
@@ -155,6 +156,12 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   const lateInitRecoveredRef = useRef(false); // NIM-817: one-shot auto-retry when the backend comes up after the init timeout
   const initStartTimeRef = useRef<number>(0); // Track when initialization started
   const disposedRef = useRef(false); // Ref to track disposed state for async callbacks
+  // A ghostty-vt.wasm trap poisons the terminal's instance (upstream
+  // coder/ghostty-web#138): every later write traps too. Rebuild once on a
+  // fresh instance without replaying the saved history that may have caused
+  // it; a second trap is surfaced as an init error instead of looping.
+  const wasmTrapRecoveriesRef = useRef(0);
+  const skipScrollbackReplayRef = useRef(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
   const [restoreWarning, setRestoreWarning] = useState<string | null>(null);
@@ -275,9 +282,29 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     let focusOutHandler: (() => void) | null = null;
     let renderStatePersistTimer: ReturnType<typeof setTimeout> | null = null;
     let renderStateReadyToPersist = false;
+    let wasmTrapped = false;
+
+    const handleWasmTrap = (error: unknown) => {
+      if (wasmTrapped) return;
+      wasmTrapped = true;
+      if (wasmTrapRecoveriesRef.current >= 1) {
+        console.error('[TerminalPanel] Terminal WASM trapped again after a rebuild:', error);
+        // No live instance, so Retry re-runs the whole init effect.
+        terminalInstanceRef.current = null;
+        setInitError('The terminal display failed and could not be rebuilt.');
+        return;
+      }
+      wasmTrapRecoveriesRef.current += 1;
+      console.warn('[TerminalPanel] Terminal WASM trapped; rebuilding on a fresh instance without saved history:', error);
+      skipScrollbackReplayRef.current = true;
+      setRestoreWarning('The terminal display hit an internal error and was rebuilt. Saved history was not restored.');
+      hasInitializedRef.current = false;
+      setInitAttempt((n) => n + 1);
+    };
 
     const persistRenderStateNow = async () => {
-      if (!terminal || !canPersistTerminalRenderState(true, disposed, renderStateReadyToPersist)) return;
+      // A trapped instance's buffer cannot be trusted; never mirror it.
+      if (!terminal || wasmTrapped || !canPersistTerminalRenderState(true, disposed, renderStateReadyToPersist)) return;
 
       const maxCols = Math.max(1, terminal.cols);
       const maxRows = Math.max(1, terminal.rows);
@@ -421,6 +448,9 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
         if (terminalRef.current && !disposed) {
           terminal.open(terminalRef.current);
           await new Promise((resolve) => setTimeout(resolve, 0));
+          // #1818: the panel may have been removed during this wait. Do not
+          // start a terminal backend for a panel nobody is looking at.
+          if (disposed) return;
           let initialDims: { cols: number; rows: number } | undefined;
           try {
             fitAddon.fit();
@@ -493,13 +523,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           const pendingOutput: Array<{ data: string; sequence: number }> = [];
 
           unsubscribeOutput = window.electronAPI.terminal.onOutput((data) => {
-            if (data.sessionId === sessionId && terminal && !disposed) {
+            if (data.sessionId === sessionId && terminal && !disposed && !wasmTrapped) {
               if (data.sequence <= lastAppliedSequence) {
                 return;
               }
               if (scrollbackRestoreComplete) {
                 // Normal path: write directly to terminal
-                terminal.write(data.data);
+                if (!writeGuardingWasmTrap(terminal, data.data, handleWasmTrap)) return;
                 lastAppliedSequence = data.sequence;
                 scheduleRenderStatePersist();
               } else {
@@ -510,6 +540,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           });
 
           const snapshot = await window.electronAPI.terminal.getRestoreSnapshot(workspacePath, sessionId);
+          // #1818: the panel may have been removed while the history loaded.
+          // Stop here. The cleanup below already disposes the terminal that
+          // was built, because it holds the same `terminal` variable.
+          if (disposed) return;
           lastAppliedSequence = snapshot.sequence;
 
           // NIM-823: for a full-screen TUI (the genuine claude CLI) the raw
@@ -518,7 +552,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           // Restore only the captured screen + cursor; the authoritative resize
           // at the end of init delivers a SIGWINCH that makes the live TUI
           // repaint itself over the stamp.
-          if (launchMode === 'claude-cli') {
+          //
+          // Rebuilt after a WASM trap: the saved history may be what trapped
+          // the old instance, so start blank and let that same resize make the
+          // shell or TUI repaint.
+          if (skipScrollbackReplayRef.current) {
+            // Intentionally nothing to restore.
+          } else if (launchMode === 'claude-cli') {
             if (!disposed && snapshot.screenLines && snapshot.screenLines.length > 0) {
               terminal.write('\x1b[r'); // reset scroll region
               const visibleLines = snapshot.screenLines.slice(-terminal.rows);
@@ -568,7 +608,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
                   }
 
                   try {
-                    terminal.write(cleaned.slice(i, i + CHUNK_SIZE));
+                    if (!writeGuardingWasmTrap(terminal, cleaned.slice(i, i + CHUNK_SIZE), handleWasmTrap)) return;
                   } catch (err) {
                     writeError = err instanceof Error ? err : new Error(String(err));
                     break;
@@ -586,6 +626,9 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
               } catch (err) {
                 writeError = err instanceof Error ? err : new Error(String(err));
               }
+
+              // handleWasmTrap has already scheduled a rebuild on a fresh instance.
+              if (wasmTrapped) return;
 
               if (writeError) {
                 console.warn('[TerminalPanel] Failed to restore scrollback, keeping persisted history:', writeError);
@@ -616,13 +659,18 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             }
           }
 
+          // #1818: the panel may have been removed while saved history was
+          // replayed. Without this check the code below tries to watch a screen
+          // element that no longer exists, and the app logs a false start-up error.
+          if (disposed) return;
+
           // Mark scrollback restoration as complete and flush any queued output
           scrollbackRestoreComplete = true;
           renderStateReadyToPersist = true;
           if (pendingOutput.length > 0 && terminal && !disposed) {
             for (const pending of pendingOutput) {
               if (pending.sequence <= lastAppliedSequence) continue;
-              terminal.write(pending.data);
+              if (!writeGuardingWasmTrap(terminal, pending.data, handleWasmTrap)) return;
               lastAppliedSequence = pending.sequence;
             }
           }
@@ -752,8 +800,17 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           }
         }
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        console.error('[TerminalPanel] Error initializing terminal:', error);
+        // #1818: a failure after the panel was removed is not a start-up error.
+        if (disposed) return;
+        // Any other init-time write (screen stamp, cursor restore) that trapped.
+        if (isGhosttyWasmTrap(error)) {
+          handleWasmTrap(error);
+          return;
+        }
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        // #1818: console output is not saved in packaged builds; the logger
+        // writes to main.log, so the cause survives a Retry click.
+        logger.renderer.error('[TerminalPanel] Error initializing terminal:', error);
         setInitError(errorMessage);
       }
     };
@@ -785,7 +842,14 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       unsubscribeOutput?.();
       unsubscribeExited?.();
       inputDisposable?.dispose();
-      terminal?.dispose();
+      if (wasmTrapped) {
+        // free() on a trapped instance can trap again. ghostty-web removes the
+        // canvas and DOM listeners before it frees, and the instance memory is
+        // dropped with this closure, so the trap is safe to discard here.
+        try { terminal?.dispose(); } catch { /* trapped instance */ }
+      } else {
+        terminal?.dispose();
+      }
       fitAddon?.dispose();
       terminalInstanceRef.current = null;
       fitAddonRef.current = null;

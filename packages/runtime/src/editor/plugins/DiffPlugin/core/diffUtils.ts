@@ -118,14 +118,15 @@
 /* eslint-disable @typescript-eslint/no-unused-vars, no-shadow */
 
 import type {Transformer} from '@lexical/markdown';
-import {
-  $convertFromEnhancedMarkdownString,
-  $convertToEnhancedMarkdownString,
-} from '../../../markdown';
+// Deep paths, not the `markdown` barrel: this engine also runs headless in the
+// collab worker (`@nimbalyst/markdown-ydoc`), which must not load React.
+import {$convertFromEnhancedMarkdownString} from '../../../markdown/EnhancedMarkdownImport';
+import {$convertToEnhancedMarkdownString} from '../../../markdown/EnhancedMarkdownExport';
 import type {LexicalEditor, SerializedLexicalNode, TextNode} from 'lexical';
 import {
   type ElementNode,
   type LexicalNode,
+  $createParagraphNode,
   $createTextNode,
   $getNodeByKey,
   $getRoot,
@@ -139,8 +140,8 @@ import {
   SKIP_DOM_SELECTION_TAG,
 } from 'lexical';
 import {$createAutoLinkNode, $isAutoLinkNode, $isLinkNode} from '@lexical/link';
-import {$isEmbeddedFileNode} from '../../EmbedPlugin/EmbeddedFileNode';
-import {$rescanForEmbedUpgrade} from '../../../extensions/builtin/EmbedExtension';
+import {$isEmbeddedFileNode} from '../../EmbedPlugin/EmbeddedFileNodeCore';
+import {$rescanForEmbedUpgrade} from '../../EmbedPlugin/embedUpgrade';
 
 import {createHeadlessEditor} from '@lexical/headless';
 import {createNodeFromSerialized} from './createNodeFromSerialized';
@@ -154,6 +155,8 @@ import {QuoteDiffHandler} from '../handlers/QuoteDiffHandler';
 import {TableDiffHandler} from '../handlers/TableDiffHandler';
 import {CodeBlockDiffHandler} from '../handlers/CodeBlockDiffHandler';
 import {MermaidDiffHandler} from '../handlers/MermaidDiffHandler';
+import {DecisionDiffHandler} from '../handlers/DecisionDiffHandler';
+import {preserveCommentMarks} from './preserveCommentMarks';
 import {NodeStructureValidator} from './NodeStructureValidator';
 import {applyParsedDiffToMarkdown} from './standardDiffFormat';
 import {
@@ -163,8 +166,16 @@ import {
   DiffError,
 } from './DiffError';
 import {createWindowedTreeMatcher, NodeDiff} from './TreeMatcher';
+import {
+  DEFAULT_MAX_PAIR_EVALUATIONS,
+  DiffBudgetExceededError,
+} from './ThresholdedOrderPreservingTree';
 import type {CanonicalTreeNode} from './canonicalTree';
 import { applyFrontmatterUpdateIfNeeded } from './diffFrontmatter';
+// Circular with diffPluginUtils (which imports `initializeHandlers` from here);
+// both sides only call the other at run time, never during module evaluation.
+import {$approveDiffs} from './diffPluginUtils';
+import {isDiffDebug} from './diffDebug';
 
 // Initialize a simple registry (in future this could be external)
 let _handlersInitialized = false;
@@ -178,6 +189,7 @@ export function initializeHandlers() {
   diffHandlerRegistry.register(new TableDiffHandler());
   diffHandlerRegistry.register(new CodeBlockDiffHandler());
   diffHandlerRegistry.register(new MermaidDiffHandler());
+  diffHandlerRegistry.register(new DecisionDiffHandler());
   diffHandlerRegistry.register(new ParagraphDiffHandler());
   diffHandlerRegistry.register(new QuoteDiffHandler());
   diffHandlerRegistry.register(new HeadingDiffHandler());
@@ -598,6 +610,15 @@ export interface ApplyMarkdownReplaceOptions {
    * Callers with no human in the loop set this. See `headlessMarkdownEdit`.
    */
   exactTextMatchRequired?: boolean;
+  /**
+   * Land the edit as final text instead of a pending red/green diff.
+   *
+   * The approval runs inside the same Lexical update that applies the change,
+   * so a collaborative binding emits one Y.Doc transaction holding only the
+   * final text. Approving in a later update would broadcast the pending diff
+   * nodes to every collaborator first. See `agentEditsApplyDirectly`.
+   */
+  acceptChanges?: boolean;
 }
 
 export function applyMarkdownReplace(
@@ -767,6 +788,7 @@ export function applyMarkdownReplace(
       originalMarkdown,
       normalizedNewMarkdown,
       transformers,
+      {acceptChanges: options.acceptChanges},
     );
     // console.log('✅ applyMarkdownDiffToDocument completed successfully');
 
@@ -946,6 +968,7 @@ export function applyMarkdownDiffToDocument(
   originalMarkdown: string,
   newMarkdown: string,
   transformers: Array<Transformer>,
+  options: {acceptChanges?: boolean} = {},
 ): void {
   // Debug: Starting diff application
   // console.log('\n🔍 STARTING DIFF APPLICATION...');
@@ -957,12 +980,14 @@ export function applyMarkdownDiffToDocument(
   }
 
   try {
-    // Validate editor state before starting
+    // A brand-new collaborative document has a root with zero children until
+    // someone types. Give it the empty paragraph a fresh local editor starts
+    // with so the tree matcher has a node to diff against.
     editor.update(
       () => {
         const liveRoot = $getRoot();
-        if (liveRoot.getChildren().length === 0) {
-          throw new Error('Live editor root has no children');
+        if (liveRoot.getChildrenSize() === 0) {
+          liveRoot.append($createParagraphNode());
         }
       },
       {discrete: true},
@@ -1070,6 +1095,8 @@ export function applyMarkdownDiffToDocument(
         $applyEmbedUpgradeToHeadlessEditor(targetEditor);
       }
 
+      preserveCommentMarks(sourceEditor, targetEditor);
+
 
       // DEBUG: Show what target editor contains
       // targetEditor.getEditorState().read(() => {
@@ -1100,18 +1127,31 @@ export function applyMarkdownDiffToDocument(
     }
 
     // NEW: Use TreeMatcher for root-level matching
-    // Use a large window size to handle documents with many nodes
-    // Window size determines how far apart nodes can be and still be considered for matching
     const sourceNodeCount = sourceEditor.getEditorState().read(() => $getRoot().getChildren().length);
     const targetNodeCount = targetEditor.getEditorState().read(() => $getRoot().getChildren().length);
-    const maxNodeCount = Math.max(sourceNodeCount, targetNodeCount);
-    // Use 50% of document size as window, with minimum of 10 and maximum of 100
-    const windowSize = Math.min(100, Math.max(10, Math.floor(maxNodeCount * 0.5)));
+
+    // The tree matcher aligns siblings with an O(m*n) cost matrix, so a
+    // document with thousands of top-level blocks on each side blocks the
+    // renderer main thread for tens of seconds and then dies on V8's Map size
+    // cap (#4821). Refuse it up front, before the guide-post pass, so callers
+    // get a fast typed failure instead of a freeze. Surfaces that can degrade
+    // gracefully should skip the diff before calling us at all.
+    if (sourceNodeCount * targetNodeCount > DEFAULT_MAX_PAIR_EVALUATIONS) {
+      throw new DiffError(
+        `Document too large to diff structurally: ${sourceNodeCount} source x ` +
+          `${targetNodeCount} target root nodes exceeds the ` +
+          `${DEFAULT_MAX_PAIR_EVALUATIONS} pair budget`,
+        'DIFF_TOO_LARGE',
+        {
+          operation: 'applyMarkdownDiffToDocument',
+          additionalInfo: {sourceNodeCount, targetNodeCount},
+        },
+      );
+    }
 
     // console.log('[diffUtils] Document sizes:', {
     //   sourceNodeCount,
     //   targetNodeCount,
-    //   windowSize,
     //   originalMarkdownLength: originalMarkdown.length,
     //   newMarkdownLength: newMarkdown.length,
     // });
@@ -1135,7 +1175,6 @@ export function applyMarkdownDiffToDocument(
 
     const treeMatcher = createWindowedTreeMatcher(sourceEditor, targetEditor, {
       transformers,
-      windowSize,
       similarityThreshold: 0.05, // Very low threshold to catch dramatic changes
     });
 
@@ -1246,10 +1285,14 @@ export function applyMarkdownDiffToDocument(
               $applyNodeDiff(editor, diff, transformers, sourceEditor, targetEditor, treeMatcher);
             }
           }
+
+          if (options.acceptChanges) {
+            $approveDiffs();
+          }
         },
         {discrete: true},
       );
-      if (process?.env?.DIFF_DEBUG === '1') {
+      if (isDiffDebug()) {
         editor.getEditorState().read(() => {
           const root = $getRoot();
           const snapshot = root.getChildren().map((child, idx) => ({
@@ -1286,6 +1329,21 @@ export function applyMarkdownDiffToDocument(
         error.context.targetMarkdown = newMarkdown;
       }
       throw error;
+    }
+
+    // A nested container (a long list, a wide table) blew the pair budget even
+    // though the root-level counts were within it. Same story as the root
+    // guard above -- report it as a size refusal, not a mystery failure.
+    if (error instanceof DiffBudgetExceededError) {
+      const tooLarge = new DiffError(
+        `Document too large to diff structurally: ${error.message}`,
+        'DIFF_TOO_LARGE',
+        {operation: 'applyMarkdownDiffToDocument'},
+        error,
+      );
+      tooLarge.context.originalMarkdown = originalMarkdown;
+      tooLarge.context.targetMarkdown = newMarkdown;
+      throw tooLarge;
     }
 
     // For unexpected errors, wrap in a DiffError
@@ -1566,11 +1624,8 @@ export function $applySubTreeDiff(
   }
 
   // Create a TreeMatcher with pre-cached data for both editors
-  // Use adaptive window size based on child count
-  const childWindowSize = Math.min(50, Math.max(5, Math.floor(sourceChildren.length * 0.5)));
   const treeMatcher = createWindowedTreeMatcher(sourceEditor, targetEditor, {
     transformers,
-    windowSize: childWindowSize,
     similarityThreshold: 0.05,
   });
 

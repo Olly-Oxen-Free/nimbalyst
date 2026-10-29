@@ -1,69 +1,63 @@
-function normalizeIdentityValue(value: unknown): string | null {
-  return typeof value === 'string' && value.trim()
-    ? value.trim().toLowerCase()
-    : null;
+/**
+ * The app's entry point to the shared activity writer.
+ *
+ * The logic lives in `@nimbalyst/tracker-core` because the CLI's offline write
+ * path has to produce identical stored bytes; keeping a second copy here is how
+ * the two drifted on coalescing before. `DirectGateway.write.test.ts` compares a
+ * CLI-written row against what this module produces, so the parity claim is
+ * checked rather than asserted in a comment.
+ */
+import type { TrackerItemPayload } from '@nimbalyst/runtime/sync';
+import { capActivityValue } from '@nimbalyst/tracker-core';
+
+export { appendActivity } from '@nimbalyst/tracker-core';
+
+type ActivityEntry = NonNullable<TrackerItemPayload['activity']>[number];
+
+/** True when `incoming` is exactly the wire-capped form of a longer `local`. */
+function isCappedFormOf(incoming: string | undefined, local: string | undefined): boolean {
+  return incoming !== local && local !== undefined && capActivityValue(local) === incoming;
 }
 
-function isSameAuthor(left: any, right: any): boolean {
-  if (!left || !right) return false;
-
-  const leftEmails = [left.email, left.gitEmail]
-    .map(normalizeIdentityValue)
-    .filter((value): value is string => value !== null);
-  const rightEmails = [right.email, right.gitEmail]
-    .map(normalizeIdentityValue)
-    .filter((value): value is string => value !== null);
-  if (leftEmails.length > 0 || rightEmails.length > 0) {
-    return leftEmails.some((value) => rightEmails.includes(value));
-  }
-
-  const leftGitName = normalizeIdentityValue(left.gitName);
-  const rightGitName = normalizeIdentityValue(right.gitName);
-  if (leftGitName || rightGitName) {
-    return leftGitName !== null && leftGitName === rightGitName;
-  }
-
-  const leftDisplayName = normalizeIdentityValue(left.displayName);
-  const rightDisplayName = normalizeIdentityValue(right.displayName);
-  return leftDisplayName !== null && leftDisplayName === rightDisplayName;
+/**
+ * The wire copy of an oversized item caps activity values, and the room echoes
+ * that copy back with the same entry ids. Keep the full local value then, so
+ * the trim never reaches local history. Only for the same version of the
+ * entry: coalescing keeps the id and moves the timestamp, and a newer edit that
+ * shares the first characters caps to the same value.
+ */
+function preferFullLocalValues(local: ActivityEntry, incoming: ActivityEntry): ActivityEntry {
+  if (incoming.timestamp !== local.timestamp) return incoming;
+  const keepOld = isCappedFormOf(incoming.oldValue, local.oldValue);
+  const keepNew = isCappedFormOf(incoming.newValue, local.newValue);
+  if (!keepOld && !keepNew) return incoming;
+  return {
+    ...incoming,
+    ...(keepOld ? { oldValue: local.oldValue } : {}),
+    ...(keepNew ? { newValue: local.newValue } : {}),
+  };
 }
 
-/** Append or coalesce an activity entry in a tracker item's data.activity array. */
-export function appendActivity(
-  data: Record<string, any>,
-  authorIdentity: any,
-  action: string,
-  details?: { field?: string; oldValue?: string; newValue?: string },
-): void {
-  const activity = data.activity || data.customFields?.activity || [];
-  if (data.customFields?.activity) {
-    delete data.customFields.activity;
-    if (Object.keys(data.customFields).length === 0) delete data.customFields;
+/**
+ * Union a synced item's prior and incoming activity trails.
+ *
+ * Entries are keyed on `id`, so every writer must mint one -- an entry without
+ * an id collapses into every other id-less entry on the item the first time it
+ * syncs. The sort is numeric, so `timestamp` has to be epoch ms, not an ISO
+ * string. `appendActivity` guarantees both; nothing else should build entries.
+ */
+export function mergeActivity(
+  prior: TrackerItemPayload['activity'],
+  incoming: TrackerItemPayload['activity'],
+): TrackerItemPayload['activity'] {
+  if (!prior && !incoming) return undefined;
+  const merged = new Map<string, ActivityEntry>();
+  for (const entry of prior ?? []) merged.set(entry.id, entry);
+  for (const entry of incoming ?? []) {
+    const local = merged.get(entry.id);
+    merged.set(entry.id, local ? preferFullLocalValues(local, entry) : entry);
   }
-  const now = Date.now();
-  const lastEntry = activity[activity.length - 1];
-  const shouldCoalesce = action === 'updated'
-    && lastEntry?.action === 'updated'
-    && lastEntry.field === details?.field
-    && isSameAuthor(lastEntry.authorIdentity, authorIdentity);
-
-  if (shouldCoalesce) {
-    if (details?.field !== 'content') {
-      lastEntry.newValue = details?.newValue;
-    }
-    lastEntry.timestamp = now;
-    data.activity = activity.length > 100 ? activity.slice(-100) : activity;
-    return;
-  }
-
-  activity.push({
-    id: `activity_${now}_${Math.random().toString(36).slice(2, 6)}`,
-    authorIdentity,
-    action,
-    field: details?.field,
-    oldValue: details?.oldValue,
-    newValue: details?.newValue,
-    timestamp: now,
-  });
-  data.activity = activity.length > 100 ? activity.slice(-100) : activity;
+  return [...merged.values()]
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .slice(-100);
 }

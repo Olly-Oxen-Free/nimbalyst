@@ -108,6 +108,53 @@ describe('parseCommitRequest', () => {
     expect(parsed!.isWorktree).toBe(true);
   });
 
+  it('round-trips a file list that spans repos, and asks for one call per repo', () => {
+    // The prompt format and this parser are a stringly-typed contract: a group
+    // header the parser does not know makes parseCommitRequest return null and
+    // the user gets raw prompt text instead of the card.
+    const prompt = buildCommitPrompt({
+      commitContext: {
+        success: true,
+        files: [
+          { path: 'src/app.ts', status: 'modified', repo: '/repos/app' },
+          { path: '/repos/infra/main.tf', status: 'added', repo: '/repos/infra' },
+          { path: 'notes.md', status: 'modified' },
+        ],
+        scenario: 'single',
+      },
+      isInWorktree: false,
+    });
+
+    expect(prompt).toContain('Repository: /repos/app');
+    expect(prompt).toContain('Repository: /repos/infra');
+    expect(prompt).toContain('once per repository');
+
+    expect(parseCommitRequest(prompt)).toMatchObject({
+      files: [
+        { path: 'src/app.ts', status: 'modified', repo: '/repos/app' },
+        { path: '/repos/infra/main.tf', status: 'added', repo: '/repos/infra' },
+        { path: 'notes.md', status: 'modified' },
+      ],
+    });
+  });
+
+  it('leaves a single-repo prompt flat and free of repo instructions', () => {
+    const prompt = buildCommitPrompt({
+      commitContext: {
+        success: true,
+        files: [{ path: 'src/app.ts', status: 'modified', repo: '/repos/app' }],
+        scenario: 'single',
+      },
+      isInWorktree: false,
+    });
+
+    expect(prompt).not.toContain('Repository:');
+    expect(prompt).not.toContain('once per repository');
+    expect(parseCommitRequest(prompt)?.files).toEqual([
+      { path: 'src/app.ts', status: 'modified' },
+    ]);
+  });
+
   it('excludes control-character paths without allowing forged rows or headers', () => {
     const prompt = buildSelectedCommitPrompt([
       modifiedFile('src/safe.ts'),
@@ -124,4 +171,15 @@ describe('parseCommitRequest', () => {
       excludedFileCount: 1,
     });
   });
+});
+
+
+it('carries actual tracking gaps into an empty commit list without claiming ownership', () => {
+  const prompt = buildCommitPrompt({ isInWorktree: false, commitContext: {
+    success: true, files: [], scenario: 'single', coverage: [{ sessionId: 'a', state: 'degraded', reasons: { persistence: 2 }, turns: [] }],
+  } });
+  expect(prompt).toContain('File tracking incomplete');
+  expect(prompt).toContain('File links could not be saved');
+  expect(prompt).toContain('Reconcile your actual work');
+  expect(prompt).toContain('do not include unrelated changes');
 });

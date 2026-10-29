@@ -21,15 +21,21 @@ import { createPGLiteWorkspaceRepository } from './PGLiteWorkspaceRepository';
 import { createPGLiteDocumentsRepository } from './PGLiteDocumentsRepository';
 import { createPGLiteQueuedPromptsStore, type QueuedPromptsStore } from './PGLiteQueuedPromptsStore';
 import { createPGLiteSessionWakeupsStore, type SessionWakeupsStore } from './PGLiteSessionWakeupsStore';
+import { createPendingSubmissionStore, type PendingSubmissionStore } from './ai/pendingSubmissions';
 import { runAgentMessagesBackfill } from './AgentMessagesBackfill';
 import { healArchivedWorkstreamChildren } from './healArchivedWorkstreamChildren';
+import { migrateSessionTrees } from './sessionTreeMigration';
+import { trimSessionCurrentTasks } from './sessionCurrentTasksTrim';
+import { AnalyticsService } from './analytics/AnalyticsService';
+import { app } from 'electron';
+import * as path from 'path';
 import { runWhenFirstUsable } from './startupMaintenanceGate';
 import { database } from '../database/PGLiteDatabaseWorker';
 import { createSQLiteStoreAdapter } from '../database/sqlite/SQLiteStoreAdapter';
 import { logger } from '../utils/logger';
 import { pruneWorkstreamStates } from '../utils/store';
 import { drainAllLegacyPendingUpdates } from './LegacyPendingUpdateDrainService';
-import { initializeSync, shutdownSync, isSyncEnabled, reinitializeSync } from './SyncManager';
+import { initializeSync, shutdownSync, isSyncEnabled, reinitializeSync, getSyncProvider } from './SyncManager';
 import { shutdownTrackerSync, initializeTrackerSync } from './TrackerSyncManager';
 import { ensureWorkspaceLocalNumbersInBackground } from './tracker/ensureWorkspaceLocalNumbers';
 import { onAuthStateChange } from './StytchAuthService';
@@ -45,6 +51,7 @@ class RepositoryManager {
   private documentsRepository: DocumentsRepository | null = null;
   private queuedPromptsStore: QueuedPromptsStore | null = null;
   private sessionWakeupsStore: SessionWakeupsStore | null = null;
+  private pendingSubmissionStore: PendingSubmissionStore | null = null;
   private initialized = false;
   private authListenerUnsubscribe: (() => void) | null = null;
   private wasAuthenticated = false; // Track auth state to detect transitions
@@ -69,7 +76,7 @@ class RepositoryManager {
       const sqliteDatabase = database.getActiveSQLiteDatabase();
       const dbAdapter = sqliteDatabase
         ? createSQLiteStoreAdapter(sqliteDatabase)
-        : { query: database.query.bind(database) };
+        : { query: database.query.bind(database), runTransaction: database.runTransaction.bind(database) };
 
       // Create base session store
       this.baseSessionStore = createPGLiteSessionStore(
@@ -134,6 +141,14 @@ class RepositoryManager {
         }
       );
 
+      // Composer prompts between send and turn end. Writes through the base
+      // store so the record is never published to mobile sync.
+      const baseSessionStore = this.baseSessionStore!;
+      this.pendingSubmissionStore = createPendingSubmissionStore(
+        dbAdapter,
+        (sessionId, update) => baseSessionStore.updateMetadata(sessionId, update),
+      );
+
       // Create session wakeups store (scheduled re-invocations)
       this.sessionWakeupsStore = createPGLiteSessionWakeupsStore(
         dbAdapter,
@@ -182,6 +197,22 @@ class RepositoryManager {
       // Deferred like the backfill above so it never head-of-line-blocks the
       // shared SQLite worker while the first window loads.
       runWhenFirstUsable('archive-orphan-heal', async () => {
+        const { moved } = await migrateSessionTrees(dbAdapter);
+        if (moved) {
+          const provider = getSyncProvider();
+          if (provider) {
+            const { rows } = await dbAdapter.query<{ id: string; parent_session_id: string | null; created_by_session_id: string | null }>(
+              "SELECT id, parent_session_id, created_by_session_id FROM ai_sessions WHERE CAST(metadata->>'sessionTreeMigrationVersion' AS TEXT) = '1'");
+            for (let offset = 0; offset < rows.length; offset += 100) {
+              await Promise.allSettled(rows.slice(offset, offset + 100).map(row => provider.pushChange(row.id, {
+                type: 'metadata_updated', metadata: { parentSessionId: row.parent_session_id ?? null, createdBySessionId: row.created_by_session_id ?? null },
+              })));
+            }
+          }
+          for (const window of windows.values()) {
+            if (!window.isDestroyed()) window.webContents.send('sessions:refresh-list', {});
+          }
+        }
         const { healed } = await healArchivedWorkstreamChildren(dbAdapter);
         if (healed > 0) {
           logger.main.info(`[RepositoryManager] Archived ${healed} orphaned workstream child session(s) whose parent was archived (NIM-1831)`);
@@ -211,6 +242,19 @@ class RepositoryManager {
       // in case sign-in already completed; the auth hook below retries when it
       // has not, since the replica identity needs an account id.
       runWhenFirstUsable('legacy-pending-update-drain', () => drainAllLegacyPendingUpdates());
+
+      // Bring task lists written before the provider bounded them down to the
+      // same bound, after exporting everything removed. Runs once.
+      runWhenFirstUsable('session-task-history-trim', async () => {
+        const result = await trimSessionCurrentTasks(dbAdapter, {
+          exportDir: path.join(app.getPath('userData'), 'session-task-history-exports'),
+          onBeforeTrim: summary => AnalyticsService.getInstance().sendEvent('session_task_history_trimmed', {
+            sessions: summary.sessions, entries: summary.entries, agentReports: summary.agentReports,
+          }),
+          log: message => logger.main.info(message),
+        });
+        if (result.status === 'export-unverified') logger.main.error(`[RepositoryManager] Session task history export did not verify; nothing trimmed: ${result.exportPath}`);
+      });
 
       // Subscribe to auth state changes to reinitialize sync when user authenticates
       // This handles the case where Stytch is lazy-initialized after repositories are ready
@@ -320,6 +364,13 @@ class RepositoryManager {
       throw new Error('RepositoryManager not initialized. Call initialize() first.');
     }
     return this.baseAgentMessagesStore;
+  }
+
+  getPendingSubmissionStore(): PendingSubmissionStore {
+    if (!this.pendingSubmissionStore) {
+      throw new Error('RepositoryManager not initialized. Call initialize() first.');
+    }
+    return this.pendingSubmissionStore;
   }
 
   /**
@@ -459,6 +510,10 @@ export function getBaseAgentMessagesStore(): AgentMessagesStore {
 
 export function getQueuedPromptsStore(): QueuedPromptsStore {
   return repositoryManager.getQueuedPromptsStore();
+}
+
+export function getPendingSubmissionStore(): PendingSubmissionStore {
+  return repositoryManager.getPendingSubmissionStore();
 }
 
 export function getSessionWakeupsStore(): SessionWakeupsStore {

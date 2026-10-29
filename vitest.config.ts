@@ -26,6 +26,40 @@ const electronLogStub = path.resolve(__dirname, './test-utils/electronLogStub.ts
 
 const alias = [
   {
+    find: '@nimbalyst/tracker-engine',
+    replacement: path.resolve(__dirname, './packages/tracker-engine/src'),
+  },
+  {
+    find: '@nimbalyst/tracker-schema',
+    replacement: path.resolve(__dirname, './packages/tracker-schema/src'),
+  },
+  {
+    find: '@nimbalyst/tracker-core',
+    replacement: path.resolve(__dirname, './packages/tracker-core/src'),
+  },
+  {
+    find: /^@nimbalyst\/local-wiki$/,
+    replacement: path.resolve(__dirname, './packages/local-wiki/src/index.ts'),
+  },
+  {
+    find: /^@nimbalyst\/local-wiki\/browser$/,
+    replacement: path.resolve(__dirname, './packages/local-wiki/src/browser.ts'),
+  },
+  {
+    find: '@nimbalyst/collab-protocol',
+    replacement: path.resolve(__dirname, './packages/collab-protocol/src'),
+  },
+  {
+    // `nim hook session-inputs` runs the knowledge extension's server; see packages/cli/src/types/wikiPlugin.d.ts.
+    find: '@nimbalyst/wiki-plugin/session-inputs',
+    replacement: path.resolve(__dirname, './packages/extensions/knowledge/src/sessionInputs/server.ts'),
+  },
+  {
+    // wiki-web imports runtime source under this name (see its vite.config.ts); must precede the plain prefix below.
+    find: /^@nimbalyst\/runtime-source\//,
+    replacement: `${path.resolve(__dirname, './packages/runtime/src')}/`,
+  },
+  {
     find: '@nimbalyst/runtime',
     replacement: path.resolve(__dirname, './packages/runtime/src'),
   },
@@ -36,6 +70,10 @@ const alias = [
   {
     find: '@nimbalyst/extension-sdk/file-mask',
     replacement: path.resolve(__dirname, './packages/extension-sdk/src/fileMask.ts'),
+  },
+  {
+    find: '@nimbalyst/extension-sdk/git-operation-log',
+    replacement: path.resolve(__dirname, './packages/extension-sdk/src/gitOperationLog.ts'),
   },
   {
     find: '@nimbalyst/extension-sdk',
@@ -96,7 +134,7 @@ const include = [
 // its files never reach CI. Collecting them locally means a scratch probe --
 // often written to fail on purpose so it prints a value -- blocks the pre-push
 // gate for unrelated work.
-const baseExclude = ['node_modules', 'dist', 'build', '.idea', '.git', '.cache', '**/temptests/**'];
+const baseExclude = ['**/node_modules/**', 'dist', 'build', '.idea', '.git', '.cache', '**/temptests/**'];
 
 // Paths that must run under the node environment (vitest 4 removed
 // `environmentMatchGlobs`; expressed with `test.projects` instead).
@@ -104,15 +142,23 @@ const baseExclude = ['node_modules', 'dist', 'build', '.idea', '.git', '.cache',
 // diff-model test is routed here rather than the whole directory.
 const nodeOnly = [
   'packages/electron/src/main/**',
-  // Pure property-contract modules with no DOM. Their `// @vitest-environment
-  // node` pragmas were inert once vitest 4 replaced `environmentMatchGlobs`
-  // with projects, so they were paying for jsdom while claiming not to.
+  // Pure property contracts default to Node here. Per-file environment pragmas
+  // also work in Vitest 4 projects; this routing protects files without one.
   'packages/electron/src/shared/analytics/**',
   'packages/runtime/src/ai/**',
+  // The host capability contract is two methods over `process`; it exists
+  // precisely so runtime can run where there is no DOM and no Electron.
+  'packages/runtime/src/host/**',
   'packages/runtime/src/ui/git/__tests__/unifiedDiffModel.test.ts',
+  // The recovery planner is a pure function over three numbers.
+  'packages/tracker-engine/src/__tests__/trackerIdentityRecovery.test.ts',
+  // Key-derivation vectors are WebCrypto over fixed bytes; no DOM involved.
+  'packages/runtime/src/sync/__tests__/encryptionKey.test.ts',
   // `feedback-ui` is otherwise React components; only the pure scroll-carry
   // arithmetic is routed here, for the same reason as the diff model above.
   'packages/collab-client/src/feedback-ui/__tests__/artifactScrollCarry.test.ts',
+  // Layout <-> saved-view definition translation is pure object shuffling.
+  'packages/electron/src/renderer/components/TrackerMode/__tests__/trackerViewDefinition.test.ts',
   // `EmbedFrame` is otherwise React components; the drop payload is pure
   // string handling over a `getData` stub and needs no DOM.
   'packages/electron/src/renderer/components/EmbedFrame/__tests__/canvasDropSource.test.ts',
@@ -121,6 +167,20 @@ const nodeOnly = [
   // boundary stubbed; it never mounts an editor, which is the whole point.
   'packages/electron/src/renderer/services/__tests__/HeadlessCollabDocument.test.ts',
   'packages/electron/src/renderer/services/__tests__/codecOnlyHeadlessEdit.test.ts',
+  // `nim` is a terminal process; nothing under it can touch a DOM. These were
+  // running in the jsdom project purely because they matched the default
+  // include, paying an environment they cannot use.
+  'packages/cli/src/**',
+  'packages/tracker-core/src/**',
+  'packages/tracker-schema/src/**',
+  // The headless node host is a terminal process with no Electron and no DOM;
+  // that is the entire point of the package.
+  'packages/node/src/**',
+  'packages/cloudflare-sandbox/**',
+  // The memory engine is host-agnostic with zero app imports, so nothing under
+  // it can reach a DOM. The explicit project default complements per-file
+  // pragmas. The extension's own `src/` is excluded because it is React.
+  'packages/extensions/nimbalyst-memory/engine/src/**',
 ];
 
 // The node project's `include` and the jsdom project's `exclude` must describe
@@ -139,13 +199,11 @@ export default defineConfig({
     // minutes; losing which tests failed to a dot reporter or a truncated pipe
     // should never cost a second run to find out.
     reporters: ['default', './scripts/vitest-run-log-reporter.mjs'],
-    // Tests under packages/electron/src/main touch better-sqlite3, whose
-    // build/Release/.node binary is compiled for Electron (NODE_MODULE_VERSION
-    // 145) and unloadable under the system Node that vitest runs against.
-    // The globalSetup fetches a Node-ABI prebuild into a side cache and sets
-    // NIMBALYST_BETTER_SQLITE3_NATIVE; SQLiteDatabase reads that env to load
-    // the right binary via better-sqlite3's `nativeBinding` option without
-    // disturbing the Electron binary that the dev server depends on.
+    // Tests under packages/electron/src/main touch better-sqlite3. Version 13
+    // ships Node-API prebuilds that are stable across supported Node and
+    // Electron hosts. The globalSetup still provisions an isolated side-cache
+    // binary and sets NIMBALYST_BETTER_SQLITE3_NATIVE so tests do not rebuild or
+    // replace the workspace installation used by the running dev server.
     globalSetup: ['./packages/electron/vitest.globalSetup.ts'],
     coverage: {
       reporter: ['text', 'json', 'html'],
@@ -187,7 +245,7 @@ export default defineConfig({
           silent: SILENT,
           globals: true,
           environment: 'node',
-          setupFiles,
+          setupFiles: [...setupFiles, './test-utils/setup-ai.ts'],
           include: nodeOnlyInclude,
           exclude: baseExclude,
           server: { deps: { inline: [/y-monaco/] } },

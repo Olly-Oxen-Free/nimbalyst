@@ -9,8 +9,8 @@
     "dev": "vite build --watch"
   },
   "devDependencies": {
-    "@nimbalyst/extension-sdk": "*",
-    "typescript": "^5.0.0",
+    "@nimbalyst/extension-sdk": "workspace:*",
+    "typescript": "^6.0.3",
     "vite": "^7.1.12"
   },
   "peerDependencies": {

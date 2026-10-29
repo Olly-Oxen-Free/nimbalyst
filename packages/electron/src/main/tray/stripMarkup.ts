@@ -17,8 +17,8 @@
  * a dark wallpaper -- not worth reasoning about further here.
  */
 
+import { FLEET_STRIP_COLORS as COLORS } from '../../shared/fleetStripColors';
 import type { StripView } from './stripStateMachine';
-import type { PriorityState } from './fleetSnapshot';
 
 /**
  * Menu bar item height in DIP.
@@ -40,18 +40,6 @@ const GLYPH_SIZE = 18;
 
 /** Hard ceiling on the offscreen canvas, and therefore on a captured strip. */
 export const STRIP_MAX_WIDTH = 300;
-
-const COLORS: Record<PriorityState | 'running', string> = {
-  approval: '#fbbf24',
-  decision: '#f0abfc',
-  failed: '#ef4444',
-  running: '#60a5fa',
-  // The mockups' "done" green. Note the resting strip cannot reuse the running
-  // blue for unread, since two blue dot-and-digit pairs would be unreadable
-  // side by side -- so finished-and-unread is green here where the tray panel
-  // uses its blue unread dot.
-  completed: '#4ade80',
-};
 
 const FOREGROUND = 'rgba(255,255,255,0.94)';
 
@@ -88,6 +76,7 @@ export function renderStripBody(view: StripView): string {
     const waiting = view.needsApproval + view.needsDecision;
     if (waiting > 0) parts.push(pair(COLORS.approval, waiting));
     if (view.running > 0) parts.push(pair(COLORS.running, view.running));
+    if (view.stalled > 0) parts.push(pair(COLORS.stalled, view.stalled));
     if (view.failed > 0) parts.push(pair(COLORS.failed, view.failed));
     // Finished while you were away and not yet read. The old `setTitle` counted
     // these, and dropping them meant a session that completed in the background

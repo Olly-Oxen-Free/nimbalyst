@@ -24,6 +24,11 @@ const mocks = vi.hoisted(() => ({
   showError: vi.fn(),
   showInfo: vi.fn(),
   showWarning: vi.fn(),
+  shareFolderToTeamFromContextMenu: vi.fn(async () => {}),
+}));
+
+vi.mock('../../services/shareFolderToTeamFlow', () => ({
+  shareFolderToTeamFromContextMenu: mocks.shareFolderToTeamFromContextMenu,
 }));
 
 vi.mock('@nimbalyst/runtime', () => ({
@@ -124,7 +129,7 @@ function renderActions(fileName: string) {
   );
 }
 
-describe('CommonFileActions Share to Team catalog eligibility', () => {
+describe('CommonFileActions Copy to Wiki catalog eligibility', () => {
   it('uses the platform-aware system file browser label', () => {
     mocks.resolveShareability.mockReturnValue({ state: 'unsupported', reason: 'Unsupported' });
     renderActions('index.ts');
@@ -184,7 +189,7 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
     });
 
     renderActions('notes.md');
-    fireEvent.click(screen.getByRole('button', { name: 'Share to Team' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to Wiki...' }));
 
     await vi.waitFor(() => expect(mocks.openDialog).toHaveBeenCalledWith(
       'share-to-team',
@@ -202,11 +207,11 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
     ));
   });
 
-  it('shows Share to Team for a ready first-wave non-markdown type', () => {
+  it('shows Copy to Wiki for a ready first-wave non-markdown type', () => {
     mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
     renderActions('people.tsv');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Share to Team' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to Wiki...' }));
     expect(mocks.openDialog).toHaveBeenCalledWith('share-to-team', expect.objectContaining({
       fileName: 'people.tsv',
       descriptor: spreadsheetDescriptor,
@@ -236,7 +241,7 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
     });
 
     renderActions('people.csv');
-    fireEvent.click(screen.getByRole('button', { name: 'Share to Team' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to Wiki...' }));
     const dialogData = mocks.openDialog.mock.calls[0]?.[1];
     await dialogData.onConfirm({
       folderId: null,
@@ -264,19 +269,70 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
     );
   });
 
+  it('offers Copy to Wiki with no team (for Personal) for any type but code', async () => {
+    const { useAtomValue } = await import('jotai');
+    vi.mocked(useAtomValue).mockReturnValue(false);
+    try {
+      mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
+      const { unmount } = renderActions('people.csv');
+      screen.getByRole('button', { name: 'Copy to Wiki...' });
+      unmount();
+      mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: { ...spreadsheetDescriptor, documentType: 'code' } });
+      renderActions('index.ts');
+      expect(screen.queryByRole('button', { name: 'Copy to Wiki...' })).toBeNull();
+    } finally {
+      vi.mocked(useAtomValue).mockReturnValue(true);
+    }
+  });
+
   it('keeps Monaco files visible but disabled with the catalog reason', () => {
     const reason = 'The built-in Monaco editor does not yet provide a collaborative binding for ".ts".';
     mocks.resolveShareability.mockReturnValue({ state: 'unsupported', reason });
     renderActions('index.ts');
 
-    const action = screen.getByRole('button', { name: /Share to Team/ });
+    const action = screen.getByRole('button', { name: /Copy to Wiki/ });
     expect(action.getAttribute('aria-disabled')).toBe('true');
     expect(action.textContent).toContain(reason);
     fireEvent.click(action);
     expect(mocks.openDialog).not.toHaveBeenCalled();
   });
 
-  it('does not offer Share to Team for an already-shared collaborative document', () => {
+  it('offers a folder the folder promote instead of a file-extension verdict', async () => {
+    // A folder has no document type, so the catalog's "no collaborative
+    // document type is registered for X" is a file message about a non-file.
+    // It used to be the reason the action was greyed out on every folder.
+    mocks.resolveShareability.mockReturnValue({
+      state: 'unsupported',
+      reason: 'No collaborative document type is registered for "design".',
+    });
+    render(
+      <CommonFileActions
+        filePath="/workspace/design"
+        fileName="design"
+        onClose={() => {}}
+        menuItemClass="menu-item"
+        separatorClass="separator"
+        useButtons
+        isDirectory
+      />,
+    );
+
+    const action = screen.getByRole('button', { name: /Share Folder to Team/ });
+    expect(action.getAttribute('aria-disabled')).toBe('false');
+    expect(action.textContent).not.toContain('No collaborative document type');
+
+    fireEvent.click(action);
+    await vi.waitFor(() => {
+      expect(mocks.shareFolderToTeamFromContextMenu).toHaveBeenCalledWith({
+        folderPath: '/workspace/design',
+        folderName: 'design',
+      });
+    });
+    // The single-file dialog is not the folder path.
+    expect(mocks.openDialog).not.toHaveBeenCalled();
+  });
+
+  it('does not offer Copy to Wiki for an already-shared collaborative document', () => {
     mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
     render(
       <CommonFileActions
@@ -289,7 +345,7 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
       />,
     );
 
-    expect(screen.queryByRole('button', { name: 'Share to Team' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Copy to Wiki...' })).toBeNull();
   });
 
   it('omits Copy Path for collaborative documents while keeping it for local files', () => {

@@ -35,7 +35,8 @@ const naturalCollator = new Intl.Collator(undefined, {
 // MAX_DEPTH: deepest we'll recurse from workspace root. Prevents infinite loops
 //   in circular symlinks and limits scan cost on deeply nested trees.
 // MAX_ITEMS_PER_DIR: max immediate children shown in a single directory.
-//   If a directory has more than this many entries, only the first N are shown.
+//   If a directory has more than this many entries, only the first N after
+//   sorting are shown, so the cut never depends on raw readdir order.
 //   This handles flat-huge directories (e.g., a folder with 50,000 images).
 const MAX_DEPTH = 8;
 const MAX_ITEMS_PER_DIR = 200;
@@ -47,63 +48,140 @@ function isSpecialDirectory(name: string): boolean {
     return SPECIAL_DIRECTORIES.includes(name);
 }
 
-function sortItems(items: FileTreeItem[]): void {
-    items.sort((a, b) => {
-        const aIsSpecial = a.type === 'directory' && isSpecialDirectory(a.name);
-        const bIsSpecial = b.type === 'directory' && isSpecialDirectory(b.name);
+function compareItems(a: FileTreeItem, b: FileTreeItem): number {
+    const aIsSpecial = a.type === 'directory' && isSpecialDirectory(a.name);
+    const bIsSpecial = b.type === 'directory' && isSpecialDirectory(b.name);
 
-        if (aIsSpecial && !bIsSpecial) return -1;
-        if (!aIsSpecial && bIsSpecial) return 1;
-        if (aIsSpecial && bIsSpecial) {
-            return SPECIAL_DIRECTORIES.indexOf(a.name) - SPECIAL_DIRECTORIES.indexOf(b.name);
-        }
-        if (a.type !== b.type) {
-            return a.type === 'directory' ? -1 : 1;
-        }
-        return naturalCollator.compare(a.name, b.name);
-    });
+    if (aIsSpecial && !bIsSpecial) return -1;
+    if (!aIsSpecial && bIsSpecial) return 1;
+    if (aIsSpecial && bIsSpecial) {
+        return SPECIAL_DIRECTORIES.indexOf(a.name) - SPECIAL_DIRECTORIES.indexOf(b.name);
+    }
+    if (a.type !== b.type) {
+        return a.type === 'directory' ? -1 : 1;
+    }
+    return naturalCollator.compare(a.name, b.name);
 }
 
-export async function getFolderContents(dirPath: string, depth: number = 0): Promise<FileTreeItem[]> {
-    const result: FileTreeItem[] = [];
-    const directoriesToPopulate: FileTreeItem[] = [];
+function sortItems(items: FileTreeItem[]): void {
+    items.sort(compareItems);
+}
 
-    if (depth > MAX_DEPTH) {
+/**
+ * Every file under `dirPath`, as folder-relative POSIX paths.
+ *
+ * Deliberately NOT `getFolderContents`: that function's MAX_DEPTH and
+ * MAX_ITEMS_PER_DIR exist so the sidebar stays cheap to paint, and silently
+ * dropping the 201st file is fine for a tree a human is scrolling. It is not
+ * fine for "share this folder with my team", where a dropped file is a file the
+ * team never gets and nobody is told about. This walk has one global cap and
+ * reports when it hits it, so the caller can say so out loud.
+ */
+export async function listFolderFilesRecursive(
+    dirPath: string,
+    options: { limit?: number } = {}
+): Promise<{ files: string[]; truncated: boolean }> {
+    const limit = options.limit ?? 5000;
+    const files: string[] = [];
+    let truncated = false;
+
+    const walk = async (currentPath: string, relativePrefix: string): Promise<void> => {
+        if (truncated) return;
+        let entries: Dirent[];
+        try {
+            entries = await readdir(currentPath, { withFileTypes: true });
+        } catch (error: any) {
+            if (error.code !== 'ENOENT') {
+                console.error('Error listing folder files:', error);
+            }
+            return;
+        }
+
+        const subdirectories: Array<{ path: string; prefix: string }> = [];
+        for (const entry of entries) {
+            if (entry.name === '.DS_Store') continue;
+            const fullPath = join(currentPath, entry.name);
+            const resolved = await resolveEntryType(entry, fullPath);
+            if (!resolved) continue; // Broken symlink
+            const relativePath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
+
+            if (resolved.isDir) {
+                if (shouldExcludeDir(entry.name) || shouldExcludePath(fullPath)) continue;
+                subdirectories.push({ path: fullPath, prefix: relativePath });
+            } else if (resolved.isFile) {
+                if (files.length >= limit) {
+                    truncated = true;
+                    return;
+                }
+                files.push(relativePath);
+            }
+        }
+
+        for (const subdirectory of subdirectories) {
+            await walk(subdirectory.path, subdirectory.prefix);
+            if (truncated) return;
+        }
+    };
+
+    await walk(dirPath, '');
+    files.sort((left, right) => naturalCollator.compare(left, right));
+    return { files, truncated };
+}
+
+export async function getFolderContents(dirPath: string, depth: number = 0, signal?: AbortSignal): Promise<FileTreeItem[]> {
+    const result: FileTreeItem[] = [];
+
+    if (signal?.aborted || depth > MAX_DEPTH) {
         return result;
     }
 
     try {
         const entries = await readdir(dirPath, { withFileTypes: true });
-        let visibleCount = 0;
+        const symlinks: Dirent[] = [];
 
-        for (const entry of entries) {
-            if (entry.name === '.DS_Store') continue;
-            if (visibleCount >= MAX_ITEMS_PER_DIR) break;
-
-            const fullPath = join(dirPath, entry.name);
-
-            const resolved = await resolveEntryType(entry, fullPath);
-            if (!resolved) continue; // Broken symlink
-            const { isDir, isFile } = resolved;
-
+        const addItem = (name: string, fullPath: string, isDir: boolean, isFile: boolean) => {
             if (isDir) {
-                if (shouldExcludeDir(entry.name) || shouldExcludePath(fullPath)) continue;
-                const dirItem: FileTreeItem = {
-                    name: entry.name,
-                    type: 'directory',
-                    path: fullPath,
-                    children: []
-                };
-                directoriesToPopulate.push(dirItem);
-                result.push(dirItem);
-                visibleCount++;
+                if (shouldExcludeDir(name) || shouldExcludePath(fullPath)) return;
+                result.push({ name, type: 'directory', path: fullPath, children: [] });
             } else if (isFile) {
-                result.push({ name: entry.name, type: 'file', path: fullPath });
-                visibleCount++;
+                result.push({ name, type: 'file', path: fullPath });
             }
+        };
+
+        // Plain files and directories are typed by readdir itself, so the whole
+        // folder can be sorted before the cap without any per-entry I/O.
+        for (const entry of entries) {
+            if (signal?.aborted) return [];
+            if (entry.name === '.DS_Store') continue;
+            if (entry.isSymbolicLink()) {
+                symlinks.push(entry);
+                continue;
+            }
+            addItem(entry.name, join(dirPath, entry.name), entry.isDirectory(), entry.isFile());
         }
 
+        // Sort before capping so the cut keeps the first N in display order.
         sortItems(result);
+        if (result.length > MAX_ITEMS_PER_DIR) result.length = MAX_ITEMS_PER_DIR;
+
+        // A symlink sorts by its target's type, which costs a stat. Skip the stat
+        // when the link would land past the cap even as a directory (the earliest
+        // it can sort), so a huge folder of links is not stat'd entry by entry.
+        for (const entry of symlinks) {
+            if (signal?.aborted) return [];
+            if (result.length >= MAX_ITEMS_PER_DIR
+                && compareItems({ name: entry.name, type: 'directory', path: '' }, result[result.length - 1]) >= 0) {
+                continue;
+            }
+            const fullPath = join(dirPath, entry.name);
+            const resolved = await resolveEntryType(entry, fullPath);
+            if (!resolved) continue; // Broken symlink
+            addItem(entry.name, fullPath, resolved.isDir, resolved.isFile);
+            sortItems(result);
+            if (result.length > MAX_ITEMS_PER_DIR) result.length = MAX_ITEMS_PER_DIR;
+        }
+
+        const directoriesToPopulate = result.filter(item => item.type === 'directory');
 
         // Recurse into each child directory.
         // MAX_DEPTH + MAX_ITEMS_PER_DIR bound the total work per branch:
@@ -112,7 +190,14 @@ export async function getFolderContents(dirPath: string, depth: number = 0): Pro
         // Recurse sequentially to avoid unbounded file-descriptor fan-out.
         // Each call is still async (non-blocking), so the main thread stays responsive.
         for (const directory of directoriesToPopulate) {
-            directory.children = await getFolderContents(directory.path, depth + 1);
+            if (signal?.aborted) return [];
+            // Past the limit the folder is unread, not empty. Say so, or a
+            // rebuild replaces children the renderer loaded on expand with [].
+            if (depth + 1 > MAX_DEPTH) {
+                directory.childrenTruncated = true;
+                continue;
+            }
+            directory.children = await getFolderContents(directory.path, depth + 1, signal);
         }
     } catch (error: any) {
         if (error.code !== 'ENOENT') {

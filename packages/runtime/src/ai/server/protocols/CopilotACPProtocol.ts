@@ -24,6 +24,7 @@ import {
   ProtocolEvent,
   ToolResult,
 } from './ProtocolInterface';
+import { scrubProviderApiKeys } from '../providerApiKeyScrub';
 
 interface ACPRequest {
   jsonrpc: '2.0';
@@ -60,6 +61,7 @@ export class CopilotACPProtocol implements AgentProtocol {
   readonly platform = 'copilot-acp';
 
   private process: ChildProcess | null = null;
+  private onProcessExit: ((code: number | null, signal: NodeJS.Signals | null) => void) | null = null;
   private readline: ReadlineInterface | null = null;
   private nextRequestId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
@@ -93,9 +95,13 @@ export class CopilotACPProtocol implements AgentProtocol {
       return this.process;
     }
 
+    // The `?? process.env` fallback (taken whenever the provider could not
+    // build an environment) hands the child the user's shell verbatim, so the
+    // scrub has to happen here, on the map actually passed to spawn, rather
+    // than upstream where it only covers the authoritative branch.
     const proc = spawn(this.command, this.baseArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: this.processEnv ?? process.env,
+      env: scrubProviderApiKeys({ ...(this.processEnv ?? process.env) }),
     });
 
     this.process = proc;
@@ -111,12 +117,15 @@ export class CopilotACPProtocol implements AgentProtocol {
       console.warn('[COPILOT-ACP] stderr:', data.toString());
     });
 
-    proc.on('exit', (code, signal) => {
+    // Kept on the instance so destroy() can detach it: a deliberately killed
+    // child would otherwise report its own exit after the caller has moved on.
+    this.onProcessExit = (code, signal) => {
       console.log(`[COPILOT-ACP] Process exited: code=${code}, signal=${signal}`);
       this.rejectAllPending(new Error(`Copilot process exited (code=${code})`));
       this.process = null;
       this.readline = null;
-    });
+    };
+    proc.on('exit', this.onProcessExit);
 
     return proc;
   }
@@ -381,8 +390,12 @@ export class CopilotACPProtocol implements AgentProtocol {
 
   destroy(): void {
     if (this.process && !this.process.killed) {
+      if (this.onProcessExit) {
+        this.process.off('exit', this.onProcessExit);
+      }
       this.process.kill();
     }
+    this.onProcessExit = null;
     this.process = null;
     this.readline = null;
     this.initialized = false;
@@ -468,9 +481,14 @@ export class CopilotACPProtocol implements AgentProtocol {
           events.push({
             type: 'tool_call',
             toolCall: {
-              id: typeof update.id === 'string' ? update.id : (typeof content?.id === 'string' ? content.id : undefined),
-              name: typeof update.name === 'string' ? update.name : (typeof content?.name === 'string' ? content.name : 'unknown'),
-              arguments: (update.arguments ?? update.input ?? content?.arguments ?? content?.input) as Record<string, unknown> | undefined,
+              // ACP tool_call updates carry toolCallId / title / kind / rawInput.
+              id: typeof update.toolCallId === 'string' ? update.toolCallId :
+                  typeof update.id === 'string' ? update.id : (typeof content?.id === 'string' ? content.id : undefined),
+              name: typeof update.name === 'string' ? update.name :
+                    typeof content?.name === 'string' ? content.name :
+                    typeof update.title === 'string' && update.title.trim() ? update.title.trim() :
+                    typeof update.kind === 'string' ? update.kind : 'unknown',
+              arguments: (update.arguments ?? update.input ?? update.rawInput ?? content?.arguments ?? content?.input) as Record<string, unknown> | undefined,
             },
           });
         } else if (updateType === 'tool_result') {

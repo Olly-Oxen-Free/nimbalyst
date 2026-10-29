@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "nimbalyst-session": {
+      "command": "npx",
+      "args": [
+        "--prefix",
+        "/",
+        "-y",
+        "@nimbalyst/cli@0.12.3",
+        "hook",
+        "session-inputs"
+      ]
+    },
+    "nimbalyst-local": {
+      "command": "npx",
+      "env_vars": [
+        "CODEX_HOME"
+      ],
+      "args": [
+        "--prefix",
+        "/",
+        "-y",
+        "@nimbalyst/cli@0.12.3",
+        "mcp",
+        "--plugin-agent",
+        "codex"
+      ]
+    }
+  }
+}

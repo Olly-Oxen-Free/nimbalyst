@@ -1,4 +1,4 @@
-import { globalRegistry } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel';
+import { globalRegistry, scopeValidationToChanges } from '@nimbalyst/tracker-schema';
 import type { TrackerItem } from '@nimbalyst/runtime';
 import { getCurrentIdentity } from '../../services/TrackerIdentityService';
 import {
@@ -13,13 +13,20 @@ import {
 import { isTrackerSyncActive, isTrackerSyncConfigured, syncTrackerItem } from '../../services/TrackerSyncManager';
 import { awaitServerIssueKey } from '../../services/tracker/awaitServerIssueKey';
 import { isLocalIssueKey, resolveDisplayIssueKey } from '../../../shared/localIssueKey';
-import { applyHeadlessBodyMarkdown } from '../../services/MainBodyDocService';
+import { applyHeadlessBodyMarkdown, initializeHeadlessBodyMarkdown } from '../../services/MainBodyDocService';
+import { initialTrackerBodyCache } from '../../services/tracker/trackerBodySnapshot';
+import { writeTrackerBodyCacheVersion } from '../../services/tracker/trackerBodyCacheRetention';
+import { recordTypedPageBodySnapshot } from '../../services/tracker/typedPageBodyHistory';
 import { applyRelationshipFieldWrites } from '../../services/tracker/relationshipFieldWrite';
-import { appendActivity } from '../../services/tracker/trackerActivity';
+import { pinCitedRevisions } from '../../services/tracker/citationPins';
+import { appendActivity } from '../../services/tracker/trackerActivityTrailCap';
+import { pushSharedTrackerItem, sharedTrackerItemTooLarge, trackerItemTooLargeForRoom } from '../../services/tracker/trackerItemShareGate';
 import { assignLocalKeysToRows } from '../../services/tracker/localKeyAllocator';
+import { typeHasLocalNumbers } from '../../services/tracker/localNumberTypes';
 import { workspaceLocalKeyStore } from '../../services/tracker/workspaceLocalKeyStore';
 import { extractItemCustomFields } from '../../services/tracker/trackerRowCustomFields';
 import { nestRelationshipFieldsIntoCustomFields, readStoredFieldValue, writeStoredFieldValue } from '../../services/tracker/relationshipFieldStorage';
+import { reindexItemRelationshipsAfterWrite } from '../../services/tracker/trackerRelationshipIndexStore';
 import {
   isRelationshipField,
   matchesFilterSet,
@@ -33,7 +40,7 @@ import {
   isTerminalStatus,
   statusCategoryOfItem,
   type StatusCategory,
-} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerStatusCategory';
+} from '@nimbalyst/tracker-schema';
 import { computeReadiness, type Readiness } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerReadiness';
 import {
   describeUnresolvedBlockers,
@@ -42,7 +49,8 @@ import {
   type ProjectedBlockerRef,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerBlockerVisibility';
 import { trackerItemToRecord } from '@nimbalyst/runtime/core/TrackerRecord';
-import { getRecordStatus, resolveRoleFieldName } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
+import { getRecordStatus, getRecordTitle, resolveRoleFieldName } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
+import { buildTrackerRadar, getRecentTeammateActivity } from '@nimbalyst/tracker-core';
 import { getVisibleTrackerLinkedSessions, shouldPersistTrackerLinkedSessions } from '../../../shared/trackerSessionLinks';
 import { buildFullDocumentTrackerId } from '@nimbalyst/runtime/plugins/TrackerPlugin/documentHeader/frontmatterUtils';
 import { normalizeLegacyLabelValues } from '@nimbalyst/runtime/sync';
@@ -59,6 +67,7 @@ import {
   resolveTrackerRowByReference,
 } from './trackerToolItemAccess';
 import { handleTrackerPublicationUpdate } from './trackerPublicationTool';
+import { prepareTrackerUpdateInput } from './trackerToolUpdateInput';
 import { handleGithubIssueOverlayCreate } from './githubIssueOverlayTool';
 import {
   bodyWriteFailure,
@@ -70,6 +79,7 @@ import {
   issueKeyStatus,
   localIssueKeyResponseMessage,
   TRACKER_TRACKS_EXPLANATION,
+  tooLargeToShareToolResult,
   type BodyWriteFailure,
   type McpToolResult,
 } from './trackerToolResult';
@@ -94,6 +104,21 @@ function trackMcpTrackerMutation(
     trackerType,
     view: 'agent_tool',
   });
+}
+
+function trackerRadarAdvisory(item: TrackerItem | null | undefined, workspacePath?: string): string {
+  if (!item) return '';
+  try {
+    const activity = getRecentTeammateActivity(
+      trackerItemToRecord(item),
+      getCurrentIdentity(workspacePath),
+    );
+    return activity ? `\n- **Radar**: ${activity.summary}` : '';
+  } catch {
+    // Advisory-only: malformed legacy metadata must never turn a successful
+    // tracker mutation into a failed tool call.
+    return '';
+  }
 }
 
 function buildTrackerSchemaValidationError(
@@ -603,6 +628,24 @@ export const trackerToolSchemas = [
     },
   },
   {
+    name: 'work_radar',
+    description:
+      'Show compact recent team activity from synced tracker history. Call with an issueKey before starting work on an item to see whether a teammate has already touched it; call without one to see active work across the current tracker corpus.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        windowHours: {
+          type: 'number',
+          description: 'Rolling window in hours, clamped to 2..72 (default 24).',
+        },
+        issueKey: {
+          type: 'string',
+          description: 'Optional issue key, local key, or stable item id to inspect.',
+        },
+      },
+    },
+  },
+  {
     name: "tracker_get",
     description:
       "Get a single tracker item with its full content (as markdown). Use this to read the detailed body of a bug, plan, task, etc.",
@@ -842,12 +885,23 @@ export const trackerToolSchemas = [
       properties: {
         schema: {
           type: "object",
-          description: "Full custom tracker type schema object to persist. Cannot target a built-in type — use `patch` for those.",
+          description: "Full custom tracker type schema object to persist. Cannot target a built-in type — use `patch` for those. A subtype sets `extends: <baseType>` and declares only what it adds: new fields, narrowed select options, or overridden displayName/icon/color/roles/tableView; everything else, including sharing, is inherited from the base.",
         },
         patch: {
           type: "object",
           description:
             "Delta override for a tracker type (required: `type`). Merge semantics: `fields[]` by name (`{name, set?, options?, remove?}`); select options by value (`options: {set?: [{value,label,icon?,color?,category?}], remove?: [value], order?: [value]}`); scalars (displayName, icon, color, inlineTemplate, sharing, draftByDefault) last-writer; `roles` shallow-merged. On the workflow-status field, `category` declares where the status sits in the lifecycle — 'backlog', 'unstarted', 'started', 'done', or 'cancelled' — and is what makes an item count as closed for progress rollups and the Open/Closed filter. ALWAYS set it when adding a status; an omitted category is guessed from the value's name and defaults to open. Example — add a way to close something you are not going to do: {\"type\":\"feature\",\"fields\":[{\"name\":\"status\",\"options\":{\"set\":[{\"value\":\"wont-do\",\"label\":\"Won't Do\",\"icon\":\"do_not_disturb_on\",\"color\":\"#64748b\",\"category\":\"cancelled\"}]}}]}.",
+        },
+        predicates: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "Merge entries into the project's PREDICATE REGISTRY: the named relations between typed pages. Each entry is {id, label, inverseLabel?, subjectKinds: [type|'*'], objectKinds?: [type|'*'], valueShape: entity|text|boolean-assessment|quantity|select, direction: directed|symmetric, transitive?}. A relation is `valueShape: entity` with `label` read from the linking page, `inverseLabel` read from the linked page, `subjectKinds` the linking page's types and `objectKinds` the linked page's types (subtypes count through `extends`). It is offered when one typed page links another, and stored on that body link as `rel=<id>`. No qualifiers; no generic relations such as 'related to'. MERGES BY ID: an entry replaces the predicate with the same id or is added; predicates you omit are kept. To delete, list ids in `removePredicates`. Removals and narrowing `subjectKinds` are destructive and need `confirmDestructive`. May be sent alone or alongside `schema`/`patch`; predicates are applied first. Persisted to .nimbalyst/predicates.yaml.",
+        },
+        removePredicates: {
+          type: "array",
+          items: { type: "string" },
+          description: "Predicate ids to delete from the registry. Destructive: requires `confirmDestructive`.",
         },
         fileName: {
           type: "string",
@@ -1497,6 +1551,86 @@ export function handleTrackerReady(
   );
 }
 
+export async function handleWorkRadar(
+  args: { windowHours?: number; issueKey?: string },
+  workspacePath?: string,
+): Promise<McpToolResult> {
+  let tempDocService: { destroy?: () => void } | undefined;
+  try {
+    if (workspacePath) ensureWorkspaceTrackerSchemasLoaded(workspacePath);
+    const { documentServices } = await import('../../window/WindowManager');
+    let docService = workspacePath ? documentServices.get(workspacePath) : undefined;
+    if (!docService && workspacePath) {
+      const { ElectronDocumentService } = await import('../../services/ElectronDocumentService');
+      docService = new ElectronDocumentService(workspacePath);
+      tempDocService = docService;
+    }
+    const reference = args.issueKey?.trim().toLowerCase();
+    const rawItems = docService ? await docService.listTrackerItems() : [];
+    const selected = reference
+      ? rawItems.filter((item) => [item.issueKey, item.localKey, item.id]
+          .some((value) => value?.toLowerCase() === reference))
+      : rawItems;
+    const radar = buildTrackerRadar(selected.map(trackerItemToRecord), {
+      windowHours: args.windowHours,
+      currentIdentity: getCurrentIdentity(workspacePath),
+      getTitle: getRecordTitle,
+      getStatus: getRecordStatus,
+    });
+    const allThreads = radar.lanes.flatMap((lane) => lane.marks.map((mark) => ({
+      actor: lane.actor.displayName,
+      title: mark.label,
+      issueKey: mark.kind === 'thread' ? mark.items[0]?.issueKey : undefined,
+      itemIds: mark.itemIds,
+      state: mark.state,
+      lastActivityAt: mark.lastActivityAt,
+      agentDriven: mark.agentDriven,
+    }))).sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+    const allSameItem = radar.ties.map((tie) => ({
+      issueKey: tie.issueKey,
+      itemId: tie.itemId,
+      actors: [
+        radar.lanes.find((lane) => lane.actorKey === tie.fromActorKey)?.actor.displayName,
+        radar.lanes.find((lane) => lane.actorKey === tie.toActorKey)?.actor.displayName,
+      ].filter((value): value is string => Boolean(value)),
+      kind: tie.type,
+    }));
+    // A bare session-start read can span thousands of items. Preserve every
+    // issue-scoped result, but bound the team-wide payload so the coordination
+    // check does not consume the context it is meant to protect.
+    const threads = reference ? allThreads : allThreads.slice(0, 50);
+    const sameItem = reference ? allSameItem : allSameItem.slice(0, 20);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          structured: {
+            windowHours: radar.windowHours,
+            totalThreads: allThreads.length,
+            threads,
+            sameItem,
+            waitingOnYou: radar.waitingOnYou.slice(0, 20),
+            youHandedOff: radar.youHandedOff.slice(0, 20),
+            truncated: threads.length < allThreads.length || sameItem.length < allSameItem.length,
+          },
+          summary: reference && selected.length === 0
+            ? `No tracker item matched ${args.issueKey}.`
+            : `${allThreads.length} recent work thread${allThreads.length === 1 ? '' : 's'} across ${radar.lanes.length} actor lane${radar.lanes.length === 1 ? '' : 's'}; ${allSameItem.length} shared-item signal${allSameItem.length === 1 ? '' : 's'}.`,
+        }),
+      }],
+      isError: false,
+    };
+  } catch (error) {
+    console.error('[MCP Server] work_radar failed:', error);
+    return {
+      content: [{ type: 'text', text: `Error reading work radar: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true,
+    };
+  } finally {
+    tempDocService?.destroy?.();
+  }
+}
+
 export async function handleTrackerGet(
   args: any,
   workspacePath?: string,
@@ -1662,6 +1796,13 @@ export async function handleTrackerGet(
         tags: item.tags || [],
         owner: item.owner || undefined,
         dueDate: item.dueDate || undefined,
+        // #1224: without these the tool contradicts its own mutations -- an
+        // agent that archived an item read it back as active, and comments
+        // arrive in customFields, which the filter below strips.
+        // `fromDbBoolean`: the flag is INTEGER on SQLite, boolean on PGLite.
+        archived: fromDbBoolean(item.archived),
+        archivedAt: item.archivedAt || undefined,
+        comments: item.customFields?.comments || undefined,
         // Surface schema-defined custom fields (e.g. github-pr's prNumber) that
         // are otherwise dropped by the known-field whitelist above. Uses the
         // same internal-key filtering as the summary so the bag is clean.
@@ -1679,7 +1820,7 @@ export async function handleTrackerGet(
           type: "text",
           text: JSON.stringify({
             structured,
-            summary: lines.join("\n"),
+            summary: lines.join("\n") + trackerRadarAdvisory(item, workspacePath),
           }),
         },
       ],
@@ -1873,6 +2014,7 @@ export async function handleTrackerCreate(
         isError: true,
       };
     }
+    await pinCitedRevisions(db, workspacePath, id, data, globalRegistry.get(args.type)?.fields ?? []);
 
     const validationResult = globalRegistry.validate(args.type, data);
     if (!validationResult.valid) {
@@ -1915,27 +2057,35 @@ export async function handleTrackerCreate(
     }
 
     // Normalize literal \n sequences to real newlines (MCP tool args may contain escaped sequences)
-    const descriptionText = args.description
+    const descriptionText = typeof args.description === 'string'
       ? args.description.replace(/\\n/g, '\n')
       : null;
-    const contentJson = descriptionText
+    const contentJson = descriptionText !== null
       ? JSON.stringify(descriptionText)
       : null;
 
-    await db.query(
-      `INSERT INTO tracker_items (
+    const creationStatements = [{
+      sql: `INSERT INTO tracker_items (
         id, type, type_tags, data, workspace, document_path, line_number,
         created, updated, last_indexed, sync_status,
-        content, archived, source, source_ref
-      ) VALUES ($1, $2, $3, $4, $5, '', NULL, NOW(), NOW(), NOW(), $6, $7, FALSE, $8, $9)`,
-      [id, args.type, typeTags, JSON.stringify(data), workspacePath, syncStatus, contentJson, originSource, originSourceRef]
-    );
+        content, archived, source, source_ref, body_version
+      ) VALUES ($1, $2, $3, $4, $5, '', NULL, NOW(), NOW(), NOW(), $6, $7, FALSE, $8, $9, $10)`,
+      params: [id, args.type, typeTags, JSON.stringify(data), workspacePath, syncStatus, contentJson, originSource, originSourceRef, contentJson === null ? 0 : 1],
+    }];
+    if (contentJson !== null) creationStatements.push(initialTrackerBodyCache(id, contentJson));
+    const tooLarge = shouldSyncTrackerItem(sharingPolicy, data) ? trackerItemTooLargeForRoom(rowToTrackerItem({
+      id, type: args.type, type_tags: typeTags, data: JSON.stringify(data), workspace: workspacePath,
+      source: originSource, source_ref: originSourceRef, created: new Date(), updated: new Date(), last_indexed: new Date(),
+    })) : null;
+    if (tooLarge) return tooLargeToShareToolResult('tracker_create', tooLarge);
+    await db.runTransaction(creationStatements);
+    if (descriptionText !== null) await recordTypedPageBodySnapshot(id, args.type, descriptionText);
 
     // Number the row before it is read back, so an agent-created item reports
     // its key in this tool's own result rather than only after the next list
     // sweep. Failure is not fatal -- an unnumbered item still works, and the
     // list will pick it up.
-    if (workspacePath) {
+    if (workspacePath && typeHasLocalNumbers(args.type)) {
       try {
         await assignLocalKeysToRows(db, workspaceLocalKeyStore, workspacePath, [id]);
       } catch (error) {
@@ -1961,68 +2111,15 @@ export async function handleTrackerCreate(
       }
     }
 
-    // Route the description through the canonical body path so it shows up
-    // in the editor when the item is opened. The initial INSERT above sets
-    // `content` for backward compatibility, but that column alone is not
-    // enough: without this block `body_version` stays at 0,
-    // `tracker_body_cache` is never populated, and the live
-    // DocumentRoom Y.Doc is never seeded -- so the collaborative editor
-    // mounts empty. This mirrors `ElectronDocumentService.updateTrackerItemContent`
-    // inline so we do not depend on `documentServices` having an entry for
-    // this workspace (which is empty after a main-process hot-reload until
-    // the first window finishes wiring up).
+    // The body and cache committed with the item. Only published team items
+    // may contact the body room; personal items and team drafts stay local.
     let bodyWriteResult: BodyWriteFailure | undefined;
-    if (descriptionText) {
-      let localSnapshotStored = false;
+    if (descriptionText !== null && shouldSyncTrackerItem(sharingPolicy, data)) {
       try {
-        const bodyContentJson = JSON.stringify(descriptionText);
-        const bumpResult = await db.query<{ body_version: string | number | null }>(
-          `UPDATE tracker_items
-              SET content = $1,
-                  body_version = COALESCE(body_version, 0) + 1,
-                  updated = NOW()
-            WHERE id = $2
-            RETURNING body_version`,
-          [bodyContentJson, id]
-        );
-        const newBodyVersion = Number(bumpResult.rows[0]?.body_version ?? 0);
-        if (newBodyVersion > 0) {
-          await db.query(
-            `INSERT INTO tracker_body_cache (item_id, body_version, content, cached_at)
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (item_id, body_version) DO NOTHING`,
-            [id, newBodyVersion, bodyContentJson]
-          );
-        }
-        localSnapshotStored = true;
-
-        // Re-sync metadata so peers learn the bodyVersion bump (cold readers
-        // invalidate their cache and refetch from `tracker_body_cache`).
-        if (shouldSyncTrackerItem(sharingPolicy, data) && isTrackerSyncActive(workspacePath)) {
-          createdRow = await resolveTrackerRowByReference(db, id, workspacePath);
-          createdItem = createdRow ? rowToTrackerItem(createdRow) : createdItem;
-          if (createdItem) {
-            await syncTrackerItem(createdItem);
-          }
-        }
-
-        // Seed the live DocumentRoom Y.Doc so the collaborative editor mounts
-        // with content instead of waiting on a never-bootstrapped room. No-op
-        // for local trackers (resolveConfig returns null without a team).
-        const collaborativeBodyStored = await applyHeadlessBodyMarkdown(workspacePath, id, descriptionText);
-        if (
-          collaborativeBodyStored === false &&
-          shouldSyncTrackerItem(sharingPolicy, data)
-        ) {
-          bodyWriteResult = bodyWriteFailure(true);
-          console.error('[MCP Server] tracker_create collaborative body write failed:', {
-            itemId: id,
-            workspacePath,
-          });
-        }
+        await initializeHeadlessBodyMarkdown(workspacePath, id, descriptionText);
       } catch (bodyError) {
-        bodyWriteResult = bodyWriteFailure(localSnapshotStored);
-        console.error('[MCP Server] tracker_create body write failed:', bodyError);
+        bodyWriteResult = bodyWriteFailure(true);
+        console.error('[MCP Server] tracker_create collaborative body write failed:', { itemId: id, workspacePath, error: bodyError });
       }
     }
 
@@ -2069,6 +2166,21 @@ export async function handleTrackerCreate(
       }
     }
 
+    // This tool inserts into `tracker_items` directly rather than going through
+    // `createNativeTrackerItem`, so it owns its own edge projection: an agent
+    // can set `subject`/`object` in the same call that creates the item. Last,
+    // after every read this handler depends on, because the projection is
+    // derived state and nothing above it should be able to see a partial one.
+    await reindexItemRelationshipsAfterWrite(
+      workspacePath,
+      id,
+      data,
+      globalRegistry.get(args.type)?.fields ?? [],
+      new Date().toISOString(),
+      undefined,
+      descriptionText ?? undefined,
+    );
+
     const createdRef = createdItem || { id };
     const createdKeyContext = {
       published: shouldSyncTrackerItem(sharingPolicy, data),
@@ -2100,7 +2212,7 @@ export async function handleTrackerCreate(
           type: "text",
           text: JSON.stringify({
             structured,
-            summary: `Created tracker item:\n- **Type**: ${args.type}\n- **Title**: ${data[titleField]}\n- **Status**: ${data[statusField]}\n- **Ref**: ${getTrackerDisplayRef(createdRef)}\n- **ID**: ${id}${issueKeyAvailabilityNote(createdRef, createdKeyContext)}${bodyWriteResult ? `\n- **Body write**: Failed — ${bodyWriteResult.message}` : ''}`,
+            summary: `Created tracker item:\n- **Type**: ${args.type}\n- **Title**: ${data[titleField]}\n- **Status**: ${data[statusField]}\n- **Ref**: ${getTrackerDisplayRef(createdRef)}\n- **ID**: ${id}${issueKeyAvailabilityNote(createdRef, createdKeyContext)}${bodyWriteResult ? `\n- **Body write**: Failed — ${bodyWriteResult.message}` : ''}${trackerRadarAdvisory(createdItem, workspacePath)}`,
           }),
         },
       ],
@@ -2126,22 +2238,7 @@ export async function handleTrackerUpdate(
   sessionId?: string | undefined
 ): Promise<McpToolResult> {
   try {
-    // NIM-438: a description delivered via the generic fields bag
-    // (fields.description) must update the canonical visible body the same way
-    // a top-level `description` does. The body-seed path keys off
-    // args.description, so hoist fields.description up to the top level (and
-    // drop it from the bag to avoid a redundant data.description write) before
-    // any field processing runs.
-    if (
-      args &&
-      args.fields &&
-      typeof args.fields === 'object' &&
-      args.fields.description !== undefined &&
-      args.description === undefined
-    ) {
-      args.description = args.fields.description;
-      delete args.fields.description;
-    }
+    prepareTrackerUpdateInput(args);
 
     // Make custom (.nimbalyst/trackers/*.yaml) types visible so primaryType
     // reassignment and schema validation accept them (NIM-760).
@@ -2318,7 +2415,10 @@ export async function handleTrackerUpdate(
           }
         }
 
-        const validationResult = globalRegistry.validate(item.type, data);
+        const validationResult = scopeValidationToChanges(
+          globalRegistry.validate(item.type, data),
+          [...Object.keys(changes), ...Object.keys(fileUpdates)],
+        );
         if (!validationResult.valid) {
           return buildTrackerSchemaValidationError('tracker_update', item.type, validationResult.errors);
         }
@@ -2335,6 +2435,8 @@ export async function handleTrackerUpdate(
           });
         }
 
+        const tooLarge = row ? sharedTrackerItemTooLarge(rowToTrackerItem({ ...row, data: JSON.stringify(data) }), workspacePath) : null;
+        if (tooLarge) return tooLargeToShareToolResult('tracker_update', tooLarge);
         if (Object.keys(fileUpdates).length > 0) {
           await docService.updateTrackerItemInFile(publicTrackerId, fileUpdates);
         }
@@ -2378,21 +2480,10 @@ export async function handleTrackerUpdate(
         }
 
         if (row && workspacePath) {
-          const updateModel = globalRegistry.get(refreshedItem.type);
-          const sharingPolicy = getEffectiveTrackerSharingPolicy(workspacePath, refreshedItem.type, updateModel);
+          const sharingPolicy = getEffectiveTrackerSharingPolicy(workspacePath, refreshedItem.type, globalRegistry.get(refreshedItem.type));
           if (shouldSyncTrackerItem(sharingPolicy, refreshedItem)) {
-            if (isTrackerSyncActive(workspacePath)) {
-              try {
-                await syncTrackerItem(refreshedItem);
-              } catch (syncError) {
-                console.error('[MCP Server] tracker_update sync failed:', syncError);
-              }
-            } else {
-              await db.query(
-                `UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`,
-                [row.id]
-              );
-            }
+            const pushed = { ...refreshedItem, workspace: workspacePath };
+            await pushSharedTrackerItem(pushed, () => db.query(`UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`, [row!.id]), '[MCP Server] tracker_update');
           }
         }
 
@@ -2443,7 +2534,7 @@ export async function handleTrackerUpdate(
                   ...updateSummaryParts,
                 ].join('\n') + issueKeyAvailabilityNote(refreshedItem, {
                   canIssueKeys: isTrackerSyncConfigured(workspacePath),
-                }),
+                }) + trackerRadarAdvisory(refreshedItem, workspacePath),
               }),
             },
           ],
@@ -2577,8 +2668,15 @@ export async function handleTrackerUpdate(
           isError: true,
         };
       }
+      await pinCitedRevisions(db, row.workspace, row.id, data, globalRegistry.get(row.type)?.fields ?? []);
 
-      const validationResult = globalRegistry.validate(row.type, data);
+      // A new type's schema applies to every field; otherwise the update answers
+      // only for what it writes, so an item that predates a required field can
+      // still be archived or edited.
+      const wholeItem = globalRegistry.validate(row.type, data);
+      const validationResult = primaryTypeChanged
+        ? wholeItem
+        : scopeValidationToChanges(wholeItem, [...Object.keys(changes), ...explicitlyWrittenFields, ...explicitlyUnsetFields]);
       if (!validationResult.valid) {
         return buildTrackerSchemaValidationError('tracker_update', row.type, validationResult.errors);
       }
@@ -2625,6 +2723,8 @@ export async function handleTrackerUpdate(
         });
       }
 
+      const tooLarge = sharedTrackerItemTooLarge(rowToTrackerItem({ ...row, data: JSON.stringify(data) }), workspacePath);
+      if (tooLarge) return tooLargeToShareToolResult('tracker_update', tooLarge);
       if (primaryTypeChanged) {
         await db.query(
           `UPDATE tracker_items SET type = $1 WHERE id = $2`,
@@ -2673,14 +2773,12 @@ export async function handleTrackerUpdate(
         );
         const newBodyVersion = Number(bumpResult.rows[0]?.body_version ?? 0);
         if (newBodyVersion > 0) {
-          await db.query(
-            `INSERT INTO tracker_body_cache (item_id, body_version, content, cached_at)
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (item_id, body_version) DO NOTHING`,
-            [row.id, newBodyVersion, contentJson]
-          );
+          await writeTrackerBodyCacheVersion(db, row.id, newBodyVersion, contentJson);
         }
         localSnapshotStored = true;
+        // This write bypasses updateTrackerItemContent, which carries the
+        // recorder for every other body save; keep the replaced body too.
+        await recordTypedPageBodySnapshot(row.id, row.type, normalizedContent, { replaced: row.content });
 
         if (workspacePath) {
           try {
@@ -2750,21 +2848,10 @@ export async function handleTrackerUpdate(
       const refreshedRow = await resolveTrackerRowByReference(db, row.id, workspacePath);
       const effectiveWorkspacePath = refreshedRow?.workspace || workspacePath;
       if (refreshedRow && effectiveWorkspacePath) {
-        const updateModel = globalRegistry.get(refreshedRow.type);
-        const sharingPolicy = getEffectiveTrackerSharingPolicy(effectiveWorkspacePath, refreshedRow.type, updateModel);
-        if (shouldSyncTrackerItem(sharingPolicy, rowToTrackerItem(refreshedRow))) {
-          if (isTrackerSyncActive(effectiveWorkspacePath)) {
-            try {
-              await syncTrackerItem(rowToTrackerItem(refreshedRow));
-            } catch (syncError) {
-              console.error('[MCP Server] tracker_update sync failed:', syncError);
-            }
-          } else {
-            await db.query(
-              `UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`,
-              [row.id]
-            );
-          }
+        const sharingPolicy = getEffectiveTrackerSharingPolicy(effectiveWorkspacePath, refreshedRow.type, globalRegistry.get(refreshedRow.type));
+        const refreshedItem = rowToTrackerItem(refreshedRow);
+        if (shouldSyncTrackerItem(sharingPolicy, refreshedItem)) {
+          await pushSharedTrackerItem({ ...refreshedItem, workspace: effectiveWorkspacePath },() => db.query(`UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`, [row.id]), '[MCP Server] tracker_update');
         }
       }
       // Defect A (NIM-1305): materialize inverse relationship fields on target
@@ -2807,6 +2894,20 @@ export async function handleTrackerUpdate(
         analyticsRow.id,
         analyticsRow.type,
         shouldSyncTrackerItem(analyticsPolicy, rowToTrackerItem(analyticsRow)),
+      );
+
+      // This tool writes `tracker_items` directly, so it owns its own edge
+      // projection for the same reason tracker_create does. Last, after every
+      // read this handler depends on, including the inverse propagation above
+      // which writes its own targets.
+      await reindexItemRelationshipsAfterWrite(
+        row.workspace,
+        row.id,
+        data,
+        globalRegistry.get(row.type)?.fields ?? [],
+        new Date().toISOString(),
+        undefined,
+        args.description !== undefined ? args.description.replace(/\\n/g, '\n') : undefined,
       );
 
       const updateSummaryParts: string[] = [];
@@ -2857,7 +2958,10 @@ export async function handleTrackerUpdate(
             type: "text",
             text: JSON.stringify({
               structured,
-              summary: summaryLines.join("\n"),
+              summary: summaryLines.join("\n") + trackerRadarAdvisory(
+                rowToTrackerItem({ ...row, data }),
+                effectiveWorkspacePath,
+              ),
             }),
           },
         ],
@@ -3290,6 +3394,8 @@ export async function handleTrackerAddComment(
     data.lastModifiedBy = authorIdentity;
     appendActivity(data, authorIdentity, 'commented');
 
+    const tooLarge = sharedTrackerItemTooLarge(rowToTrackerItem({ ...row, data: JSON.stringify(data) }), workspacePath);
+    if (tooLarge) return tooLargeToShareToolResult('tracker_add_comment', tooLarge);
     await db.query(
       `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
       [JSON.stringify(data), row.id]
@@ -3347,7 +3453,7 @@ export async function handleTrackerAddComment(
               commentId,
               author: authorIdentity.displayName,
             },
-            summary: `Added comment to ${getTrackerDisplayRef(commentedRef)} by ${authorIdentity.displayName}${issueKeyAvailabilityNote(commentedRef, { canIssueKeys: isTrackerSyncConfigured(workspacePath) })}`,
+            summary: `Added comment to ${getTrackerDisplayRef(commentedRef)} by ${authorIdentity.displayName}${issueKeyAvailabilityNote(commentedRef, { canIssueKeys: isTrackerSyncConfigured(workspacePath) })}${trackerRadarAdvisory(rowToTrackerItem({ ...row, data }), workspacePath)}`,
           }),
         },
       ],

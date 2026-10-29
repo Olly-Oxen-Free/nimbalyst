@@ -1,3 +1,4 @@
+import { shellCoverageDetails, type ShellCoverageSummary } from '../../../ai/shellTrackingCoverage';
 /**
  * Producer half of the commit-request contract. The consumer half —
  * `isCommitRequestMessage` / `parseCommitRequest` in `../components/CommitRequestCard`
@@ -11,9 +12,17 @@ export type CommitFileStatus = 'added' | 'modified' | 'deleted';
 export interface CommitPromptFile {
   path: string;
   status: CommitFileStatus;
+  /**
+   * The repo that owns this file, when the workspace spans more than one. A
+   * commit cannot cross repos, so the prompt groups on this and asks for one
+   * proposal per repo; a flat list left the agent no way to know it needed
+   * several calls, and the split happened invisibly at execution instead.
+   */
+  repo?: string;
 }
 
 export interface CommitContext {
+  coverage?: ShellCoverageSummary[];
   success: boolean;
   files: CommitPromptFile[];
   scenario: 'single' | 'workstream' | 'worktree';
@@ -34,6 +43,8 @@ export const COMMIT_FILE_LIST_HEADERS = [
 ] as const;
 
 export const COMMIT_FILE_LIST_END = 'End of commit file list.';
+/** Group header for files that belong to no repo when the list spans repos. */
+export const NO_REPOSITORY_GROUP_HEADER = 'Not in any repository:';
 export const COMMIT_FILE_COUNT_PREFIX = 'Commit file count: ';
 
 const CONTROL_CHARACTER_PATTERN = /[\x00-\x1f\x7f]/;
@@ -54,9 +65,41 @@ function formatFileList(files: CommitPromptFile[]): FormattedFileList {
   const safeFiles = files.filter((file) => isCommitPromptSafePath(file.path));
 
   return {
-    fileList: safeFiles.map((file) => `- ${file.path} (${file.status})`).join('\n'),
+    fileList: formatSafeFileRows(safeFiles),
     excludedFileCount: files.length - safeFiles.length,
   };
+}
+
+/**
+ * Distinct repos across a file list, in first-seen order. Files with no `repo`
+ * are ignored: a workspace whose files carry no repo at all is the ordinary
+ * single-repo case and must render exactly as it always has.
+ */
+export function distinctRepos(files: CommitPromptFile[]): string[] {
+  const seen = new Set<string>();
+  for (const file of files) {
+    if (file.repo) seen.add(file.repo);
+  }
+  return [...seen];
+}
+
+function formatSafeFileRows(safeFiles: CommitPromptFile[]): string {
+  const repos = distinctRepos(safeFiles);
+  const row = (file: CommitPromptFile) => `- ${file.path} (${file.status})`;
+
+  // One repo (or none identified) keeps the flat list every existing prompt,
+  // card parser, and test already expects.
+  if (repos.length < 2) {
+    return safeFiles.map(row).join('\n');
+  }
+
+  const grouped = repos.map((repo) => {
+    const rows = safeFiles.filter((file) => file.repo === repo).map(row).join('\n');
+    return `Repository: ${repo}\n${rows}`;
+  });
+  // Files in no repo still have to be listed, or the agent silently loses them.
+  const orphans = safeFiles.filter((file) => !file.repo).map(row).join('\n');
+  return [...grouped, ...(orphans ? [`${NO_REPOSITORY_GROUP_HEADER}\n${orphans}`] : [])].join('\n\n');
 }
 
 function formatFileSection(header: string, files: CommitPromptFile[]): FormattedFileList & { section: string } {
@@ -75,6 +118,18 @@ function formatExcludedFileNotice(excludedFileCount: number): string {
     : '';
 }
 
+/**
+ * Instruction for a file list spanning repos. Empty for the single-repo case,
+ * so an ordinary commit prompt is byte-identical to before.
+ */
+function formatMultiRepoNotice(files: CommitPromptFile[]): string {
+  const repos = distinctRepos(files);
+  if (repos.length < 2) return '';
+  return `\n\nThese files span ${repos.length} git repositories, and a commit cannot cross repositories. ` +
+    'Call developer_git_commit_proposal once per repository, each with only that repository\'s files ' +
+    'and a commit message describing that repository\'s change. A call whose files span repositories is rejected.';
+}
+
 export function buildCommitPrompt({
   commitContext,
   isInWorktree,
@@ -85,6 +140,12 @@ export function buildCommitPrompt({
   workstreamSessionCount?: number;
 }): string {
   let message = COMMIT_PROMPT_PREFIX;
+  const coverageReasons = shellCoverageDetails(commitContext.coverage ?? []);
+  if (coverageReasons.length) {
+    message += '\n\nFile tracking incomplete: ' + coverageReasons.join('; ') + '. ' +
+      'The recorded file list may omit edits. Reconcile your actual work with current diffs and git status before proposing a commit. ' +
+      'Git status does not establish session ownership. Preserve explicitly selected file boundaries and do not include unrelated changes.';
+  }
 
   if (commitContext.success && commitContext.files.length > 0) {
     let formatted: ReturnType<typeof formatFileSection>;
@@ -104,6 +165,7 @@ export function buildCommitPrompt({
       message += formatted.fileList
         ? '\n\nThen call developer_git_commit_proposal with the file list.'
         : '\n\nNo safely representable file paths remain. Do not create a commit proposal.';
+      message += formatMultiRepoNotice(commitContext.files);
       message += '\nDo NOT call get_session_edited_files or get_workstream_edited_files -- the file data is already provided above.';
     } else {
       const scope = commitContext.scenario === 'workstream'
@@ -116,13 +178,13 @@ export function buildCommitPrompt({
       );
       message += `\n\n${formatted.section}`;
       message += formatExcludedFileNotice(formatted.excludedFileCount);
-      message += '\n\nThis list covers safely representable files edited directly. If you ALSO ran commands this session that change files as a side effect ' +
-        '(e.g. npm install rewriting package-lock.json, a build/codegen step, license regeneration), include those changed files too -- ' +
-        'check git status for them. If you ran no such commands, the list above is complete except for any explicitly reported excluded paths; do not go looking. ' +
-        'Either way, do NOT add unrelated uncommitted changes -- other concurrent sessions may have their own work in this repo.';
+      message += '\n\nThis list includes recorded edits and may include inferred shell edits. File links do not establish exclusive ownership of a whole-file diff. ' +
+        'Review the listed diffs against this session\'s work before committing. Shell tracking can miss ambiguous, delayed, or external writes; ' +
+        'if commands changed additional files, check git status for those paths. Do NOT add unrelated changes from other sessions.';
       message += formatted.fileList
         ? '\n\nThen call developer_git_commit_proposal with the file list.'
         : '\n\nNo safely representable file paths remain. Do not create a commit proposal.';
+      message += formatMultiRepoNotice(commitContext.files);
       message += '\nDo NOT call get_session_edited_files or get_workstream_edited_files -- the edited-file data is already provided above.';
     }
   } else if (commitContext.success && commitContext.files.length === 0) {
@@ -164,13 +226,16 @@ export function mapSelectedCommitFiles(files: SelectedCommitFile[]): CommitPromp
   });
 }
 
-export function buildSelectedCommitPrompt(files: CommitPromptFile[]): string {
+export function buildSelectedCommitPrompt(files: CommitPromptFile[], repoPath?: string): string {
   const formatted = formatFileSection('Here are the files selected for this commit:', files);
   let message = COMMIT_PROMPT_PREFIX;
   message += `\n\n${formatted.section}`;
   message += formatExcludedFileNotice(formatted.excludedFileCount);
   message += formatted.fileList
     ? '\n\nCommit exactly these files and add nothing else. Read the diffs for these files before proposing the commit message.' +
+      // The picker chose this repo, so the proposal must target it. Without
+      // saying so the agent can propose files the picker never showed.
+      (repoPath ? `\n\nThese files are all in the repository ${repoPath}. Make one commit proposal for that repository and no other.` : '') +
       '\n\nThen call developer_git_commit_proposal with exactly this file list.'
     : '\n\nNo safely representable file paths remain. Do not create a commit proposal.';
   message += '\nDo NOT call get_session_edited_files or get_workstream_edited_files -- the file data is already provided above.';

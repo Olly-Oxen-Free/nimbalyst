@@ -5,6 +5,7 @@ import type { NewFileType, ExtensionFileType } from './NewFileMenu';
 import { CommonFileActions } from './CommonFileActions';
 import { useFloatingMenu, FloatingPortal, virtualElement } from '../hooks/useFloatingMenu';
 import { historyDialogFileAtom } from '../store';
+import { requestConfirmation } from '../dialogs/requestConfirmation';
 
 interface FileContextMenuProps {
   x: number;
@@ -22,6 +23,16 @@ interface FileContextMenuProps {
   selectedPaths?: Set<string>;
   /** Extension-contributed file types */
   extensionFileTypes?: ExtensionFileType[];
+  /**
+   * This row is a top-level root of a multi-root workspace. Rename and Delete
+   * are suppressed: the row stands for the workspace's membership of that
+   * folder, and "Delete" on it would read as removing it from the workspace
+   * while actually erasing it from disk.
+   */
+  isWorkspaceRoot?: boolean;
+  /** The primary root cannot be detached -- it is the workspace's identity. */
+  isPrimaryRoot?: boolean;
+  onDetachFolder?: (folderPath: string) => void;
 }
 
 export function FileContextMenu({
@@ -38,7 +49,10 @@ export function FileContextMenu({
   onNewFolder,
   onViewWorkspaceHistory,
   selectedPaths,
-  extensionFileTypes = []
+  extensionFileTypes = [],
+  isWorkspaceRoot = false,
+  isPrimaryRoot = false,
+  onDetachFolder,
 }: FileContextMenuProps) {
   const openHistoryDialog = useSetAtom(historyDialogFileAtom);
   const [isRenaming, setIsRenaming] = useState(false);
@@ -94,7 +108,7 @@ export function FileContextMenu({
     }
   };
 
-  const handleDelete = () => {
+  const handleDelete = async () => {
     // Check if we have multiple items selected
     const hasMultipleSelected = selectedPaths && selectedPaths.size > 1;
 
@@ -102,7 +116,13 @@ export function FileContextMenu({
       const selectedArray = Array.from(selectedPaths);
       const confirmMessage = `Are you sure you want to delete ${selectedArray.length} items?`;
 
-      if (window.confirm(confirmMessage)) {
+      const confirmed = await requestConfirmation({
+        title: 'Delete items?',
+        message: confirmMessage,
+        confirmLabel: 'Delete',
+        destructive: true,
+      });
+      if (confirmed) {
         onDeleteMultiple(selectedArray);
         onClose();
       }
@@ -111,7 +131,13 @@ export function FileContextMenu({
         ? `Are you sure you want to delete the folder "${fileName}" and all its contents?`
         : `Are you sure you want to delete "${fileName}"?`;
 
-      if (window.confirm(confirmMessage)) {
+      const confirmed = await requestConfirmation({
+        title: fileType === 'directory' ? 'Delete folder?' : 'Delete file?',
+        message: confirmMessage,
+        confirmLabel: 'Delete',
+        destructive: true,
+      });
+      if (confirmed) {
         onDelete(filePath);
         onClose();
       }
@@ -253,25 +279,44 @@ export function FileContextMenu({
           onClose={onClose}
           menuItemClass={menuItemClasses}
           separatorClass={separatorClasses}
+          isDirectory={fileType === 'directory'}
         />
 
-        <div className={separatorClasses} />
+        {isWorkspaceRoot ? (
+          !isPrimaryRoot && onDetachFolder && (
+            <>
+              <div className={separatorClasses} />
+              <div
+                className={menuItemClasses}
+                data-testid="context-menu-detach-folder"
+                onClick={() => { onDetachFolder(filePath); onClose(); }}
+              >
+                <MaterialSymbol icon="link_off" size={18} />
+                <span>Detach Folder from Workspace</span>
+              </div>
+            </>
+          )
+        ) : (
+          <>
+            <div className={separatorClasses} />
 
-        <div className={menuItemClasses} onClick={handleRenameClick}>
-          <MaterialSymbol icon="edit" size={18} />
-          <span>Rename</span>
-        </div>
+            <div className={menuItemClasses} onClick={handleRenameClick}>
+              <MaterialSymbol icon="edit" size={18} />
+              <span>Rename</span>
+            </div>
 
-        <div className={separatorClasses} />
+            <div className={separatorClasses} />
 
-        <div
-          className={dangerItemClasses}
-          data-testid="context-menu-delete"
-          onClick={handleDelete}
-        >
-          <MaterialSymbol icon="delete" size={18} />
-          <span>Delete</span>
-        </div>
+            <div
+              className={dangerItemClasses}
+              data-testid="context-menu-delete"
+              onClick={handleDelete}
+            >
+              <MaterialSymbol icon="delete" size={18} />
+              <span>Delete</span>
+            </div>
+          </>
+        )}
       </div>
     </FloatingPortal>
   );

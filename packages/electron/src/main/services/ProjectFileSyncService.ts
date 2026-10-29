@@ -15,15 +15,17 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { logger } from '../utils/logger';
-import { ProjectSyncProvider, type ProjectSyncManifestFile, type ProjectSyncResponse, type ProjectSyncFileUpdate } from '@nimbalyst/runtime/sync';
+import { ProjectSyncProvider, type ProjectSyncManifestFile, type ProjectSyncResponse, type ProjectSyncFileUpdate, type ProjectFilePushOutcome } from '@nimbalyst/runtime/sync';
 import { getPersonalDocSyncConfig } from './SyncManager';
 import { timeStartupPhase } from '../utils/startupTiming';
 import { database } from '../database/PGLiteDatabaseWorker';
 import { dirtyEditorRegistry } from './DirtyEditorRegistry';
 import { getPersonalSessionJwt } from './StytchAuthService';
-import { hashProjectFiles } from './ProjectManifestHasher';
-
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+import { hashProjectFiles, scanProjectSyncCandidates } from './ProjectManifestHasher';
+import { exceedsProjectSyncLimit, OversizedFileWarnings, projectSyncTitle, storedSyncIds } from './projectFileSyncLimits';
+import { keepDivergedRemoteCopy } from './projectFileSyncConflicts';
+import { isInWiki, isProjectSyncPath, isWikiMarkerPath, PROJECT_SYNC_CANDIDATES, ProjectSyncWikiRules, wikiMarkerFirst } from './sync/projectSyncWikiRules';
+import { parseDiskStamp, persistDiskStamps, stampMatches, type DiskStamp, type ScannedFile } from './projectFileSyncDiskCache';
 
 interface SyncedFileState {
   syncId: string;
@@ -31,18 +33,36 @@ interface SyncedFileState {
   lastSyncedMtime: number;
 }
 
+/** What writeRemoteFileToDisk did with one offered file; logged per sync response. */
+type RemoteWriteOutcome =
+  | 'written' | 'in-sync' | 'not-sync-path' | 'deferred-dirty'
+  | 'kept-local-newer' | 'kept-local-diverged' | 'moved-away' | 'deleted-locally' | 'failed';
+
 export class ProjectFileSyncService {
   private provider: ProjectSyncProvider | null = null;
   private projectStates = new Map<string, Map<string, SyncedFileState>>(); // projectId -> (syncId -> state)
+  // projectId -> (syncId -> hash of the bytes on disk at a size + mtime). Lets a
+  // manifest build skip files that have not moved; see projectFileSyncDiskCache.
+  private diskStamps = new Map<string, Map<string, DiskStamp>>();
   private recentlyWrittenFiles = new Set<string>(); // absolute paths of files we just wrote from remote
   private writeSuppressionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // Remote writes held back because the target is open in a dirty editor; keyed
   // by absolute path, latest update wins. Flushed when the editor becomes clean.
   private deferredRemoteWrites = new Map<string, { projectId: string; workspacePath: string; file: ProjectSyncFileUpdate }>();
+  private sweepListeners = new Set<(projectId: string, filePaths: string[]) => void>();
   // Remote deletes held back because the target is open in a dirty editor; keyed
   // by absolute path. Resolved when the editor becomes clean.
   private deferredRemoteDeletes = new Map<string, { projectId: string; workspacePath: string; syncId: string; filePath: string }>();
   private cleanUnsubscribe: (() => void) | null = null;
+  private oversizedWarnings = new OversizedFileWarnings();
+  private wikiRules = new ProjectSyncWikiRules({
+    baselineHash: (projectId, syncId) => this.projectStates.get(projectId)?.get(syncId)?.contentHash,
+    forget: async (projectId, syncId, filePath) => {
+      this.suppressFileWatcherEcho(filePath);
+      this.fileMapFor(projectId)?.fileMap.delete(syncId);
+      await this.deleteBaseline(projectId, syncId);
+    },
+  });
 
   constructor() {
     // When an editor saves or closes, retry any remote write/delete we deferred
@@ -124,14 +144,13 @@ export class ProjectFileSyncService {
       // which files diverged locally before this restart (NIM-853, Layer 3).
       await this.loadBaseline(encryptedProjectId);
 
-      // Initial sweep: scan + hash current disk, refresh the file-map, and seed a
-      // baseline only for files with no persisted one. Timed separately because
-      // buildManifest (read + sha256 every .md) dominates startup on large projects.
-      const manifest = await timeStartupPhase(
+      // Initial sweep: scan current disk (hashing only files whose size or mtime
+      // moved), refresh the file-map, and seed a baseline only for files with no
+      // persisted one. buildManifest logs its rehashed/cached counts.
+      await timeStartupPhase(
         `ProjectFileSync.buildManifest(${projectName})`,
         () => this.buildManifest(workspacePath, encryptedProjectId, { seedBaseline: true }),
       );
-      logger.main.info(`[ProjectFileSync] Found ${manifest.length} .md files`);
 
       // Connect with a manifest *builder* (not a static array): every reconnect
       // re-announces current disk state so the server never compares against a
@@ -141,7 +160,7 @@ export class ProjectFileSyncService {
         `ProjectFileSync.connect(${projectName})`,
         () => this.provider!.connect(
           encryptedProjectId,
-          () => this.buildManifest(workspacePath, encryptedProjectId, { seedBaseline: false }),
+          ({ fullRehash }) => this.buildManifest(workspacePath, encryptedProjectId, { seedBaseline: false, fullRehash }),
         ),
       );
     } catch (err) {
@@ -157,13 +176,17 @@ export class ProjectFileSyncService {
    * @param opts.seedBaseline when true (startup only), also seed the in-memory
    *   last-synced baseline from current disk. Reconnects pass false so an
    *   existing baseline (which may reflect locally-diverged content) is kept.
+   * @param opts.fullRehash re-read every file instead of reusing the hash of a
+   *   file whose size and mtime have not moved. Only an explicit resync asks.
    */
   private async buildManifest(
     workspacePath: string,
     encryptedProjectId: string,
-    opts: { seedBaseline: boolean },
+    opts: { seedBaseline: boolean; fullRehash?: boolean },
   ): Promise<ProjectSyncManifestFile[]> {
-    const mdFiles = await this.scanMarkdownFiles(workspacePath);
+    const startedAt = Date.now();
+    const scanned = await this.scanSyncFiles(workspacePath);
+    const mdFiles = scanned.map((f) => f.filePath);
     const manifest: ProjectSyncManifestFile[] = [];
 
     // Ensure the file-map cache exists for this project (syncId -> absolutePath).
@@ -180,25 +203,44 @@ export class ProjectFileSyncService {
       this.projectStates.set(encryptedProjectId, baseline);
     }
 
-    // Read + sha256 every file on a worker thread. This loop used to do both
-    // inline on the main-process event loop (~22s blocked on a 1531-file
-    // project, every startup and every reconnect). Only digests come back, so
-    // file contents never cross the thread boundary.
-    const hashed = await hashProjectFiles(mdFiles);
+    // A file whose size and mtime match its stamp reuses the stamped hash; only
+    // the rest are read and hashed.
+    const stamps = this.diskStampsFor(encryptedProjectId);
+    const entries = scanned.map((file) => {
+      const syncId = this.syncIdFromPath(path.relative(workspacePath, file.filePath));
+      const stamp = stamps.get(syncId);
+      return { file, syncId, cachedHash: !opts.fullRehash && stampMatches(stamp, file) ? stamp.hash : undefined };
+    });
+    const toHash = entries.filter((e) => e.cachedHash === undefined).map((e) => e.file.filePath);
 
-    for (const entry of hashed) {
-      const filePath = entry.filePath;
+    // Read + sha256 on a worker thread. Only digests come back, so file
+    // contents never cross the thread boundary.
+    const hashedByPath = new Map((await hashProjectFiles(toHash)).map((h) => [h.filePath, h]));
+    const freshStamps: Array<{ syncId: string; stamp: DiskStamp }> = [];
+
+    for (const { file, syncId, cachedHash } of entries) {
+      const filePath = file.filePath;
       try {
-        if (entry.error || !entry.contentHash || entry.lastModifiedAt == null) {
-          // Same outcome as the previous per-file try/catch: log and skip, so a
-          // single unreadable file never truncates the manifest.
-          logger.main.error(`[ProjectFileSync] Failed to process ${filePath}: ${entry.error ?? 'no hash'}`);
-          continue;
+        let contentHash: string;
+        let lastModifiedAt: number;
+        if (cachedHash !== undefined) {
+          contentHash = cachedHash;
+          lastModifiedAt = file.mtime;
+        } else {
+          const entry = hashedByPath.get(filePath);
+          if (!entry || entry.error || !entry.contentHash || entry.lastModifiedAt == null) {
+            // Log and skip, so a single unreadable file never truncates the manifest.
+            logger.main.error(`[ProjectFileSync] Failed to process ${filePath}: ${entry?.error ?? 'no hash'}`);
+            continue;
+          }
+          contentHash = entry.contentHash;
+          lastModifiedAt = entry.lastModifiedAt;
+          // The worker stats after reading. Only stamp when that mtime equals the
+          // scan's, so the hash belongs to the size + mtime it is stored under.
+          if (lastModifiedAt === file.mtime) {
+            freshStamps.push({ syncId, stamp: { hash: contentHash, size: file.size, mtime: file.mtime } });
+          }
         }
-        const relativePath = path.relative(workspacePath, filePath);
-        const syncId = this.syncIdFromPath(relativePath);
-        const contentHash = entry.contentHash;
-        const lastModifiedAt = entry.lastModifiedAt;
 
         manifest.push({ syncId, contentHash, lastModifiedAt, hasYjs: false, yjsSeq: 0 });
         cache.fileMap.set(syncId, filePath);
@@ -214,7 +256,29 @@ export class ProjectFileSyncService {
       }
     }
 
+    await this.recordDiskStamps(encryptedProjectId, freshStamps);
+    logger.main.info(
+      `[ProjectFileSync] buildManifest(${path.basename(workspacePath)}): ${manifest.length} files, ${toHash.length} rehashed, ${entries.length - toHash.length} cached${opts.fullRehash ? ' (full rehash)' : ''} in ${Date.now() - startedAt}ms`,
+    );
+
+    for (const listener of this.sweepListeners) listener(encryptedProjectId, mdFiles);
     return manifest;
+  }
+
+  /** Called with the files every sweep (startup and each reconnect) found. Returns the unsubscribe. */
+  onSwept(listener: (encryptedProjectId: string, filePaths: string[]) => void): () => void {
+    this.sweepListeners.add(listener);
+    return () => this.sweepListeners.delete(listener);
+  }
+
+  /**
+   * The wiki's marker just appeared here, so tables the server offered while it
+   * was missing were refused. Ask again; they return through the normal path.
+   */
+  resync(encryptedProjectId: string, opts: { fullRehash?: boolean } = {}): void {
+    void (opts.fullRehash
+      ? this.provider?.resync(encryptedProjectId, { fullRehash: true })
+      : this.provider?.resync(encryptedProjectId));
   }
 
   /**
@@ -226,17 +290,36 @@ export class ProjectFileSyncService {
     // Suppress echoes from files we just wrote from remote
     if (this.recentlyWrittenFiles.has(filePath)) return;
 
-    // Only sync .md files
-    if (!filePath.endsWith('.md')) return;
+    if (!isProjectSyncPath(filePath, workspacePath)) return;
 
     try {
       const relativePath = path.relative(workspacePath, filePath);
       const syncId = this.syncIdFromPath(relativePath);
-      const content = await fs.readFile(filePath, 'utf-8');
       const stat = await fs.stat(filePath);
-      const title = path.basename(filePath, '.md');
+      if (exceedsProjectSyncLimit(stat.size, relativePath)) {
+        this.oversizedWarnings.warn(filePath, stat.size);
+        return;
+      }
+      // Stat came before the read, so if the file changes in between, the stamp
+      // carries the older mtime and the next manifest build rehashes it.
+      const content = await fs.readFile(filePath, 'utf-8');
+      const title = projectSyncTitle(filePath);
+      const stamp: DiskStamp = { hash: this.sha256(content), size: stat.size, mtime: Math.floor(stat.mtimeMs) };
 
-      await this.provider.pushFileContent(
+      // Register newly-created files in the file map so remote deletes/updates
+      // from mobile can be applied to the right local path. The map is only
+      // seeded at startup (buildManifest), so files created after the sweep
+      // would otherwise be invisible to round-trip handling.
+      this.fileMapFor(encryptedProjectId)?.fileMap.set(syncId, filePath);
+
+      // A save that left the content at the agreed baseline (touch, format-on-
+      // save with no change, a re-save) has nothing for the server.
+      if (this.projectStates.get(encryptedProjectId)?.get(syncId)?.contentHash === stamp.hash) {
+        await this.recordDiskStamps(encryptedProjectId, [{ syncId, stamp }]);
+        return;
+      }
+
+      const outcome = await this.provider.pushFileContent(
         encryptedProjectId,
         syncId,
         content,
@@ -245,18 +328,10 @@ export class ProjectFileSyncService {
         Math.floor(stat.mtimeMs)
       );
 
-      // The pushed content is now the agreed baseline (durable so the conflict
-      // guard survives a restart).
-      await this.setBaseline(encryptedProjectId, syncId, this.sha256(content), Math.floor(stat.mtimeMs));
-
-      // Register newly-created files in the file map so remote deletes/updates
-      // from mobile can be applied to the right local path. The map is only
-      // seeded at startup (buildManifest), so files created after the sweep
-      // would otherwise be invisible to round-trip handling.
-      const cache = (this as any)._fileMapCache?.get(encryptedProjectId) as
-        | { fileMap: Map<string, string>; workspacePath: string }
-        | undefined;
-      cache?.fileMap.set(syncId, filePath);
+      // Content the server stored is the agreed baseline (durable so the
+      // conflict guard survives a restart).
+      await this.setBaselinesForStored(encryptedProjectId, outcome, [{ syncId, content, lastModifiedAt: Math.floor(stat.mtimeMs) }]);
+      await this.recordDiskStamps(encryptedProjectId, [{ syncId, stamp }]);
     } catch (err) {
       logger.main.error(`[ProjectFileSync] Failed to push file save:`, err);
     }
@@ -284,8 +359,7 @@ export class ProjectFileSyncService {
     if (!this.provider) return;
     this.provider.deleteFile(encryptedProjectId, syncId);
     void this.deleteBaseline(encryptedProjectId, syncId);
-    const cache = (this as any)._fileMapCache?.get(encryptedProjectId) as { fileMap: Map<string, string> } | undefined;
-    cache?.fileMap.delete(syncId);
+    this.fileMapFor(encryptedProjectId)?.fileMap.delete(syncId);
   }
 
   /**
@@ -306,6 +380,7 @@ export class ProjectFileSyncService {
   disconnectProject(encryptedProjectId: string): void {
     this.provider?.disconnect(encryptedProjectId);
     this.projectStates.delete(encryptedProjectId);
+    this.diskStamps.delete(encryptedProjectId);
   }
 
   /**
@@ -314,6 +389,7 @@ export class ProjectFileSyncService {
   shutdown(): void {
     this.provider?.disconnectAll();
     this.projectStates.clear();
+    this.diskStamps.clear();
     for (const timer of this.writeSuppressionTimers.values()) {
       clearTimeout(timer);
     }
@@ -328,7 +404,10 @@ export class ProjectFileSyncService {
   // MARK: - Sync Response Handling
 
   private async handleSyncResponse(projectId: string, response: ProjectSyncResponse): Promise<void> {
-    const cache = (this as any)._fileMapCache?.get(projectId) as { fileMap: Map<string, string>; workspacePath: string } | undefined;
+    // Pushes whose ack was lost and which the server says it holds are agreed
+    // content; settle them before the diff below consults the baseline.
+    for (const p of response.confirmedPushes ?? []) await this.setBaseline(projectId, p.syncId, p.contentHash, p.lastModifiedAt);
+    const cache = this.fileMapFor(projectId);
     if (!cache) return;
 
     const startedAt = Date.now();
@@ -340,12 +419,19 @@ export class ProjectFileSyncService {
 
     // Write updated/new files from server to disk
     const writePhaseStart = Date.now();
-    const filesToWrite = [...response.updatedFiles, ...response.newFiles];
+    const filesToWrite = wikiMarkerFirst([...response.updatedFiles, ...response.newFiles], cache.workspacePath);
+    const outcomes = new Map<RemoteWriteOutcome, string[]>();
     for (const file of filesToWrite) {
-      await this.writeRemoteFileToDisk(projectId, cache.workspacePath, file);
+      const outcome = await this.writeRemoteFileToDisk(projectId, cache.workspacePath, file);
+      outcomes.set(outcome, [...(outcomes.get(outcome) ?? []), file.syncId]);
     }
     if (filesToWrite.length > 0) {
-      logger.main.info(`[ProjectFileSync] handleSyncResponse wrote ${filesToWrite.length} remote files in ${Date.now() - writePhaseStart}ms`);
+      // Per outcome, with the syncIds of everything not written. A set of files
+      // the server re-offers on every reconnect shows up here as the same ids.
+      const summary = [...outcomes].map(([outcome, ids]) =>
+        outcome === 'written' ? `written=${ids.length}` : `${outcome}=${ids.length} [${ids.slice(0, 50).join(',')}${ids.length > 50 ? ',...' : ''}]`,
+      ).join(' ');
+      logger.main.info(`[ProjectFileSync] handleSyncResponse offered ${filesToWrite.length} remote files in ${Date.now() - writePhaseStart}ms: ${summary}`);
     }
 
     // Delete files that were deleted on server
@@ -381,7 +467,7 @@ export class ProjectFileSyncService {
           const content = await fs.readFile(filePath, 'utf-8');
           const stat = await fs.stat(filePath);
           const relativePath = path.relative(cache.workspacePath, filePath);
-          const title = path.basename(filePath, '.md');
+          const title = projectSyncTitle(filePath);
 
           filesToPush.push({
             syncId,
@@ -400,14 +486,13 @@ export class ProjectFileSyncService {
 
       if (filesToPush.length > 0) {
         const networkStart = Date.now();
-        await this.provider!.pushFileBatch(projectId, filesToPush);
-        // The server requested these because the client's copy was newer; after
-        // pushing, both sides agree on the local content. Advance the baseline so
-        // a later legitimate remote edit isn't wrongly rejected as locally-diverged.
-        for (const f of filesToPush) {
-          await this.setBaseline(projectId, f.syncId, this.sha256(f.content), f.lastModifiedAt);
-        }
-        logger.main.info(`[ProjectFileSync] Pushed ${filesToPush.length} files to server in ${Date.now() - networkStart}ms`);
+        const outcome = await this.provider!.pushFileBatch(projectId, filesToPush);
+        // The server requested these because the client's copy was newer; once
+        // it stores them, both sides agree on the local content. Advance the
+        // baseline so a later legitimate remote edit isn't wrongly rejected as
+        // locally-diverged.
+        await this.setBaselinesForStored(projectId, outcome, filesToPush);
+        logger.main.info(`[ProjectFileSync] Pushed ${filesToPush.length} files to server (${outcome.stored.length} stored, ${outcome.rejected.length} rejected, ${outcome.unconfirmed.length} unconfirmed) in ${Date.now() - networkStart}ms`);
       }
     }
 
@@ -418,14 +503,14 @@ export class ProjectFileSyncService {
 
   private async handleRemoteFileUpdate(_projectId: string, file: ProjectSyncFileUpdate): Promise<void> {
     // Find the workspace path for this project
-    const cache = (this as any)._fileMapCache?.get(_projectId) as { fileMap: Map<string, string>; workspacePath: string } | undefined;
+    const cache = this.fileMapFor(_projectId);
     if (!cache) return;
 
     await this.writeRemoteFileToDisk(_projectId, cache.workspacePath, file);
   }
 
   private async handleRemoteFileDelete(_projectId: string, syncId: string): Promise<void> {
-    const cache = (this as any)._fileMapCache?.get(_projectId) as { fileMap: Map<string, string>; workspacePath: string } | undefined;
+    const cache = this.fileMapFor(_projectId);
     if (!cache) return;
 
     const filePath = cache.fileMap.get(syncId);
@@ -450,18 +535,47 @@ export class ProjectFileSyncService {
     logger.main.info(`[ProjectFileSync] Deferring remote delete of dirty file: ${path.basename(filePath)}`);
   }
 
-  /** Unlink a file for a remote delete and clear its baseline + file-map entry. */
-  private async applyRemoteDelete(projectId: string, syncId: string, filePath: string): Promise<void> {
-    try {
-      this.suppressFileWatcherEcho(filePath);
-      await fs.unlink(filePath);
-      logger.main.info(`[ProjectFileSync] Remote delete: ${path.basename(filePath)}`);
-    } catch {
-      // File might already be gone.
-    }
-    await this.deleteBaseline(projectId, syncId);
-    const cache = (this as any)._fileMapCache?.get(projectId) as { fileMap: Map<string, string> } | undefined;
-    cache?.fileMap.delete(syncId);
+  /**
+   * Handle a remote delete. Project sync does NOT remove local files.
+   *
+   * This used to `fs.unlink(filePath)`. A workspace is a real directory on a
+   * real disk -- frequently a git working tree -- and a tombstone in the room's
+   * state is not consent to destroy the user's copy of a file. The only guard
+   * was `dirtyEditorRegistry.isDirty()`, which protects an unsaved editor
+   * buffer and nothing else: no git check, no confirmation, no backup, and
+   * `unlink` does not go to the trash. A single stale tombstone therefore
+   * deleted the same path on every client, on every sync, indefinitely --
+   * observed as 91 extension `.md` files (including a command file added the
+   * day before) being removed four times in two days, each time restored from
+   * git and each time deleted again on the next sync burst.
+   *
+   * See `.claude/rules/destructive-data-paths.md`: a destructive path must
+   * verify the damage is real, ask, and leave a recoverable artifact. None of
+   * that was true here, so the delete does not happen at all.
+   *
+   * Consequence, deliberately chosen: a file genuinely deleted on another
+   * device stays on disk here and is re-offered to the server on the next
+   * manifest sweep. Resurrecting a file is recoverable; deleting one is not.
+   */
+  private async applyRemoteDelete(_projectId: string, _syncId: string, filePath: string): Promise<void> {
+    // Inside the Local wiki, a delete whose page id now lives elsewhere was a move: the stale copy goes to the wiki trash.
+    const workspacePath = this.workspacePathFor(_projectId);
+    if (workspacePath && await this.wikiRules.applyRemoteDelete(_projectId, workspacePath, _syncId, filePath)) return;
+    // Keep the baseline and file-map entry: the file is still on disk, so the
+    // conflict guard must keep working and the next sweep must still see it.
+    logger.main.debug(
+      `[ProjectFileSync] Ignoring remote delete for ${path.relative(this.workspacePathFor(_projectId) ?? '', filePath) || path.basename(filePath)} -- project sync does not remove local files`,
+    );
+  }
+
+  /** Workspace root for a project, if the file-map cache knows it. */
+  private workspacePathFor(projectId: string): string | undefined {
+    return this.fileMapFor(projectId)?.workspacePath;
+  }
+
+  /** syncId -> absolute path for a project, seeded by its first manifest build. */
+  private fileMapFor(projectId: string): { fileMap: Map<string, string>; workspacePath: string } | undefined {
+    return (this as any)._fileMapCache?.get(projectId);
   }
 
   /**
@@ -471,8 +585,11 @@ export class ProjectFileSyncService {
    * so a stale `updatedFiles` (e.g. from a reconnect) can never silently clobber
    * a newer local copy.
    */
-  private async writeRemoteFileToDisk(projectId: string, workspacePath: string, file: ProjectSyncFileUpdate): Promise<void> {
+  private async writeRemoteFileToDisk(projectId: string, workspacePath: string, file: ProjectSyncFileUpdate): Promise<RemoteWriteOutcome> {
     const filePath = path.join(workspacePath, file.relativePath);
+    // An older client may have pushed wiki trash; it is not restored into the
+    // trash here. Wiki tables are only written inside this desktop's wiki folder.
+    if (!isProjectSyncPath(filePath, workspacePath)) return 'not-sync-path';
 
     // Never overwrite an editor's unsaved buffer. Hold the remote write until the
     // editor saves or closes, then retry it through the normal guard below. A
@@ -481,17 +598,21 @@ export class ProjectFileSyncService {
       this.deferredRemoteDeletes.delete(filePath);
       this.deferredRemoteWrites.set(filePath, { projectId, workspacePath, file });
       logger.main.info(`[ProjectFileSync] Deferring remote write to dirty editor: ${file.relativePath}`);
-      return;
+      return 'deferred-dirty';
     }
 
     try {
       let localExists = false;
       let localContent = '';
       let localMtimeMs = 0;
+      let localSize = 0;
       try {
-        localContent = await fs.readFile(filePath, 'utf-8');
+        // Stat before reading, so a change in between leaves an older mtime on
+        // the in-sync stamp below and the next manifest build rehashes.
         const stat = await fs.stat(filePath);
+        localContent = await fs.readFile(filePath, 'utf-8');
         localMtimeMs = Math.floor(stat.mtimeMs);
+        localSize = stat.size;
         localExists = true;
       } catch {
         // File doesn't exist locally -- genuinely new from remote.
@@ -502,7 +623,8 @@ export class ProjectFileSyncService {
 
         // Already in sync: nothing to write (avoids disk IO + watcher noise).
         if (localHash === file.contentHash) {
-          return;
+          this.diskStampsFor(projectId).set(file.syncId, { hash: localHash, size: localSize, mtime: localMtimeMs });
+          return 'in-sync';
         }
 
         const baseline = this.projectStates.get(projectId)?.get(file.syncId);
@@ -515,8 +637,9 @@ export class ProjectFileSyncService {
           logger.main.warn(
             `[ProjectFileSync] Refusing stale remote overwrite (local mtime ${localMtimeMs} >= remote ${file.lastModifiedAt}): ${file.relativePath}; re-pushing local`,
           );
+          await keepDivergedRemoteCopy(filePath, file, localHash, baseline?.contentHash);
           await this.repushLocalFile(projectId, workspacePath, file.syncId, filePath);
-          return;
+          return 'kept-local-newer';
         }
 
         // Guard 2 (baseline): the local copy diverged from the last point both
@@ -526,9 +649,27 @@ export class ProjectFileSyncService {
           logger.main.warn(
             `[ProjectFileSync] Refusing remote overwrite of locally-diverged file: ${file.relativePath}; re-pushing local`,
           );
+          await keepDivergedRemoteCopy(filePath, file, localHash, baseline.contentHash);
           await this.repushLocalFile(projectId, workspacePath, file.syncId, filePath);
-          return;
+          return 'kept-local-diverged';
         }
+      } else if (await this.wikiRules.isMovedAwayLocally(projectId, workspacePath, file)) {
+        this.handleFileDeleted(file.syncId, projectId);
+        return 'moved-away';
+      } else if (
+        !isInWiki(filePath, workspacePath)
+        && this.projectStates.get(projectId)?.get(file.syncId)?.contentHash === file.contentHash
+      ) {
+        // This desktop synced exactly this version and the file is gone, so it
+        // was deleted here without a per-file unlink reaching sync: a folder
+        // removal, or a delete while the app was closed. Restoring it made
+        // deleted folders come back (NIM-7587). Send the delete instead; a
+        // version edited elsewhere since has another hash and is still written.
+        // Inside the wiki the move rules above decide, and restore unless the
+        // moved copy provably holds the content.
+        logger.main.info(`[ProjectFileSync] Deleted locally since last sync: ${file.relativePath}`);
+        this.handleFileDeleted(file.syncId, projectId);
+        return 'deleted-locally';
       }
 
       // Fast-forward: remote is strictly newer and local is unchanged since the
@@ -548,15 +689,24 @@ export class ProjectFileSyncService {
 
       // The two sides now agree on this content -- record it as the baseline.
       await this.setBaseline(projectId, file.syncId, file.contentHash, file.lastModifiedAt);
+      // Stamp what was written so the next manifest build does not read it back.
+      const written = await fs.stat(filePath);
+      await this.recordDiskStamps(projectId, [{
+        syncId: file.syncId,
+        stamp: { hash: this.sha256(file.content), size: written.size, mtime: Math.floor(written.mtimeMs) },
+      }]);
 
       // Register the path so a later remote delete/update for a file created on
       // another device can resolve it before the next full manifest rebuild.
-      const cache = (this as any)._fileMapCache?.get(projectId) as { fileMap: Map<string, string> } | undefined;
-      cache?.fileMap.set(file.syncId, filePath);
+      this.fileMapFor(projectId)?.fileMap.set(file.syncId, filePath);
 
       logger.main.info(`[ProjectFileSync] Wrote remote file: ${file.relativePath}`);
+      await this.wikiRules.afterRemoteWrite(projectId, workspacePath, filePath, file.content);
+      if (!localExists && isWikiMarkerPath(filePath, workspacePath)) this.resync(projectId);
+      return 'written';
     } catch (err) {
       logger.main.error(`[ProjectFileSync] Failed to write remote file: ${file.relativePath}`, err);
+      return 'failed';
     }
   }
 
@@ -588,13 +738,30 @@ export class ProjectFileSyncService {
     }
   }
 
+  /** A push only moves the baseline for files the server confirmed it stored (NIM-7337). */
+  private async setBaselinesForStored(
+    projectId: string,
+    outcome: ProjectFilePushOutcome,
+    files: Array<{ syncId: string; content: string; lastModifiedAt: number }>,
+  ): Promise<void> {
+    const stored = storedSyncIds(outcome);
+    for (const f of files) {
+      if (stored.has(f.syncId)) await this.setBaseline(projectId, f.syncId, this.sha256(f.content), f.lastModifiedAt);
+    }
+  }
+
   /** Load the durable baseline for a project into the in-memory cache. */
   private async loadBaseline(projectId: string): Promise<void> {
     try {
-      const result = await database.query<{ sync_id: string; content_hash: string; last_synced_mtime: number | string }>(
-        `SELECT sync_id, content_hash, last_synced_mtime FROM project_file_sync_baseline WHERE project_id = $1`,
+      const result = await database.query<{
+        sync_id: string; content_hash: string; last_synced_mtime: number | string;
+        disk_hash?: string | null; disk_size?: number | string | null; disk_mtime?: number | string | null;
+      }>(
+        `SELECT sync_id, content_hash, last_synced_mtime, disk_hash, disk_size, disk_mtime
+         FROM project_file_sync_baseline WHERE project_id = $1`,
         [projectId],
       );
+      const stamps = this.diskStampsFor(projectId);
       let state = this.projectStates.get(projectId);
       if (!state) {
         state = new Map();
@@ -606,15 +773,44 @@ export class ProjectFileSyncService {
           ? parseInt(row.last_synced_mtime, 10)
           : row.last_synced_mtime;
         state.set(row.sync_id, { syncId: row.sync_id, contentHash: row.content_hash, lastSyncedMtime: mtime });
+        const stamp = parseDiskStamp(row);
+        if (stamp) stamps.set(row.sync_id, stamp);
       }
     } catch (err) {
       logger.main.error(`[ProjectFileSync] Failed to load baseline for ${projectId}:`, err);
     }
   }
 
+  private diskStampsFor(projectId: string): Map<string, DiskStamp> {
+    let stamps = this.diskStamps.get(projectId);
+    if (!stamps) {
+      stamps = new Map();
+      this.diskStamps.set(projectId, stamps);
+    }
+    return stamps;
+  }
+
+  /**
+   * Remember disk stamps in memory, and persist those whose file has a baseline
+   * row (the stamp columns live on that row). One batched write per call.
+   */
+  private async recordDiskStamps(projectId: string, entries: Array<{ syncId: string; stamp: DiskStamp }>): Promise<void> {
+    if (entries.length === 0) return;
+    const stamps = this.diskStampsFor(projectId);
+    const baseline = this.projectStates.get(projectId);
+    const rows = [];
+    for (const { syncId, stamp } of entries) {
+      stamps.set(syncId, stamp);
+      const b = baseline?.get(syncId);
+      if (b) rows.push({ syncId, baselineHash: b.contentHash, baselineMtime: b.lastSyncedMtime, stamp });
+    }
+    await persistDiskStamps(projectId, rows);
+  }
+
   /** Remove a file's baseline from the in-memory cache and the durable table. */
   private async deleteBaseline(projectId: string, syncId: string): Promise<void> {
     this.projectStates.get(projectId)?.delete(syncId);
+    this.diskStamps.get(projectId)?.delete(syncId);
     try {
       await database.query(
         `DELETE FROM project_file_sync_baseline WHERE project_id = $1 AND sync_id = $2`,
@@ -636,8 +832,8 @@ export class ProjectFileSyncService {
       const content = await fs.readFile(filePath, 'utf-8');
       const stat = await fs.stat(filePath);
       const relativePath = path.relative(workspacePath, filePath);
-      const title = path.basename(filePath, '.md');
-      await this.provider.pushFileContent(
+      const title = projectSyncTitle(filePath);
+      const outcome = await this.provider.pushFileContent(
         projectId,
         syncId,
         content,
@@ -645,7 +841,7 @@ export class ProjectFileSyncService {
         title,
         Math.floor(stat.mtimeMs),
       );
-      await this.setBaseline(projectId, syncId, this.sha256(content), Math.floor(stat.mtimeMs));
+      await this.setBaselinesForStored(projectId, outcome, [{ syncId, content, lastModifiedAt: Math.floor(stat.mtimeMs) }]);
     } catch (err) {
       logger.main.error(`[ProjectFileSync] Failed to re-push local file: ${filePath}`, err);
     }
@@ -682,8 +878,7 @@ export class ProjectFileSyncService {
     } catch {
       // File already gone locally -- nothing to delete; just clear our state.
       await this.deleteBaseline(projectId, syncId);
-      const cache = (this as any)._fileMapCache?.get(projectId) as { fileMap: Map<string, string> } | undefined;
-      cache?.fileMap.delete(syncId);
+      this.fileMapFor(projectId)?.fileMap.delete(syncId);
       return;
     }
 
@@ -726,50 +921,19 @@ export class ProjectFileSyncService {
 
   // MARK: - File Scanning
 
-  private async scanMarkdownFiles(dir: string): Promise<string[]> {
-    const results: string[] = [];
-    await this.walkDir(dir, results);
-    return results;
-  }
-
-  private async walkDir(dir: string, results: string[]): Promise<void> {
-    const basename = path.basename(dir);
-
-    // Skip common non-content directories
-    const skipDirs = new Set([
-      'node_modules', '.git', '.nimbalyst', 'dist', 'build', '.build',
-      'out', '.next', '.nuxt', '.svelte-kit', 'coverage', '.cache',
-      '.turbo', '.vercel', '.output', '__pycache__', '.venv', 'venv',
-      'target', 'Pods', '.gradle', 'DerivedData',
-    ]);
-    if (skipDirs.has(basename) || basename.startsWith('.build')) {
-      return;
-    }
-
-    let entries;
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return; // Permission denied or other error
-    }
-
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await this.walkDir(fullPath, results);
-      } else if (entry.isFile() && entry.name.endsWith('.md')) {
-        try {
-          const stat = await fs.stat(fullPath);
-          if (stat.size <= MAX_FILE_SIZE) {
-            results.push(fullPath);
-          } else {
-            logger.main.warn(`[ProjectFileSync] Skipping large file: ${entry.name} (${Math.round(stat.size / 1024 / 1024)}MB)`);
-          }
-        } catch {
-          // Skip files we can't stat
-        }
+  /** The walk and its stats run on the manifest worker; the sync rules apply here. */
+  private async scanSyncFiles(root: string): Promise<ScannedFile[]> {
+    const candidates = await scanProjectSyncCandidates({ root, ...PROJECT_SYNC_CANDIDATES });
+    const results: ScannedFile[] = [];
+    for (const file of candidates) {
+      if (!isProjectSyncPath(file.filePath, root)) continue;
+      if (exceedsProjectSyncLimit(file.size, path.relative(root, file.filePath))) {
+        this.oversizedWarnings.warn(file.filePath, file.size);
+        continue;
       }
+      results.push(file);
     }
+    return results;
   }
 
   // MARK: - Stats

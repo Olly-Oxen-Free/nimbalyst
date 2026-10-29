@@ -37,8 +37,10 @@ import {
   getDefaultColumnConfig,
   getStatusColor as getStatusColorFromRegistry,
   getPriorityColor as getPriorityColorFromRegistry,
-  getTypeColor as getTypeColorFromRegistry,
-  getTypeIcon as getTypeIconFromRegistry,
+  getTypeColor,
+  getTypeIcon,
+  applyTypeColumnDisplay,
+  resolveTypeColumnDisplay,
   formatRelativeDate,
   formatTrackerDateCell,
   getCellValue,
@@ -54,7 +56,8 @@ import type { Readiness } from '../models/trackerReadiness';
 import type { BlockerVisibilityScope } from '../models/trackerBlockerVisibility';
 import { TrackerUnreadDot } from '../../../readReceipts/TrackerUnreadDot';
 import { DisplayOptionsPanel } from './DisplayOptionsPanel';
-import { useTrackerRows } from './useTrackerRows';
+import { TrackerTypeCell } from './TrackerTypeCell';
+import { useTrackerRows, type ConfirmTrackerDelete } from './useTrackerRows';
 import { TrackerFavoriteStar } from './TrackerFavoriteStar';
 import { compareRecords, groupTrackerRecords, searchMatchesRecord } from './trackerRowData';
 
@@ -89,6 +92,8 @@ interface TrackerTableProps {
   onArchiveItems?: (itemIds: string[], archive: boolean) => void;
   /** Callback for bulk/single delete action */
   onDeleteItems?: (itemIds: string[]) => void;
+  /** Host confirmation for delete; delete is unavailable without it. */
+  confirmDelete?: ConfirmTrackerDelete;
   /** Copy a shareable deep link for the given tracker item. Only shown when
    *  exactly one item is selected. Callers omit this when the workspace
    *  has no team configured. */
@@ -202,22 +207,6 @@ function getTypeDescription(type: TrackerItemType): { title: string; description
 }
 
 /**
- * Get color for tracker type (used for icons and accents)
- */
-function getTypeColor(type: TrackerItemType): string {
-  const colors: Record<TrackerItemType, string> = {
-    'bug': '#dc2626',
-    'task': '#2563eb',
-    'plan': '#7c3aed',
-    'idea': '#ca8a04',
-    'decision': '#8b5cf6',
-    'automation': '#60a5fa',
-    'feature': '#10b981',
-  };
-  return colors[type] || '#6b7280';
-}
-
-/**
  * Multi-select checkbox dropdown for filtering table columns.
  */
 const MultiSelectFilter: React.FC<{
@@ -326,19 +315,6 @@ function getPriorityColor(priority: string | undefined): string {
     'low': '#6b7280',
   };
   return priorityColors[priority] || '#6b7280';
-}
-
-function getTypeIcon(type: TrackerItemType): string {
-  const icons: Record<TrackerItemType, string> = {
-    'bug': 'bug_report',
-    'task': 'check_box',
-    'plan': 'assignment',
-    'idea': 'lightbulb',
-    'decision': 'gavel',
-    'automation': 'auto_mode',
-    'feature': 'rocket_launch',
-  };
-  return icons[type];
 }
 
 /**
@@ -520,11 +496,7 @@ export function renderCell(
 
   switch (col.id) {
     case 'type':
-      return (
-        <span className={`type-icon flex items-center justify-center w-5 h-5 rounded`} style={{ color: getTypeColor(item.primaryType) }}>
-          <span className="material-symbols-outlined text-sm">{getTypeIcon(item.primaryType)}</span>
-        </span>
-      );
+      return <TrackerTypeCell type={item.primaryType} display={col.typeDisplay} />;
 
     case 'title':
       if (editingCell?.itemId === item.id && editingCell?.field === 'title') {
@@ -777,6 +749,7 @@ export function TrackerTable({
   overrideItems,
   onArchiveItems,
   onDeleteItems,
+  confirmDelete,
   onCopyDeepLink,
   onOpenDocument,
   searchQuery: externalSearchQuery,
@@ -811,12 +784,17 @@ export function TrackerTable({
     return resolveColumnsForType(activeTypeFilter === 'all' ? '' : activeTypeFilter);
   }, [activeTypeFilter]);
 
-  // Get the visible column defs in order
+  // Whether the Type indicator draws a glyph or the type's name.
+  const typeColumnDisplay = resolveTypeColumnDisplay(effectiveColumnConfig);
+
+  // Get the visible column defs in order, with the Type column carrying the
+  // view's chosen presentation.
   const visibleColumnDefs = useMemo(() => {
-    return effectiveColumnConfig.visibleColumns
+    const ordered = effectiveColumnConfig.visibleColumns
       .map(id => allColumns.find(c => c.id === id))
       .filter((c): c is TrackerColumnDef => c !== undefined);
-  }, [effectiveColumnConfig.visibleColumns, allColumns]);
+    return applyTypeColumnDisplay(ordered, typeColumnDisplay);
+  }, [effectiveColumnConfig.visibleColumns, typeColumnDisplay, allColumns]);
 
   // Read tracker items from cross-platform atoms (populated by host adapter)
   const atomItems = useAtomValue(trackerItemsByTypeAtom(activeTypeFilter));
@@ -967,6 +945,7 @@ export function TrackerTable({
     activeTypeFilter,
     onItemSelect,
     onDeleteItems,
+    confirmDelete,
     onArchiveItems,
     onSwitchToFilesMode,
   });
@@ -1384,10 +1363,8 @@ export function TrackerTable({
                   onToggle={onToggleFavorite}
                 />
 
-                {/* Type icon - fixed width for alignment */}
-                <span className="shrink-0 w-5 flex items-center justify-center" style={{ color: getTypeColor(item.primaryType), opacity: 0.7 }}>
-                  <span className="material-symbols-outlined" style={{ fontSize: '16px', fontVariationSettings: "'wght' 300" }}>{getTypeIcon(item.primaryType)}</span>
-                </span>
+                {/* Type indicator - the row's own gutter, since the `type` column is filtered out of the meta list below */}
+                <TrackerTypeCell type={item.primaryType} display={typeColumnDisplay} variant="row" />
 
                 {/* Title (takes remaining space) */}
                 <div className="tracker-table-cell title flex-1 min-w-0">
@@ -1478,6 +1455,7 @@ export function TrackerTable({
         onOpenDocument={onOpenDocument}
         onArchiveItems={onArchiveItems}
         onDeleteItems={onDeleteItems}
+        confirmDelete={confirmDelete}
         closeContextMenu={closeContextMenu}
         clearSelection={() => setSelectedIds(new Set())}
       />

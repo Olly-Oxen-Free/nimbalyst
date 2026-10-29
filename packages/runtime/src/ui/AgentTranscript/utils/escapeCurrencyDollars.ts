@@ -23,10 +23,14 @@
  *
  * Cases preserved:
  *   - legitimate inline math `$x = 5$` (closing `$` followed by space, not digit)
- *   - display math `$$...$$` (no digit immediately after `$$`)
+ *   - display math `$$...$$`, including a formula that opens with a digit
  *   - already-escaped currency `\$5 to \$10` (skipped via lookbehind)
- *   - lone unpaired `$` with no closing pair on the same line
- *   - currency split across newlines (the regex content class excludes newlines)
+ *   - lone unpaired `$` with no closing pair on the same or the next line
+ *   - currency split across a blank line (a paragraph boundary)
+ *
+ * A pair split across a single soft line break *is* escaped: remark-math pairs
+ * any two `$` inside one paragraph, so `$990/mo.` + newline + `$1,500` was
+ * rendering as math (nimbalyst/nimbalyst#1385).
  *
  * Code is exempt (nimbalyst/nimbalyst#1373). A backslash is not an escape
  * character inside `code` / `inlineCode`, so escaping there is not invisible
@@ -45,7 +49,19 @@ import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
 import type { Root, RootContent } from 'mdast';
 
-const CURRENCY_PAIR_RE = /(?<!\\)\$([^$\n]*?)(?<!\\)\$(?=\d)/g;
+// The content may cross one soft line break (nimbalyst/nimbalyst#1385), but
+// never a blank line: that is a paragraph boundary, and remark-math will not
+// pair across it either.
+//
+// Neither delimiter may sit next to another `$`. To remark-math a `$$` run is
+// one display-math delimiter, never two inline ones, so a `$` drawn from such a
+// run is not a currency delimiter at all (nimbalyst/nimbalyst#1385). Without
+// this, the second `$` of the opening `$$` in `$$5x + 1$$` read as a currency
+// opener — the closing `$` is followed by the digit that starts the formula.
+// The closing delimiter needs no `(?!\$)` of its own: `(?=\d)` already excludes
+// one, and `(?!\$)` on the opener rules out an empty-content `$$` pair.
+const CURRENCY_PAIR_RE =
+  /(?<![\\$])\$(?!\$)([^$\n]*?(?:\n(?![ \t]*\n)[^$\n]*?)?)(?<![\\$])\$(?=\d)/g;
 
 /** Backtick/tilde fence or span, or an indented code line. */
 const MAY_CONTAIN_CODE_RE = /[`~]|^(?: {4}|\t)/m;

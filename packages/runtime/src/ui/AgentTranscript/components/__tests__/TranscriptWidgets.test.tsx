@@ -250,6 +250,34 @@ describe('MessageSegment', () => {
     expect(container.querySelector('.context-limit-widget')).not.toBeNull();
   });
 
+  it('offers auto-resume only on the latest blocked usage-limit card and passes its reset', async () => {
+    const { interactiveWidgetHostAtom } = await import('../../../../store/atoms/interactiveWidgetHost');
+    const testStore = createStore();
+    const setUsageLimitAutoResume = vi.fn().mockResolvedValue(undefined);
+    testStore.set(interactiveWidgetHostAtom('limited'), { usageLimitAutoResumeEnabled: false, setUsageLimitAutoResume } as never);
+    const blocked = makeMessage({
+      type: 'system_message',
+      isError: true,
+      text: "<!-- [RATE_LIMIT] limitType=5-hour session resetsAtUnix=1772233200 -->\n\nYou've hit your session limit",
+    });
+    const segment = (isLastMessage: boolean) => (
+      <JotaiProvider store={testStore}>
+        <MessageSegment message={blocked} isUser={false} showToolCalls={false} showThinking={false}
+          expandedTools={new Set()} onToggleToolExpand={() => {}} sessionId="limited" isLastMessage={isLastMessage} />
+      </JotaiProvider>
+    );
+
+    const older = render(segment(false));
+    expect(older.container.querySelector('.rate-limit-widget-blocked')).not.toBeNull();
+    expect(older.container.querySelector('.rate-limit-auto-resume-on')).toBeNull();
+    older.unmount();
+
+    render(segment(true));
+    fireEvent.click(screen.getByText('Resume automatically when the limit resets'));
+    await waitFor(() => screen.getByText('Turn off'));
+    expect(setUsageLimitAutoResume).toHaveBeenCalledWith(true, 1772233200000);
+  });
+
   it('renders tool call card with expand/collapse', () => {
     const toolId = 'test-tool-1';
     const message = makeToolMessage(
@@ -1227,6 +1255,33 @@ describe('GitCommitConfirmationWidget', () => {
     expect(screen.getByTestId('git-commit-error').textContent).toContain('HOOK_DETAIL: lint failed');
   });
 
+  it.each([
+    ['committed', 'Commit hash: abc1234', 'Changes Committed'],
+    ['error', 'Error: hook failed', 'Commit Failed'],
+  ])('waits for the server result before showing auto-commit %s', async (state, result, title) => {
+    const { interactiveWidgetHostAtom } = await import('../../../../store/atoms/interactiveWidgetHost');
+    const testStore = createStore();
+    const gitCommit = vi.fn();
+    testStore.set(interactiveWidgetHostAtom('auto-result'), {
+      autoCommitEnabled: true, gitCommit, trackEvent: vi.fn(),
+    } as unknown as import('../CustomToolWidgets/InteractiveWidgetHost').InteractiveWidgetHost);
+    const message = makeToolMessage('git_commit_proposal', {
+      commitMessage: 'fix: wait for result', filesToStage: ['file.ts'],
+    });
+    const tree = (msg: typeof message) => <JotaiProvider store={testStore}>
+      <GitCommitConfirmationWidget message={msg} isExpanded={false} onToggle={() => {}} sessionId="auto-result" />
+    </JotaiProvider>;
+    const { rerender } = render(tree(message));
+    expect(screen.queryByText('Changes Committed')).toBeNull();
+    expect(screen.getByTestId('git-commit-widget').dataset.state).toBe('committing');
+    expect(gitCommit).not.toHaveBeenCalled();
+    rerender(tree({ ...message, toolCall: { ...message.toolCall!, result,
+      ...(state === 'error' ? { isError: true } : {}) } }));
+    expect(screen.getByTestId('git-commit-widget').dataset.state).toBe(state);
+    expect(screen.getByText(title).textContent).toBe(title);
+    expect(gitCommit).not.toHaveBeenCalled();
+  });
+
   it('sends cancel through the interactive host', async () => {
     const { interactiveWidgetHostAtom } = await import('../../../../store/atoms/interactiveWidgetHost');
 
@@ -1544,7 +1599,7 @@ describe('ContextLimitWidget', () => {
   });
 
   it('shows compact button only on last message', () => {
-    const onCompact = vi.fn();
+    const onCompact = vi.fn(() => new Promise<void>(() => {}));
     render(<ContextLimitWidget isLastMessage={true} onCompact={onCompact} />);
     const compactButton = screen.getByText('Compact');
     expect(compactButton).toBeDefined();
@@ -1558,10 +1613,78 @@ describe('ContextLimitWidget', () => {
   });
 
   it('shows "Compacting..." after clicking compact', () => {
-    const onCompact = vi.fn();
+    const onCompact = vi.fn(() => new Promise<void>(() => {}));
     render(<ContextLimitWidget isLastMessage={true} onCompact={onCompact} />);
     fireEvent.click(screen.getByText('Compact'));
     expect(screen.getByText('Compacting...')).toBeDefined();
+  });
+
+  // #1414: the button used to latch on "Compacting..." forever, so the one
+  // recovery affordance disappeared in exactly the case that needs it -- a
+  // compaction the model refused. SessionTranscript's handler swallows its own
+  // errors and resolves, so the failure looks like a completed call here.
+  it('hands the button back once a failed compaction settles', async () => {
+    let settle!: () => void;
+    const onCompact = vi.fn(() => new Promise<void>((resolve) => { settle = resolve; }));
+    render(
+      <ContextLimitWidget isLastMessage={true} variant="compaction-failed" onCompact={onCompact} />
+    );
+
+    fireEvent.click(screen.getByText('Try again'));
+    expect(screen.getByText('Retrying...')).toBeDefined();
+
+    settle();
+    await waitFor(() => expect(screen.getByText('Try again')).toBeDefined());
+    expect((screen.getByText('Try again') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // The widget renders INSTEAD of the message it matched, so for a failed
+  // compaction it has to carry the detail forward -- that string is the only
+  // thing naming who refused (a router, in #1414). A plain context-limit error
+  // says nothing the widget's own copy doesn't, so it stays suppressed.
+  it('surfaces the failure detail only for a failed compaction', () => {
+    const detail = 'Error during compaction: API Error: 400 All target providers failed.';
+    const { rerender } = render(
+      <ContextLimitWidget isLastMessage={true} variant="compaction-failed" detail={detail} />
+    );
+    expect(screen.getByText(detail)).toBeDefined();
+
+    rerender(<ContextLimitWidget isLastMessage={true} variant="context-limit" detail={detail} />);
+    expect(screen.queryByText(detail)).toBeNull();
+  });
+});
+
+// ============================================================================
+// Context failure classification
+// ============================================================================
+
+describe('classifyContextFailure', () => {
+  let classifyContextFailure: (text: string) => string | null;
+  let isCompactionFailureText: (text: string) => boolean;
+
+  beforeEach(async () => {
+    const mod = await import('../contextFailureDetection');
+    classifyContextFailure = mod.classifyContextFailure;
+    isCompactionFailureText = mod.isCompactionFailureText;
+  });
+
+  // The CLI prefixes its automatic-compaction failure with "Prompt is too
+  // long", so a context-limit-first check routes it to the "just compact"
+  // copy -- advice the user has already taken and watched fail.
+  it('prefers the compaction verdict over the context-limit phrase it embeds', () => {
+    expect(classifyContextFailure('Prompt is too long · automatic compaction failed: API Error: 400'))
+      .toBe('compaction-failed');
+    expect(classifyContextFailure('Error during compaction: API Error: 400 All target providers failed.'))
+      .toBe('compaction-failed');
+    expect(classifyContextFailure('Prompt is too long')).toBe('context-limit');
+    expect(classifyContextFailure('the build succeeded')).toBeNull();
+  });
+
+  // The unflagged-text path renders this widget INSTEAD of the message, so a
+  // loose match would hide an agent's own prose behind an error card.
+  it('only matches the CLI framing on unflagged text', () => {
+    expect(isCompactionFailureText('Error during compaction: API Error: 400')).toBe(true);
+    expect(isCompactionFailureText('I checked the logs and compaction failed twice')).toBe(false);
   });
 });
 
@@ -1758,6 +1881,64 @@ describe('InteractivePromptWidget', () => {
     expect(screen.getByText('Blue')).toBeDefined();
     expect(screen.getByText('Warm')).toBeDefined();
     expect(screen.getByText('Cool')).toBeDefined();
+  });
+
+  // Regression test for GitHub issue #1418. The transcript is virtualized, so
+  // scrolling a pending question out of view unmounts this widget. Its answers,
+  // "Other" toggle and "Other" text used to live in component state and were
+  // discarded with it, unrecoverably. They now live in a draft atom keyed by
+  // questionId, so all three survive the remount.
+  it('keeps selections, the Other toggle and the Other text across unmount/remount', () => {
+    const questionContent = {
+      type: 'ask_user_question_request' as const,
+      questionId: 'q-draft-1418',
+      questions: [
+        {
+          question: 'Which areas?',
+          header: 'Areas',
+          options: [
+            { label: 'Editor', description: 'Editing surface' },
+            { label: 'Sync', description: 'Collaboration' },
+          ],
+          multiSelect: true,
+        },
+      ],
+      status: 'pending' as const,
+    };
+    const typed = 'Ten minutes of carefully written user input.';
+
+    const first = render(
+      <InteractivePromptWidget
+        promptType="ask_user_question_request"
+        content={questionContent}
+        onSubmitResponse={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByText('Editor'));
+    fireEvent.click(screen.getByText('Other'));
+    fireEvent.change(first.container.querySelector('textarea')!, {
+      target: { value: typed },
+    });
+    expect(first.container.querySelector('textarea')!.value).toBe(typed);
+
+    // Scrolled out of view, then back.
+    first.unmount();
+    const second = render(
+      <InteractivePromptWidget
+        promptType="ask_user_question_request"
+        content={questionContent}
+        onSubmitResponse={() => {}}
+      />
+    );
+
+    expect(second.container.querySelector('textarea')!.value).toBe(typed);
+    expect(
+      screen.getByText('Editor').closest('.interactive-prompt__option')!.className
+    ).toContain('interactive-prompt__option--selected');
+    expect(
+      screen.getByText('Other').closest('.interactive-prompt__option')!.className
+    ).toContain('interactive-prompt__option--selected');
   });
 
   it('calls onSubmitResponse with correct permission response', () => {
@@ -2176,5 +2357,75 @@ describe('EditorScreenshotWidget', () => {
     const img = container.querySelector('img');
     expect(img).not.toBeNull();
     expect(img?.getAttribute('src')).toContain('data:image/png;base64,');
+
+    // The lightbox must portal out of the transcript, otherwise a transformed
+    // transcript ancestor confines the fixed overlay to the transcript pane.
+    fireEvent.click(screen.getByTitle('Click to enlarge'));
+    const dialog = screen.getByRole('dialog', { name: 'Image preview' });
+    expect(container.contains(dialog)).toBe(false);
+    expect(dialog.parentElement).toBe(document.body);
+  });
+});
+
+describe('VisualDisplayWidget', () => {
+  it('enlarges an image from outside the workspace using the bytes the thumbnail loaded', async () => {
+    const { VisualDisplayWidget } = await import('../CustomToolWidgets/VisualDisplayWidget');
+    const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+    // nim-asset:// only serves workspace roots, so a /tmp path must not be
+    // handed to the lightbox as a URL; readFile can reach it.
+    const readFile = vi.fn(async () => ({ success: true, content: pixel }));
+    const message = makeToolMessage(
+      'mcp__nimbalyst__display_to_user',
+      { items: [
+        { description: 'Mockup A', image: { path: '/tmp/arch-mock/a.png' } },
+        { description: 'Mockup B', image: { path: '/tmp/arch-mock/b.png' } },
+      ] },
+      'ok',
+    );
+    render(
+      <Wrapper>
+        <VisualDisplayWidget message={message} isExpanded={false} onToggle={() => {}} sessionId="visual-lightbox" readFile={readFile} />
+      </Wrapper>
+    );
+
+    fireEvent.click(await screen.findByAltText('Mockup B'));
+    const enlarged = await screen.findByTestId('zoomable-image');
+    await waitFor(() => expect(enlarged.getAttribute('src')).toBe(`data:image/png;base64,${pixel}`));
+    expect(readFile).toHaveBeenCalledWith('/tmp/arch-mock/b.png');
+  });
+
+  it('holds a remounted image row at its loaded height until the image is back', async () => {
+    // The virtual list unmounts rows that leave its buffer. A remount that
+    // shrank to the "Loading..." box made the list move the reader back to
+    // the image, so they could not reach the bottom.
+    const { VisualDisplayWidget } = await import('../CustomToolWidgets/VisualDisplayWidget');
+    const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+    let readCount = 0;
+    const readFile = vi.fn(() => (++readCount === 1
+      ? Promise.resolve({ success: true, content: pixel })
+      : new Promise<{ success: boolean; content?: string }>(() => {})));
+    const message = makeToolMessage(
+      'mcp__nimbalyst__display_to_user',
+      { items: [{ description: 'Remount shot', image: { path: '/tmp/remount-height/shot.png' } }] },
+      'ok',
+    );
+    const widget = (
+      <Wrapper>
+        <VisualDisplayWidget message={message} isExpanded={false} onToggle={() => {}} sessionId="visual-remount" readFile={readFile} />
+      </Wrapper>
+    );
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ height: 352 } as DOMRect);
+    try {
+      const first = render(widget);
+      fireEvent.load(await screen.findByAltText('Remount shot'));
+      first.unmount();
+
+      const second = render(widget);
+      screen.getByText('Loading...');
+      const row = second.container.querySelector('.visual-display-image') as HTMLElement;
+      expect(row.style.minHeight).toBe('352px');
+    } finally {
+      rect.mockRestore();
+    }
   });
 });

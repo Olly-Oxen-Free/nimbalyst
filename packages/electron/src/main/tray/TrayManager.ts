@@ -1,3 +1,4 @@
+import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
 /**
  * TrayManager - System tray icon and menu for AI session status
  *
@@ -14,14 +15,21 @@ import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStat
 import type { SessionStateEvent } from '@nimbalyst/runtime/ai/server/types/SessionState';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { findWindowByWorkspace } from '../window/WindowManager';
+import { getProjectWindows } from '../window/windowState';
+import { getRestorableProjectWindow, restoreApplicationWindow } from '../window/ApplicationWindowRecovery';
 import { getPackageRoot } from '../utils/appPaths';
 import {
   isShowTrayIcon,
   setShowTrayIcon,
   isShowTrayStrip,
   setShowTrayStrip,
+  getTrayStripStyle,
+  setTrayStripStyle,
+  type TrayStripStyle,
   getSessionSyncConfig,
   setSessionSyncConfig,
+  isOSNotificationsEnabled,
+  setOSNotificationsEnabled,
 } from '../utils/store';
 import { logger } from '../utils/logger';
 import { isPreventingSleep, getSleepPreventionMode } from '../services/PowerSaveService';
@@ -29,14 +37,40 @@ import { updateSleepPrevention, resolvePreventSleepMode, getSyncProvider } from 
 import {
   closeTrayPanelWindow,
   isTrayPanelSupported,
-  isTrayPanelWindow,
   pushTrayPanelFeed,
   toggleTrayPanelWindow,
 } from '../window/TrayPanelWindow';
-import type { TrayPanelFeed, TrayPanelSession } from '../../shared/traySessions';
-import { deriveFleetSnapshot, type FleetSnapshot, type PromptKind, type TraySessionInfo } from './fleetSnapshot';
-import { StripStateMachine, stripViewKey, type StripView } from './stripStateMachine';
+import {
+  emptyTrayPanelFeed,
+  type TrayIdleSummary,
+  type TrayPanelFeed,
+  type TrayPanelSession,
+} from '../../shared/traySessions';
+import type {
+  MenuBarIslandSettingChange,
+  MenuBarIslandSettings,
+} from '../../shared/menuBarIsland';
+import {
+  deriveFleetSnapshot,
+  isStalled,
+  type FleetSnapshot,
+  type PromptKind,
+  type TraySessionInfo,
+} from './fleetSnapshot';
+import { buildFleetActivityPayload } from './fleetActivity';
+import { FleetActivityPublisher } from './fleetActivityPublisher';
+import { isFleetActivityAvailable, sendFleetActivity } from '../services/ai/fleetActivityPush';
+import { isIdleView, StripStateMachine, stripViewKey, type StripView } from './stripStateMachine';
 import { TrayStripRenderer } from './TrayStripRenderer';
+import { ISLAND_STRIP_KEY, toIslandStrip } from './islandStrip';
+import { latestAssistantTextSql, sessionTitlesSql, toSnippetLine } from './sessionSnippets';
+import { unreadSeedQuery } from './unreadSeedQuery';
+import {
+  closeMenuBarIsland,
+  isMenuBarIslandSupported,
+  showMenuBarIsland,
+  shutdownMenuBarIsland,
+} from '../window/MenuBarIslandWindow';
 
 export type { TraySessionInfo, PromptKind } from './fleetSnapshot';
 
@@ -63,24 +97,23 @@ interface TrayUnreadClearPayload {
 const MENU_REBUILD_DEBOUNCE_MS = 300;
 const COMPLETED_LINGER_MS = 60_000; // Keep completed sessions visible for 1 minute
 /**
+ * How many already-unread sessions to restore from the database at launch.
+ *
+ * A cap rather than the whole set. Nothing clears the unread flag on a session
+ * the user never opens, so it accumulates without bound -- a real install had
+ * 427 of them -- and the tray menu and the island panel are both lists someone
+ * is meant to work through. `seedUnreadFromDatabase` takes the newest.
+ */
+const UNREAD_SEED_LIMIT = 25;
+/**
  * The strip's age is rounded to minutes, so it only needs redrawing that often.
  * A ticking second counter would be 60x the captures to say the same thing.
  */
 const STRIP_AGE_TICK_MS = 60_000;
-
-/**
- * Project windows only.
- *
- * The tray panel is a BrowserWindow too, so it appears in `getAllWindows()`.
- * Focusing it in response to "Open Nimbalyst" would be a no-op from the user's
- * point of view, and counting it as a visible foreground window makes the app
- * look focused whenever the panel is open.
- */
-function projectWindows(): BrowserWindow[] {
-  return BrowserWindow.getAllWindows().filter(
-    (window) => !window.isDestroyed() && !isTrayPanelWindow(window),
-  );
-}
+/** How many sessions the idle panel offers to reopen. Enough to recognise one. */
+const RECENT_SESSIONS_LIMIT = 5;
+/** Idle repaints every minute; this answer does not change nearly that often. */
+const RECENT_SESSIONS_TTL_MS = 5 * 60_000;
 
 // ─── Row helpers ────────────────────────────────────────────────────────────
 
@@ -146,8 +179,16 @@ function toPanelSession(session: TraySessionInfo, hasPendingPrompt: boolean): Tr
  *
  * Exported as a free function so the grouping is testable without the singleton.
  */
-export function groupTraySessions(sessions: Iterable<TraySessionInfo>): TrayPanelFeed {
-  const feed: TrayPanelFeed = { needsAttention: [], running: [], unread: [] };
+/**
+ * `now` is required for the same reason `deriveFleetSnapshot`'s is: the stalled
+ * bucket is clock-dependent, and a defaulted `Date.now()` would let a fixture
+ * pinned to a fixed timestamp be measured against the real wall clock.
+ */
+export function groupTraySessions(
+  sessions: Iterable<TraySessionInfo>,
+  now: number,
+): TrayPanelFeed {
+  const feed = emptyTrayPanelFeed();
 
   const visible = Array.from(sessions)
     .filter((session) => !session.isArchived)
@@ -158,7 +199,13 @@ export function groupTraySessions(sessions: Iterable<TraySessionInfo>): TrayPane
       feed.needsAttention.push(toPanelSession(session, session.hasPendingPrompt));
     } else if (session.status === 'running') {
       if (session.phase !== 'complete') {
-        feed.running.push(toPanelSession(session, false));
+        // The same `isStalled` the snapshot uses, not a second copy of the
+        // rule: the panel is the sentence form of the strip, so the two must
+        // not be able to disagree about which sessions have gone quiet. Both
+        // callers are handed a clock rather than reading one, so both are
+        // testable without faking time.
+        const bucket = isStalled(session, now) ? feed.stalled : feed.running;
+        bucket.push(toPanelSession(session, false));
       }
     } else if (session.hasUnread) {
       feed.unread.push(toPanelSession(session, false));
@@ -195,11 +242,36 @@ export class TrayManager {
    * Newest activity anywhere, surviving cache eviction.
    *
    * Completed sessions leave the cache after a minute, so the cache cannot
-   * answer "how long has it been quiet" -- which is the one thing the quiet
-   * strip has to say. Seeded from the database at startup so a fresh launch
-   * reports a real age instead of claiming everything just happened.
+   * answer "how long has it been quiet". Seeded from the database at startup so
+   * a fresh launch reports a real age instead of claiming everything just
+   * happened.
+   *
+   * This used to drive the strip's quiet age, which is exactly what it should
+   * not have done: an unlabeled duration in the strip's actionable slot, whose
+   * value on a fresh launch was a `MAX(updated_at)` over rows the user had long
+   * since finished with. Its only consumer now is the panel's idle header,
+   * where it is labeled and sits next to the sessions it describes.
    */
   private lastFleetActivityAt: number | null = null;
+  /** Backing the idle panel's "reopen one of these" list. See refreshRecentSessions. */
+  private recentSessions: TrayPanelSession[] = [];
+  private recentSessionsFetchedAt = 0;
+  // ─── iOS Live Activity ────────────────────────────────────────────────
+  /**
+   * The phone's half of the same snapshot.
+   *
+   * Owned here rather than beside the strip because the Live Activity is not a
+   * render style: it must keep publishing when the menu bar icon is hidden, when
+   * the strip is switched off, and on Windows and Linux, where the desktop is
+   * still the only thing that knows what the fleet is doing.
+   */
+  private fleetPublisher: FleetActivityPublisher | null = null;
+  private fleetActivityTimer: NodeJS.Timeout | null = null;
+
+  /** Whether the island panel is open; snippets are only read while it is. */
+  private islandExpanded = false;
+  /** sessionId -> one line of what that session last said. */
+  private readonly sessionSnippets = new Map<string, string>();
 
   private constructor() {}
 
@@ -267,26 +339,26 @@ export class TrayManager {
     // would never appear in the tray's "Unread" section.
     await this.seedUnreadFromDatabase();
 
-    // Create the tray if setting is enabled (default: true)
-    if (isShowTrayIcon()) {
-      this.createTray();
-    }
+    // Not `createTray()` directly: which surface the menu bar gets is a decision
+    // now, and the island has to be able to paint on a launch where there is no
+    // tray item at all.
+    this.refreshMenuBar();
+
+    this.startFleetActivity();
 
     logger.main.info('[TrayManager] Initialized');
   }
 
   /**
    * Show or hide the tray icon. Persists the preference.
+   *
+   * Only the *icon*. The island is the other menu bar surface and answers to
+   * `showTrayStrip` plus the style; conflating the two is how the app ended up
+   * drawing both at once.
    */
   setVisible(visible: boolean): void {
     setShowTrayIcon(visible);
-    if (visible) {
-      if (!this.tray) {
-        this.createTray();
-      }
-    } else {
-      this.destroyTray();
-    }
+    this.refreshMenuBar();
   }
 
   private createTray(): void {
@@ -304,16 +376,24 @@ export class TrayManager {
         if (this.tray && this.appMenu) this.tray.popUpContextMenu(this.appMenu);
       });
     }
-
-    this.rebuildMenu();
   }
 
-  private destroyTray(): void {
+  /**
+   * Take the tray item away, leaving the island alone.
+   *
+   * Distinct from `teardownStrip`, which also closes the island: island mode
+   * destroys the tray item precisely so the island can keep drawing, so the two
+   * must not be the same call.
+   */
+  private destroyTrayItem(): void {
     if (this.tray) {
       this.tray.destroy();
       this.tray = null;
     }
-    this.teardownStrip();
+    this.appMenu = null;
+    this.lastStripKey = null;
+    this.stripRenderer?.destroy();
+    this.stripRenderer = null;
     closeTrayPanelWindow();
   }
 
@@ -336,7 +416,64 @@ export class TrayManager {
 
   /** The current cross-workspace feed the panel renders. */
   buildPanelFeed(): TrayPanelFeed {
-    return groupTraySessions(this.sessionCache.values());
+    return groupTraySessions(this.sessionCache.values(), Date.now());
+  }
+
+  /**
+   * What the panel shows when every bucket is empty.
+   *
+   * Reads the cached list rather than awaiting a query, because the caller is a
+   * synchronous paint. The refresh below is what keeps it current; an empty
+   * `recent` on the very first idle paint simply means the read has not landed
+   * yet, and the repaint it triggers fills it in.
+   */
+  private buildIdleSummary(): TrayIdleSummary {
+    void this.refreshRecentSessions();
+    return {
+      ...(this.lastFleetActivityAt !== null ? { lastActivityAt: this.lastFleetActivityAt } : {}),
+      recent: this.recentSessions,
+    };
+  }
+
+  /**
+   * The most recently touched sessions, for the idle panel.
+   *
+   * Deliberately a database read and not the session cache: the cache is a live
+   * working set, not a history, and it is empty in exactly the state this list
+   * is for. Rate-limited because idle repaints happen on every age tick and this
+   * answer changes about as often as the fleet does.
+   */
+  private async refreshRecentSessions(): Promise<void> {
+    if (!this.database) return;
+    const now = Date.now();
+    if (now - this.recentSessionsFetchedAt < RECENT_SESSIONS_TTL_MS) return;
+    this.recentSessionsFetchedAt = now;
+
+    try {
+      const { rows } = await this.database.query<any>(
+        `SELECT id, title, workspace_id, provider, model, updated_at FROM ai_sessions
+         WHERE is_archived = false
+         ORDER BY updated_at DESC
+         LIMIT ${RECENT_SESSIONS_LIMIT}`
+      );
+      this.recentSessions = rows.map((row) => ({
+        sessionId: row.id,
+        title: row.title || 'Untitled Session',
+        workspacePath: row.workspace_id || '',
+        workspaceName: row.workspace_id ? path.basename(row.workspace_id) : '',
+        provider: row.provider || 'claude',
+        ...(row.model ? { model: row.model } : {}),
+        updatedAt: toMillis(row.updated_at),
+        isStreaming: false,
+        hasPendingPrompt: false,
+        hasError: false,
+      }));
+      // The paint that asked for this had nothing to show; repaint now that it
+      // does. Cheap, and only ever while the fleet is idle.
+      void this.tickStrip();
+    } catch (error) {
+      logger.main.error('[TrayManager] Failed to read recent sessions for the idle panel:', error);
+    }
   }
 
   /**
@@ -364,6 +501,8 @@ export class TrayManager {
     this.lingerTimers.clear();
 
     this.teardownStrip();
+    shutdownMenuBarIsland();
+    this.stopFleetActivity();
 
     if (this.tray) {
       this.tray.destroy();
@@ -445,7 +584,63 @@ export class TrayManager {
     }
   }
 
+  /**
+   * Take a phase change into the cache as it is written.
+   *
+   * `phase` decides whether a running session is counted at all, and the cache
+   * used to read it exactly once -- at `fetchSessionMetadata`, when the session
+   * first appeared. Nothing wrote it back, so the guard below could only ever
+   * act on a value that was already stale by a turn.
+   *
+   * Called from `SessionNamingService.applySessionMetadata`, the funnel every
+   * agent-driven and commit-driven metadata write already goes through, and
+   * from the renderer's `ai:updateSessionMetadata` handler alongside the
+   * existing `hasUnread` forward. A session not in the cache is not a miss:
+   * it is not on any ambient surface, and it will read the current phase when
+   * it next starts a turn.
+   */
+  onSessionPhaseChanged(sessionId: string, phase: string): void {
+    const session = this.sessionCache.get(sessionId);
+    if (!session || session.phase === phase) return;
+    session.phase = phase;
+    this.scheduleMenuRebuild();
+  }
+
   // ─── Session state event handling ───────────────────────────────────────
+
+  /**
+   * Re-read the fields the cache froze when the session first entered it.
+   *
+   * `title` already had `refreshCachedTitles`, but that one runs over the rows
+   * the panel is *about* to show -- which cannot recover a session that a stale
+   * `phase` has excluded from the feed in the first place. This reads by id, so
+   * it works on exactly the sessions the feed cannot see.
+   *
+   * `isArchived` comes along because it is the other frozen field that decides
+   * visibility, off the same row.
+   */
+  private async refreshCachedSessionFlags(session: TraySessionInfo): Promise<void> {
+    if (!this.database) return;
+
+    try {
+      const { rows } = await this.database.query<{ is_archived: unknown; metadata: unknown }>(
+        `SELECT is_archived, metadata FROM ai_sessions WHERE id = $1`,
+        [session.sessionId],
+      );
+      if (rows.length === 0) return;
+
+      const metadata = parseMetadataColumn(rows[0].metadata);
+      session.phase = typeof metadata.phase === 'string' ? metadata.phase : undefined;
+      session.isArchived = !!rows[0].is_archived;
+    } catch (error) {
+      // Failing to refresh leaves the previous value, which is what the cache
+      // did unconditionally before. It must never cost the panel.
+      logger.main.warn(
+        `[TrayManager] Failed to refresh cached flags for ${session.sessionId}:`,
+        error,
+      );
+    }
+  }
 
   private async onSessionStateEvent(event: SessionStateEvent): Promise<void> {
     switch (event.type) {
@@ -466,7 +661,8 @@ export class TrayManager {
         // Stamp only the transition *into* running. `session:streaming` fires
         // repeatedly for the same run, and re-stamping would make the strip
         // announce a working session over and over instead of once as it starts.
-        if (session.status !== 'running' || session.startedAt === undefined) {
+        const enteringRun = session.status !== 'running' || session.startedAt === undefined;
+        if (enteringRun) {
           session.startedAt = Date.now();
           // A new run is not the old run's completion; leaving this set would
           // keep the finished session eligible to be named a second time.
@@ -476,6 +672,17 @@ export class TrayManager {
         session.isStreaming = event.type === 'session:streaming';
         // Clear any linger timer if session restarts
         this.clearLingerTimer(event.sessionId);
+        // The one moment a stale `phase` is guaranteed to cost something: the
+        // session is about to be judged by it. Bounded to the transition rather
+        // than every `session:streaming` tick, which fires throughout a turn and
+        // would make this a query per tick.
+        //
+        // Deliberately after the mutations above rather than before them: the
+        // await is a window in which a short turn's `session:completed` can land,
+        // and resuming into `status = 'running'` on the far side of it would
+        // strand a finished session in the running bucket. The refresh writes
+        // only `phase` and `isArchived`, which no other branch touches.
+        if (enteringRun) await this.refreshCachedSessionFlags(session);
         break;
       }
 
@@ -492,7 +699,7 @@ export class TrayManager {
           // Check if app is backgrounded -- if so, mark as unread. The tray
           // panel does not count: the user opening it to check on sessions must
           // not suppress the unread flag on everything that finishes meanwhile.
-          const hasVisibleFocusedWindow = projectWindows().some(w => w.isVisible() && w.isFocused());
+          const hasVisibleFocusedWindow = getProjectWindows().some(w => w.isVisible() && w.isFocused());
           if (!hasVisibleFocusedWindow) {
             session.hasUnread = true;
           }
@@ -535,8 +742,44 @@ export class TrayManager {
       }
 
       case 'session:activity': {
-        // Activity events don't change tray state, skip rebuild
+        // The liveness tick (see turnLivenessTicker). This is the *only* signal
+        // that a long turn is still working: `updatedAt` below moves on
+        // transitions, and a turn inside a thirty-minute tool call makes none,
+        // so measuring silence against it called every long turn stalled.
+        //
+        // It deliberately does not fall through to the rebuild at the bottom.
+        // A tick a minute that says "still running" changes nothing on screen,
+        // and repainting the island for it would be a minute-by-minute redraw
+        // in the user's peripheral vision. The one visible consequence -- a
+        // session climbing back out of the stalled bucket -- is handled below.
+        const alive = this.sessionCache.get(event.sessionId);
+        if (!alive) return;
+
+        const wasStalled = alive.status === 'running'
+          && alive.phase !== 'complete'
+          && !alive.hasPendingPrompt
+          && isStalled(alive, Date.now());
+
+        alive.liveAt = Date.now();
+        alive.turnInFlight = true;
+
+        // Only a bucket change is worth a repaint.
+        if (wasStalled) this.scheduleMenuRebuild();
         return;
+      }
+    }
+
+    // `turnInFlight` tracks the ticker's lifetime, so it flips on exactly the
+    // events that start and end a turn. Not on `session:waiting`: a session
+    // blocked on a prompt still has its turn open (and its ticker running), and
+    // it is bucketed by `hasPendingPrompt` long before liveness matters.
+    const settled = this.sessionCache.get(event.sessionId);
+    if (settled) {
+      if (event.type === 'session:started' || event.type === 'session:streaming') {
+        settled.turnInFlight = true;
+        settled.liveAt = Date.now();
+      } else if (event.type === 'session:completed' || event.type === 'session:error') {
+        settled.turnInFlight = false;
       }
     }
 
@@ -604,14 +847,45 @@ export class TrayManager {
     }
     this.menuRebuildTimer = setTimeout(() => {
       this.menuRebuildTimer = null;
-      this.rebuildMenu();
+      // A throw from a bare timer callback is an Uncaught Exception dialog. When
+      // the process is out of file descriptors the settings reads in here fail
+      // (#1748); keep the last menu and let the next rebuild try again.
+      try {
+        // Ahead of `rebuildMenu`, which returns early when the tray icon is
+        // hidden. The phone's card has nothing to do with whether there is an icon
+        // in this machine's menu bar.
+        this.publishFleetActivity();
+        this.refreshMenuBar();
+      } catch (error) {
+        logger.main.error('[TrayManager] menu rebuild failed:', error);
+      }
     }, MENU_REBUILD_DEBOUNCE_MS);
   }
 
   /** Last built app-actions menu, popped up on right-click when the panel owns left-click. */
   private appMenu: Electron.Menu | null = null;
 
-  private rebuildMenu(): void {
+  /**
+   * Reconcile the menu bar: exactly one fleet-status surface, never two.
+   *
+   * The island and the tray item are alternatives, not layers. Before this was a
+   * decision the island drew in the middle of the menu bar *and* the tray item
+   * sat on the right with its own state dot, which is two presences for one
+   * fleet and made the style setting look broken. Island mode therefore takes
+   * the tray item away entirely -- and that is what the island's own gear panel
+   * exists to compensate for, because the tray's right-click menu goes with it.
+   */
+  private refreshMenuBar(): void {
+    if (this.isIslandActive()) {
+      this.destroyTrayItem();
+      void this.updateStrip();
+      this.updateDockBadge(this.buildPanelFeed().needsAttention.length);
+      return;
+    }
+
+    closeMenuBarIsland();
+    if (isShowTrayIcon()) this.createTray();
+    else this.destroyTrayItem();
     if (!this.tray) return;
 
     const feed = this.buildPanelFeed();
@@ -717,18 +991,7 @@ export class TrayManager {
     const syncConfig = getSessionSyncConfig();
     if (syncConfig?.enabled) {
       const currentMode = resolvePreventSleepMode(syncConfig);
-      const setMode = (mode: 'off' | 'always' | 'pluggedIn') => {
-        const currentConfig = getSessionSyncConfig();
-        if (currentConfig) {
-          const updated = { ...currentConfig, preventSleepMode: mode, preventSleepWhenSyncing: undefined };
-          setSessionSyncConfig(updated);
-          updateSleepPrevention();
-          this.scheduleMenuRebuild();
-          for (const win of BrowserWindow.getAllWindows()) {
-            win.webContents.send('sync:config-updated', updated);
-          }
-        }
-      };
+      const setMode = (mode: 'off' | 'always' | 'pluggedIn') => this.setPreventSleepMode(mode);
       menuItems.push({
         label: 'Prevent Sleep',
         submenu: [
@@ -748,6 +1011,26 @@ export class TrayManager {
         checked: isShowTrayStrip(),
         click: () => this.setStripVisible(!isShowTrayStrip()),
       });
+      if (isShowTrayStrip()) {
+        const style = getTrayStripStyle();
+        menuItems.push({
+          label: 'Fleet Status Style',
+          submenu: [
+            {
+              label: 'Menu Bar Item',
+              type: 'radio',
+              checked: style === 'image',
+              click: () => this.setStripStyle('image'),
+            },
+            {
+              label: 'Island',
+              type: 'radio',
+              checked: style === 'island',
+              click: () => this.setStripStyle('island'),
+            },
+          ],
+        });
+      }
     }
     menuItems.push({
       label: 'Hide Menu Bar Icon',
@@ -811,16 +1094,87 @@ export class TrayManager {
     return process.platform === 'darwin' && isShowTrayStrip();
   }
 
+  /**
+   * Whether the island owns the menu bar, and therefore whether the tray item
+   * must not exist. The one predicate `refreshMenuBar` and `paintStrip` share,
+   * so the two can never disagree about which surface is live.
+   */
+  private isIslandActive(): boolean {
+    return this.isStripEnabled()
+      && getTrayStripStyle() === 'island'
+      && isMenuBarIslandSupported();
+  }
+
   /** The current cross-workspace fleet snapshot, with a fresh revision. */
-  buildFleetSnapshot(): FleetSnapshot {
+  buildFleetSnapshot(now: number = Date.now()): FleetSnapshot {
     this.snapshotRevision += 1;
     return deriveFleetSnapshot(this.sessionCache.values(), this.snapshotRevision, {
+      now,
       ...(this.lastFleetActivityAt !== null ? { lastActivityAt: this.lastFleetActivityAt } : {}),
     });
   }
 
+  // ─── iOS Live Activity ─────────────────────────────────────────────────
+
+  /**
+   * Start publishing the fleet to the phone.
+   *
+   * Its own timer rather than a ride on `stripAgeTimer`, for the same reason it
+   * is not part of `paintStrip`: the strip's timer only exists while the strip
+   * is enabled and the tray icon is showing, and neither has any bearing on
+   * whether a phone across the room should know a session went quiet. The
+   * interval is the same, because the thing it catches is the same -- a stall
+   * emits no event, so it is only ever noticed by re-deriving on a clock.
+   */
+  private startFleetActivity(): void {
+    if (this.fleetPublisher) return;
+    // `isStripEnabled()` is read at flush time rather than captured here: the
+    // user can toggle Show Fleet Status from the tray menu at any point, and the
+    // phone should hear the current answer on the next send rather than whatever
+    // was true when the publisher was constructed.
+    this.fleetPublisher = new FleetActivityPublisher({
+      send: (payload) =>
+        sendFleetActivity(payload, this.isStripEnabled() && isShowTrayIcon()),
+    });
+    this.publishFleetActivity();
+    // Same containment as the menu rebuild: the send reads settings from disk.
+    this.fleetActivityTimer = setInterval(() => {
+      try {
+        this.publishFleetActivity();
+      } catch (error) {
+        logger.main.error('[TrayManager] fleet activity tick failed:', error);
+      }
+    }, STRIP_AGE_TICK_MS);
+    this.fleetActivityTimer.unref?.();
+  }
+
+  private stopFleetActivity(): void {
+    if (this.fleetActivityTimer) {
+      clearInterval(this.fleetActivityTimer);
+      this.fleetActivityTimer = null;
+    }
+    this.fleetPublisher?.stop();
+    this.fleetPublisher = null;
+  }
+
+  /**
+   * Hand the publisher the current truth. It decides whether that is news.
+   *
+   * Cheap enough to call on every rebuild by design -- the coalescing lives in
+   * the publisher, so no caller has to reason about the APNs budget.
+   */
+  private publishFleetActivity(): void {
+    if (!this.fleetPublisher || !isFleetActivityAvailable()) return;
+    const now = Date.now();
+    const snapshot = this.buildFleetSnapshot(now);
+    this.fleetPublisher.submit(
+      buildFleetActivityPayload(snapshot, this.sessionCache.values(), now),
+    );
+  }
+
   private async updateStrip(): Promise<void> {
-    const view = this.stripMachine.update(this.buildFleetSnapshot(), Date.now());
+    const now = Date.now();
+    const view = this.stripMachine.update(this.buildFleetSnapshot(now), now);
     this.scheduleStripTimers();
     await this.paintStrip(view);
   }
@@ -828,8 +1182,8 @@ export class TrayManager {
   /**
    * Redraw against the last snapshot at the current time.
    *
-   * The two things that change without a session event: a name hold expiring,
-   * and the age rolling over a minute.
+   * Used for the one thing that changes without either a session event or a
+   * reclassification: a name hold expiring.
    */
   private async tickStrip(): Promise<void> {
     if (!this.tray || !this.isStripEnabled()) return;
@@ -838,10 +1192,30 @@ export class TrayManager {
     await this.paintStrip(view);
   }
 
+  /**
+   * Re-derive on the clock, not just on events.
+   *
+   * A session going quiet emits nothing -- that is what makes it a stall -- so
+   * the stalled bucket only exists if something re-runs the derivation
+   * periodically. `tickStrip` cannot do it: it re-renders the *last* snapshot,
+   * so a session could sit silent for an hour and never be reclassified. The
+   * blocked-age rolling over a minute needs the same interval anyway.
+   */
+  private async reviseStrip(): Promise<void> {
+    if (!this.tray || !this.isStripEnabled()) return;
+    await this.updateStrip();
+  }
+
   private async paintStrip(view: StripView): Promise<void> {
     this.namedSessionId = view.mode === 'named'
       ? { sessionId: view.sessionId, workspacePath: view.workspacePath }
       : null;
+
+    if (this.isIslandActive()) {
+      this.paintIsland(view);
+      return;
+    }
+    closeMenuBarIsland();
 
     const key = stripViewKey(view);
     if (key === this.lastStripKey) return;
@@ -855,6 +1229,105 @@ export class TrayManager {
     this.tray.setImage(image);
     // The strip carries its own counts, so the title would be a second copy.
     if (process.platform === 'darwin') this.tray.setTitle('');
+  }
+
+  /**
+   * The island render style.
+   *
+   * The island is a live window, so unlike the bitmap strip there is no image to
+   * cache and no `stripViewKey` short-circuit -- the renderer diffs for us, and
+   * the session rows have to keep arriving even when the strip line is unchanged.
+   *
+   * It paints in every state, including the quiet one, where the strip line
+   * collapses to the bare app glyph. That is not decoration: island mode removes
+   * the tray item, so a pill that vanished when the fleet went quiet would leave
+   * an idle Mac with no way to open the panel, reach the gear, or switch the
+   * style back.
+   */
+  private paintIsland(view: StripView): void {
+    const feed = this.buildPanelFeed();
+    // Refreshed here rather than on a timer: a repaint is exactly when the rows
+    // changed, and the guard inside makes it a no-op while the panel is closed.
+    void this.refreshSessionSnippets(feed);
+    const idle = isIdleView(view) ? this.buildIdleSummary() : undefined;
+    showMenuBarIsland({
+      strip: toIslandStrip(view),
+      feed,
+      snippets: Object.fromEntries(this.sessionSnippets),
+      settings: this.buildIslandSettings(),
+      ...(idle ? { idle } : {}),
+    });
+
+    this.lastStripKey = ISLAND_STRIP_KEY;
+  }
+
+  /**
+   * What the island's gear panel shows.
+   *
+   * Read fresh on every frame rather than pushed on change: the same settings
+   * are also reachable from the tray menu and from app Settings, and a panel
+   * that cached its own copy would show a stale toggle after either.
+   */
+  private buildIslandSettings(): MenuBarIslandSettings {
+    const syncConfig = getSessionSyncConfig();
+    return {
+      style: getTrayStripStyle(),
+      showFleetStatus: isShowTrayStrip(),
+      osNotifications: isOSNotificationsEnabled(),
+      // Null, not 'off'. Sleep prevention only means anything while sync is
+      // configured, which is why the tray menu omits it in that case too.
+      preventSleep: syncConfig?.enabled ? resolvePreventSleepMode(syncConfig) : null,
+    };
+  }
+
+  /** Apply one change from the island's gear panel. */
+  applyIslandSetting(change: MenuBarIslandSettingChange): void {
+    switch (change.key) {
+      case 'style':
+        this.setStripStyle(change.value);
+        return;
+      case 'showFleetStatus':
+        this.setStripVisible(change.value);
+        return;
+      case 'osNotifications':
+        setOSNotificationsEnabled(change.value);
+        // App Settings holds its own copy of this and rewrites the whole
+        // notification block on any edit, so a window that never heard about
+        // this change would silently put the old value back.
+        this.broadcastNotificationsEnabled(change.value);
+        this.refreshMenuBar();
+        return;
+      case 'preventSleep':
+        this.setPreventSleepMode(change.value);
+        return;
+    }
+  }
+
+  private broadcastNotificationsEnabled(enabled: boolean): void {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (window.isDestroyed()) continue;
+      window.webContents.send('notifications:enabled-changed', enabled);
+    }
+  }
+
+  /**
+   * Set the sleep-prevention mode and tell everyone who caches it.
+   *
+   * Shared by the tray menu item and the island's gear panel so the two cannot
+   * apply it differently -- this was a closure inside `buildAppMenuItems`, which
+   * put it out of reach of the second caller.
+   */
+  private setPreventSleepMode(mode: 'off' | 'always' | 'pluggedIn'): void {
+    const currentConfig = getSessionSyncConfig();
+    if (!currentConfig) return;
+    const updated = { ...currentConfig, preventSleepMode: mode, preventSleepWhenSyncing: undefined };
+    setSessionSyncConfig(updated);
+    updateSleepPrevention();
+    this.scheduleMenuRebuild();
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue;
+      win.webContents.send('sync:config-updated', updated);
+    }
   }
 
   private scheduleStripTimers(): void {
@@ -874,7 +1347,7 @@ export class TrayManager {
     }
 
     if (!this.stripAgeTimer) {
-      this.stripAgeTimer = setInterval(() => void this.tickStrip(), STRIP_AGE_TICK_MS);
+      this.stripAgeTimer = setInterval(() => void this.reviseStrip(), STRIP_AGE_TICK_MS);
       // Nothing in the menu bar is worth keeping the event loop alive for.
       this.stripAgeTimer.unref?.();
     }
@@ -891,15 +1364,119 @@ export class TrayManager {
     }
     this.stripRenderer?.destroy();
     this.stripRenderer = null;
+    closeMenuBarIsland();
     this.lastStripKey = null;
     this.namedSessionId = null;
   }
 
-  /** Show or hide the menu bar strip, independently of the tray icon itself. */
+  /**
+   * Told by the island when it opens or closes.
+   *
+   * Opening is the trigger to go and read the snippets, because that is the
+   * only moment they are about to be seen. Closing drops them so a stale line
+   * cannot flash on the next open before the fresh read lands.
+   */
+  onIslandExpandedChange(expanded: boolean): void {
+    this.islandExpanded = expanded;
+    if (!expanded) {
+      this.sessionSnippets.clear();
+      return;
+    }
+    void this.refreshSessionSnippets(this.buildPanelFeed()).then(() => {
+      if (this.islandExpanded) void this.tickStrip();
+    });
+  }
+
+  /**
+   * Read what the panel's rows say, for every session it is about to show.
+   *
+   * Two batched queries, never one per row: the snippet read is against the
+   * largest table in the database. Skipped entirely while the panel is closed,
+   * which is almost always -- a read per `session:streaming` tick would be
+   * indefensible.
+   *
+   * The stalled bucket is included. It was left out when this was written, which
+   * meant the one bucket whose rows say the least ("running, but silent") was
+   * also the only one with no line of context under the title.
+   */
+  private async refreshSessionSnippets(feed: TrayPanelFeed): Promise<void> {
+    if (!this.islandExpanded || !this.database) return;
+
+    const ids = [...feed.needsAttention, ...feed.running, ...feed.stalled, ...feed.unread]
+      .map((session) => session.sessionId);
+
+    await Promise.all([this.refreshSnippetLines(ids), this.refreshCachedTitles(ids)]);
+  }
+
+  private async refreshSnippetLines(ids: string[]): Promise<void> {
+    const sql = latestAssistantTextSql(ids);
+    if (!sql) return;
+
+    try {
+      const { rows } = await this.database!.query<{ session_id: string; searchable_text: string }>(sql);
+      this.sessionSnippets.clear();
+      for (const row of rows) {
+        const line = toSnippetLine(row.searchable_text);
+        if (line) this.sessionSnippets.set(row.session_id, line);
+      }
+    } catch (error) {
+      // A missing snippet costs a line of context; it must never cost the panel.
+      logger.main.warn('[TrayManager] Failed to read session snippets:', error);
+    }
+  }
+
+  /**
+   * Re-read the titles of the rows about to be shown.
+   *
+   * The cache fills `title` once, when the session first enters it, and a
+   * session is renamed routinely afterwards -- so the panel was naming sessions
+   * by whatever they were called at first sight. Writing back into the cache
+   * rather than into the feed means the strip, the native menu and the Live
+   * Activity all get the correction too.
+   */
+  private async refreshCachedTitles(ids: string[]): Promise<void> {
+    const sql = sessionTitlesSql(ids);
+    if (!sql) return;
+
+    try {
+      const { rows } = await this.database!.query<{ id: string; title: string | null }>(sql);
+      for (const row of rows) {
+        const session = this.sessionCache.get(row.id);
+        if (session && row.title && row.title !== session.title) {
+          session.title = row.title;
+        }
+      }
+    } catch (error) {
+      // A stale title is a cosmetic loss; it must never cost the panel.
+      logger.main.warn('[TrayManager] Failed to refresh session titles:', error);
+    }
+  }
+
+  /**
+   * Switch between the bitmap strip and the island.
+   *
+   * The two surfaces are exclusive, so this is a swap rather than a toggle:
+   * `refreshMenuBar` tears down whichever one is leaving before the incoming one
+   * paints. Without the teardown the tray would keep the last bitmap forever.
+   */
+  setStripStyle(style: TrayStripStyle): void {
+    if (style === getTrayStripStyle()) return;
+    setTrayStripStyle(style);
+    closeMenuBarIsland();
+    this.lastStripKey = null;
+    this.refreshMenuBar();
+  }
+
+  /**
+   * Show or hide the fleet status, independently of the tray icon itself.
+   *
+   * Turning it off in island mode is what brings the tray icon back -- it is the
+   * only menu bar presence left, and the way back to this setting.
+   */
   setStripVisible(visible: boolean): void {
     setShowTrayStrip(visible);
     this.lastStripKey = null;
-    this.updateIcon();
+    this.refreshMenuBar();
   }
 
   private computeIconState(): TrayIconState {
@@ -1041,23 +1618,21 @@ export class TrayManager {
   // ─── Session click handling ────────────────────────────────────────────
 
   handleNewSession(): void {
-    const windows = projectWindows();
-    if (windows.length > 0) {
-      const win = windows[0];
+    const win = getRestorableProjectWindow();
+    if (win) {
+      if (win.isMinimized()) win.restore();
       win.show();
       win.focus();
       // Tell renderer to switch to agent mode and create a new session
       win.webContents.send('tray:new-session');
+    } else {
+      restoreApplicationWindow();
     }
   }
 
   /** Focus any project window. Shared by the native menu item and the panel footer. */
   handleOpenApp(): void {
-    const windows = projectWindows();
-    if (windows.length > 0) {
-      windows[0].show();
-      windows[0].focus();
-    }
+    restoreApplicationWindow();
   }
 
   handleSessionClick(sessionId: string, workspacePath: string): void {
@@ -1067,17 +1642,13 @@ export class TrayManager {
 
     const targetWindow = findWindowByWorkspace(workspacePath);
     if (targetWindow && !targetWindow.isDestroyed()) {
+      if (targetWindow.isMinimized()) targetWindow.restore();
       targetWindow.show();
       targetWindow.focus();
       // Send navigation request to renderer
       targetWindow.webContents.send('tray:navigate-to-session', { sessionId, workspacePath });
     } else {
-      // No window for this workspace -- just show any window
-      const windows = projectWindows();
-      if (windows.length > 0) {
-        windows[0].show();
-        windows[0].focus();
-      }
+      restoreApplicationWindow();
     }
 
     // Clear unread flag when user clicks (in-memory + database)
@@ -1162,10 +1733,11 @@ export class TrayManager {
         },
       });
       if (syncProvider) {
-        syncProvider.pushChange(sessionId, {
+        const outcome = await syncProvider.pushChange(sessionId, {
           type: 'metadata_updated',
           metadata: { lastReadAt },
         });
+        warnIfUnpublished(message => logger.main.warn(message), sessionId, '[TrayManager] Failed to publish read state', outcome);
       }
     } catch (error) {
       logger.main.error('[TrayManager] Failed to persist read state from tray action:', error);
@@ -1183,17 +1755,11 @@ export class TrayManager {
     if (!this.database) return;
 
     try {
-      // The hasUnread flag is stored in the metadata JSONB column.
-      // metadata.metadata.hasUnread is the nested path used by sessionStateListeners.
-      // Also check metadata.hasUnread for backwards compatibility.
-      const { rows } = await this.database.query<any>(
-        `SELECT id, title, workspace_id, provider, model, updated_at, metadata FROM ai_sessions
-         WHERE is_archived = false
-           AND (metadata->'metadata'->>'hasUnread' = 'true'
-                OR metadata->>'hasUnread' = 'true')`
-      );
+      // One row over the cap, so the log can say whether it truncated.
+      const { rows } = await this.database.query<any>(unreadSeedQuery(UNREAD_SEED_LIMIT + 1));
+      const seeded = rows.slice(0, UNREAD_SEED_LIMIT);
 
-      for (const row of rows) {
+      for (const row of seeded) {
         // Don't overwrite sessions already in cache (e.g., currently running)
         if (this.sessionCache.has(row.id)) continue;
 
@@ -1216,16 +1782,22 @@ export class TrayManager {
         });
       }
 
-      if (rows.length > 0) {
-        logger.main.info(`[TrayManager] Seeded ${rows.length} unread session(s) from database`);
+      if (seeded.length > 0) {
+        // The truncation is logged because the strip's unread count is drawn
+        // from the cache: past the cap it stops being the fleet's real number,
+        // and a capped count that says so is recoverable where a silent one is
+        // just wrong.
+        const truncated = rows.length > UNREAD_SEED_LIMIT ? ` (capped at ${UNREAD_SEED_LIMIT})` : '';
+        logger.main.info(`[TrayManager] Seeded ${seeded.length} unread session(s) from database${truncated}`);
         this.scheduleMenuRebuild();
       }
     } catch (error) {
       logger.main.error('[TrayManager] Failed to seed unread sessions from database:', error);
     }
 
-    // The quiet strip reports how long it has been quiet, and "since this app
-    // launched" is not that. One aggregate read gives it an honest starting point.
+    // The idle panel reports how long it has been quiet, and "since this app
+    // launched" is not that. One aggregate read gives it an honest starting
+    // point. It feeds the panel header only -- never the strip.
     try {
       const { rows } = await this.database.query<{ last_activity: unknown }>(
         `SELECT MAX(updated_at) AS last_activity FROM ai_sessions WHERE is_archived = false`,

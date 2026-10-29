@@ -226,6 +226,36 @@ export function getMigrations(schemaDir: string): Migration[] {
       name: 'drop_unused_message_index',
       sqlFile: path.join(schemaDir, '0037_drop_unused_message_index.sql'),
     },
+    {
+      version: 38,
+      name: 'repair_double_quoted_review_status',
+      sqlFile: path.join(schemaDir, '0038_repair_double_quoted_review_status.sql'),
+    },
+    {
+      version: 39,
+      name: 'drop_unique_issue_number_index',
+      sqlFile: path.join(schemaDir, '0039_drop_unique_issue_number_index.sql'),
+    },
+    {
+      version: 40,
+      name: 'worktree_source_folder',
+      sqlFile: path.join(schemaDir, '0040_worktree_source_folder.sql'),
+    },
+    { version: 41, name: 'document_feedback_index', sqlFile: path.join(schemaDir, '0041_document_feedback_index.sql') },
+    { version: 42, name: 'tracker_creation_receipts', sqlFile: path.join(schemaDir, '0042_tracker_creation_receipts.sql') },
+    { version: 43, name: 'shell_tracking_coverage', sqlFile: path.join(schemaDir, '0043_shell_tracking_coverage.sql') },
+    { version: 44, name: 'external_session_cursors', sqlFile: path.join(schemaDir, '0044_external_session_cursors.sql') },
+    { version: 45, name: 'tracker_item_revisions', sqlFile: path.join(schemaDir, '0045_tracker_item_revisions.sql') },
+    { version: 46, name: 'tracker_item_revision_tombstones', sqlFile: path.join(schemaDir, '0046_tracker_item_revision_tombstones.sql') },
+    { version: 47, name: 'tracker_item_revision_scope', sqlFile: path.join(schemaDir, '0047_tracker_item_revision_scope.sql') },
+    { version: 48, name: 'tracker_relationship_index_qualifiers', sqlFile: path.join(schemaDir, '0048_tracker_relationship_index_qualifiers.sql') },
+    { version: 49, name: 'personal_pages', sqlFile: path.join(schemaDir, '0049_personal_pages.sql') },
+    { version: 50, name: 'personal_pages_one_tree', sqlFile: path.join(schemaDir, '0050_personal_pages_one_tree.sql') },
+    { version: 51, name: 'personal_pages_parents_and_order', sqlFile: path.join(schemaDir, '0051_personal_pages_parents_and_order.sql') },
+    { version: 52, name: 'personal_pages_fields', sqlFile: path.join(schemaDir, '0052_personal_pages_fields.sql') },
+    { version: 53, name: 'index_hygiene', sqlFile: path.join(schemaDir, '0053_index_hygiene.sql') },
+    { version: 54, name: 'project_file_sync_disk_stamp', sqlFile: path.join(schemaDir, '0054_project_file_sync_disk_stamp.sql') },
+    { version: 55, name: 'tracker_recovery_revision', sqlFile: path.join(schemaDir, '0055_tracker_recovery_revision.sql') },
   ];
 }
 

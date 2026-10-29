@@ -26,7 +26,7 @@ import { HeadlessAgentRawParser } from './parsers/HeadlessAgentRawParser';
 import { GeminiAntigravityRawParser } from './parsers/GeminiAntigravityRawParser';
 import type { RawMessage } from './TranscriptTransformer';
 import type { TranscriptEvent } from './types';
-import { processDescriptor, selectRawParser, findTeammateSpawnToolUseId } from './processDescriptor';
+import { processDescriptor, selectRawParser, findTeammateSpawnToolUseId, stampPromptSource } from './processDescriptor';
 import { isTaskSubagentRawChunk } from '../providers/claudeCode/subagentTaskCorrelation';
 
 export interface RawProjectionOptions {
@@ -105,7 +105,7 @@ export async function rawMessagesToCanonicalEvents(
           writer,
           store,
           msg.sessionId,
-          desc,
+          stampPromptSource(desc, msg),
           toolEventIds,
           subagentEventIds,
         );

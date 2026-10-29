@@ -2,9 +2,15 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { watch, FSWatcher } from 'fs';
-import { MCPConfig, MCPServerConfig, MCPServerEnv } from '@nimbalyst/runtime/types/MCPServerConfig';
+import {
+  MCPConfig,
+  MCPServerConfig,
+  MCPServerEnv,
+  isMCPServerEnabledForProvider,
+  type MCPProviderId,
+} from '@nimbalyst/runtime/types/MCPServerConfig';
 import { logger } from '../utils/logger';
-import { getEnhancedPath } from './CLIManager';
+import { getEnhancedPath } from './shellEnvironment';
 import {
   applyDisabledMcpjsonServersToSettings,
   applyDisabledServersToClaudeConfig,
@@ -48,6 +54,94 @@ export interface TestProgressCallback {
 interface ClaudeConfig {
   mcpServers?: Record<string, MCPServerConfig>;
   [key: string]: any; // Other Claude Code settings
+}
+
+/** What `loadTrustGatedMcpServers` needs from its caller. */
+export interface TrustGatedMcpLoaderOptions {
+  service: Pick<
+    MCPConfigService,
+    'getMergedConfigWithOrigins' | 'isOAuthAuthorized' | 'processServerConfigForRuntime'
+  >;
+  providerId: MCPProviderId;
+  /** Used only in log lines. */
+  displayName: string;
+  workspacePath?: string;
+  /**
+   * Read the workspace's stored trust mode.
+   *
+   * A thunk rather than a value so the read happens *inside* this function's
+   * fail-closed catch. Evaluating it at the call site put the permission-store
+   * read outside the catch, and a throw from there reached the runtime's
+   * ungated fallback loader — the exact bypass the catch exists to prevent.
+   */
+  getTrustMode: () => 'ask' | 'allow-all' | 'bypass-all' | null | undefined;
+  log?: { info: (message: string) => void; warn: (message: string, error?: unknown) => void };
+}
+
+/**
+ * The servers a headless CLI agent may be given, with the repository's own
+ * servers withheld unless the user already trusted this workspace to run things
+ * without asking.
+ *
+ * Grok and Cursor are handed their servers at session start and spawn each
+ * `command` themselves — Grok's arrive inline on ACP `session/new`, which
+ * happens before the first permission prompt can be shown. So a `.mcp.json`
+ * committed to a repository executes on the first turn after a clone, in a
+ * workspace the user only ever set to `ask`. Gating on the same trust mode the
+ * turn gate consults keeps that from being a way around it. A server the user
+ * configured globally is never withheld: they chose it, and cloning a
+ * repository cannot change that.
+ *
+ * Two failure modes matter as much as the gate itself, because the runtime's
+ * MCP config service catches anything thrown by a config loader and falls back
+ * to reading `<workspace>/.mcp.json` *directly*, with no gate at all:
+ *
+ * - A malformed entry (`{"mcpServers": {"bad": null}}`) is skipped, not thrown
+ *   on. A repository could otherwise pair one null entry with one real command
+ *   and reach the ungated fallback on purpose.
+ * - Anything else that goes wrong returns an empty map. Losing MCP for a turn
+ *   is recoverable; handing a repository's commands to a CLI is not.
+ */
+export async function loadTrustGatedMcpServers({
+  service,
+  providerId,
+  displayName,
+  workspacePath,
+  getTrustMode,
+  log = logger.mcp,
+}: TrustGatedMcpLoaderOptions): Promise<Record<string, MCPServerConfig>> {
+  try {
+    const { mcpServers, repositoryProvided } = await service.getMergedConfigWithOrigins(workspacePath);
+    const trustMode = getTrustMode();
+    const repositoryAllowed = trustMode === 'allow-all' || trustMode === 'bypass-all';
+
+    const enabledServers: Record<string, MCPServerConfig> = {};
+    for (const [name, config] of Object.entries(mcpServers)) {
+      if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        log.info(`[MCP] Ignoring malformed MCP server entry for ${displayName}: ${name}`);
+        continue;
+      }
+      if (!repositoryAllowed && repositoryProvided.has(name)) {
+        log.info(
+          `[MCP] Withholding repository-provided server from ${displayName} until this workspace is trusted to run without asking: ${name}`,
+        );
+        continue;
+      }
+      if (!isMCPServerEnabledForProvider(config, providerId)) continue;
+      const isAuthorized = await service.isOAuthAuthorized(config, {
+        useMcpRemoteForNativeOAuth: true,
+      });
+      if (!isAuthorized) {
+        log.info(`[MCP] Skipping unauthorized OAuth server for ${displayName}: ${name}`);
+        continue;
+      }
+      enabledServers[name] = service.processServerConfigForRuntime(config);
+    }
+    return enabledServers;
+  } catch (error) {
+    log.warn(`[MCP] Could not load MCP servers for ${displayName}; continuing with none:`, error);
+    return {};
+  }
 }
 
 /**
@@ -313,19 +407,24 @@ export class MCPConfigService {
   }
 
   /**
-   * Read workspace-scope MCP configuration (.mcp.json in project root).
+   * Read the two workspace-scope sources separately, so a caller that needs to
+   * know which of them a server came from can find out from the same read that
+   * produced it.
+   *
+   * Splitting this out of `readWorkspaceMCPConfig` is a security requirement,
+   * not tidiness: classifying origin from a second read of `.mcp.json` means the
+   * file can change between the two, and a config that has since been deleted
+   * reads back as "no repository servers" while its commands are already loaded.
    */
-  async readWorkspaceMCPConfig(workspacePath: string): Promise<MCPConfig> {
-    if (!workspacePath) {
-      throw new Error('workspacePath is required');
-    }
-
-    // Try reading from two locations and merge them:
-    // 1. ~/.claude.json projects section (Claude CLI standard)
-    // 2. .mcp.json in workspace root (legacy/alternative location)
-
+  private async readWorkspaceMcpLayers(workspacePath: string): Promise<{
+    claudeJsonServers: Record<string, MCPServerConfig>;
+    mcpJsonServers: Record<string, MCPServerConfig>;
+    /** True when `.mcp.json` existed but could not be read or parsed. */
+    mcpJsonUnreadable: boolean;
+  }> {
     let claudeJsonServers: Record<string, MCPServerConfig> = {};
     let mcpJsonServers: Record<string, MCPServerConfig> = {};
+    let mcpJsonUnreadable = false;
 
     // 1. Read from ~/.claude.json projects section
     try {
@@ -356,8 +455,22 @@ export class MCPConfigService {
     } catch (error: any) {
       if (error.code !== 'ENOENT') {
         logger.mcp.warn('Failed to read .mcp.json:', error);
+        mcpJsonUnreadable = true;
       }
     }
+
+    return { claudeJsonServers, mcpJsonServers, mcpJsonUnreadable };
+  }
+
+  /**
+   * Read workspace-scope MCP configuration (.mcp.json in project root).
+   */
+  async readWorkspaceMCPConfig(workspacePath: string): Promise<MCPConfig> {
+    if (!workspacePath) {
+      throw new Error('workspacePath is required');
+    }
+
+    const { claudeJsonServers, mcpJsonServers } = await this.readWorkspaceMcpLayers(workspacePath);
 
     // Merge both sources: .mcp.json overrides ~/.claude.json projects
     return {
@@ -365,6 +478,53 @@ export class MCPConfigService {
         ...claudeJsonServers,
         ...mcpJsonServers
       })
+    };
+  }
+
+  /**
+   * The merged server map, plus which of those servers the *repository author*
+   * controls rather than the user.
+   *
+   * `getMergedConfig` flattens the sources into one map and loses that, but only
+   * `<workspace>/.mcp.json` is content that arrives with a `git clone`;
+   * `~/.claude.json` (global and per-project alike) is the user's own file.
+   * Callers that hand servers to a CLI which spawns `command` without asking
+   * need the distinction to gate on workspace trust.
+   *
+   * Both answers come from one read, so nothing can change on disk between
+   * "what are the servers" and "where did they come from".
+   *
+   * Fails closed. `.mcp.json` wins the merge, so a name in both sources is
+   * repository-provided in the config that is actually used; and if `.mcp.json`
+   * existed but could not be read, every workspace-scope server is treated as
+   * repository-provided rather than assumed safe.
+   */
+  async getMergedConfigWithOrigins(workspacePath?: string): Promise<{
+    mcpServers: Record<string, MCPServerConfig>;
+    repositoryProvided: Set<string>;
+  }> {
+    const userConfig = await this.readUserMCPConfig();
+    if (!workspacePath) {
+      return { mcpServers: userConfig.mcpServers ?? {}, repositoryProvided: new Set() };
+    }
+
+    const { claudeJsonServers, mcpJsonServers, mcpJsonUnreadable } =
+      await this.readWorkspaceMcpLayers(workspacePath);
+
+    const repositoryProvided = new Set(Object.keys(mcpJsonServers));
+    if (mcpJsonUnreadable) {
+      for (const name of Object.keys(claudeJsonServers)) {
+        repositoryProvided.add(name);
+      }
+    }
+
+    return {
+      mcpServers: this.normalizeServers({
+        ...userConfig.mcpServers,
+        ...claudeJsonServers,
+        ...mcpJsonServers,
+      }),
+      repositoryProvided,
     };
   }
 
@@ -615,8 +775,15 @@ export class MCPConfigService {
       throw new Error('workspacePath is required');
     }
 
+    // Each watcher is deduplicated on its own. A workspace with no .mcp.json
+    // has only the directory watcher, so guarding on the file watcher alone
+    // opened a new directory handle on every call and leaked the old one (#1748).
+    this.ensureWorkspaceConfigFileWatcher(workspacePath);
+    this.ensureWorkspaceDirWatcher(workspacePath);
+  }
+
+  private ensureWorkspaceConfigFileWatcher(workspacePath: string): void {
     if (this.workspaceWatchers.has(workspacePath)) {
-      logger.mcp.debug('[MCPConfigService] Already watching workspace:', workspacePath);
       return;
     }
 
@@ -643,6 +810,7 @@ export class MCPConfigService {
         if ((error as any).code !== 'ENOENT') {
           logger.mcp.error('[MCPConfigService] Workspace config watcher error:', error);
         }
+        this.evictWatcher(this.workspaceWatchers, workspacePath, fileWatcher);
       });
 
       this.workspaceWatchers.set(workspacePath, fileWatcher);
@@ -651,8 +819,16 @@ export class MCPConfigService {
       // File doesn't exist yet - that's fine, we'll watch the directory instead
       logger.mcp.debug('[MCPConfigService] .mcp.json does not exist yet, watching directory');
     }
+  }
 
-    // Also watch the workspace directory to detect when .mcp.json is created
+  /** Watch the workspace directory to detect when .mcp.json is created. */
+  private ensureWorkspaceDirWatcher(workspacePath: string): void {
+    if (this.workspaceDirWatchers.has(workspacePath)) {
+      return;
+    }
+
+    const mcpJsonPath = path.join(workspacePath, '.mcp.json');
+
     try {
       const dirWatcher = watch(workspacePath, (eventType, filename) => {
         if (filename === '.mcp.json' && (eventType === 'rename' || eventType === 'change')) {
@@ -665,9 +841,7 @@ export class MCPConfigService {
             logger.mcp.info('[MCPConfigService] Workspace .mcp.json created/changed (external):', workspacePath);
 
             // If we weren't watching the file yet, start watching it now
-            if (!this.workspaceWatchers.has(workspacePath)) {
-              this.startWatchingWorkspaceConfig(workspacePath);
-            }
+            this.ensureWorkspaceConfigFileWatcher(workspacePath);
 
             this.notifyChange('workspace', workspacePath);
           });
@@ -676,6 +850,7 @@ export class MCPConfigService {
 
       dirWatcher.on('error', (error) => {
         logger.mcp.error('[MCPConfigService] Workspace directory watcher error:', error);
+        this.evictWatcher(this.workspaceDirWatchers, workspacePath, dirWatcher);
       });
 
       this.workspaceDirWatchers.set(workspacePath, dirWatcher);
@@ -683,6 +858,17 @@ export class MCPConfigService {
     } catch (error) {
       logger.mcp.error('[MCPConfigService] Failed to start workspace directory watcher:', error);
     }
+  }
+
+  /**
+   * Node closes an fs.watch handle when it emits 'error'. Drop it from the
+   * dedupe map so the next start replaces it instead of skipping a dead
+   * watcher. Only the same instance is removed; a replacement stays.
+   */
+  private evictWatcher(watchers: Map<string, FSWatcher>, workspacePath: string, watcher: FSWatcher): void {
+    if (watchers.get(workspacePath) !== watcher) return;
+    watchers.delete(workspacePath);
+    watcher.close();
   }
 
   /**

@@ -1,7 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import type { ContentMode } from '../types/WindowModeTypes';
-import type { AgentModeRef } from '../components/AgentMode';
 import {
   toggleTerminalPanelAtom,
   closeTerminalPanelAtom,
@@ -18,7 +17,8 @@ import {
 } from '../store/atoms/openProjects';
 import { prRemoteAtom } from '../store/atoms/pullRequests';
 import { developerModeAtom } from '../store/atoms/appSettings';
-import { sessionLaunchPopupRequestAtom } from '../store/atoms/appCommands';
+import { sessionLaunchPopupRequestAtom, trackerQuickCreateRequestAtom } from '../store/atoms/appCommands';
+import { titleBarCreateMenusAtom, type TitleBarCreateMenuItem } from '../store/atoms/titleBarCreate';
 import posthog from 'posthog-js';
 
 interface KeyboardShortcutsOptions {
@@ -38,8 +38,6 @@ interface KeyboardShortcutsOptions {
     openHistoryDialog: () => void;
   } | null>;
 
-  // AgentMode ref for worktree operations
-  agentModeRef: React.RefObject<AgentModeRef | null>;
 
   // Agent mode toggle
   toggleAgentCollapsed: () => void;
@@ -72,10 +70,20 @@ interface KeyboardShortcutsOptions {
  * - Cmd+Y: Open history dialog (Files mode only)
  * - Cmd+T: Switch to Tracker mode (or toggle its sidebar if already in Tracker mode)
  * - Cmd+Alt+M: Switch to Org mode (or toggle its sidebar if already in Org mode)
- * - Cmd+Alt+W: Create new worktree session
+ * - Cmd+Alt+W: Open the new-worktree dialog
  * - Ctrl+`: Toggle Terminal panel
  */
 const isMac = navigator.platform.startsWith('Mac');
+
+/**
+ * The agent mode's "New Worktree" item, as the title bar's create menu shows
+ * it. Cmd+Alt+W runs this item so the shortcut opens the same dialog (base
+ * branch, name, repositories) and is disabled in the same cases. It is absent
+ * until agent mode's session list has mounted.
+ */
+function findNewWorktreeMenuItem(): TitleBarCreateMenuItem | undefined {
+  return store.get(titleBarCreateMenusAtom).agent?.items.find(item => item.id === 'worktree');
+}
 
 export function isSessionLaunchPopupShortcut(
   event: Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey'>,
@@ -83,6 +91,14 @@ export function isSessionLaunchPopupShortcut(
 ): boolean {
   const isAppModifier = macPlatform ? event.metaKey : event.ctrlKey;
   return isAppModifier && event.shiftKey && !event.altKey && event.key.toLowerCase() === 'n';
+}
+
+export function isTrackerQuickCreateShortcut(
+  event: Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey'>,
+  macPlatform = isMac,
+): boolean {
+  const isAppModifier = macPlatform ? event.metaKey : event.ctrlKey;
+  return isAppModifier && event.shiftKey && !event.altKey && event.key.toLowerCase() === 'i';
 }
 
 export function isToggleSidebarShortcut(
@@ -96,13 +112,41 @@ export function isToggleSidebarShortcut(
     && event.key.toLowerCase() === 'b';
 }
 
+/**
+ * True when the keystroke landed inside a rich-text surface, where Cmd/Ctrl+B
+ * means bold. This listener runs in the capture phase, so without this check it
+ * preventDefaults the keystroke before Lexical's own root-element handler ever
+ * sees it and the editor can never bold anything.
+ *
+ * Plain inputs, textareas and Monaco (which types into a hidden textarea) are
+ * not editable regions, so the sidebar shortcut still applies there — matching
+ * VS Code's Cmd+B in code.
+ */
+export function isRichTextEditingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  // jsdom never sets isContentEditable, so fall back to the nearest declared
+  // editing host — which is also how a target nested inside the editor matches.
+  const host = target.closest<HTMLElement>('[contenteditable]');
+  return host !== null && host.getAttribute('contenteditable') !== 'false';
+}
+
+/**
+ * True when the keystroke landed inside a surface that claims `chord` for
+ * itself with `data-claims-shortcuts="mod+k mod+b"` (the CSV grid uses Cmd+K
+ * for links and Cmd+B for bold). Opt-in per element; nothing else changes.
+ */
+export function isShortcutClaimedByTarget(target: EventTarget | null, chord: 'mod+k' | 'mod+b'): boolean {
+  if (!(target instanceof Element)) return false;
+  return target.closest(`[data-claims-shortcuts~="${chord}"]`) !== null;
+}
+
 export function useKeyboardShortcuts({
   activeMode,
   workspaceMode,
   setActiveMode,
   activeModeStateRef,
   editorModeRef,
-  agentModeRef,
   toggleAgentCollapsed,
   toggleActiveLeftPane,
   openHistoryForCurrentDocument,
@@ -115,19 +159,22 @@ export function useKeyboardShortcuts({
   const closeTerminalPanel = useSetAtom(closeTerminalPanelAtom);
   const developerMode = useAtomValue(developerModeAtom);
 
-  // Track if worktree creation is pending after mode switch
-  const pendingWorktreeCreationRef = useRef(false);
+  // Cmd+Alt+W pressed outside agent mode: open the new-worktree dialog once
+  // agent mode has published its create menu.
+  const pendingWorktreeDialogRef = useRef(false);
 
-  // When agentModeRef becomes available and worktree creation is pending, execute it
   useEffect(() => {
-    if (pendingWorktreeCreationRef.current && agentModeRef.current && activeMode === 'agent') {
-      pendingWorktreeCreationRef.current = false;
-      void agentModeRef.current.createNewWorktreeSession().catch(() => {
-        // Swallowed: AgentMode already logs the error; keyboard shortcut
-        // has no UI to display it.
-      });
-    }
-  }, [agentModeRef, activeMode]);
+    if (activeMode !== 'agent') return;
+    const openPendingDialog = () => {
+      if (!pendingWorktreeDialogRef.current) return;
+      const item = findNewWorktreeMenuItem();
+      if (!item) return;
+      pendingWorktreeDialogRef.current = false;
+      if (!item.disabled) item.onSelect();
+    };
+    openPendingDialog();
+    return store.sub(titleBarCreateMenusAtom, openPendingDialog);
+  }, [activeMode]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent): void => {
@@ -145,7 +192,19 @@ export function useKeyboardShortcuts({
         return;
       }
 
-      if (workspaceMode && isToggleSidebarShortcut(e)) {
+      // Cmd/Ctrl+Shift+I opens (or toggles) the tracker quick-create popup from
+      // anywhere, without changing the active content mode.
+      if (workspaceMode && isTrackerQuickCreateShortcut(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        store.set(trackerQuickCreateRequestAtom, (version) => version + 1);
+        return;
+      }
+
+      // Cmd/Ctrl+B toggles the active left pane, except inside a rich-text
+      // editor where it is bold.
+      if (workspaceMode && isToggleSidebarShortcut(e) && !isRichTextEditingTarget(e.target)
+        && !isShortcutClaimedByTarget(e.target, 'mod+b')) {
         e.preventDefault();
         e.stopPropagation();
         toggleActiveLeftPane();
@@ -173,7 +232,7 @@ export function useKeyboardShortcuts({
 
       // Cmd+K for Agent mode (toggle session history if already in agent mode)
       // This is a global shortcut, but should be preempted if another component handles it
-      if (isAppModifier && e.key === 'k' && !e.shiftKey) {
+      if (isAppModifier && e.key === 'k' && !e.shiftKey && !isShortcutClaimedByTarget(e.target, 'mod+k')) {
         e.preventDefault();
         e.stopPropagation();
 
@@ -199,6 +258,10 @@ export function useKeyboardShortcuts({
 
       // Cmd+T for Tracker mode (toggle the sidebar if already in tracker mode)
       if (workspaceMode && isAppModifier && !e.shiftKey && !e.altKey && e.key === 't') {
+        // Quick Track owns Cmd+T while it is open. This listener runs in the
+        // capture phase, before the popup's React handler can preventDefault,
+        // so arbitrate on the popup marker instead of the event state.
+        if (document.querySelector('.tracker-quick-create-popup')) return;
         e.preventDefault();
         if (isFullscreenPanelActive) {
           exitFullscreenPanel();
@@ -263,8 +326,11 @@ export function useKeyboardShortcuts({
           store.set(toggleCliTerminalDrawerAtom, activeSessionId);
         }
       }
-      // Cmd+Shift+K for Kanban view (switch to agent mode + kanban, or toggle if already there)
-      if (workspaceMode && isAppModifier && e.shiftKey && e.key === 'k') {
+      // Cmd+Shift+K for Kanban view (switch to agent mode + kanban, or toggle if already there).
+      // With Shift held the browser reports the uppercase letter, so a lowercase
+      // `key` match never fires (#1415).
+      if (workspaceMode && isAppModifier && e.shiftKey
+          && (e.code === 'KeyK' || e.key.toLowerCase() === 'k')) {
         e.preventDefault();
         e.stopPropagation();
 
@@ -296,22 +362,22 @@ export function useKeyboardShortcuts({
         }
       }
 
-      // Cmd+Alt+W (Mac) or Ctrl+Alt+W (Windows) to create new worktree session
-      if (workspaceMode && isAppModifier && e.altKey && e.key === 'w') {
+      // Cmd+Alt+W (Mac) or Ctrl+Alt+W (Windows/Linux) opens the new-worktree
+      // dialog, like the "New Worktree" item it is shown next to.
+      // `code` as well as `key`: with Option held, macOS rewrites the character
+      // (Option+W is "∑"), so the letter alone is not enough to match on.
+      if (workspaceMode && isAppModifier && e.altKey
+          && (e.key.toLowerCase() === 'w' || e.code === 'KeyW')) {
         e.preventDefault();
         e.stopPropagation();
 
         if (isFullscreenPanelActive) exitFullscreenPanel();
 
-        // If in agent mode and ref is available, create worktree directly
-        if (activeMode === 'agent' && agentModeRef.current) {
-          void agentModeRef.current.createNewWorktreeSession().catch(() => {
-            // Swallowed: AgentMode already logs the error; keyboard
-            // shortcut has no UI to display it.
-          });
+        const worktreeItem = activeMode === 'agent' ? findNewWorktreeMenuItem() : undefined;
+        if (worktreeItem) {
+          if (!worktreeItem.disabled) worktreeItem.onSelect();
         } else {
-          // Switch to agent mode first, then create worktree when ref becomes available
-          pendingWorktreeCreationRef.current = true;
+          pendingWorktreeDialogRef.current = true;
           setActiveMode('agent');
         }
       }
@@ -364,7 +430,6 @@ export function useKeyboardShortcuts({
     setActiveMode,
     activeModeStateRef,
     editorModeRef,
-    agentModeRef,
     toggleAgentCollapsed,
     toggleActiveLeftPane,
     openHistoryForCurrentDocument,
