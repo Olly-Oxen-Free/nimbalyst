@@ -124,6 +124,26 @@ describe('ClaudeCodeProvider sub-agent permission blocking', () => {
     expect(statusOf(state, 'task-a')).toBe('completed');
   });
 
+  it('blocks the sub-agent during each per-part prompt of a compound Bash command', async () => {
+    const seen: Array<[unknown, string | undefined]> = [];
+    const { state, canUseTool } = twoSubAgents(async () => ({ behavior: 'allow' }));
+    state.permissionService = { getSessionApprovedPatterns: () => new Set<string>() };
+    state.handleToolPermissionWithService = async (_toolName, input) => {
+      seen.push([(input as { command: string }).command, statusOf(state, 'task-a')]);
+      return { behavior: 'allow' };
+    };
+
+    const result = await canUseTool('Bash', { command: 'git status && npm test' }, {
+      signal: new AbortController().signal,
+      toolUseID: 'toolu_bashA',
+    });
+
+    expect(result.behavior).toBe('allow');
+    // One prompt per part, the sub-agent blocked during each.
+    expect(seen).toEqual([['git status', 'blocked'], ['npm test', 'blocked']]);
+    expect(statusOf(state, 'task-a')).toBe('running');
+  });
+
   it('tracks two simultaneous prompts independently', async () => {
     const release: Record<string, () => void> = {};
     const { state, canUseTool } = twoSubAgents(

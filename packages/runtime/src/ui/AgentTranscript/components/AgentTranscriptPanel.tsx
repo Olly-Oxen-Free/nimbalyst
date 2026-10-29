@@ -3,6 +3,7 @@ import type { SessionData } from '../../../ai/server/types';
 import type { ToolCallDiffLoadResult } from '../../../ai/server/transcript';
 import type { TranscriptSettings, PromptMarker, FileEditSummary } from '../types';
 import { RichTranscriptView } from './RichTranscriptView';
+import type { TranscriptTeammateStatus } from './TranscriptToolCard';
 import type { TranscriptFileLocation } from './MarkdownRenderer';
 import { TranscriptSidebar } from './TranscriptSidebar';
 import { FileEditsSidebar } from './FileEditsSidebar';
@@ -17,7 +18,7 @@ interface Todo {
 }
 
 function summarizePanelTeammates(
-  teammates: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }> | undefined
+  teammates: TranscriptTeammateStatus[] | undefined
 ): string {
   if (!teammates || teammates.length === 0) return 'none';
   return teammates.map(tm => `${tm.agentId}:${tm.status}`).join(', ');
@@ -117,7 +118,7 @@ interface AgentTranscriptPanelProps {
   /** Host callback for lazy, workspace-scoped history diff hydration. */
   loadToolCallDiffs?: (toolCallItemId: string, toolCallTimestamp?: number) => Promise<ToolCallDiffLoadResult>;
   /** Optional: merged teammate/worker statuses to drive transcript status UI */
-  currentTeammates?: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }>;
+  currentTeammates?: TranscriptTeammateStatus[];
   /** Optional: noun used in waiting text when teammates/workers are still running */
   waitingForNoun?: string;
   /** Optional: background tasks the session is draining after the lead turn ended */
@@ -336,7 +337,7 @@ const AgentTranscriptPanelComponent = React.forwardRef<
           onOpenSession={onOpenSession}
           onCompact={onCompact}
           promptAdditions={promptAdditions}
-          currentTeammates={currentTeammates ?? sessionData.metadata?.currentTeammates as Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }> | undefined}
+          currentTeammates={currentTeammates ?? sessionData.metadata?.currentTeammates as TranscriptTeammateStatus[] | undefined}
           waitingForNoun={waitingForNoun}
           backgroundTasks={backgroundTasks}
           appStartTime={appStartTime}

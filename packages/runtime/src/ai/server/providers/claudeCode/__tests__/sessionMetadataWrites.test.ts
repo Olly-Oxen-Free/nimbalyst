@@ -7,7 +7,7 @@ vi.mock('../../../../../storage/repositories/AISessionsRepository', () => ({
   AISessionsRepository: { updateMetadata, get },
 }));
 
-import { persistCurrentTasks } from '../sessionMetadataWrites';
+import { persistCurrentTasks, stopStaleRunningTasks } from '../sessionMetadataWrites';
 import { applySystemTaskChunk, FINISHED_TASK_RETENTION, type TrackedSystemTask } from '../systemTaskChunks';
 
 function runBashTask(tasks: Map<string, TrackedSystemTask>, id: string) {
@@ -40,5 +40,33 @@ describe('persistCurrentTasks', () => {
     expect(persisted.map(t => t.taskId)).not.toContain('t979');
     expect(persisted.some(t => 'pendingTerminalNotification' in t)).toBe(false);
     expect(get).not.toHaveBeenCalled();
+  });
+});
+
+describe('stopStaleRunningTasks', () => {
+  beforeEach(() => {
+    updateMetadata.mockClear();
+    get.mockClear();
+  });
+
+  it('stops tasks a crashed process left running or blocked, and leaves finished ones alone', async () => {
+    get.mockResolvedValueOnce({
+      metadata: {
+        currentTasks: [
+          { taskId: 'run', status: 'running' },
+          { taskId: 'blk', status: 'blocked' },
+          { taskId: 'done', status: 'completed' },
+        ],
+      },
+    });
+
+    await stopStaleRunningTasks('s1', () => {});
+
+    const persisted = updateMetadata.mock.calls.at(-1)![1].metadata.currentTasks as TrackedSystemTask[];
+    expect(Object.fromEntries(persisted.map(t => [t.taskId, t.status]))).toEqual({
+      run: 'stopped',
+      blk: 'stopped',
+      done: 'completed',
+    });
   });
 });

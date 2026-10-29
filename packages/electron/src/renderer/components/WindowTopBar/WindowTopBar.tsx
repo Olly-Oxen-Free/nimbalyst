@@ -2,6 +2,7 @@ import React, { useCallback, useLayoutEffect, useRef } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { MAIN_WINDOW_TITLE_BAR_HEIGHT } from '../../../shared/windowChrome';
+import { FloatingFocusManager } from '@floating-ui/react';
 import { FloatingPortal, useFloatingMenu, virtualElement } from '../../hooks/useFloatingMenu';
 import {
   setTrackerModeLayoutAtom,
@@ -13,8 +14,12 @@ import {
   multiProjectModeAtom,
   projectRailPositionAtom,
   projectRailExpandedDisplayAtom,
+  moveOpenProjectAtom,
+  sortOpenProjectsAtom,
   type OpenProject,
 } from '../../store/atoms/openProjects';
+import { openSettingsCommandAtom } from '../../store/atoms/settingsNavigation';
+import { useProjectRailDrag } from '../hooks/useProjectRailDrag';
 import { ProjectRailIcon, useProjectRailController, REVEAL_LABEL } from '../ProjectRailIcon';
 import { TRACKER_DOCUMENT_PANEL_MODES } from '../TrackerMode/trackerDocumentPanelModes';
 import { DRAG_REGION, NO_DRAG_REGION } from './dragRegion';
@@ -833,10 +838,16 @@ function ExitFullScreenButton() {
 function TopDockedProjectBar() {
   const expandedDisplay = useAtomValue(projectRailExpandedDisplayAtom);
   const controller = useProjectRailController();
+  const { openProjects } = controller;
+  const openSettings = useSetAtom(openSettingsCommandAtom);
+  const moveProject = useSetAtom(moveOpenProjectAtom);
+  const sortProjects = useSetAtom(sortOpenProjectsAtom);
+  const projectListRef = useRef<HTMLDivElement | null>(null);
+  const drag = useProjectRailDrag(projectListRef, moveProject, 'x');
 
-  // Right-click context menu ("Open in new window" / reveal / "Close
-  // project"), mirroring ProjectRail.tsx's own instance but opening
-  // downward (bottom-start) per R7, since this is the top-docked layout.
+  // Right-click context menu, mirroring ProjectRail.tsx's own instance but
+  // opening downward (bottom-start) per R7, since this is the top-docked
+  // layout.
   const contextMenu = useFloatingMenu({
     placement: 'bottom-start',
     open: controller.contextMenuProject !== null,
@@ -867,6 +878,13 @@ function TopDockedProjectBar() {
   }, [addMenu.refs]);
 
   const contextMenuProject = controller.contextMenuProject;
+  const menuIndex = openProjects.findIndex(project => project.path === contextMenuProject?.path);
+  const moveMenuProject = (direction: -1 | 1) => {
+    if (menuIndex < 0) return;
+    const beforePath = direction === -1 ? openProjects[menuIndex - 1]?.path : openProjects[menuIndex + 2]?.path;
+    moveProject({ path: openProjects[menuIndex].path, beforePath: beforePath ?? null });
+    controller.closeContextMenu();
+  };
 
   // R8: when 'hover-reveal', non-selected circles stay hidden until the
   // user hovers the bar area — pure CSS `:hover` (see ProjectRail.css),
@@ -891,8 +909,13 @@ function TopDockedProjectBar() {
        * icon's name element (see ProjectRailIcon) for any selector
        * previously keyed to "window-top-bar-workspace-name".
        */}
-      <div className={`window-top-bar__identity-icons flex items-center gap-1.5 ${NO_DRAG_REGION}`}>
-        {controller.openProjects.map((project) => {
+      <div
+        ref={projectListRef}
+        className={`window-top-bar__identity-icons flex items-center gap-1.5 ${NO_DRAG_REGION}`}
+        data-testid="window-top-bar-projects"
+        {...drag.listProps}
+      >
+        {openProjects.map((project) => {
           const activity = controller.getActivity(project.path);
           return (
             <ProjectRailIcon
@@ -905,6 +928,11 @@ function TopDockedProjectBar() {
               onActivate={controller.activate}
               onClose={controller.close}
               onContextMenu={handleContextMenu}
+              isDragging={drag.draggedPath === project.path}
+              menuOpen={contextMenuProject !== null}
+              dropPosition={drag.beforePath === project.path ? 'before' : drag.beforePath === null && project === openProjects.at(-1) ? 'after' : undefined}
+              onDragStart={(event, path) => { controller.closeContextMenu(); drag.onDragStart(event, path); }}
+              onDragEnd={drag.onDragEnd}
             />
           );
         })}
@@ -968,15 +996,52 @@ function TopDockedProjectBar() {
 
       {contextMenuProject && (
         <FloatingPortal>
+          <FloatingFocusManager context={contextMenu.context} modal={false}>
           <div
             ref={contextMenu.refs.setFloating}
             style={contextMenu.floatingStyles}
             {...contextMenu.getFloatingProps()}
             className={`project-rail-context-menu ${NO_DRAG_REGION}`}
             data-testid="window-top-bar-project-context-menu"
+            onKeyDown={(event) => {
+              if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+              event.preventDefault();
+              event.stopPropagation();
+              const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+              const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+              const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+                : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
+              buttons[next]?.focus();
+            }}
           >
+            <button type="button" role="menuitem" className="project-rail-context-menu-item"
+              disabled={menuIndex <= 0} onClick={() => moveMenuProject(-1)}>
+              Move left
+            </button>
+            <button type="button" role="menuitem" className="project-rail-context-menu-item"
+              disabled={menuIndex < 0 || menuIndex === openProjects.length - 1} onClick={() => moveMenuProject(1)}>
+              Move right
+            </button>
+            <button type="button" role="menuitem" className="project-rail-context-menu-item"
+              disabled={openProjects.length < 2} onClick={() => { sortProjects(); controller.closeContextMenu(); }}>
+              Sort by name
+            </button>
+            <div className="project-rail-context-menu-divider" />
             <button
               type="button"
+              role="menuitem"
+              className="project-rail-context-menu-item"
+              onClick={() => {
+                openSettings({ category: 'project-appearance', scope: 'project', timestamp: Date.now(),
+                  destination: { scope: 'project', category: 'project-appearance', target: { kind: 'workspace', workspacePath: contextMenuProject.path } } });
+                controller.closeContextMenu();
+              }}
+            >
+              Customize appearance…
+            </button>
+            <button
+              type="button"
+              role="menuitem"
               className="project-rail-context-menu-item"
               onClick={() => controller.openInNewWindow(contextMenuProject)}
             >
@@ -984,6 +1049,7 @@ function TopDockedProjectBar() {
             </button>
             <button
               type="button"
+              role="menuitem"
               className="project-rail-context-menu-item"
               onClick={() => controller.revealInFinder(contextMenuProject)}
             >
@@ -992,6 +1058,7 @@ function TopDockedProjectBar() {
             <div className="project-rail-context-menu-divider" />
             <button
               type="button"
+              role="menuitem"
               className="project-rail-context-menu-item"
               onClick={() => {
                 controller.closeContextMenu();
@@ -1001,6 +1068,7 @@ function TopDockedProjectBar() {
               Close project
             </button>
           </div>
+          </FloatingFocusManager>
         </FloatingPortal>
       )}
     </div>

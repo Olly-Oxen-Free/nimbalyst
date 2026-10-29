@@ -645,6 +645,61 @@ describe('WindowTopBar', () => {
       expect(closeActive.closest('.window-top-bar__identity-icons')?.classList.contains(NO_DRAG_REGION)).toBe(true);
       expect(switchOther.closest('.window-top-bar__identity-icons')?.classList.contains(NO_DRAG_REGION)).toBe(true);
     });
+
+    function renderTopDocked(names: string[]) {
+      const projects = names.map((name, i) => ({ path: `/p/${name}`, name, openedAt: i }));
+      getDefaultStore().set(openProjectsAtom, projects);
+      getDefaultStore().set(activeWorkspacePathAtom, projects[0].path);
+      getDefaultStore().set(multiProjectModeAtom, true);
+      getDefaultStore().set(projectRailPositionAtom, 'top');
+      render(
+        <WindowTopBar
+          workspaceName="Fallback"
+          activeModeLabel="Files"
+          gitStatus={null}
+          gitActions={{ onPull: () => {}, onPush: () => {}, onOpenLog: () => {} }}
+        />,
+      );
+      return projects;
+    }
+
+    it('reorders and sorts from the keyboard menu without activating the targeted project', async () => {
+      const projects = renderTopDocked(['Zebra', 'Alpha', 'Beta']);
+      const alpha = screen.getByRole('button', { name: 'Switch to project Alpha' });
+      alpha.focus();
+      fireEvent.keyDown(alpha, { key: 'F10', shiftKey: true });
+      fireEvent.click(await screen.findByRole('menuitem', { name: 'Move left' }));
+      expect(getDefaultStore().get(openProjectsAtom).map(p => p.name)).toEqual(['Alpha', 'Zebra', 'Beta']);
+      expect(getDefaultStore().get(activeWorkspacePathAtom)).toBe(projects[0].path);
+
+      fireEvent.keyDown(alpha, { key: 'ContextMenu' });
+      expect((await screen.findByRole('menuitem', { name: 'Move left' }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Sort by name' }));
+      expect(getDefaultStore().get(openProjectsAtom).map(p => p.name)).toEqual(['Alpha', 'Beta', 'Zebra']);
+      expect(getDefaultStore().get(activeWorkspacePathAtom)).toBe(projects[0].path);
+    });
+
+    it('drag-reorders along x and commits only on drop', () => {
+      const projects = ['A', 'B', 'C'].map((name, i) => ({ path: `/p/${name}`, name, openedAt: i }));
+      const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function(this: HTMLElement) {
+        const index = projects.findIndex(p => p.path === this.dataset.projectPath);
+        // Same y for every icon: only an x-axis hit test can tell them apart.
+        return { left: index * 32, right: index * 32 + 24, width: 24, top: 0, bottom: 24, height: 24 } as DOMRect;
+      });
+      try {
+        renderTopDocked(['A', 'B', 'C']);
+        const list = screen.getByTestId('window-top-bar-projects');
+        const source = screen.getByRole('button', { name: 'Switch to project C' });
+        const dataTransfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' };
+        fireEvent.dragStart(source, { dataTransfer });
+        fireEvent.dragOver(list, { clientX: 40, clientY: 0, dataTransfer });
+        expect(getDefaultStore().get(openProjectsAtom).map(p => p.name)).toEqual(['A', 'B', 'C']);
+        fireEvent(list, Object.assign(new MouseEvent('drop', { bubbles: true, clientX: 40, clientY: 0 }), { dataTransfer }));
+        expect(getDefaultStore().get(openProjectsAtom).map(p => p.name)).toEqual(['A', 'C', 'B']);
+      } finally {
+        rect.mockRestore();
+      }
+    });
   });
 
   // Confirmed design decision: activity is additive. Branch and ahead/behind

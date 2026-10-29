@@ -5,6 +5,7 @@
  */
 
 import type { TaskListItem } from './taskListReconstruct';
+import { isTaskAlive } from './subagentDrain';
 import { persistedTasks, pruneFinishedTasks, type TrackedSystemTask } from './systemTaskChunks';
 
 async function sessionsRepository() {
@@ -27,16 +28,20 @@ export async function persistCurrentTasks(sessionId: string, tasks: Map<string, 
   }
 }
 
-/** Marks tasks persisted as 'running' by an earlier process as stopped, and applies the retention bound. */
+/**
+ * Marks tasks persisted as 'running' or 'blocked' by an earlier process as
+ * stopped, and applies the retention bound. A task blocked on a permission
+ * prompt when the process died has no prompt left to unblock it.
+ */
 export async function stopStaleRunningTasks(sessionId: string, onChanged: () => void): Promise<void> {
   try {
     const AISessionsRepository = await sessionsRepository();
     const currentSession = await AISessionsRepository.get(sessionId);
     const tasks = currentSession?.metadata?.currentTasks;
-    if (Array.isArray(tasks) && tasks.some((t: any) => t.status === 'running')) {
+    if (Array.isArray(tasks) && tasks.some((t: any) => isTaskAlive(t?.status))) {
       const cleaned = new Map<string, TrackedSystemTask>();
       for (const t of tasks) {
-        if (t && typeof t.taskId === 'string') cleaned.set(t.taskId, t.status === 'running' ? { ...t, status: 'stopped' } : t);
+        if (t && typeof t.taskId === 'string') cleaned.set(t.taskId, isTaskAlive(t.status) ? { ...t, status: 'stopped' } : t);
       }
       await persistCurrentTasks(sessionId, cleaned, onChanged);
     }

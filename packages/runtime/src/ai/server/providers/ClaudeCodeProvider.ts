@@ -2258,13 +2258,16 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    * a wake that never became a turn would leave that session running forever,
    * because `teammates:allCompleted` already fired once and skipped the end.
    *
-   * Returns true when no teammate is left either, i.e. the host's deferred
-   * `endSession` is now safe to run.
+   * Returns true when the host's deferred `endSession` is now safe to run: no
+   * lead turn is live, nothing will resume it, and no teammate is left. The
+   * latch can already be clear here -- a wake whose send started the turn
+   * (which resets the latch) and then threw -- and that session must still end.
    */
   public releaseIdleWakeLatch(): boolean {
-    if (!this.teammateIdleMessagePending) return false;
     this.teammateIdleMessagePending = false;
-    return !this.teammateManager.hasActiveTeammates();
+    return !this.isLeadBusy()
+      && !this.willResumeAfterCompletion()
+      && !this.teammateManager.hasActiveTeammates();
   }
 
   /**
@@ -3551,6 +3554,24 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         )
       : this.handleToolPermissionFallback(toolName, input, options, sessionId, workspacePath, warnings);
 
+    // Only an interactive prompt parks on the user. Marking blocked any earlier
+    // would flip the status (and write session metadata) for every
+    // auto-allowed tool call a sub-agent makes.
+    const promptWhileBlocked = async (
+      toolName: string,
+      input: any,
+      options: ToolPermissionOptions,
+      warnings?: string[]
+    ) => {
+      const blockedTaskId = this.markTaskBlockedForToolUse(options.toolUseID, sessionId);
+      try {
+        return await promptForTool(toolName, input, options, warnings);
+      } finally {
+        // Approved, denied, cancelled or thrown — the prompt is gone.
+        if (blockedTaskId) this.clearTaskBlocked(blockedTaskId, sessionId);
+      }
+    };
+
     return async (
       toolName: string,
       input: any,
@@ -3581,7 +3602,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
                   ClaudeCodeDeps.claudeSettingsPatternChecker ?? undefined,
                   workspacePath
                 ),
-                authorizePart: (partInput, warnings) => promptForTool(toolName, partInput, options, warnings),
+                authorizePart: (partInput, warnings) => promptWhileBlocked(toolName, partInput, options, warnings),
                 logSecurity: (message, data) => this.logSecurity(message, data),
               },
               input, options
@@ -3592,16 +3613,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         } else if (compoundDecision) {
           result = compoundDecision;
         } else {
-          // Only the branches below actually park on the user. Marking blocked
-          // any earlier would flip the status (and write session metadata) for
-          // every auto-allowed tool call a sub-agent makes.
-          const blockedTaskId = this.markTaskBlockedForToolUse(options.toolUseID, sessionId);
-          try {
-            result = await promptForTool(toolName, input, options);
-          } finally {
-            // Approved, denied, cancelled or thrown — the prompt is gone.
-            if (blockedTaskId) this.clearTaskBlocked(blockedTaskId, sessionId);
-          }
+          result = await promptWhileBlocked(toolName, input, options);
         }
       } catch (error) {
         console.error(`[canUseTool] #${callNum} EXCEPTION tool="${toolName}" after ${Date.now() - callStart}ms:`, error);

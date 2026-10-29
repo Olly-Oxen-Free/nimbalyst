@@ -162,3 +162,38 @@ describe('ClaudeCodeProvider stalled sub-agent detection', () => {
     expect(state.activeTasks.get('solo')?.status).toBe('stopped');
   });
 });
+
+describe('ClaudeCodeProvider.releaseIdleWakeLatch', () => {
+  type LatchInternals = ProviderInternals & {
+    teammateIdleMessagePending: boolean;
+    teammateManager: { hasActiveTeammates: () => boolean };
+  };
+
+  it('reports an abandoned wake safe to end even when its started turn already cleared the latch', () => {
+    const provider = new ClaudeCodeProvider();
+    const state = provider as unknown as LatchInternals;
+    // The woken turn started (resetting the latch), threw, and ended.
+    state.teammateIdleMessagePending = false;
+    state.leadQuery = null;
+
+    expect(provider.releaseIdleWakeLatch()).toBe(true);
+  });
+
+  it('keeps the session alive while a teammate, a live turn, or a running sub-agent remains', () => {
+    const provider = new ClaudeCodeProvider();
+    const state = provider as unknown as LatchInternals;
+
+    state.teammateIdleMessagePending = true;
+    vi.spyOn(state.teammateManager, 'hasActiveTeammates').mockReturnValueOnce(true);
+    expect(provider.releaseIdleWakeLatch()).toBe(false);
+    // The latch is released either way; the deferred end runs when the teammate completes.
+    expect(state.teammateIdleMessagePending).toBe(false);
+
+    state.leadQuery = {};
+    expect(provider.releaseIdleWakeLatch()).toBe(false);
+
+    state.leadQuery = null;
+    seedTasks(state);
+    expect(provider.releaseIdleWakeLatch()).toBe(false);
+  });
+});

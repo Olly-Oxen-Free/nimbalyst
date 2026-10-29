@@ -168,7 +168,10 @@ export function ProjectRailIcon({
           event.preventDefault();
           event.stopPropagation();
           const rect = event.currentTarget.getBoundingClientRect();
-          onContextMenu(project, rect.right, rect.top);
+          // Anchor beside the icon on the rail, below it in the top bar,
+          // so the menu never opens over the icon it belongs to.
+          if (orientation === 'horizontal') onContextMenu(project, rect.left, rect.bottom);
+          else onContextMenu(project, rect.right, rect.top);
         }}
         aria-haspopup="menu"
         aria-label={`Switch to project ${project.name}`}

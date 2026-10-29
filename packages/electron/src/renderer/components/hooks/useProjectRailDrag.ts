@@ -2,14 +2,22 @@ import { useCallback, useEffect, useRef, useState, type DragEvent, type RefObjec
 
 const PROJECT_DRAG_TYPE = 'application/x-nimbalyst-rail-project';
 
-/** Native drag with an insertion marker and frame-based scrolling at list edges. */
+/**
+ * Native drag with an insertion marker and frame-based scrolling at list edges.
+ * `axis` is the list's main axis: 'y' for the left rail, 'x' for the top bar.
+ */
 export function useProjectRailDrag(
   listRef: RefObject<HTMLDivElement | null>,
   move: (input: { path: string; beforePath: string | null }) => void,
+  axis: 'x' | 'y' = 'y',
 ) {
+  const start = axis === 'x' ? 'left' : 'top';
+  const end = axis === 'x' ? 'right' : 'bottom';
+  const extent = axis === 'x' ? 'width' : 'height';
+  const pointer = (event: DragEvent) => (axis === 'x' ? event.clientX : event.clientY);
   const [draggedPath, setDraggedPath] = useState<string | null>(null);
   const [beforePath, setBeforePath] = useState<string | null | undefined>();
-  const drag = useRef<{ path: string; y: number; inside: boolean } | null>(null);
+  const drag = useRef<{ path: string; pos: number; inside: boolean } | null>(null);
   const frame = useRef<number | null>(null);
 
   const clear = useCallback(() => {
@@ -24,52 +32,53 @@ export function useProjectRailDrag(
     if (frame.current !== null) cancelAnimationFrame(frame.current);
   }, []);
 
-  const targetAt = useCallback((y: number) => {
+  const targetAt = useCallback((pos: number) => {
     const items = listRef.current?.querySelectorAll<HTMLElement>('.project-rail-item');
     for (const item of items ?? []) {
       if (item.dataset.projectPath === drag.current?.path) continue;
       const rect = item.getBoundingClientRect();
-      if (y < rect.top + rect.height / 2) return item.dataset.projectPath!;
+      if (pos < rect[start] + rect[extent] / 2) return item.dataset.projectPath!;
     }
     return null;
-  }, [listRef]);
+  }, [listRef, start, extent]);
 
   const tick = useCallback(() => {
     const list = listRef.current;
     const current = drag.current;
     if (!list || !current?.inside) { frame.current = null; return; }
     const rect = list.getBoundingClientRect();
-    const edge = Math.min(32, rect.height / 4);
-    const speed = current.y < rect.top + edge
-      ? -Math.min(10, (rect.top + edge - current.y) / 3)
-      : current.y > rect.bottom - edge
-        ? Math.min(10, (current.y - rect.bottom + edge) / 3)
+    const edge = Math.min(32, rect[extent] / 4);
+    const speed = current.pos < rect[start] + edge
+      ? -Math.min(10, (rect[start] + edge - current.pos) / 3)
+      : current.pos > rect[end] - edge
+        ? Math.min(10, (current.pos - rect[end] + edge) / 3)
         : 0;
     if (speed) {
-      list.scrollTop += speed;
-      setBeforePath(targetAt(current.y));
+      if (axis === 'x') list.scrollLeft += speed;
+      else list.scrollTop += speed;
+      setBeforePath(targetAt(current.pos));
     }
     frame.current = requestAnimationFrame(tick);
-  }, [listRef, targetAt]);
+  }, [listRef, targetAt, axis, start, end, extent]);
 
   const onDragStart = useCallback((event: DragEvent, path: string) => {
     event.stopPropagation();
     event.dataTransfer.effectAllowed = 'move';
     event.dataTransfer.setData(PROJECT_DRAG_TYPE, path);
-    drag.current = { path, y: event.clientY, inside: false };
+    drag.current = { path, pos: pointer(event), inside: false };
     setDraggedPath(path);
-  }, []);
+  }, [axis]);
 
   const onDragOver = useCallback((event: DragEvent) => {
     if (!drag.current) return; // Files and drags from other windows are not rail moves.
     event.preventDefault();
     event.stopPropagation();
     event.dataTransfer.dropEffect = 'move';
-    drag.current.y = event.clientY;
+    drag.current.pos = pointer(event);
     drag.current.inside = true;
-    setBeforePath(targetAt(event.clientY));
+    setBeforePath(targetAt(pointer(event)));
     if (frame.current === null) frame.current = requestAnimationFrame(tick);
-  }, [targetAt, tick]);
+  }, [targetAt, tick, axis]);
 
   const onDragLeave = useCallback((event: DragEvent) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -84,9 +93,9 @@ export function useProjectRailDrag(
     if (!drag.current) return;
     event.preventDefault();
     event.stopPropagation();
-    move({ path: drag.current.path, beforePath: targetAt(event.clientY) });
+    move({ path: drag.current.path, beforePath: targetAt(pointer(event)) });
     clear();
-  }, [move, targetAt, clear]);
+  }, [move, targetAt, clear, axis]);
 
   return { draggedPath, beforePath, onDragStart, onDragEnd: clear, listProps: { onDragOver, onDragLeave, onDrop } };
 }

@@ -13,6 +13,7 @@ import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import type { SessionMeta } from '../../store/atoms/sessions';
 import { isClaudeCliTerminalSession } from '../UnifiedAI/claudeCliInputRouting';
 import {
+  assertTrackerItemInWorkspace,
   buildTrackerLaunchContext,
   getEffectiveTrackerLaunchPromptTemplateForWorkspace,
 } from './trackerSessionLaunch';
@@ -34,6 +35,7 @@ export interface TrackerResumeOptions extends TrackerDispatchOptions {
  * prompt as a draft (never sent automatically).
  *
  * @returns the new session id, or null when session creation failed.
+ * @throws when the item belongs to another project (#1822).
  */
 export async function launchTrackerSession({
   trackerItemId,
@@ -41,6 +43,7 @@ export async function launchTrackerSession({
   workspacePath,
   defaultModel,
 }: TrackerDispatchOptions): Promise<string | null> {
+  assertTrackerItemInWorkspace(trackerItem, workspacePath);
   const effectiveTemplate = await getEffectiveTrackerLaunchPromptTemplateForWorkspace(workspacePath);
   const trackerContext = buildTrackerLaunchContext(trackerItemId, trackerItem, effectiveTemplate);
 
@@ -84,9 +87,11 @@ export async function launchTrackerSession({
  * `providerSessionId` — falls back to a fresh {@link launchTrackerSession}.
  *
  * @returns the session id to open, or null when a fallback launch failed.
+ * @throws when the item belongs to another project (#1822).
  */
 export async function resumeTrackerSession(options: TrackerResumeOptions): Promise<string | null> {
   const { linkedSession, workspacePath } = options;
+  assertTrackerItemInWorkspace(options.trackerItem, workspacePath);
   if (!linkedSession || !workspacePath || !isClaudeCliTerminalSession(linkedSession.provider)) {
     return launchTrackerSession(options);
   }

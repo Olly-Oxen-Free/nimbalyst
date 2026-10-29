@@ -11,6 +11,7 @@ import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import { store } from '../../store';
+import { errorNotificationService } from '../../services/ErrorNotificationService';
 import {
   refreshSessionListAtom,
   sessionProcessingAtom,
@@ -24,6 +25,7 @@ import { workstreamStateAtom } from '../../store/atoms/workstreamState';
 import { resolveLinkedSessions } from '../../utils/resolveLinkedSessions';
 import { isClaudeCliTerminalSession } from '../UnifiedAI/claudeCliInputRouting';
 import { launchTrackerSession, resumeTrackerSession } from './trackerSessionDispatch';
+import { assertTrackerItemInWorkspace } from './trackerSessionLaunch';
 import {
   deriveTrackerCardSessionAction,
   SESSION_ACTION_ICON,
@@ -77,6 +79,13 @@ export const TrackerCardSessionButton: React.FC<TrackerCardSessionButtonProps> =
 
     if (sessionAction === 'focus') {
       if (linkedSession) navigateToSession(linkedSession.id);
+      return;
+    }
+
+    try {
+      assertTrackerItemInWorkspace(item, workspacePath);
+    } catch (err) {
+      errorNotificationService.showError('Session not started', (err as Error).message);
       return;
     }
 

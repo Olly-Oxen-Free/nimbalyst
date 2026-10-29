@@ -27,3 +27,23 @@ it('holds a teammate message to the lead until the in-flight commit call settles
   expect(interruptWithMessage).toHaveBeenCalledTimes(1);
   expect(interruptWithMessage).toHaveBeenCalledWith(expect.stringContaining('done with the tests'), 'lead');
 });
+
+it('holds a revival-failure notice to the lead until the in-flight commit call settles', async () => {
+  const interruptWithMessage = vi.fn(async () => {});
+  const manager = new TeammateManager({
+    logNonBlocking: vi.fn(),
+    emit: vi.fn(),
+    interruptWithMessage,
+    isLeadBusy: () => true,
+  } as unknown as TeammateManagerDeps);
+  const end = beginCommitProposalCall('lead');
+
+  (manager as any).deliverRevivalFailure('lead', 'agent-1', 'alice', 'cwd missing');
+  await flush();
+  expect(interruptWithMessage).not.toHaveBeenCalled();
+
+  end();
+  await flush();
+  expect(interruptWithMessage).toHaveBeenCalledTimes(1);
+  expect(interruptWithMessage).toHaveBeenCalledWith(expect.stringContaining('revival failed'), 'lead');
+});

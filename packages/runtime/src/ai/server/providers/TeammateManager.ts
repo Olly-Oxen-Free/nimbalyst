@@ -1457,7 +1457,8 @@ export class TeammateManager {
     });
 
     const formattedMessage = `[Teammate revival failed: "${teammateName}"]\n\n${content}`;
-    this.deps.interruptWithMessage(formattedMessage, sessionId).catch(err => {
+    // #1682: never interrupt the lead mid-commit; the message stays queued until the call settles.
+    afterCommitProposalSettles(sessionId, () => this.deps.interruptWithMessage(formattedMessage, sessionId)).catch(err => {
       console.warn(`[MANAGED-TEAMMATE] Failed to interrupt lead with revival failure:`, err);
     });
 

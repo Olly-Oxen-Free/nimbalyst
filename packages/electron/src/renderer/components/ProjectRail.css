@@ -528,6 +528,19 @@
 .project-rail-item[data-drop-position="before"]::after { top: -5px; }
 .project-rail-item[data-drop-position="after"]::after { bottom: -5px; }
 
+/* Top bar reorders along x: the marker is a vertical bar beside the icon. */
+.project-rail-item.is-horizontal[data-drop-position]::after {
+  top: 0;
+  bottom: 0;
+  left: auto;
+  right: auto;
+  width: 2px;
+  height: auto;
+}
+
+.project-rail-item.is-horizontal[data-drop-position="before"]::after { left: -4px; }
+.project-rail-item.is-horizontal[data-drop-position="after"]::after { right: -4px; }
+
 .project-rail-context-menu-item:disabled {
   color: var(--nim-text-disabled);
   cursor: default;

@@ -154,3 +154,26 @@ describe('launchTrackerSession', () => {
     );
   });
 });
+
+describe('cross-project guard (#1822)', () => {
+  const foreignItem: TrackerRecord = {
+    ...trackerItem,
+    system: { ...trackerItem.system, workspace: '/other-repo' },
+  };
+
+  it('launchTrackerSession refuses an item from another project before creating anything', async () => {
+    await expect(launchTrackerSession({ ...options, trackerItem: foreignItem }))
+      .rejects.toThrow('belongs to /other-repo');
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('resumeTrackerSession refuses an item from another project before resuming', async () => {
+    await expect(resumeTrackerSession({
+      ...options,
+      trackerItem: foreignItem,
+      linkedSession: makeLinkedSession('claude-code-cli'),
+    })).rejects.toThrow('belongs to /other-repo');
+    expect(ensureClaudeCliSession).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+});
