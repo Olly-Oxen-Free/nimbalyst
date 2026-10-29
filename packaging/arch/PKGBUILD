@@ -9,7 +9,7 @@
 # makepkg just repackages what's already built.
 
 pkgname=nimbalyst
-pkgver=0.75.0
+pkgver=0.82.4
 pkgrel=2
 pkgdesc="AI coding workspace (personal fork: live theme-reload fix, Wayland glass transparency, top-dockable project bar, no background auto-update)"
 arch=('x86_64')
@@ -38,7 +38,7 @@ package() {
     rm -f "$pkgdir/opt/nimbalyst/chrome-sandbox"
 
     install -dm755 "$pkgdir/usr/bin"
-    ln -sf "/opt/nimbalyst/@nimbalystelectron" "$pkgdir/usr/bin/nimbalyst"
+    ln -sf "/opt/nimbalyst/nimbalyst" "$pkgdir/usr/bin/nimbalyst"
 
     install -Dm644 "$startdir/nimbalyst.desktop" \
         "$pkgdir/usr/share/applications/nimbalyst.desktop"
